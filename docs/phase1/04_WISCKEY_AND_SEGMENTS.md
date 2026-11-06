@@ -18,7 +18,7 @@ flowchart TB
 
     subgraph OutOfLine["Out-of-Line Blob Path (Large Payload)"]
         SizeCheck -->|"Yes"| AppendBlob["1. Append [Magic | CRC32C | KeyLen | ValLen | Key | Value]<br/>to blob_std_<SeqID>.db or blob_lru_<TblID>_<SeqID>.db"]
-        AppendBlob --> MakePtr["2. Construct 21-Byte BlobPtr<br/>{ kind, table_id, seg_id, offset, len, crc32c }"]
+        AppendBlob --> MakePtr["2. Construct 23-Byte BlobPtr<br/>{ kind, table_id, seg_id, offset, len, crc32c }"]
     end
 
     subgraph InlinePath["Inline Path (Small Setting)"]
@@ -28,9 +28,9 @@ flowchart TB
     MakePtr --> WAL["3. Log to Epoch WAL & Insert into MemTable"]
     MakeInline --> WAL
 
-    subgraph FlushCompact["Flush & Compaction (Keys + Inline Values + 21B Pointers Only)"]
+    subgraph FlushCompact["Flush & Compaction (Keys + Inline Values + 23B Pointers Only)"]
         WAL --> Flush["Flush MemTable to idx_<SeqID>.db (4 KB Blocks)"]
-        Flush --> Compact["Merge-Sort Compaction:<br/>Copies ONLY Keys, Small Inline Values, and 21B BlobPtrs!<br/>Multi-MB Blobs in blob_*.db Are NEVER Copied!"]
+        Flush --> Compact["Merge-Sort Compaction:<br/>Copies ONLY Keys, Small Inline Values, and 23B BlobPtrs!<br/>Multi-MB Blobs in blob_*.db Are NEVER Copied!"]
     end
 ```
 
@@ -123,7 +123,7 @@ Inside each 4 KB Data Block, sorted entries grow **upward** from byte `0`, while
   * `key: [u8; key_len]`
   * `value_payload`:
     * For `InlineValue (1)`: `[val_len: u16 (2B LE) | value: [u8; val_len]]`
-    * For `BlobPtr (2)`: `[kind: u8 (1B) | table_id: u16 (2B) | seg_id: u64 (8B) | offset: u32 (4B) | len: u32 (4B) | crc32c: u32 (4B)]` (21 B)
+    * For `BlobPtr (2)`: `[kind: u8 (1B) | table_id: u16 (2B) | seg_id: u64 (8B) | offset: u32 (4B) | len: u32 (4B) | crc32c: u32 (4B)]` (23 B)
     * For `Tombstone (3)`: Empty (`0 B`)
 * **Entry Offset Directory (`4088 - 2 * K .. 4088`):**
   * $K$ little-endian `u16` values (`off_0, off_1, ..., off_{K-1}`), where `off_i` is the starting byte offset of `Entry i` within the 4096-byte block.
@@ -150,10 +150,57 @@ Inside each 4 KB Data Block, sorted entries grow **upward** from byte `0`, while
 
 ### 4.1 Bounded `MemTable` (`src/memtable/mod.rs`)
 * Backed by an ordered `BTreeMap<Vec<u8>, MemEntry>` where `MemEntry` holds `{ lsn: u64, value: IndexValue }` (`Inline(Vec<u8>)`, `Blob(BlobPtr)`, or `Tombstone`).
-* Tracks exact byte usage (`approximate_bytes`). Because large values (`>= 1024 B`) are converted into 21-byte `BlobPtr` structs *before* entering the `MemTable`, a **4 MB `MemTable` can buffer tens of thousands of multi-megabyte HTTP cache insertions** without exhausting its 4 MB heap cap!
+* Tracks exact byte usage (`approximate_bytes`). Because large values (`>= 1024 B`) are converted into 23-byte `BlobPtr` structs *before* entering the `MemTable`, a **4 MB `MemTable` can buffer tens of thousands of multi-megabyte HTTP cache insertions** without exhausting its 4 MB heap cap!
 
 ### 4.2 Multi-Way Merge Compaction (`compact_idx_segments`)
 * Takes $M$ input `IdxSegmentReader` instances (ordered newest to oldest), streams their 4 KB blocks sequentially, and performs a $K$-way merge sort by key:
   * When multiple segments contain the same key, only the entry with the highest `lsn` is retained; older versions are discarded.
   * If `drop_tombstones = true` (when compacting all existing segments into a single base segment), `IndexValue::Tombstone` entries are stripped completely, reclaiming deleted key space.
   * When an overwritten or deleted entry was a `BlobPtr` pointing to `blob_std_<SeqID>.db` (or `blob_lru`), compaction reports the reclaimed `dead_bytes` per `(BlobKind, table_id, seg_id)` so `BootMetaState` can track dead blob ratios and unlink 100%-dead blob segments without copying a single blob byte!
+
+---
+
+## 5. Empirical Benchmark Results (`examples/wisckey_bench.rs`)
+
+Executed on Windows 11 NVMe via `cargo run --release --example wisckey_bench`.
+
+### 5.1 Benchmark 1: WiscKey KV Separation vs. Inline Storage (`INLINE_THRESHOLD` Validation)
+
+Measuring 4-way merge compaction and point-read latency across 4 segments $\times$ 1,500 keys:
+
+| Value Size | Storage Mode | Point Read Latency | 4-Way Compaction Time | Compaction Write Volume | In-Heap Index (Fence + Bloom) |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| **128 B** | **Inline** | `3.74 µs` | `6.28 ms` | `0.23 MB` | `3.76 KB` |
+| **128 B** | **WiscKey** | `6.38 µs` | `5.25 ms` | `0.07 MB` | `2.43 KB` |
+| **512 B** | **Inline** | `3.83 µs` | `11.51 ms` | `0.84 MB` | `8.97 KB` |
+| **512 B** | **WiscKey** | `6.67 µs` | `4.86 ms` | `0.07 MB` | `2.43 KB` |
+| **1024 B** | **Inline** | `3.84 µs` | `20.71 ms` | `1.96 MB` | `18.43 KB` |
+| **1024 B** | **WiscKey** | `6.87 µs` | `4.94 ms` | `0.07 MB` | `2.43 KB` |
+| **2048 B** | **Inline** | `5.12 µs` | `48.28 ms` | `5.88 MB` | `51.64 KB` |
+| **2048 B** | **WiscKey** | `7.30 µs` | `4.60 ms` | `0.07 MB` | `2.43 KB` |
+
+* **Architectural Takeaway:**
+  * At **128 B**, Inline storage avoids a second `pread` (`3.74 µs` vs. `6.38 µs`) while adding minimal compaction overhead (`6.28 ms`).
+  * At **1024 B (`INLINE_THRESHOLD`)** and **2048 B**, Inline compaction write volume explodes to `1.96 MB` (`28×` WiscKey) and `5.88 MB` (`84×` WiscKey), slowing compaction by **`4.2×` to `10.5×`** and bloating in-heap sparse fence pointers by **`7.6×` to `21.3×`** (`51.64 KB` vs. `2.43 KB`) because each 4 KB block can only fit 1–3 entries! Meanwhile, WiscKey keeps compaction write volume (`0.07 MB`), compaction latency (`~4.8 ms`), and heap index footprint (`2.43 KB`) **completely invariant to value size**.
+
+### 5.2 Benchmark 2: Bloom Filter `bits_per_key` Trade-off Across 10 Active Segments
+
+Measuring negative lookup latency (key absent from all 10 segments, but falling within every segment's `[first_key .. last_key]` fence range) and oldest-segment hit latency (must check 9 newer segments before hitting `seg[0]`) across 10 segments $\times$ 2,000 keys (`20,000` keys total):
+
+| `bits_per_key` | Total Bloom RAM (10 Segs) | Measured False Positive Rate | Negative Lookup Latency | Oldest-Segment Hit Latency |
+| :--- | ---: | ---: | ---: | ---: |
+| **`0` (Disabled)** | `0.00 KB` | `100.00%` | `33.12 µs` | `33.02 µs` |
+| **`6 bits/key`** | `14.65 KB` | `5.41%` | `2.39 µs` (`13.9×` faster) | `5.47 µs` (`6.0×` faster) |
+| **`10 bits/key` (Default)** | `24.41 KB` | `1.02%` | **`0.75 µs` (`44.2×` faster)** | **`4.24 µs` (`7.8×` faster)** |
+| **`14 bits/key`** | `34.18 KB` | `0.15%` | `0.52 µs` (`63.7×` faster) | `3.77 µs` (`8.8×` faster) |
+
+* **Architectural Takeaway:**
+  Without a Bloom Filter (`0 bits/key`), every negative lookup or oldest-segment lookup must issue 9–10 separate 4 KB positional `pread` syscalls (`33.12 µs`). At the default **`10 bits/key`** ($1.25\text{ B/key}$, `24.41 KB` total for 20,000 keys), false positives drop to **`1.02%`**, cutting negative lookup latency by **`44.2×`** (`0.75 µs`) and oldest-segment hit latency by **`7.8×`** (`4.24 µs` — paying practically a single `pread` on `seg[0]`).
+
+### 5.3 Benchmark 3: 4 KB Data Block In-Place Lookup (`u16` Offset Directory Binary Search vs. Linear Scan)
+
+| Lookup Algorithm Inside Verified 4 KB Block (`88` Entries) | Latency per Lookup | Relative Speedup |
+| :--- | ---: | ---: |
+| **$O(K)$ Sequential Entry Linear Scan** | `363.6 ns` | `1.00×` |
+| **$O(\log K)$ Downward-Growing `u16` Offset Directory Binary Search** | **`151.1 ns`** | **`2.41×` faster** |
+

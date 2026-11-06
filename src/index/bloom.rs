@@ -1,0 +1,126 @@
+//! Kirsch-Mitzenmacher Double-Hashing Bloom Filter built on hardware-accelerated CRC32C.
+//!
+//! Keeps a compact bitset in heap memory (~10 bits per key = 1.25 bytes per key, ~0.9%
+//! false-positive rate) so point lookups (`get`) can skip immutable `idx_<SeqID>.db` segments
+//! without issuing a single `pread` system call.
+
+use std::io;
+
+use crate::util::crc32c::crc32c_append;
+
+const SEED_H1: u32 = 0x1357_9BDF;
+const SEED_H2: u32 = 0x2468_ACE0;
+
+/// Compact in-memory Bloom filter for an `idx_<SeqID>.db` segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BloomFilter {
+    bits: Vec<u8>,
+    num_bits: u32,
+    num_probes: u8,
+}
+
+impl BloomFilter {
+    /// Creates an empty filter disabled (`bits_per_key == 0`) or sized for `num_keys`.
+    pub fn new(num_keys: usize, bits_per_key: usize) -> Self {
+        if bits_per_key == 0 || num_keys == 0 {
+            return Self {
+                bits: Vec::new(),
+                num_bits: 0,
+                num_probes: 0,
+            };
+        }
+
+        // Optimal number of probes k = ln(2) * bits_per_key (~0.69 * bits_per_key)
+        let k = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
+        let raw_bits = (num_keys.saturating_mul(bits_per_key)).max(64);
+        let num_bytes = raw_bits.div_ceil(8);
+        let num_bits = (num_bytes * 8) as u32;
+
+        Self {
+            bits: vec![0u8; num_bytes],
+            num_bits,
+            num_probes: k,
+        }
+    }
+
+    /// Inserts `key` into the Bloom filter.
+    #[inline]
+    pub fn insert(&mut self, key: &[u8]) {
+        if self.num_bits == 0 {
+            return;
+        }
+        let h1 = crc32c_append(SEED_H1, key);
+        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+
+        let mut h = h1;
+        for _ in 0..self.num_probes {
+            let bit_idx = (h % self.num_bits) as usize;
+            self.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
+            h = h.wrapping_add(h2);
+        }
+    }
+
+    /// Returns `true` if `key` may be present in the segment, or `false` if `key` is
+    /// definitely not present.
+    #[inline]
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        if self.num_bits == 0 {
+            // When the Bloom filter is disabled (0 bits/key), conservatively return true.
+            return true;
+        }
+        let h1 = crc32c_append(SEED_H1, key);
+        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+
+        let mut h = h1;
+        for _ in 0..self.num_probes {
+            let bit_idx = (h % self.num_bits) as usize;
+            if (self.bits[bit_idx >> 3] & (1u8 << (bit_idx & 7))) == 0 {
+                return false;
+            }
+            h = h.wrapping_add(h2);
+        }
+        true
+    }
+
+    /// Returns the heap memory consumed by this Bloom filter in bytes.
+    pub fn heap_bytes(&self) -> usize {
+        self.bits.len()
+    }
+
+    /// Serializes the filter into `[num_probes: u8 | reserved: [u8; 3] | bit_bytes_len: u32 LE | bits...]`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.num_probes);
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(&(self.bits.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.bits);
+    }
+
+    /// Deserializes a [`BloomFilter`] from the beginning of `input`, advancing the slice.
+    pub fn decode(input: &mut &[u8]) -> io::Result<Self> {
+        if input.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated BloomFilter header",
+            ));
+        }
+        let num_probes = input[0];
+        let byte_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+        *input = &input[8..];
+
+        if input.len() < byte_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated BloomFilter bitset",
+            ));
+        }
+        let bits = input[..byte_len].to_vec();
+        *input = &input[byte_len..];
+
+        let num_bits = (byte_len * 8) as u32;
+        Ok(Self {
+            bits,
+            num_bits,
+            num_probes,
+        })
+    }
+}

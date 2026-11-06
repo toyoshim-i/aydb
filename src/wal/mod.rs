@@ -70,7 +70,7 @@ pub enum BlobKind {
 }
 
 impl BlobKind {
-    fn from_u8(v: u8) -> io::Result<Self> {
+    pub fn from_u8(v: u8) -> io::Result<Self> {
         match v {
             0 => Ok(Self::Standard),
             1 => Ok(Self::Lru),
