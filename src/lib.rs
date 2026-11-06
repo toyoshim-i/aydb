@@ -8,6 +8,7 @@
 //!   Bloom Filters, Bounded MemTable, and Merge Compaction (`blob`, `index`, `memtable`)
 //! - Step 1-5: Capped Tables (`MAX_BYTES`), Delayed LRU Eviction, Memcomparable Keys,
 //!   and Unified Coordinator Engine (`lru`, `engine`)
+//! - Phase 2: SQLite Virtual Table (`sqlite3_module`) Adapter (`vtab`)
 
 pub mod blob;
 pub mod engine;
@@ -17,4 +18,5 @@ pub mod memtable;
 pub mod meta;
 pub mod pal;
 pub mod util;
+pub mod vtab;
 pub mod wal;
