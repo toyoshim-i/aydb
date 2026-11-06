@@ -180,3 +180,33 @@ Once both `sync_batches` and `buf_batches` have been recovered:
 1. Any batch with `batch.lsn <= boot_meta.checkpoint_lsn` is filtered out (already persisted in an `idx_<SeqID>.db` segment).
 2. The two sorted slices (`sync_batches` and `buf_batches`) are merged in $O(N)$ by ascending `batch.lsn`.
 3. For each `WalRecord::PutBlobPtr`, the recovery coordinator invokes a caller-supplied `BlobValidator` callback (`Fn(&BlobPtr) -> bool`). Following the **`Write-Blob-Before-WAL`** protocol, if a power outage prevented an un-fsynced blob payload from reaching disk, `BlobValidator` returns `false` and that uncommitted record is safely skipped without aborting recovery!
+
+---
+
+## 5. Empirical Benchmark Results (`examples/meta_wal_bench.rs`)
+
+Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NTFS / NVMe).
+
+### 5.1 WAL Write Throughput & Latency Across Durability Modes
+
+| WAL Stream & Mode | Records / Batch | Throughput (`records/sec`) | Latency / Record | Crash Resilience Guarantee |
+| :--- | ---: | ---: | ---: | :--- |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `12,736 rec/s` | `78.52 µs` | Power Loss + OS Panic + Process Kill |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `130,803 rec/s` | `7.65 µs` | Power Loss + OS Panic + Process Kill |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | **`568,372 rec/s`** | **`1.76 µs`** | Power Loss + OS Panic + Process Kill |
+| **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`282,076 rec/s`** | **`3.55 µs`** | Process Kill (`kill -9` / `TerminateProcess`) |
+| **`wal_buf.db` (`BufferedUserSpaceCoalesced`)** | `1` | **`6,482,562 rec/s`** | **`0.15 µs` (`150 ns`)** | Flushed to OS Page Cache every 4 KB sector |
+
+### 5.2 Epoch Rotation vs. Zero-Fill & Crash Recovery Scan Speed
+
+| Operation | Measured Time | Effective Bandwidth / Comparison |
+| :--- | ---: | :--- |
+| **$O(1)$ Epoch Rotation (`reset_for_new_epoch`)** | **`200 ns`** (`0.0002 ms`) | **`55,750×` faster** than zero-filling a 16 MB WAL (`11.15 ms`) |
+| **Crash Recovery Scan (`1,238` sectors / `50,000` batches)** | **`8.84 ms`** | **`547.3 MB/s`** (includes both 4 KB sector CRC32C and batch CRC32C verification) |
+
+#### Key Engineering Takeaways
+1. **Why Dual-Mode Buffering (`BufferedImmediateOsCache` vs. `BufferedUserSpaceCoalesced`) Matters:**
+   * Writing every single 80-byte record immediately to the OS Page Cache (`BufferedImmediateOsCache`) achieves **`282,076 records/sec` (`3.55 µs/op`)** while guaranteeing zero data loss even if the process is terminated via `TerminateProcess` (`kill -9`) a microsecond later.
+   * For bulk cache imports where user-space 4 KB sector coalescing (`BufferedUserSpaceCoalesced`) is used, throughput jumps **`23×` to `6.48 million records/sec` (`150 ns/op`)** because only 1 `WriteFile` syscall is issued per ~50 records (every 4 KB).
+2. **Eliminating Checkpoint Stalls via `WalEpoch`:** Rotating `wal_buf.db` after a MemTable flush takes **`200 ns`** instead of an `11.15 ms` disk zero-fill, and recovering 50,000 buffered commits on startup finishes in **`8.84 ms`**.
+
