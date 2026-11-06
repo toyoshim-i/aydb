@@ -23,3 +23,15 @@ This document defines the workflow, conventions, and engineering standards for d
    * Failure modes (torn writes, partial flushes, `SHARING_VIOLATION`, SMB write-behind errors) and how they are tested.
    * Public and internal Rust API boundaries.
 3. **Incremental Verification:** Each subsystem must be accompanied by deterministic unit tests and fault-injection / crash-recovery tests before moving on to the next layer.
+
+## 4. Living Textbook Documentation ("Build-to-Learn" Philosophy)
+
+A core goal of the `aydb` project is to produce a **living, textbook-grade record of how a production-quality embedded database is designed and built from the ground up**. Design documents under `docs/` should read like chapters of a systems engineering textbook (in the spirit of *Database Internals* or *Designing Data-Intensive Applications*) rather than terse API notes:
+
+* **Explain the "Why" and Fundamental Trade-Offs:** Do not merely state the chosen data structure or protocol. Contrast it with classic alternatives (e.g., B-Tree vs. LSM-Tree vs. WiscKey, user-space Buffer Pool vs. OS Page Cache delegation, double `fsync` vs. `Write-Blob-Before-WAL` with CRC verification) and explain the hardware and OS mechanics driving the decision.
+* **Demystify OS & Filesystem Internals:** Explicitly document how the storage engine interacts with kernel subsystems—such as Windows Cache Manager 256 KB Virtual Address Control Blocks (VACBs), SMB Read-Write-Handle (RWH) leases, NTFS MFT metadata locking, antivirus minifilter behavior, and POSIX `pread`/`pwrite`/`fcntl` semantics.
+* **Diagramming Standards:**
+  * **Mermaid Diagrams:** Use for architectural overviews, read/write control flows, sequence diagrams, state machines, and module dependency graphs so they remain easy to diff and evolve inline.
+  * **RFC-Style ASCII Box Diagrams:** Use for exact byte/bit offsets, sector headers, and fixed-size binary slot layouts.
+  * **SVG Figures (`docs/assets/*.svg`):** Use when illustrating complex multi-layer memory/disk cross-sections or pointer topologies that require pixel-precise spatial alignment.
+
