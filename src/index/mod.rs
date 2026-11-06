@@ -732,14 +732,25 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
 
     /// Scans all entries whose keys start with `prefix`.
     pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<IndexEntry>> {
+        self.scan_prefix_from(prefix, prefix, usize::MAX)
+    }
+
+    /// Scans up to `limit` entries starting at `seek_key` whose keys still begin with `prefix`.
+    pub fn scan_prefix_from(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        limit: usize,
+    ) -> io::Result<Vec<IndexEntry>> {
         let mut out = Vec::new();
-        if self.fence_pointers.is_empty() {
+        if self.fence_pointers.is_empty() || limit == 0 {
             return Ok(out);
         }
 
+        let effective_start = if seek_key > prefix { seek_key } else { prefix };
         let start_pos = self
             .fence_pointers
-            .partition_point(|fp| fp.first_key.as_ref() < prefix);
+            .partition_point(|fp| fp.first_key.as_ref() < effective_start);
         let first_block = start_pos.saturating_sub(1) as u32;
 
         let mut block_buf = [0u8; IDX_BLOCK_SIZE];
@@ -749,13 +760,16 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             let reader = IdxBlockReader::open_verified(&block_buf)?;
             for i in 0..reader.num_entries() {
                 let entry = reader.decode_entry_at(i)?;
-                if entry.key.as_slice() < prefix {
+                if entry.key.as_slice() < effective_start {
                     continue;
                 }
                 if !entry.key.starts_with(prefix) {
                     return Ok(out);
                 }
                 out.push(entry);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
             }
         }
         Ok(out)

@@ -363,6 +363,10 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         self.active_epoch
     }
 
+    pub fn file(&self) -> &Arc<F> {
+        &self.file
+    }
+
     pub fn current_sector_idx(&self) -> usize {
         self.current_sector_idx
     }

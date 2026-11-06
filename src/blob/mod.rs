@@ -64,6 +64,10 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         self.seq_id
     }
 
+    pub fn table_id(&self) -> u16 {
+        self.table_id
+    }
+
     pub fn current_len(&self) -> u64 {
         self.write_offset
     }

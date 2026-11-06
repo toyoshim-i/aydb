@@ -109,8 +109,26 @@ impl MemTable {
 
     /// Scans all entries in the `MemTable` whose key starts with `prefix`.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<IndexEntry> {
+        self.scan_prefix_from(prefix, prefix, usize::MAX)
+    }
+
+    /// Scans up to `limit` entries in the `MemTable` starting at `seek_key` whose key starts with `prefix`.
+    pub fn scan_prefix_from(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        limit: usize,
+    ) -> Vec<IndexEntry> {
         let mut out = Vec::new();
-        for (k, entry) in self.map.range(prefix.to_vec()..) {
+        if limit == 0 {
+            return out;
+        }
+        let start = if seek_key > prefix {
+            seek_key.to_vec()
+        } else {
+            prefix.to_vec()
+        };
+        for (k, entry) in self.map.range(start..) {
             if !k.starts_with(prefix) {
                 break;
             }
@@ -119,6 +137,9 @@ impl MemTable {
                 lsn: entry.lsn,
                 value: entry.value.clone(),
             });
+            if out.len() >= limit {
+                break;
+            }
         }
         out
     }

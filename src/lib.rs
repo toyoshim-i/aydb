@@ -6,9 +6,13 @@
 //! - Step 1-3: Pre-Allocated Epoch WAL and Two-Stream Crash Recovery (`wal`)
 //! - Step 1-4: WiscKey KV Separation, 4 KB Block SSTables, Sparse Fence Pointers,
 //!   Bloom Filters, Bounded MemTable, and Merge Compaction (`blob`, `index`, `memtable`)
+//! - Step 1-5: Capped Tables (`MAX_BYTES`), Delayed LRU Eviction, Memcomparable Keys,
+//!   and Unified Coordinator Engine (`lru`, `engine`)
 
 pub mod blob;
+pub mod engine;
 pub mod index;
+pub mod lru;
 pub mod memtable;
 pub mod meta;
 pub mod pal;
