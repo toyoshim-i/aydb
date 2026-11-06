@@ -1,5 +1,9 @@
 //! `aydb` (*All Your DataBase*) — Windows/SMB-optimized embedded storage engine.
 //!
-//! Currently implements Phase 1, Step 1-1: The Platform Abstraction Layer (PAL / VFS).
+//! Currently implements Phase 1:
+//! - Step 1-1: Platform Abstraction Layer (`pal`)
+//! - Step 1-2: Atomic Boot Metadata, Hardware CRC32C, and Deferred GC (`meta`, `util`)
 
+pub mod meta;
 pub mod pal;
+pub mod util;
