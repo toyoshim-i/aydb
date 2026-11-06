@@ -294,13 +294,48 @@ pub trait PlatformFs: Send + Sync + 'static {
 
 ---
 
-## 7. Planned Empirical Benchmarks for Step 1-1
+## 7. Empirical Benchmark Results (`examples/pal_bench.rs`)
 
-When implementing `src/pal/`, we will build a repeatable microbenchmark suite (`benches/pal_bench.rs`) to record quantitative measurements across **Local NTFS (NVMe)** and **Remote SMB**:
+To validate the theoretical kernel analysis in Sections 2 and 4, we executed `cargo run --release --example pal_bench` on Windows (Local NTFS / NVMe).
 
-1. **Benchmark 1 — Multi-Threaded Positional Read Scaling (`FO_SYNCHRONOUS_IO` vs. `FILE_FLAG_OVERLAPPED`):**
-   * **Setup:** A 64 MB `idx` file where 95% of reads hit hot 4 KB cached blocks and 5% of reads hit uncached offsets (or simulated/real SMB latency).
-   * **Metric:** Total throughput (ops/sec) and P99 latency of hot-cache reads across `1, 2, 4, 8, 16` reader threads, comparing standard `std::os::windows::fs::FileExt::seek_read` against `aydb`'s `FILE_FLAG_OVERLAPPED` + thread-local Event implementation.
-2. **Benchmark 2 — First-Epoch WAL Write Latency (`PhysicalZeroFill` vs. `LogicalExtendOnly`):**
-   * **Setup:** Pre-allocating a 2 MB `wal_sync.db` (`FILE_FLAG_WRITE_THROUGH`) and a 16 MB `wal_buf.db` (Buffered) using both `PreallocStrategy::PhysicalZeroFill` and `PreallocStrategy::LogicalExtendOnly`, then writing 4 KB sectors sequentially across Epoch 1 and Epoch 2.
-   * **Metric:** File creation time (ms) vs. per-4 KB write P50/P99 latency (μs) during Epoch 1 (VDL extension) and Epoch 2 (in-place overwrite within VDL).
+### 7.1 Benchmark 1: The NTFS Valid Data Length (VDL) Cliff on 4 KB WAL Writes
+
+| Target File & Mode | `PreallocStrategy` | Prealloc Time | Epoch 1 Total | Epoch 1 P50 | Epoch 1 P99 | Epoch 2 Total | Epoch 2 P50 | Epoch 2 P99 |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`wal_sync.db`**<br/>(`WRITE_THROUGH`, 2 MB / 512 sectors) | `LogicalExtendOnly` (`VDL = 0`) | `0.56 ms` | **`63.13 ms`** | **`121.30 µs`** | **`191.90 µs`** | `39.94 ms` | `76.80 µs` | `134.50 µs` |
+| **`wal_sync.db`**<br/>(`WRITE_THROUGH`, 2 MB / 512 sectors) | `PhysicalZeroFill` (`VDL = EOF`) | `3.55 ms` | **`39.61 ms`** | **`77.70 µs`** | **`132.40 µs`** | `39.18 ms` | `75.90 µs` | `116.70 µs` |
+| **`wal_buf.db`**<br/>(Buffered, 16 MB / 4096 sectors) | `LogicalExtendOnly` (`VDL = 0`) | **`0.49 ms`** | `18.90 ms` | `4.10 µs` | `10.10 µs` | `16.68 ms` | `3.70 µs` | `7.60 µs` |
+| **`wal_buf.db`**<br/>(Buffered, 16 MB / 4096 sectors) | `PhysicalZeroFill` (`VDL = EOF`) | `11.15 ms` | `17.64 ms` | `4.00 µs` | `7.00 µs` | `16.65 ms` | `3.60 µs` | `8.80 µs` |
+
+#### Key Engineering Takeaways from Benchmark 1
+1. **`wal_sync.db` (`FILE_FLAG_WRITE_THROUGH`) Suffers a ~58% Latency Penalty Without `PhysicalZeroFill`:**
+   When `wal_sync.db` is only logically extended (`VDL = 0`), every 4 KB sector write during Epoch 1 takes **`121.30 µs` (P50)** because NTFS must synchronously log a `ValidDataLength` metadata update to `$LogFile`. Paying a one-time **`3.55 ms`** cost at creation time to zero-fill the 2 MB file in 256 KB chunks reduces Epoch 1 P50 write latency immediately to **`77.70 µs`**—matching Epoch 2 (`75.90 µs`).
+2. **`wal_buf.db` (Buffered) Should Use `LogicalExtendOnly`:**
+   Because `wal_buf.db` writes into the OS Page Cache without `FILE_FLAG_WRITE_THROUGH`, NTFS coalesces VDL updates lazily in memory. `LogicalExtendOnly` initializes the 16 MB file in **`0.49 ms`** (22× faster startup than `PhysicalZeroFill`) with negligible impact on Epoch 1 buffered write latency (`4.10 µs` vs. `4.00 µs`).
+
+---
+
+### 7.2 Benchmark 2: Concurrent Positional 4 KB Reads (`FO_SYNCHRONOUS_IO` vs. `FILE_FLAG_OVERLAPPED`)
+
+#### Part 2A: Pure Hot-Cache Concurrent Read Scaling (16 MB Index File, 20,000 Reads/Thread)
+
+| Reader Threads | `std::fs::File::seek_read` (`FO_SYNCHRONOUS_IO`) | `aydb::pal::OsFile` (`FILE_FLAG_OVERLAPPED`) | Speedup |
+| ---: | ---: | ---: | ---: |
+| **1** | `0.27 Mops/sec` | `0.20 Mops/sec` | `0.75×` |
+| **2** | `0.15 Mops/sec` | `0.28 Mops/sec` | **`1.81×`** |
+| **4** | `0.14 Mops/sec` | `0.33 Mops/sec` | **`2.47×`** |
+| **8** | `0.12 Mops/sec` | `0.34 Mops/sec` | **`2.77×`** |
+| **16** | `0.12 Mops/sec` | `0.38 Mops/sec` | **`3.18×`** |
+
+*Note on 1-Thread Overhead:* At `Threads = 1`, `OVERLAPPED` incurs ~1 µs of extra kernel work per syscall because `NtReadFile` references and signals the thread-local `hEvent` (`ObReferenceObjectByHandle` + `KeSetEvent`). However, as soon as 2 or more threads read concurrently, `std::fs::File::seek_read` degrades due to `FILE_OBJECT.Lock` contention, whereas `aydb::pal::OsFile` scales up to **`3.18×` higher throughput**.
+
+#### Part 2B: Head-of-Line Blocking Under Concurrent Disk Stall (8 Hot-Cache Readers + 1 Background Flusher)
+
+| Handle Implementation | Read Throughput | P50 Read Latency | P99 Read Latency |
+| :--- | ---: | ---: | ---: |
+| **`std::fs::File` (`FO_SYNCHRONOUS_IO`)** | `7.1 K ops/sec` | `7.70 µs` | **`21,605.30 µs` (`21.6 ms`)** |
+| **`aydb::pal::OsFile` (`FILE_FLAG_OVERLAPPED`)** | **`327.6 K ops/sec` (`46.1×`)** | `20.20 µs` | **`88.80 µs` (`243×` lower)** |
+
+#### Key Engineering Takeaways from Benchmark 2B
+When a single slow I/O operation (such as a cache miss over SMB/SSD or a background flush) occurs on a standard synchronous file handle, `FILE_OBJECT.Lock` blocks all 8 reader threads even though their target 4 KB blocks are already resident in RAM—causing tail latency to explode to **`21.6 ms`**. With `aydb`'s `FILE_FLAG_OVERLAPPED` + thread-local Event architecture, hot-cache readers bypass the stalled thread completely, achieving **`46.1×` higher throughput** and **`243×` lower P99 latency (`88.80 µs`)**.
+

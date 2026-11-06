@@ -1,0 +1,8 @@
+[package]
+name = "aydb"
+version = "0.1.0"
+edition = "2024"
+description = "Windows/SMB-optimized embedded storage engine and lightweight SQL runtime"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
