@@ -75,7 +75,7 @@ flowchart TB
 
     subgraph OSCache["2. OS Page Cache (Windows Cache Manager / 256 KB VACB)"]
         direction LR
-        WalCache["Buffered WAL Sectors<br/>(hWalBuffered)"]
+        WalCache["Buffered WAL Sectors<br/>(wal_buf.db)"]
         IdxCache["Hot 4 KB Index Blocks<br/>(RANDOM_ACCESS hint)"]
         BlobCache["Prefetched 256 KB Blob Windows<br/>(SEQUENTIAL_SCAN hint)"]
     end
@@ -83,7 +83,7 @@ flowchart TB
     subgraph Disk["3. Non-Volatile Disk / Exclusive SMB Share (dwShareMode = 0)"]
         direction LR
         BootMeta["boot_meta.db (8 KB)<br/>Slot A (4 KB) | Slot B (4 KB)"]
-        WalFile["wal_00.db / wal_01.db (16 MB fixed)<br/>4 KB Sector Ring with WalEpoch"]
+        WalFile["wal_sync.db (2 MB) & wal_buf.db (16 MB)<br/>4 KB Sector Rings with WalEpoch"]
         IdxFiles["idx_<SeqID>.db<br/>Immutable Sorted 4 KB Blocks"]
         BlobFiles["blob_std_<SeqID>.db<br/>blob_lru_<TblID>_<SeqID>.db"]
     end
@@ -135,9 +135,9 @@ sequenceDiagram
     end
 
     alt DurabilityMode == Sync (Critical Settings)
-        Eng->>WAL: Write 4 KB padded sector via hWalSync (WRITE_THROUGH)
+        Eng->>WAL: Write 4 KB padded sector to wal_sync.db (WRITE_THROUGH)
     else DurabilityMode == Buffered (Cache / High-Freq State)
-        Eng->>WAL: Write via hWalBuffered (Enters OS Page Cache immediately)
+        Eng->>WAL: Write to wal_buf.db (Enters OS Page Cache immediately)
     end
 
     Eng->>MT: Insert (Key -> InlineValue or BlobPtr)

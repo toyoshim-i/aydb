@@ -39,8 +39,9 @@ To maximize the effectiveness of the Windows Cache Manager (which maps files in 
 
 | File Category | Naming Convention | OS Open Flags (Win / Unix) | Role & Lifecycle |
 | :--- | :--- | :--- | :--- |
-| **Boot Metadata** | `boot_meta.db` | Standard (4 KB-aligned updates) | Fixed 8 KB size (4 KB × 2 ping-pong buffer). Stores active segment ID lists, table statistics, and pending GC lists. |
-| **Journal (WAL)** | `wal_00.db`, `wal_01.db` | `SEQUENTIAL_SCAN` + `WRITE_THROUGH` (Dual-handle) | Fixed 16 MB size (pre-allocated). Sequentially logs updates to the MemTable. Fixed size avoids NTFS MFT metadata extension locks. |
+| **Boot Metadata** | `boot_meta.db` | Standard (`WRITE_THROUGH`, 4 KB-aligned) | Fixed 8 KB size (4 KB × 2 ping-pong buffer). Stores active segment ID lists, table statistics, and pending GC lists. |
+| **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` + `WRITE_THROUGH` | Fixed 2 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. |
+| **Buffered Journal (WAL)** | `wal_buf.db` | `OVERLAPPED` + `SEQUENTIAL_SCAN` | Fixed 16 MB size (pre-allocated). Sequentially logs high-frequency buffered updates in OS cache without disk stalls. |
 | **Index Layer** | `idx_<SeqID>.db` | `RANDOM_ACCESS` / `FADV_RANDOM` | Immutable sorted key-value file (SSTable format). Stores keys, small inline column values, and pointers to out-of-line blobs. |
 | **Standard Blob Layer** | `blob_std_<SeqID>.db` | `SEQUENTIAL_SCAN` / `FADV_SEQUENTIAL` | Append-only immutable file storing values larger than the inline threshold (e.g., 1 KB). Aligned to 256 KB boundaries to leverage sequential read-ahead. |
 | **LRU Blob Layer** | `blob_lru_<TblID>_<SeqID>.db` | `SEQUENTIAL_SCAN` / `FADV_SEQUENTIAL` | Append-only blob file dedicated to a specific LRU-capped table. Enables whole-generation file deletion (Copy-less Eviction). |
@@ -92,14 +93,14 @@ To support both fast random updates of small configuration records and zero writ
   `[Magic "AYDB" (4B) | HeaderCRC32C (4B) | Generation (8B) | ActiveWalEpoch (8B) | ActiveIdxList... | ActiveBlobList... | PendingDeleteList... | PayloadCRC32C (4B)]`
 * When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected.
 
-### 4.2 Pre-Allocated Fixed-Size WAL and Dual-Handle Commit
+### 4.2 Pre-Allocated Fixed-Size WAL and Physical Two-Stream Commit
 
 * **Zero-Fill-Free Reuse via Epoch Numbers:**
-  `wal_00.db` (fixed 16 MB) is treated as an array of 4 KB sectors. Each sector begins with a header: `[CRC32C (4B) | WalEpoch (4B) | LSN (8B)]`. When the WAL wraps around or is reused, `WalEpoch` is incremented and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
-* **Two-Tier Durability Modes via Dual Handles:**
-  For the same underlying WAL file, the engine opens both a standard buffered handle (`hWalBuffered`) and a write-through handle (`hWalSync` opened with `FILE_FLAG_WRITE_THROUGH`).
-  1. **Sync Mode (Critical configuration changes, etc.):** Padded to a 4 KB sector boundary and written via `hWalSync` (or followed by `sync_durable()`). Guaranteed durable across power loss.
-  2. **Buffered Mode (HTTP cache insertions, high-frequency state updates, etc.):** Written via `hWalBuffered` using `WriteFile` and returns immediately. Because the data enters the OS page cache immediately, **application crashes or `kill -9` / `TerminateProcess` lose zero data**. Only a full OS crash or power outage rolls back the last few seconds of unflushed buffered writes cleanly.
+  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a header: `[CRC32C (4B) | WalEpoch (4B) | LSN (8B)]`. When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
+* **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
+  To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
+  1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written directly through to non-volatile storage.
+  2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, **losing zero data on application crashes or `TerminateProcess` / `kill -9`**. Only a full OS crash or power outage cleanly rolls back the last few seconds of unflushed buffered writes. During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
 
 ### 4.3 Consistency Protocol for KV Separation (`Write-Blob-Before-WAL`)
 
