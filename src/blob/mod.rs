@@ -2,7 +2,7 @@
 //! `blob_lru_<TblID>_<SeqID>.db`).
 //!
 //! Enforces the `Write-Blob-Before-WAL` crash-consistency protocol: blobs are appended
-//! before their 21-byte [`BlobPtr`] is logged to the WAL, and every read or recovery check
+//! before their 23-byte [`BlobPtr`] is logged to the WAL, and every read or recovery check
 //! verifies the framed `BlobCrc32c` so power-loss truncated blobs safely resolve to `None`.
 
 use std::io;
@@ -24,16 +24,16 @@ pub const DEFAULT_MAX_BLOB_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 const BLOB_RECORD_MAGIC: &[u8; 4] = b"AYBL";
 const BLOB_RECORD_HEADER_LEN: usize = 16;
 /// Maximum user-space write buffer size (`256 KB`) in [`BlobSegmentWriter`] before flushing
-/// coalesced blob records to the OS file handle (`P-03`).
+/// coalesced blob records to the OS file handle.
 const BLOB_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
 /// Maximum blob frame size (`16 KB`) read via a stack buffer in [`BlobSegmentReader::append_blob_into`]
-/// to avoid redundant `Vec::resize` zero-filling and `copy_within` payload shifting (`P-03`).
+/// to avoid redundant `Vec::resize` zero-filling and `copy_within` payload shifting.
 const BLOB_STACK_READ_MAX_LEN: usize = 16 * 1024;
 
 /// Append-only writer for a single standard or per-table LRU blob segment file.
 ///
 /// Reuses an internal staging buffer (`write_buf`) to eliminate per-blob heap allocations and
-/// coalesce multi-row blob writes into fewer OS `WriteFile` / `pwrite` syscalls (`P-03`).
+/// coalesce multi-row blob writes into fewer OS `WriteFile` / `pwrite` syscalls.
 pub struct BlobSegmentWriter<F: PlatformFile> {
     file: Arc<F>,
     kind: BlobKind,
@@ -95,7 +95,7 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         &self.file
     }
 
-    /// Flushes any staged blob records in `write_buf` to the underlying OS file handle (`P-03`).
+    /// Flushes any staged blob records in `write_buf` to the underlying OS file handle.
     #[inline]
     pub fn flush_buffer(&mut self) -> io::Result<()> {
         if !self.write_buf.is_empty() {
@@ -110,7 +110,7 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
     /// Appends `[Magic "AYBL" (4B) | BlobCRC32C (4B) | KeyLen (4B) | ValLen (4B) | Key | Value]`
     /// to the blob segment and returns its [`BlobPtr`].
     ///
-    /// Stages records into the reusable `write_buf` without allocating a fresh `Vec<u8>` per blob (`P-03`).
+    /// Stages records into the reusable `write_buf` without allocating a fresh `Vec<u8>` per blob.
     pub fn append_blob(&mut self, key: &[u8], value: &[u8]) -> io::Result<BlobPtr> {
         let total_len = BLOB_RECORD_HEADER_LEN
             .checked_add(key.len())
@@ -225,7 +225,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     }
 
     /// Reads and verifies the blob payload referenced by `ptr` directly into `out` (clearing `out`
-    /// first while reusing its heap allocation) with zero intermediate `Vec<u8>` allocations (`PERF-06`).
+    /// first while reusing its heap allocation) with zero intermediate `Vec<u8>` allocations.
     pub fn read_blob_into(
         &self,
         ptr: &BlobPtr,
@@ -237,7 +237,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     }
 
     /// Appends the verified blob payload referenced by `ptr` onto the end of `out` in place
-    /// without allocating an intermediate frame buffer (`PERF-06`, `P-03`).
+    /// without allocating an intermediate frame buffer.
     pub fn append_blob_into(
         &self,
         ptr: &BlobPtr,
@@ -249,7 +249,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             return Ok(false);
         }
 
-        // Fast path (`P-03`): for typical blobs (`<= 16 KB`), read into a stack buffer so we
+        // Fast path: for typical blobs (`<= 16 KB`), read into a stack buffer so we
         // avoid `Vec::resize` user-space zero-filling and `copy_within` overlapping memmove!
         if len <= BLOB_STACK_READ_MAX_LEN {
             let mut stack_buf = [0u8; BLOB_STACK_READ_MAX_LEN];
@@ -370,35 +370,90 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
 mod tests {
     use super::*;
     use crate::pal::OsFs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::util::test_util::TempTestDir;
 
-    static BLOB_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+    #[test]
+    fn blob_write_verify_and_unflushed_truncation_safety() {
+        let tmp = TempTestDir::new("blob");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
 
-    struct TempTestDir {
-        path: PathBuf,
-    }
+        let mut writer =
+            BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).expect("open blob writer");
+        let payload = vec![0xABu8; 8192];
+        let ptr1 = writer
+            .append_blob(b"http://example.com/a.png", &payload)
+            .expect("append blob 1");
+        writer.sync_durable().unwrap();
+        drop(writer);
 
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let id = BLOB_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("aydb_blob_test_{prefix}_{pid}_{id}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self { path: dir }
-        }
-    }
+        let reader =
+            BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).expect("open blob reader");
+        let fetched = reader
+            .read_blob(&ptr1, Some(b"http://example.com/a.png"))
+            .expect("read blob")
+            .expect("blob must exist");
+        assert_eq!(fetched, payload);
 
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
+        // Wrong key check must return None
+        assert!(
+            reader
+                .read_blob(&ptr1, Some(b"http://example.com/wrong.png"))
+                .unwrap()
+                .is_none()
+        );
+
+        // Verify `read_blob_into` reuses the caller's `out: &mut Vec<u8>` buffer
+        // capacity across calls and validates CRC32C + `expected_key`!
+        let mut reusable_buf = Vec::with_capacity(16384);
+        let orig_cap = reusable_buf.capacity();
+        assert!(
+            reader
+                .read_blob_into(&ptr1, Some(b"http://example.com/a.png"), &mut reusable_buf)
+                .unwrap()
+        );
+        assert_eq!(reusable_buf, payload);
+        assert_eq!(reusable_buf.capacity(), orig_cap);
+
+        assert!(
+            !reader
+                .read_blob_into(
+                    &ptr1,
+                    Some(b"http://example.com/wrong.png"),
+                    &mut reusable_buf
+                )
+                .unwrap()
+        );
+        assert!(reusable_buf.is_empty());
+
+        let mut bad_crc_ptr = ptr1;
+        bad_crc_ptr.crc32c ^= 0xDEAD_BEEF;
+        assert!(
+            !reader
+                .read_blob_into(
+                    &bad_crc_ptr,
+                    Some(b"http://example.com/a.png"),
+                    &mut reusable_buf
+                )
+                .unwrap()
+        );
+        assert!(reusable_buf.is_empty());
+
+        // Unflushed / beyond-EOF pointer (simulating power loss before blob reached disk) must return Ok(None)
+        let dangling_ptr = BlobPtr {
+            kind: BlobKind::Standard,
+            table_id: 0,
+            seg_id: 1,
+            offset: ptr1.len,
+            len: 4096,
+            crc32c: 0x1122_3344,
+        };
+        assert!(reader.read_blob(&dangling_ptr, None).unwrap().is_none());
+        assert!(!reader.validate_blob_ptr(&dangling_ptr));
     }
 
     #[test]
-    fn p03_buffered_blob_writer_and_fast_stack_or_large_reads() {
-        let dir = TempTestDir::new("p03_blob");
+    fn buffered_blob_writer_and_fast_stack_or_large_reads() {
+        let dir = TempTestDir::new("buffered_blob");
         let fs = OsFs::open(&dir.path, true).unwrap();
 
         let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();

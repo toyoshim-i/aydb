@@ -1,7 +1,7 @@
 //! Capped Table (`MAX_BYTES`) quota accounting, bounded in-memory `AccessTick` coalescing,
 //! and Lazy Promotion during LRU eviction.
 
-pub mod key_codec;
+pub use crate::index::key_codec;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,10 +51,10 @@ impl CappedTableState {
 ///
 /// Uses a two-level `BTreeMap<u16, HashMap<Vec<u8>, u64>>` so all read hits on existing
 /// hot keys, peeks (`peek_hot_tick`), lazy promotions (`take_hot_tick`), and overwrites/deletes
-/// (`remove_key`) probe by `&[u8]` (`Borrow<[u8]>`) with zero heap allocations (`P-04`).
+/// (`remove_key`) probe by `&[u8]` (`Borrow<[u8]>`) with zero heap allocations.
 pub struct AccessTracker {
     next_tick: AtomicU64,
-    /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys (`P-04`).
+    /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys.
     hot_ticks: std::collections::BTreeMap<u16, HashMap<Vec<u8>, u64>>,
     total_entries: usize,
     max_entries: usize,
@@ -94,7 +94,7 @@ impl AccessTracker {
     }
 
     /// Records a read hit in RAM (`O(1)` hash map update, zero disk I/O).
-    /// Updates existing hot keys in place with zero heap allocation (`P-04`).
+    /// Updates existing hot keys in place with zero heap allocation.
     /// Returns the newly assigned `AccessTick`.
     pub fn record_read_hit(&mut self, table_id: u16, pk: &[u8]) -> u64 {
         let tick = self.next_tick();
@@ -132,7 +132,7 @@ impl AccessTracker {
         tick
     }
 
-    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation (`P-04`).
+    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn take_hot_tick(&mut self, table_id: u16, pk: &[u8]) -> Option<u64> {
         if self.total_entries == 0 {
@@ -145,7 +145,7 @@ impl AccessTracker {
         removed
     }
 
-    /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation (`P-04`).
+    /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
         if self.total_entries == 0 {
@@ -155,7 +155,7 @@ impl AccessTracker {
     }
 
     /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete)
-    /// with zero allocation (`P-04`).
+    /// with zero allocation.
     #[inline]
     pub fn remove_key(&mut self, table_id: u16, pk: &[u8]) {
         if self.total_entries == 0 {
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn p04_access_tracker_two_level_map_borrows_slice_and_bounds_capacity() {
+    fn access_tracker_two_level_map_borrows_slice_and_bounds_capacity() {
         let mut tracker = AccessTracker::new(100, 64);
         assert!(tracker.is_empty());
         assert_eq!(tracker.len(), 0);

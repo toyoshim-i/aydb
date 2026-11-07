@@ -43,14 +43,47 @@ impl BloomFilter {
         }
     }
 
+    /// Computes the `(h1, h2)` double-hashing probe pair for `key`.
+    #[inline]
+    pub fn hash_pair(key: &[u8]) -> (u32, u32) {
+        let h1 = crc32c_append(SEED_H1, key);
+        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+        (h1, h2)
+    }
+
+    /// Computes a packed 64-bit hash `((h1 as u64) << 32) | (h2 as u64)` for `key`.
+    #[inline]
+    pub fn hash64(key: &[u8]) -> u64 {
+        let (h1, h2) = Self::hash_pair(key);
+        ((h1 as u64) << 32) | (h2 as u64)
+    }
+
+    /// Builds a [`BloomFilter`] from packed 64-bit hashes without retaining raw keys.
+    pub fn from_hashes64(hashes: &[u64], bits_per_key: usize) -> Self {
+        if bits_per_key == 0 || hashes.is_empty() {
+            return Self::new(0, 0);
+        }
+        let mut filter = Self::new(hashes.len(), bits_per_key);
+        for &packed in hashes {
+            let h1 = (packed >> 32) as u32;
+            let h2 = packed as u32;
+            let mut h = h1;
+            for _ in 0..filter.num_probes {
+                let bit_idx = (h % filter.num_bits) as usize;
+                filter.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
+                h = h.wrapping_add(h2);
+            }
+        }
+        filter
+    }
+
     /// Inserts `key` into the Bloom filter.
     #[inline]
     pub fn insert(&mut self, key: &[u8]) {
         if self.num_bits == 0 {
             return;
         }
-        let h1 = crc32c_append(SEED_H1, key);
-        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+        let (h1, h2) = Self::hash_pair(key);
 
         let mut h = h1;
         for _ in 0..self.num_probes {
@@ -68,8 +101,7 @@ impl BloomFilter {
             // When the Bloom filter is disabled (0 bits/key), conservatively return true.
             return true;
         }
-        let h1 = crc32c_append(SEED_H1, key);
-        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+        let (h1, h2) = Self::hash_pair(key);
 
         let mut h = h1;
         for _ in 0..self.num_probes {

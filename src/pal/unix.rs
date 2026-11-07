@@ -89,15 +89,7 @@ impl PlatformFile for UnixPlatformFile {
             }
         }
         if strategy == PreallocStrategy::PhysicalZeroFill && current_len < target_len {
-            const CHUNK_SIZE: usize = 256 * 1024;
-            let zero_buf = vec![0u8; CHUNK_SIZE.min((target_len - current_len) as usize)];
-            let mut pos = current_len;
-            while pos < target_len {
-                let to_write = ((target_len - pos) as usize).min(zero_buf.len());
-                self.write_all_at(&zero_buf[..to_write], pos)?;
-                pos += to_write as u64;
-            }
-            self.sync_durable()?;
+            super::preallocate_physical_zero_fill(self, current_len, target_len)?;
         }
         Ok(())
     }
@@ -156,7 +148,7 @@ impl UnixPlatformFs {
     }
 
     /// Flushes directory metadata to non-volatile storage so newly created or unlinked
-    /// segment/manifest directory entries survive sudden power loss (`AUD-10`).
+    /// segment/manifest directory entries survive sudden power loss.
     pub fn sync_dir(&self) -> io::Result<()> {
         let dir = File::open(&self.root)?;
         dir.sync_all()
@@ -197,19 +189,7 @@ impl PlatformFs for UnixPlatformFs {
     }
 
     fn list_files(&self) -> io::Result<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                if let Some(s) = entry.file_name().to_str() {
-                    if s != DB_LOCK_FILE_NAME {
-                        names.push(s.to_owned());
-                    }
-                }
-            }
-        }
-        names.sort();
-        Ok(names)
+        super::list_dir_files(&self.root)
     }
 
     fn root_path(&self) -> &Path {

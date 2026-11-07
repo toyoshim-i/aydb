@@ -75,7 +75,7 @@ impl MemTable {
     }
 
     /// Restores `key` to its pre-mutation state (`prev`) during transaction/savepoint rollback
-    /// in $O(\log N)$ time while maintaining exact `approximate_bytes` accounting (`PERF-03`).
+    /// in $O(\log N)$ time while maintaining exact `approximate_bytes` accounting.
     pub fn restore_entry(&mut self, key: Vec<u8>, prev: Option<MemEntry>) {
         let klen = key.len();
         match prev {
@@ -142,7 +142,7 @@ impl MemTable {
         }
     }
 
-    /// Applies a single [`WalRecord`] at `lsn` into this `MemTable` without cloning (`R-02`, `P5`),
+    /// Applies a single [`WalRecord`] at `lsn` into this `MemTable` without cloning,
     /// returning the displaced previous [`MemEntry`] if any.
     #[inline]
     pub fn apply_single_wal_record(&mut self, lsn: u64, rec: WalRecord) -> Option<MemEntry> {
@@ -287,236 +287,15 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{BlobSegmentReader, BlobSegmentWriter};
-    use crate::index::compact_idx_segments;
     use crate::pal::OsFs;
-    use crate::wal::BlobKind;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static WISCKEY_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let id = WISCKEY_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("aydb_wisckey_test_{prefix}_{pid}_{id}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self { path: dir }
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::util::test_util::TempTestDir;
 
     #[test]
-    fn blob_write_verify_and_unflushed_truncation_safety() {
-        let tmp = TempTestDir::new("blob");
+    fn single_pass_upsert_zero_copy_cursors_and_256kb_coalesced_segment_builder() {
+        let tmp = TempTestDir::new("memtable_idx");
         let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
 
-        let mut writer =
-            BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).expect("open blob writer");
-        let payload = vec![0xABu8; 8192];
-        let ptr1 = writer
-            .append_blob(b"http://example.com/a.png", &payload)
-            .expect("append blob 1");
-        writer.sync_durable().unwrap();
-        drop(writer);
-
-        let reader =
-            BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).expect("open blob reader");
-        let fetched = reader
-            .read_blob(&ptr1, Some(b"http://example.com/a.png"))
-            .expect("read blob")
-            .expect("blob must exist");
-        assert_eq!(fetched, payload);
-
-        // Wrong key check must return None
-        assert!(
-            reader
-                .read_blob(&ptr1, Some(b"http://example.com/wrong.png"))
-                .unwrap()
-                .is_none()
-        );
-
-        // PERF-06: Verify `read_blob_into` reuses the caller's `out: &mut Vec<u8>` buffer
-        // capacity across calls and validates CRC32C + `expected_key`!
-        let mut reusable_buf = Vec::with_capacity(16384);
-        let orig_cap = reusable_buf.capacity();
-        assert!(
-            reader
-                .read_blob_into(&ptr1, Some(b"http://example.com/a.png"), &mut reusable_buf)
-                .unwrap()
-        );
-        assert_eq!(reusable_buf, payload);
-        assert_eq!(reusable_buf.capacity(), orig_cap);
-
-        assert!(
-            !reader
-                .read_blob_into(
-                    &ptr1,
-                    Some(b"http://example.com/wrong.png"),
-                    &mut reusable_buf
-                )
-                .unwrap()
-        );
-        assert!(reusable_buf.is_empty());
-
-        let mut bad_crc_ptr = ptr1;
-        bad_crc_ptr.crc32c ^= 0xDEAD_BEEF;
-        assert!(
-            !reader
-                .read_blob_into(
-                    &bad_crc_ptr,
-                    Some(b"http://example.com/a.png"),
-                    &mut reusable_buf
-                )
-                .unwrap()
-        );
-        assert!(reusable_buf.is_empty());
-
-        // Unflushed / beyond-EOF pointer (simulating power loss before blob reached disk) must return Ok(None)
-        let dangling_ptr = BlobPtr {
-            kind: BlobKind::Standard,
-            table_id: 0,
-            seg_id: 1,
-            offset: ptr1.len,
-            len: 4096,
-            crc32c: 0x1122_3344,
-        };
-        assert!(reader.read_blob(&dangling_ptr, None).unwrap().is_none());
-        assert!(!reader.validate_blob_ptr(&dangling_ptr));
-    }
-
-    #[test]
-    fn idx_segment_fence_pointers_bloom_and_compaction() {
-        let tmp = TempTestDir::new("idx_compact");
-        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
-
-        // Segment 1 (Older, LSN 1..=200)
-        let mut mt1 = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
-        for i in 0..200u32 {
-            let key = format!("user_key_{i:05}").into_bytes();
-            if i == 50 {
-                // Key 50 holds a BlobPtr in Segment 1 that will be overwritten in Segment 2
-                mt1.put_blob_ptr(
-                    key,
-                    BlobPtr {
-                        kind: BlobKind::Standard,
-                        table_id: 0,
-                        seg_id: 10,
-                        offset: 0,
-                        len: 16384,
-                        crc32c: 0x9999,
-                    },
-                    (i + 1) as u64,
-                );
-            } else {
-                mt1.put_inline(key, format!("val_v1_{i}").into_bytes(), (i + 1) as u64);
-            }
-        }
-        let seg1 = mt1.flush_to_segment(&fs, 1, 10).expect("flush seg 1");
-        assert!(seg1.num_blocks() >= 2);
-
-        // Reopen Segment 1 from disk to test Footer + Bloom + FencePointer deserialization
-        drop(seg1);
-        let seg1 = IdxSegmentReader::open(&fs, 1).expect("reopen seg 1");
-
-        // PERF-02: Verify `[min_key, max_key]` key-range metadata & pruning on `seg1`
-        assert_eq!(seg1.min_key(), b"user_key_00000");
-        assert_eq!(seg1.max_key(), b"user_key_00199");
-        assert!(!seg1.may_contain_key(b"aaa_before_min"));
-        assert!(!seg1.may_contain_key(b"zzz_after_max"));
-        assert!(seg1.may_contain_key(b"user_key_00042"));
-        assert!(!seg1.overlaps_range(b"zzz_0", Some(b"zzz_9")));
-        assert!(!seg1.overlaps_range(b"aaa_0", Some(b"aaa_9")));
-        assert!(seg1.overlaps_range(b"user_key_00100", Some(b"user_key_00150")));
-
-        // Point lookups on Segment 1
-        assert_eq!(
-            seg1.get(b"user_key_00042").unwrap(),
-            Some((43, IndexValue::Inline(b"val_v1_42".to_vec())))
-        );
-        assert_eq!(seg1.get(b"nonexistent_key").unwrap(), None);
-
-        // Segment 2 (Newer, LSN 500..): Overwrites key 50 and deletes key 100
-        let mut mt2 = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
-        mt2.put_inline(
-            b"user_key_00050".to_vec(),
-            b"val_v2_50_inline".to_vec(),
-            500,
-        );
-        mt2.delete(b"user_key_00100".to_vec(), 501);
-        let seg2 = mt2.flush_to_segment(&fs, 2, 10).expect("flush seg 2");
-
-        // Compact Segment 2 and Segment 1 into Segment 3 with drop_tombstones = true
-        let comp = compact_idx_segments(&fs, &[&seg2, &seg1], 3, 1, 10, true).expect("compact");
-        assert_eq!(comp.new_segment.record_count(), 199); // 200 - 1 deleted key (key 100)
-        assert_eq!(
-            comp.new_segment.get(b"user_key_00050").unwrap(),
-            Some((500, IndexValue::Inline(b"val_v2_50_inline".to_vec())))
-        );
-        assert_eq!(comp.new_segment.get(b"user_key_00100").unwrap(), None);
-
-        // Verify that overwriting key 50's BlobPtr reported 16384 newly dead blob bytes on seg_id 10!
-        assert_eq!(
-            comp.newly_dead_blob_bytes,
-            vec![(BlobKind::Standard, 0, 10, 16384)]
-        );
-
-        // S01: Verify that a crafted index segment with an inflated `fp_count` (even with a
-        // valid recomputed footer_crc32c) is rejected before allocating `fence_pointers`.
-        drop(comp);
-        let seg_fname = crate::meta::format_idx_file_name(3);
-        let seg_file = fs
-            .open_file(&seg_fname, false, true, crate::pal::OpenHint::ImmutableRandom)
-            .unwrap();
-        let flen = seg_file.file_len().unwrap() as usize;
-        let mut raw_seg = vec![0u8; flen];
-        seg_file.read_exact_at(&mut raw_seg, 0).unwrap();
-
-        let footer_start = flen - 48;
-        let meta_offset =
-            u64::from_le_bytes(raw_seg[footer_start + 24..footer_start + 32].try_into().unwrap())
-                as usize;
-        // `meta_buf` starts with `[num_probes: u8 | reserved: [u8; 3] | bit_bytes_len: u32 LE | bits...]`,
-        // followed by `fp_count: u32`.
-        let bloom_byte_len =
-            u32::from_le_bytes(raw_seg[meta_offset + 4..meta_offset + 8].try_into().unwrap())
-                as usize;
-        let fp_count_pos = meta_offset + 8 + bloom_byte_len;
-        // Overwrite `fp_count` with `u32::MAX` and recompute both `meta_crc` and `footer_crc32c`
-        raw_seg[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        let new_meta_crc = crate::util::crc32c::crc32c(&raw_seg[meta_offset..footer_start]);
-        raw_seg[footer_start + 36..footer_start + 40].copy_from_slice(&new_meta_crc.to_le_bytes());
-        let new_footer_crc =
-            crate::util::crc32c::crc32c(&raw_seg[footer_start..footer_start + 44]);
-        raw_seg[footer_start + 44..footer_start + 48]
-            .copy_from_slice(&new_footer_crc.to_le_bytes());
-        seg_file.write_all_at(&raw_seg, 0).unwrap();
-        drop(seg_file);
-
-        let err = match IdxSegmentReader::open(&fs, 3) {
-            Ok(_) => panic!("S01: crafted huge fp_count with valid CRC must be rejected"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn p2_p3_p5_single_pass_upsert_zero_copy_cursors_and_256kb_coalesced_segment_builder() {
-        let tmp = TempTestDir::new("p2_p3_p5_idx");
-        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
-
-        // P5 Part A: Verify single-pass `put_inline`, `delete`, and `apply_single_wal_record`
+        // Verify single-pass `put_inline`, `delete`, and `apply_single_wal_record`
         // return the displaced `Option<MemEntry>` directly without a separate lookup.
         let mut mt = MemTable::new(16 * 1024 * 1024);
         assert_eq!(mt.put_inline(b"k1".to_vec(), b"v1".to_vec(), 10), None);
@@ -548,7 +327,7 @@ mod tests {
             })
         );
 
-        // P3: Populate > 80 blocks (> 320 KB, crossing the 256 KB VACB write coalescing boundary)
+        // Populate > 80 blocks (> 320 KB, crossing the 256 KB VACB write coalescing boundary)
         // and flush to an `idx_<SeqID>.db` segment.
         let mut big_mt = MemTable::new(16 * 1024 * 1024);
         let payload = vec![0x5Au8; 256];
@@ -573,7 +352,7 @@ mod tests {
         assert_eq!(reopened.num_blocks(), num_blocks);
         assert_eq!(reopened.record_count(), total_keys);
 
-        // P2: Verify zero-copy forward and reverse cursors (`current_key()` and `peek_raw()`)
+        // Verify zero-copy forward and reverse cursors (`current_key()` and `peek_raw()`)
         let mut fwd = reopened.cursor_all().expect("forward cursor");
         let mut count_fwd = 0u32;
         while let Some(raw) = fwd.peek_raw() {

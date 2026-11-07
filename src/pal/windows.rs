@@ -20,7 +20,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use super::path::{normalize_db_root_path, validate_flat_file_name};
-use super::{DB_LOCK_FILE_NAME, OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+use super::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 
 type HANDLE = *mut core::ffi::c_void;
 type BOOL = i32;
@@ -239,7 +239,7 @@ impl WinPlatformFile {
             OpenHint::ImmutableSequential => {
                 // `blob_*.db` files serve random point lookups (`get_row` / `get_row_into`), so
                 // omit `FILE_FLAG_SEQUENTIAL_SCAN` to avoid aggressive read-ahead and premature
-                // page eviction in the Windows Cache Manager (`PERF-06`).
+                // page eviction in the Windows Cache Manager.
             }
             OpenHint::ImmutableRandom => {
                 flags |= FILE_FLAG_RANDOM_ACCESS;
@@ -267,7 +267,7 @@ impl WinPlatformFile {
             }
             let err = unsafe { GetLastError() };
             // If an antivirus / EDR minifilter briefly holds a scan handle on a freshly written
-            // segment or manifest file, retry with short exponential backoff (`O-01`).
+            // segment or manifest file, retry with short exponential backoff.
             if err == ERROR_SHARING_VIOLATION && retry < 4 {
                 std::thread::sleep(std::time::Duration::from_millis(1u64 << retry));
                 continue;
@@ -483,15 +483,7 @@ impl PlatformFile for WinPlatformFile {
         // 2. If PhysicalZeroFill is requested, write zeros sequentially across [current_len, target_len)
         //    so NTFS ValidDataLength (VDL) advances all the way to `target_len`.
         if strategy == PreallocStrategy::PhysicalZeroFill && current_len < target_len {
-            const CHUNK_SIZE: usize = 256 * 1024; // 256 KB VACB-aligned chunk
-            let zero_buf = vec![0u8; CHUNK_SIZE.min((target_len - current_len) as usize)];
-            let mut pos = current_len;
-            while pos < target_len {
-                let to_write = ((target_len - pos) as usize).min(zero_buf.len());
-                self.write_all_at(&zero_buf[..to_write], pos)?;
-                pos += to_write as u64;
-            }
-            self.sync_durable()?;
+            super::preallocate_physical_zero_fill(self, current_len, target_len)?;
         }
 
         Ok(())
@@ -562,19 +554,7 @@ impl PlatformFs for WinPlatformFs {
     }
 
     fn list_files(&self) -> io::Result<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                if let Some(s) = entry.file_name().to_str() {
-                    if s != DB_LOCK_FILE_NAME {
-                        names.push(s.to_owned());
-                    }
-                }
-            }
-        }
-        names.sort();
-        Ok(names)
+        super::list_dir_files(&self.root)
     }
 
     fn root_path(&self) -> &Path {

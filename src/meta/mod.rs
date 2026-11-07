@@ -9,6 +9,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+use crate::util::byte_reader::ByteReader;
 use crate::util::crc32c::crc32c;
 
 /// Fixed filename for the 8 KB ping-pong boot metadata file.
@@ -268,39 +269,12 @@ impl BootMetaState {
     }
 
     /// Deserializes the catalog lists from `payload` into `self`.
-    pub(crate) fn decode_catalog_payload(&mut self, mut payload: &[u8]) -> io::Result<()> {
-        fn read_bytes<'a>(input: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
-            if input.len() < n {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated catalog payload in boot_meta",
-                ));
-            }
-            let (head, tail) = input.split_at(n);
-            *input = tail;
-            Ok(head)
-        }
-
-        fn read_u16(input: &mut &[u8]) -> io::Result<u16> {
-            let b = read_bytes(input, 2)?;
-            Ok(u16::from_le_bytes([b[0], b[1]]))
-        }
-
-        fn read_u32(input: &mut &[u8]) -> io::Result<u32> {
-            let b = read_bytes(input, 4)?;
-            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        }
-
-        fn read_u64(input: &mut &[u8]) -> io::Result<u64> {
-            let b = read_bytes(input, 8)?;
-            Ok(u64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]))
-        }
+    pub(crate) fn decode_catalog_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut r = ByteReader::with_eof_msg(payload, "truncated catalog payload in boot_meta");
 
         // 1. Index segments
-        let num_idx = read_u32(&mut payload)? as usize;
-        if num_idx.checked_mul(24).is_none_or(|b| b > payload.len()) {
+        let num_idx = r.read_u32_le()? as usize;
+        if num_idx.checked_mul(24).is_none_or(|b| b > r.remaining()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted idx_segments count",
@@ -311,11 +285,11 @@ impl BootMetaState {
             .try_reserve_exact(num_idx)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "idx_segments allocation overflow"))?;
         for _ in 0..num_idx {
-            let seq_id = read_u64(&mut payload)?;
-            let file_len = read_u64(&mut payload)?;
-            let level = read_u16(&mut payload)?;
-            let _reserved = read_u16(&mut payload)?;
-            let record_count = read_u32(&mut payload)?;
+            let seq_id = r.read_u64_le()?;
+            let file_len = r.read_u64_le()?;
+            let level = r.read_u16_le()?;
+            let _reserved = r.read_u16_le()?;
+            let record_count = r.read_u32_le()?;
             idx_segments.push(IdxSegmentMeta {
                 seq_id,
                 file_len,
@@ -325,8 +299,8 @@ impl BootMetaState {
         }
 
         // 2. Standard blob segments
-        let num_std_blob = read_u32(&mut payload)? as usize;
-        if num_std_blob.checked_mul(24).is_none_or(|b| b > payload.len()) {
+        let num_std_blob = r.read_u32_le()? as usize;
+        if num_std_blob.checked_mul(24).is_none_or(|b| b > r.remaining()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted std_blob_segments count",
@@ -337,9 +311,9 @@ impl BootMetaState {
             .try_reserve_exact(num_std_blob)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "std_blob_segments allocation overflow"))?;
         for _ in 0..num_std_blob {
-            let seq_id = read_u64(&mut payload)?;
-            let file_len = read_u64(&mut payload)?;
-            let dead_bytes = read_u64(&mut payload)?;
+            let seq_id = r.read_u64_le()?;
+            let file_len = r.read_u64_le()?;
+            let dead_bytes = r.read_u64_le()?;
             std_blob_segments.push(StdBlobSegmentMeta {
                 seq_id,
                 file_len,
@@ -348,8 +322,8 @@ impl BootMetaState {
         }
 
         // 3. LRU blob segments
-        let num_lru_blob = read_u32(&mut payload)? as usize;
-        if num_lru_blob.checked_mul(32).is_none_or(|b| b > payload.len()) {
+        let num_lru_blob = r.read_u32_le()? as usize;
+        if num_lru_blob.checked_mul(32).is_none_or(|b| b > r.remaining()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted lru_blob_segments count",
@@ -360,11 +334,11 @@ impl BootMetaState {
             .try_reserve_exact(num_lru_blob)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lru_blob_segments allocation overflow"))?;
         for _ in 0..num_lru_blob {
-            let seq_id = read_u64(&mut payload)?;
-            let file_len = read_u64(&mut payload)?;
-            let dead_bytes = read_u64(&mut payload)?;
-            let table_id = read_u16(&mut payload)?;
-            let _reserved = read_bytes(&mut payload, 6)?;
+            let seq_id = r.read_u64_le()?;
+            let file_len = r.read_u64_le()?;
+            let dead_bytes = r.read_u64_le()?;
+            let table_id = r.read_u16_le()?;
+            let _reserved = r.read_bytes(6)?;
             lru_blob_segments.push(LruBlobSegmentMeta {
                 seq_id,
                 file_len,
@@ -374,8 +348,8 @@ impl BootMetaState {
         }
 
         // 4. Table quotas
-        let num_quotas = read_u32(&mut payload)? as usize;
-        if num_quotas.checked_mul(24).is_none_or(|b| b > payload.len()) {
+        let num_quotas = r.read_u32_le()? as usize;
+        if num_quotas.checked_mul(24).is_none_or(|b| b > r.remaining()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted table_quotas count",
@@ -386,12 +360,12 @@ impl BootMetaState {
             .try_reserve_exact(num_quotas)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "table_quotas allocation overflow"))?;
         for _ in 0..num_quotas {
-            let table_id = read_u16(&mut payload)?;
-            let policy_byte = read_bytes(&mut payload, 1)?[0];
+            let table_id = r.read_u16_le()?;
+            let policy_byte = r.read_u8()?;
             let eviction_policy = EvictionPolicy::from_u8(policy_byte)?;
-            let _reserved = read_bytes(&mut payload, 5)?;
-            let max_bytes = read_u64(&mut payload)?;
-            let current_logical_bytes = read_u64(&mut payload)?;
+            let _reserved = r.read_bytes(5)?;
+            let max_bytes = r.read_u64_le()?;
+            let current_logical_bytes = r.read_u64_le()?;
             table_quotas.push(TableQuotaMeta {
                 table_id,
                 eviction_policy,
@@ -401,8 +375,8 @@ impl BootMetaState {
         }
 
         // 5. Pending deletes
-        let num_deletes = read_u32(&mut payload)? as usize;
-        if num_deletes.checked_mul(2).is_none_or(|b| b > payload.len()) {
+        let num_deletes = r.read_u32_le()? as usize;
+        if num_deletes.checked_mul(2).is_none_or(|b| b > r.remaining()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted pending_delete_files count",
@@ -413,8 +387,8 @@ impl BootMetaState {
             .try_reserve_exact(num_deletes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pending_delete_files allocation overflow"))?;
         for _ in 0..num_deletes {
-            let name_len = read_u16(&mut payload)? as usize;
-            let name_bytes = read_bytes(&mut payload, name_len)?;
+            let name_len = r.read_u16_le()? as usize;
+            let name_bytes = r.read_bytes(name_len)?;
             let name = std::str::from_utf8(name_bytes).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -424,7 +398,7 @@ impl BootMetaState {
             pending_delete_files.push(name.to_owned());
         }
 
-        if !payload.is_empty() {
+        if !r.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected trailing bytes in boot_meta catalog payload",
@@ -487,7 +461,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     }
 
     /// Opens `boot_meta.db` and runs the 4-state crash-recovery truth table across Slot A and
-    /// Slot B **without** sweeping orphan segment files yet (`R-01`).
+    /// Slot B **without** sweeping orphan segment files yet.
     ///
     /// Used by `StorageEngine::open` so uncataloged `blob_std_*` / `blob_lru_*` segments created
     /// during the active WAL epoch (or in a torn opposite slot) can be discovered and validated
@@ -510,7 +484,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         if a_all_zero && b_all_zero {
             // Guard against a missing or zeroed `boot_meta.db` destroying an existing database:
             // if any managed segment/manifest file or non-empty WAL file already exists, refuse
-            // to initialize a blank state or run the orphan sweep (`AUD-09`).
+            // to initialize a blank state or run the orphan sweep.
             for fname in fs.list_files()? {
                 if fname == crate::pal::DB_LOCK_FILE_NAME {
                     continue;
@@ -594,7 +568,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     }
 
     /// Sweeps any unreferenced `idx_*`, `blob_std_*`, `blob_lru_*`, or `manifest_*` files on disk
-    /// and processes `pending_delete_files` (`R-01`).
+    /// and processes `pending_delete_files`.
     pub fn sweep_orphans(&mut self) -> io::Result<()> {
         let standby_mf = self.standby_manifest_id;
         self.sweep_orphans_and_pending_deletes(standby_mf)
@@ -607,11 +581,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
     /// Returns a shared reference to the current authoritative [`BootMetaState`].
     pub fn state(&self) -> &BootMetaState {
-        &self.state
-    }
-
-    /// Returns a shared reference to the current authoritative [`BootMetaState`].
-    pub fn state_snapshot(&self) -> &BootMetaState {
         &self.state
     }
 
@@ -932,31 +901,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
 mod tests {
     use super::*;
     use crate::pal::OsFs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static META_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let id = META_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("aydb_meta_test_{prefix}_{pid}_{id}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self { path: dir }
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::util::test_util::TempTestDir;
 
     #[test]
     fn fresh_init_and_ping_pong_commits() {
@@ -1193,8 +1138,8 @@ mod tests {
     }
 
     #[test]
-    fn aud_09_missing_or_zeroed_boot_meta_refuses_to_destroy_existing_segments() {
-        let tmp = TempTestDir::new("aud_09_missing_boot_meta");
+    fn missing_or_zeroed_boot_meta_refuses_to_destroy_existing_segments() {
+        let tmp = TempTestDir::new("missing_boot_meta");
         let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
 
         let idx_name = format_idx_file_name(1);
@@ -1231,8 +1176,8 @@ mod tests {
     }
 
     #[test]
-    fn s01_corrupted_catalog_counts_with_valid_crc_rejected() {
-        let tmp = TempTestDir::new("s01_corrupted_catalog_counts");
+    fn corrupted_catalog_counts_with_valid_crc_rejected() {
+        let tmp = TempTestDir::new("corrupted_catalog_counts");
         let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
         {
             let _mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
@@ -1262,7 +1207,7 @@ mod tests {
         drop(file);
 
         let err = match BootMetaManager::open_or_recover(Arc::clone(&fs)) {
-            Ok(_) => panic!("S01: crafted huge num_deletes with valid CRC must be rejected"),
+            Ok(_) => panic!("crafted huge num_deletes with valid CRC must be rejected"),
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

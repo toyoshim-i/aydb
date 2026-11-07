@@ -28,8 +28,8 @@ flowchart TB
     subgraph Disk["OS Cache Manager & Non-Volatile Storage (dwShareMode = 0)"]
         META["boot_meta.db (8 KB Ping-Pong)<br/>Rename-Free Atomic Manifest + Deferred GC"]
         WAL["Dual-Stream Epoch WAL (src/wal/)<br/>wal_sync.db (2 MB WRITE_THROUGH) & wal_buf.db (16 MB Buffered)"]
-        IDX["idx_<SeqID>.db (RANDOM_ACCESS)<br/>Immutable 4 KB Offset-Indexed SSTables"]
-        BLOB["blob_std_<SeqID>.db & blob_lru_<TblID>_<SeqID>.db<br/>Append-Only Blobs (SEQUENTIAL_SCAN / 256 KB Read-Ahead)"]
+        IDX["idx_<SeqID>.db (RANDOM_ACCESS; SEQUENTIAL_SCAN in Compaction)<br/>Immutable 4 KB Offset-Indexed SSTables"]
+        BLOB["blob_std_<SeqID>.db & blob_lru_<TblID>_<SeqID>.db<br/>Append-Only Blobs (Random Point Read + Buffered Append)"]
     end
 
     VTAB --> KVAPI
@@ -111,7 +111,7 @@ This repository is structured as a **"Build-to-Learn" Living Textbook**. Every s
 * **[Chapter 1.2: `boot_meta.db` Ping-Pong Manifest & Deferred GC](docs/phase1/02_BOOT_META_AND_GC.md)** — 8 KB double-buffered (`Slot A` / `Slot B`) atomic metadata layout, dual `CRC32C` verification, generation promotion, and rename-free deferred garbage collection (`PendingDeleteList`).
 * **[Chapter 1.3: Dual-Stream Fixed-Size Epoch WAL & Crash Recovery](docs/phase1/03_EPOCH_WAL_AND_RECOVERY.md)** — Pre-allocated 4 KB sector rings (`wal_sync.db` & `wal_buf.db`), `WalEpoch` wrap-around without zero-filling, multi-sector record fragmentation (`Full`/`First`/`Middle`/`Last`), multi-sector batch coalescing, and deterministic LSN merge-sort recovery.
 * **[Chapter 1.4: WiscKey Blob Separation, 4 KB Index Segments, & MemTable](docs/phase1/04_WISCKEY_AND_SEGMENTS.md)** — `Write-Blob-Before-WAL` consistency protocol, append-only `blob_*.db` framing, offset-indexed 4 KB SSTable blocks (`idx_*.db`), Sparse Fence Pointers, double-hashed Bloom Filters, and copy-free blob compaction.
-* **[Chapter 1.5: Capped Tables (`MAX_BYTES`), Zero-Write LRU, & Ordered KV API](docs/phase1/05_CAPPED_LRU_AND_KV_API.md)** — Memcomparable key encoding (`src/lru/key_codec.rs`), bounded in-memory `AccessTracker` coalescing, lazy promotion during quota eviction, copy-less `blob_lru` segment unlinking, and the `StorageEngine` API.
+* **[Chapter 1.5: Capped Tables (`MAX_BYTES`), Zero-Write LRU, & Ordered KV API](docs/phase1/05_CAPPED_LRU_AND_KV_API.md)** — Memcomparable key encoding (`src/index/key_codec.rs`), bounded in-memory `AccessTracker` coalescing, lazy promotion during quota eviction, copy-less `blob_lru` segment unlinking, and the `StorageEngine` API.
 
 ### Phase 2: SQLite Virtual Table Adapter & Comparative Benchmarks (`docs/phase2/`)
 * **[Chapter 2.0: Phase 2 Overview](docs/phase2/00_OVERVIEW.md)** — Bridging SQLite's VDBE bytecode engine to `aydb` via `sqlite3_module` and zero-dependency `winsqlite3.dll` / `libsqlite3` FFI.
@@ -133,16 +133,36 @@ aydb/
 │   └── phase2/                               # Phase 2: SQLite VTab & Benchmarks (Chapters 2.0 - 2.3)
 ├── src/
 │   ├── lib.rs                                # Crate root & module exports
-│   ├── util/crc32c.rs                        # Castagnoli CRC32C checksum implementation
+│   ├── util/                                 # Shared utilities (CRC32C, ByteReader, test helpers)
+│   │   ├── mod.rs
+│   │   ├── crc32c.rs
+│   │   ├── byte_reader.rs
+│   │   └── test_util.rs
 │   ├── pal/                                  # Platform Abstraction Layer (Win32 OVERLAPPED / Unix pread)
 │   ├── meta/mod.rs                           # 8 KB Ping-Pong boot_meta.db & Deferred GC
 │   ├── wal/mod.rs                            # Dual-Stream Fixed-Size Epoch WAL & Recovery
 │   ├── blob/mod.rs                           # Append-only Standard & Per-Table LRU Blob Segments
-│   ├── index/                                # 4 KB Block SSTables, Sparse Fence Pointers & Bloom Filter
+│   ├── index/                                # 4 KB Block SSTables, Key Codec, Sparse Fence Pointers & Bloom Filter
+│   │   ├── mod.rs
+│   │   ├── bloom.rs
+│   │   └── key_codec.rs
 │   ├── memtable/mod.rs                       # Bounded In-Memory B-Tree MemTable
-│   ├── lru/                                  # Memcomparable Key Codec & Zero-I/O AccessTracker
-│   ├── engine/mod.rs                         # StorageEngine Coordinator, Compaction, & Table API
-│   └── vtab/                                 # SQLite Virtual Table Adapter (ffi, row_codec, mod)
+│   ├── lru/mod.rs                            # Zero-I/O AccessTracker & Capped Table Metadata
+│   ├── engine/                               # StorageEngine Coordinator, Transactions, Scans, Compaction & Eviction
+│   │   ├── mod.rs
+│   │   ├── tx.rs
+│   │   ├── scan.rs
+│   │   ├── compaction.rs
+│   │   ├── eviction.rs
+│   │   └── tests.rs
+│   └── vtab/                                 # SQLite Virtual Table Adapter
+│       ├── mod.rs
+│       ├── ddl.rs
+│       ├── rowid_map.rs
+│       ├── connection.rs
+│       ├── row_codec.rs
+│       ├── ffi.rs
+│       └── tests.rs
 └── examples/
     ├── pal_bench.rs                          # Step 1-1: OS Cache & Positional I/O microbenchmarks
     ├── meta_wal_bench.rs                     # Step 1-2/1-3: Ping-Pong Meta & Dual-Stream WAL benchmarks

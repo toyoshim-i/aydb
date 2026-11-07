@@ -31,7 +31,7 @@ pub enum OpenHint {
     MutableBufferedLog,
     /// For `idx_<SeqID>.db` (4 KB random block lookups).
     ImmutableRandom,
-    /// For `blob_*_<SeqID>.db` (Sequential large payload reads & appends).
+    /// For `blob_*_<SeqID>.db` (Random point reads & append writes without `FILE_FLAG_SEQUENTIAL_SCAN`).
     ImmutableSequential,
     /// For background compaction and GC bulk scans.
     BackgroundBulk,
@@ -105,35 +105,49 @@ pub trait PlatformFs: Send + Sync + 'static {
     fn root_path(&self) -> &Path;
 }
 
+/// Writes 256 KB zero-filled chunks across `[current_len, target_len)` and syncs durably.
+pub(crate) fn preallocate_physical_zero_fill<F: PlatformFile + ?Sized>(
+    file: &F,
+    current_len: u64,
+    target_len: u64,
+) -> io::Result<()> {
+    if current_len >= target_len {
+        return Ok(());
+    }
+    const CHUNK_SIZE: usize = 256 * 1024;
+    let zero_buf = vec![0u8; CHUNK_SIZE.min((target_len - current_len) as usize)];
+    let mut pos = current_len;
+    while pos < target_len {
+        let to_write = ((target_len - pos) as usize).min(zero_buf.len());
+        file.write_all_at(&zero_buf[..to_write], pos)?;
+        pos += to_write as u64;
+    }
+    file.sync_durable()
+}
+
+/// Lists all regular files in `root` (excluding [`DB_LOCK_FILE_NAME`]), sorted lexicographically.
+pub(crate) fn list_dir_files(root: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            if let Some(s) = entry.file_name().to_str() {
+                if s != DB_LOCK_FILE_NAME {
+                    names.push(s.to_owned());
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test_util::TempTestDir;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("aydb_pal_test_{prefix}_{pid}_{id}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self { path: dir }
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     #[test]
     fn path_normalization_and_validation() {

@@ -8,6 +8,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+use crate::util::byte_reader::ByteReader;
 use crate::util::crc32c::crc32c;
 
 /// Fixed filename for the synchronous write-through WAL stream.
@@ -108,9 +109,9 @@ pub enum WalRecord {
     Delete {
         key: Vec<u8>,
     },
-    /// Marks the start of a multi-chunk transaction (`AUD-04`).
+    /// Marks the start of a multi-chunk transaction.
     TxBegin,
-    /// Marks the final chunk of a multi-chunk transaction (`AUD-04`).
+    /// Marks the final chunk of a multi-chunk transaction.
     TxCommit,
 }
 
@@ -192,33 +193,22 @@ impl WalBatch {
     }
 
     /// Decodes a serialized [`WalBatch`] and verifies its `batch_crc32c`.
-    pub fn decode(mut data: &[u8]) -> io::Result<Self> {
-        fn read_bytes<'a>(input: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
-            if input.len() < n {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated WalBatch payload",
-                ));
-            }
-            let (head, tail) = input.split_at(n);
-            *input = tail;
-            Ok(head)
-        }
+    pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let mut r = ByteReader::with_eof_msg(data, "truncated WalBatch payload");
 
-        let lsn = u64::from_le_bytes(read_bytes(&mut data, 8)?.try_into().unwrap());
-        let expected_crc = u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap());
-        let record_count =
-            u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
+        let lsn = r.read_u64_le()?;
+        let expected_crc = r.read_u32_le()?;
+        let record_count = r.read_u32_le()? as usize;
 
-        if crc32c(data) != expected_crc {
+        if crc32c(r.remaining_slice()) != expected_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "WalBatch CRC32C mismatch",
             ));
         }
 
-        // Minimum serialized WalRecord is 5 bytes (1B op + 4B key_len for Delete with 0-byte key).
-        if record_count.checked_mul(5).is_none_or(|b| b > data.len()) {
+        // Minimum serialized WalRecord is 1 byte (1B op for TxBegin / TxCommit).
+        if record_count > r.remaining() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "WalBatch record_count exceeds remaining payload bytes",
@@ -229,27 +219,24 @@ impl WalBatch {
             .try_reserve_exact(record_count)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WalBatch records allocation overflow"))?;
         for _ in 0..record_count {
-            let op = read_bytes(&mut data, 1)?[0];
+            let op = r.read_u8()?;
             match op {
                 1 => {
-                    let klen =
-                        u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
-                    let key = read_bytes(&mut data, klen)?.to_vec();
-                    let vlen =
-                        u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
-                    let value = read_bytes(&mut data, vlen)?.to_vec();
+                    let klen = r.read_u32_le()? as usize;
+                    let key = r.read_bytes(klen)?.to_vec();
+                    let vlen = r.read_u32_le()? as usize;
+                    let value = r.read_bytes(vlen)?.to_vec();
                     records.push(WalRecord::PutInline { key, value });
                 }
                 2 => {
-                    let klen =
-                        u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
-                    let key = read_bytes(&mut data, klen)?.to_vec();
-                    let kind = BlobKind::from_u8(read_bytes(&mut data, 1)?[0])?;
-                    let table_id = u16::from_le_bytes(read_bytes(&mut data, 2)?.try_into().unwrap());
-                    let seg_id = u64::from_le_bytes(read_bytes(&mut data, 8)?.try_into().unwrap());
-                    let offset = u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap());
-                    let len = u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap());
-                    let crc = u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap());
+                    let klen = r.read_u32_le()? as usize;
+                    let key = r.read_bytes(klen)?.to_vec();
+                    let kind = BlobKind::from_u8(r.read_u8()?)?;
+                    let table_id = r.read_u16_le()?;
+                    let seg_id = r.read_u64_le()?;
+                    let offset = r.read_u32_le()?;
+                    let len = r.read_u32_le()?;
+                    let crc = r.read_u32_le()?;
                     records.push(WalRecord::PutBlobPtr {
                         key,
                         blob_ptr: BlobPtr {
@@ -263,9 +250,8 @@ impl WalBatch {
                     });
                 }
                 3 => {
-                    let klen =
-                        u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
-                    let key = read_bytes(&mut data, klen)?.to_vec();
+                    let klen = r.read_u32_le()? as usize;
+                    let key = r.read_bytes(klen)?.to_vec();
                     records.push(WalRecord::Delete { key });
                 }
                 4 => {
@@ -283,7 +269,7 @@ impl WalBatch {
             }
         }
 
-        if !data.is_empty() {
+        if !r.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected trailing bytes in WalBatch",
@@ -429,7 +415,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     }
 
     /// Grows the underlying WAL file if `target_size > current_size` to accommodate an oversized
-    /// multi-chunk transaction in a single epoch (`AUD-04`).
+    /// multi-chunk transaction in a single epoch.
     pub fn ensure_min_size(&mut self, target_size: u64) -> io::Result<()> {
         let aligned = ((target_size + WAL_SECTOR_SIZE as u64 - 1) / WAL_SECTOR_SIZE as u64)
             * WAL_SECTOR_SIZE as u64;
@@ -761,7 +747,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
                     FragmentType::Full => {
                         if let Some(ref mut buf) = partial_batch_buf {
                             // A previous `First`/`Middle` fragment chain was left dangling by a crash;
-                            // discard the incomplete partial batch and decode the new `Full` fragment (`AUD-01`).
+                            // discard the incomplete partial batch and decode the new `Full` fragment.
                             buf.clear();
                         }
                         partial_batch_buf = None;
@@ -775,7 +761,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
                     }
                     FragmentType::First => {
                         if let Some(ref mut buf) = partial_batch_buf {
-                            // Discard any prior dangling `First`/`Middle` chain (`AUD-01`).
+                            // Discard any prior dangling `First`/`Middle` chain.
                             buf.clear();
                             buf.extend_from_slice(frag_data);
                         } else {
@@ -863,8 +849,8 @@ where
     let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
 
     // Filter out uncommitted multi-chunk transactions (`TxBegin` without a matching `TxCommit`)
-    // per stream (`AUD-04`) AND validate `PutBlobPtr` records across the entire transaction group
-    // (`F03`) before stripping transaction markers, while recording the highest LSN observed across
+    // per stream AND validate `PutBlobPtr` records across the entire transaction group
+    // before stripping transaction markers, while recording the highest LSN observed across
     // all recovered batches.
     let mut max_lsn = checkpoint_lsn;
     let mut filter_committed_stream =
@@ -956,31 +942,7 @@ where
 mod tests {
     use super::*;
     use crate::pal::OsFs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static WAL_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let id = WAL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("aydb_wal_test_{prefix}_{pid}_{id}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create temp test dir");
-            Self { path: dir }
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::util::test_util::TempTestDir;
 
     #[test]
     fn multi_sector_fragmentation_and_truncated_tail_recovery() {
@@ -1386,8 +1348,8 @@ mod tests {
     }
 
     #[test]
-    fn f03_multi_chunk_transaction_rejected_atomically_when_any_chunk_blob_is_invalid() {
-        let tmp = TempTestDir::new("f03_multi_chunk_atomicity");
+    fn multi_chunk_transaction_rejected_atomically_when_any_chunk_blob_is_invalid() {
+        let tmp = TempTestDir::new("multi_chunk_atomicity");
         let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
 
         let wal_size = 64 * 1024u64;

@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// Resolves relative paths and applies the `\\?\` extended-length prefix *before* calling
 /// `std::fs::create_dir_all` so directories deeper than `MAX_PATH` (260 characters) can be
-/// created on Windows even when `LongPathsEnabled` is not set in the registry (`O-02`).
+/// created on Windows even when `LongPathsEnabled` is not set in the registry.
 pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> {
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -108,9 +108,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn o02_normalize_db_root_path_creates_deep_long_paths_exceeding_max_path() {
+    fn normalize_db_root_path_creates_deep_long_paths_exceeding_max_path() {
         let pid = std::process::id();
-        let base = std::env::temp_dir().join(format!("aydb_o02_long_path_{pid}"));
+        let base = std::env::temp_dir().join(format!("aydb_long_path_{pid}"));
         let base_prefixed = ensure_extended_length_prefix(clean_lexical_path(&base));
         let _ = std::fs::remove_dir_all(&base_prefixed);
 
@@ -124,7 +124,7 @@ mod tests {
         );
 
         let normalized = normalize_db_root_path(&deep, true)
-            .expect("O-02: normalize_db_root_path must create paths > 260 chars");
+            .expect("normalize_db_root_path must create paths > 260 chars");
         assert!(normalized.exists());
         let _ = std::fs::remove_dir_all(&base_prefixed);
     }

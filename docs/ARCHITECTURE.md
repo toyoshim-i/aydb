@@ -43,8 +43,8 @@ To maximize the effectiveness of the Windows Cache Manager (which maps files in 
 | **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` + `WRITE_THROUGH` | Fixed 2 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. |
 | **Buffered Journal (WAL)** | `wal_buf.db` | `OVERLAPPED` + `SEQUENTIAL_SCAN` | Fixed 16 MB size (pre-allocated). Sequentially logs high-frequency buffered updates in OS cache without disk stalls. |
 | **Index Layer** | `idx_<SeqID>.db` | `RANDOM_ACCESS` / `FADV_RANDOM` | Immutable sorted key-value file (SSTable format). Stores keys, small inline column values, and pointers to out-of-line blobs. |
-| **Standard Blob Layer** | `blob_std_<SeqID>.db` | `SEQUENTIAL_SCAN` / `FADV_SEQUENTIAL` | Append-only immutable file storing values larger than the inline threshold (e.g., 1 KB). Aligned to 256 KB boundaries to leverage sequential read-ahead. |
-| **LRU Blob Layer** | `blob_lru_<TblID>_<SeqID>.db` | `SEQUENTIAL_SCAN` / `FADV_SEQUENTIAL` | Append-only blob file dedicated to a specific LRU-capped table. Enables whole-generation file deletion (Copy-less Eviction). |
+| **Standard Blob Layer** | `blob_std_<SeqID>.db` | Standard (`OVERLAPPED` / positional I/O) | Append-only immutable file storing values larger than the inline threshold (e.g., 1 KB). Opened without `SEQUENTIAL_SCAN` to avoid 256 KB read-ahead amplification on random point reads. |
+| **LRU Blob Layer** | `blob_lru_<TblID>_<SeqID>.db` | Standard (`OVERLAPPED` / positional I/O) | Append-only blob file dedicated to a specific LRU-capped table. Enables whole-generation file deletion (Copy-less Eviction) while optimizing random point reads. |
 
 ### 2.3 Rename-Free & Deferred GC File Management (Samba / Antivirus Resilience)
 
@@ -68,8 +68,8 @@ To support both fast random updates of small configuration records and zero writ
 * **Inline Storage (`Value < 1 KB`):**
   Stored directly alongside the key inside the MemTable and `idx_<SeqID>.db`. A single index lookup retrieves both the key and the value.
 * **Out-of-Line Blob Storage (`Value >= 1 KB`):**
-  The payload is appended first to `blob_*_<SeqID>.db`, while the index stores only a compact 20-byte pointer structure:
-  `[BlobSegID (8B) | Offset (4B) | Length (4B) | BlobCRC32C (4B)]`.
+  The payload is appended first to `blob_*_<SeqID>.db`, while the index stores only a compact 23-byte pointer structure:
+  `[Kind (1B) | TableID (2B) | SegID (8B) | Offset (4B) | Length (4B) | ValueCRC32C (4B)]`.
   Consequently, index compaction never copies large blob payloads.
 
 ### 3.2 Two-Tier Index Management Under Strict Heap Limits
@@ -88,15 +88,15 @@ To support both fast random updates of small configuration records and zero writ
 
 ### 4.1 `boot_meta.db` Ping-Pong Buffer (Double Buffering)
 
-* Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B**.
-* Layout of each 4 KB slot:
-  `[Magic "AYDB" (4B) | HeaderCRC32C (4B) | Generation (8B) | ActiveWalEpoch (8B) | ActiveIdxList... | ActiveBlobList... | PendingDeleteList... | PayloadCRC32C (4B)]`
+* Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B** (automatically extended with an auxiliary `boot_meta_ext_<Generation>.db` payload file if the catalog ever exceeds 4,028 bytes).
+* Layout of each 4 KB slot (64-byte fixed header + variable catalog payload + 4-byte slot trailer):
+  `[Header(64B): Magic "AYBM"(4B) | Version(2B) |HeaderFlags(2B) | Generation(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | NextSeqID(8B) | IdxCount(2B) | StdBlobCount(2B) | LruBlobCount(2B) | QuotaCount(2B) | PendingDelCount(2B) | PayloadLen(2B) | HeaderCRC32C(4B)] + [CatalogPayload: ActiveIdxList | ActiveStdBlobList | ActiveLruBlobList | TableQuotaList | PendingDeleteList] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
 * When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected.
 
 ### 4.2 Pre-Allocated Fixed-Size WAL and Physical Two-Stream Commit
 
 * **Zero-Fill-Free Reuse via Epoch Numbers:**
-  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a header: `[CRC32C (4B) | WalEpoch (4B) | LSN (8B)]`. When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
+  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 7-byte fragment headers (`[FragType (1B) | FragLen (2B) | FragCRC32C (4B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
   1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written directly through to non-volatile storage.
@@ -162,10 +162,9 @@ pub enum OpenHint {
     /// - macOS: F_RDAHEAD(0)
     ImmutableRandom,
 
-    /// For blob_NNNN.db
-    /// - Win: FILE_FLAG_SEQUENTIAL_SCAN (256 KB VACB read-ahead + working set release after read)
-    /// - Linux: POSIX_FADV_SEQUENTIAL
-    /// - macOS: F_RDAHEAD(1)
+    /// For blob_NNNN.db (random point reads + buffered append writes)
+    /// - Win: Standard OVERLAPPED handle without FILE_FLAG_SEQUENTIAL_SCAN (avoids 256 KB read-ahead amplification on point reads)
+    /// - Linux/macOS: Standard positional pread/pwrite handle
     ImmutableSequential,
 
     /// For Compaction / GC bulk read/write

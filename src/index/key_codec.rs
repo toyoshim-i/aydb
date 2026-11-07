@@ -153,7 +153,7 @@ pub fn encode_secondary_index_key(
 }
 
 /// Encodes the 5-byte prefix `[TableID: u16 BE | 'i' | IndexID: u16 BE]` for scanning all
-/// entries belonging to secondary index `(table_id, index_id)` (`P1`).
+/// entries belonging to secondary index `(table_id, index_id)`.
 #[inline]
 pub fn encode_secondary_index_prefix(table_id: u16, index_id: u16) -> [u8; 5] {
     let tb = table_id.to_be_bytes();
@@ -190,7 +190,7 @@ pub fn decode_secondary_index_key(
 }
 
 /// Extracts the borrowed `pk` suffix directly from a Secondary Index Key belonging to
-/// `(table_id, index_id)` with zero heap allocations (`P1`).
+/// `(table_id, index_id)` with zero heap allocations.
 #[inline]
 pub fn decode_secondary_index_pk_slice(
     table_id: u16,

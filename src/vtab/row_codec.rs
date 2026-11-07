@@ -13,17 +13,19 @@ use crate::vtab::ffi::{
 };
 
 /// 1-byte key storage-class type tags ordered according to SQLite's comparison rules:
-/// `NULL < Number (INTEGER & REAL) < TEXT < BLOB` (`AUD-05`, `F05`).
+/// `NULL < Number (INTEGER & REAL) < TEXT < BLOB`.
 ///
 /// Unified exact numeric key domain (`0x0E..=0x12`):
 /// - `KEY_TAG_FLOAT_LT_I64_MIN` (`0x0E`): `f64` values with `f < -9223372036854775808.0` (`-2^63`),
 ///   including `-inf` (9 bytes: `[0x0E, encode_f64_memcomparable(f)]`).
 /// - `KEY_TAG_INTEGER` (`0x10`): All `i64` values (`9` bytes: `[0x10, encode_i64_memcomparable(i)]`)
 ///   AND all finite `f64` values in `[-2^63, 2^63)` (`17` bytes:
-///   `[0x10, encode_i64_memcomparable(floor(f) as i64), frac_bits.to_be_bytes()]` where
-///   `frac = f - (floor(f) as f64) in [0.0, 1.0)`).
+///   `[0x10, encode_i64_memcomparable(floor(f) as i64), r_bytes]` where `r_bytes` is `[0u8; 8]`
+///   for exact-integer floats (`norm == floor(norm)`) or `encode_f64_memcomparable(norm)` for
+///   non-integer floats (`norm != floor(norm)`), preserving full IEEE-754 bit identity and
+///   sub-ULP ordering without floating-point subtraction cancellation).
 ///   Under lexicographical slice comparison:
-///   - `Integer(q)` (`9` bytes) sorts immediately before `Float(q.0)` (`17` bytes with `frac_bits == 0`),
+///   - `Integer(q)` (`9` bytes) sorts immediately before `Float(q.0)` (`17` bytes with `r_bytes == [0; 8]`),
 ///     which sorts before any `Float(q + r)` with `r > 0`, which sorts before `Integer(q + 1)`!
 ///   - Any two `i64` values compare in exact 64-bit integer order (including `2^53` vs `2^53 + 1`).
 ///   - Any `i64` and `f64` compare in exact mathematical order (`1.5 < 10`, `-10 < -1.5`).
@@ -34,7 +36,7 @@ pub const KEY_TAG_NULL: u8 = 0x05;
 pub const KEY_TAG_FLOAT_LT_I64_MIN: u8 = 0x0E;
 pub const KEY_TAG_INTEGER: u8 = 0x10;
 pub const KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1: u8 = 0x12;
-pub const KEY_TAG_FLOAT: u8 = 0x18;
+const LEGACY_KEY_TAG_FLOAT: u8 = 0x18;
 pub const KEY_TAG_TEXT: u8 = 0x20;
 pub const KEY_TAG_BLOB: u8 = 0x30;
 
@@ -74,7 +76,7 @@ impl ColumnAffinity {
     }
 }
 
-/// Built-in SQLite text collating sequences (`F04`).
+/// Built-in SQLite text collating sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColCollation {
     #[default]
@@ -147,7 +149,7 @@ pub fn parse_sqlite_numeric_str(s: &str) -> Option<Result<i64, f64>> {
 }
 
 /// Formats an `f64` into SQLite's canonical text representation (`%.15g`) when coerced by
-/// `TEXT` affinity (`C-05`).
+/// `TEXT` affinity.
 #[inline]
 pub fn format_sqlite_float_text(f: f64) -> String {
     if f == 0.0 {
@@ -193,7 +195,7 @@ pub fn format_sqlite_float_text(f: f64) -> String {
     }
 }
 
-/// Encodes an `f64` into the unified exact numeric key domain (`F05`, `C-01`):
+/// Encodes an `f64` into the unified exact numeric key domain:
 /// - `f < -2^63`: `[0x0E, encode_f64_memcomparable(f)]` (9 bytes).
 /// - `-2^63 <= f < 2^63`: `[0x10, encode_i64_memcomparable(q), r_bytes]` (17 bytes),
 ///   where `r_bytes` is `[0; 8]` if `f` is an exact integer (`norm == fl`), or
@@ -410,7 +412,7 @@ impl SqlValue {
             }
             KEY_TAG_FLOAT_LT_I64_MIN
             | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1
-            | KEY_TAG_FLOAT
+            | LEGACY_KEY_TAG_FLOAT
                 if payload.len() == 8 =>
             {
                 let arr: [u8; 8] = payload.try_into().ok()?;
@@ -513,10 +515,10 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
 
 /// Encodes a slice of raw `sqlite3_value*` pointers (`argv[2 .. 2 + col_count]`) directly into
 /// a compact binary row byte vector without allocating intermediate `SqlValue` structs!
-/// Applies each column's declared [`ColumnAffinity`] and [`ColCollation`] (`F04`), and extracts
+/// Applies each column's declared [`ColumnAffinity`] and [`ColCollation`], and extracts
 /// the primary key bytes (`pk_col_idx`) and any secondary index `(index_id, col_key_bytes)`.
 /// If `pk_override` is `Some(auto_id)` (for `INTEGER PRIMARY KEY` when `SQLITE_NULL` is inserted),
-/// serializes `auto_id` as an `SQLITE_INTEGER` in the `pk_col_idx` slot (`USE-05`).
+/// serializes `auto_id` as an `SQLITE_INTEGER` in the `pk_col_idx` slot.
 ///
 /// # Safety
 /// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
@@ -760,7 +762,7 @@ pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
 }
 
 /// Converts a raw `*mut sqlite3_value` into type-tagged memcomparable key bytes, applying the
-/// target column's [`ColumnAffinity`] and [`ColCollation`] (`F04`, `F05`).
+/// target column's [`ColumnAffinity`] and [`ColCollation`].
 /// When `canonical_numeric` is `true`, exact integer floats (`10.0`) encode identically to
 /// `Integer(10)` (`9` bytes).
 ///
@@ -1007,7 +1009,7 @@ pub fn extract_column_key_bytes(row_bytes: &[u8], col_idx: usize) -> io::Result<
 }
 
 /// Extracts the type-tagged memcomparable key bytes for column `col_idx` directly from `row_bytes`,
-/// applying `collation` for `TEXT` columns (`F04`, `F05`).
+/// applying `collation` for `TEXT` columns.
 pub fn extract_column_key_bytes_with_collation(
     row_bytes: &[u8],
     col_idx: usize,
@@ -1215,7 +1217,7 @@ mod tests {
         );
 
         // Verify unified cross-type key ordering (`NULL < Number (INTEGER & REAL) < TEXT < BLOB`)
-        // including exact 64-bit integer precision at 2^53, negative floats, signed zero, and infinities (`F05`)
+        // including exact 64-bit integer precision at 2^53, negative floats, signed zero, and infinities
         let ordered_values = [
             SqlValue::Null,
             SqlValue::Float(f64::NEG_INFINITY),
@@ -1261,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn f04_collation_and_numeric_affinity_helpers() {
+    fn collation_and_numeric_affinity_helpers() {
         let mut out = Vec::new();
         ColCollation::NoCase.push_normalized_text(b"AlIcE_123!", &mut out);
         assert_eq!(out, b"alice_123!");
@@ -1277,8 +1279,8 @@ mod tests {
     }
 
     #[test]
-    fn c01_c05_negative_sub_ulp_float_key_roundtrip_and_sqlite_float_text_format() {
-        // C-01: Negative sub-ULP and small floats in (-1.0, 0.0) must encode to distinct keys
+    fn negative_sub_ulp_float_key_roundtrip_and_sqlite_float_text_format() {
+        // Negative sub-ULP and small floats in (-1.0, 0.0) must encode to distinct keys
         // in strict mathematical order and round-trip with 0 bits of difference!
         let vals = [
             f64::NEG_INFINITY,
@@ -1319,7 +1321,7 @@ mod tests {
                     assert_eq!(
                         d.to_bits(),
                         v.to_bits(),
-                        "C-01: {v:e} failed exact bit-level round-trip (got {d:e})"
+                        "{v:e} failed exact bit-level round-trip (got {d:e})"
                     );
                 }
                 other => panic!("expected Float, got {other:?}"),
@@ -1339,7 +1341,7 @@ mod tests {
             let kb = SqlValue::Float(pair[1]).to_key_bytes();
             assert!(
                 ka < kb,
-                "C-01: {:e} (key {:02x?}) must sort strictly before {:e} (key {:02x?})",
+                "{:e} (key {:02x?}) must sort strictly before {:e} (key {:02x?})",
                 pair[0],
                 ka,
                 pair[1],
@@ -1347,7 +1349,7 @@ mod tests {
             );
         }
 
-        // C-05: format_sqlite_float_text matches SQLite's %.15g / %!.15g formatting
+        // format_sqlite_float_text matches SQLite's %.15g / %!.15g formatting
         assert_eq!(format_sqlite_float_text(0.0), "0.0");
         assert_eq!(format_sqlite_float_text(-0.0), "0.0");
         assert_eq!(format_sqlite_float_text(42.0), "42.0");

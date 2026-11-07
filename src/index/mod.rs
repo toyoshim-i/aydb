@@ -9,7 +9,16 @@ use std::io;
 use std::sync::Arc;
 
 pub mod bloom;
+pub mod key_codec;
 pub use bloom::BloomFilter;
+pub use key_codec::{
+    NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX, RowMetaRecord,
+    decode_bytes_escaped, decode_i64_memcomparable, decode_lru_queue_key, decode_primary_row_key,
+    decode_secondary_index_key, decode_secondary_index_pk_slice, encode_bytes_escaped,
+    encode_i64_memcomparable, encode_lru_queue_key, encode_namespace_prefix,
+    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_exact_prefix,
+    encode_secondary_index_key, encode_secondary_index_prefix,
+};
 
 use crate::meta::format_idx_file_name;
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
@@ -20,7 +29,7 @@ use crate::wal::{BlobKind, BlobPtr};
 pub const IDX_BLOCK_SIZE: usize = 4096;
 
 /// Write coalescing buffer capacity (`256 KB` = 64 data blocks, matching the Windows Cache
-/// Manager Virtual Address Control Block size) used by [`IdxSegmentBuilder`] (`P3`).
+/// Manager Virtual Address Control Block size) used by [`IdxSegmentBuilder`].
 const IDX_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
 
 /// Size of the fixed trailer at the end of every 4 KB index data block (`4088..4096`).
@@ -38,7 +47,7 @@ pub const BLOB_PTR_ENCODED_LEN: usize = 23;
 /// Default Bloom filter bits per key (`10` bits/key -> ~0.9% false-positive rate).
 pub const DEFAULT_BLOOM_BITS_PER_KEY: usize = 10;
 
-/// Maximum defensive size for an index segment's filter/fence metadata trailer (64 MB, `S01`).
+/// Maximum defensive size for an index segment's filter/fence metadata trailer (64 MB).
 pub const MAX_INDEX_META_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fixed 48-byte footer at the end of every `idx_<SeqID>.db` file.
@@ -95,7 +104,7 @@ impl IndexEntry {
     }
 
     /// Returns `true` if an `IndexValue::Inline` entry with `(key_len, val_len)` fits in a single
-    /// 4 KB index block (`11 + key_len + 2 + val_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    /// 4 KB index block (`11 + key_len + 2 + val_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`).
     #[inline]
     pub const fn inline_fits_in_block(key_len: usize, val_len: usize) -> bool {
         match key_len.checked_add(val_len) {
@@ -108,7 +117,7 @@ impl IndexEntry {
     }
 
     /// Returns `true` if an `IndexValue::Blob` entry with `key_len` fits in a single 4 KB index
-    /// block (`11 + key_len + 23 <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    /// block (`11 + key_len + 23 <= MAX_SINGLE_BLOCK_ENTRY_BYTES`).
     #[inline]
     pub const fn blob_ptr_fits_in_block(key_len: usize) -> bool {
         match key_len.checked_add(11 + BLOB_PTR_ENCODED_LEN) {
@@ -118,7 +127,7 @@ impl IndexEntry {
     }
 
     /// Returns `true` if an `IndexValue::Tombstone` entry with `key_len` fits in a single 4 KB
-    /// index block (`11 + key_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    /// index block (`11 + key_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`).
     #[inline]
     pub const fn tombstone_fits_in_block(key_len: usize) -> bool {
         match key_len.checked_add(11) {
@@ -173,7 +182,7 @@ impl IdxBlockBuilder {
         used + needed <= IDX_BLOCK_USABLE_SIZE
     }
 
-    /// Returns `true` if a raw entry with `(key_len, val_type, val_len)` fits in this 4 KB block (`P2`).
+    /// Returns `true` if a raw entry with `(key_len, val_type, val_len)` fits in this 4 KB block.
     #[inline]
     pub fn can_fit_raw(&self, key_len: usize, val_type: u8, val_len: usize) -> bool {
         let payload_len = match val_type {
@@ -186,7 +195,7 @@ impl IdxBlockBuilder {
         used + needed <= IDX_BLOCK_USABLE_SIZE
     }
 
-    /// Appends a raw borrowed entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to this block (`P2`).
+    /// Appends a raw borrowed entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to this block.
     pub fn add_raw_entry(
         &mut self,
         key: &[u8],
@@ -324,7 +333,7 @@ impl IdxBlockBuilder {
     }
 }
 
-/// Zero-copy borrowed view of an entry inside a verified 4 KB index data block (`P2`).
+/// Zero-copy borrowed view of an entry inside a verified 4 KB index data block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawIdxEntry<'a> {
     pub key: &'a [u8],
@@ -334,7 +343,7 @@ pub struct RawIdxEntry<'a> {
 }
 
 impl<'a> RawIdxEntry<'a> {
-    /// Decodes a 23-byte encoded [`BlobPtr`] slice without heap allocation (`P2`).
+    /// Decodes a 23-byte encoded [`BlobPtr`] slice without heap allocation.
     #[inline]
     pub fn decode_blob_ptr(val_bytes: &[u8]) -> io::Result<BlobPtr> {
         if val_bytes.len() != BLOB_PTR_ENCODED_LEN {
@@ -467,7 +476,7 @@ impl<'a> IdxBlockReader<'a> {
         Ok(&self.buf[kstart..kstart + klen])
     }
 
-    /// Parses the byte ranges of the entry at `index` inside `self.buf` with zero heap allocations (`P2`).
+    /// Parses the byte ranges of the entry at `index` inside `self.buf` with zero heap allocations.
     #[inline]
     fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
         let off = self.entry_offset(index);
@@ -534,7 +543,7 @@ impl<'a> IdxBlockReader<'a> {
         })
     }
 
-    /// Returns a zero-copy [`RawIdxEntry`] at `index` borrowed directly from `self.buf` (`P2`).
+    /// Returns a zero-copy [`RawIdxEntry`] at `index` borrowed directly from `self.buf`.
     #[inline]
     pub fn raw_entry_at(&self, index: usize) -> io::Result<RawIdxEntry<'a>> {
         let span = self.parse_entry_span_at(index)?;
@@ -593,79 +602,6 @@ impl<'a> IdxBlockReader<'a> {
 pub struct FencePointer {
     pub first_key: Box<[u8]>,
     pub block_idx: u32,
-}
-
-impl BloomFilter {
-    /// Computes the `(h1, h2)` double-hashing probe pair for `key`.
-    #[inline]
-    pub fn hash_pair(key: &[u8]) -> (u32, u32) {
-        const SEED_H1: u32 = 0x1357_9BDF;
-        const SEED_H2: u32 = 0x2468_ACE0;
-        let h1 = crate::util::crc32c::crc32c_append(SEED_H1, key);
-        let h2 = crate::util::crc32c::crc32c_append(SEED_H2, key).rotate_left(17) | 1;
-        (h1, h2)
-    }
-
-    /// Computes a packed 64-bit hash `((h1 as u64) << 32) | (h2 as u64)` for `key` (`P02`).
-    #[inline]
-    pub fn hash64(key: &[u8]) -> u64 {
-        let (h1, h2) = Self::hash_pair(key);
-        ((h1 as u64) << 32) | (h2 as u64)
-    }
-
-    /// Builds a [`BloomFilter`] from precomputed `(h1, h2)` hash pairs without retaining raw keys.
-    pub fn from_hash_pairs(hashes: &[(u32, u32)], bits_per_key: usize) -> Self {
-        if bits_per_key == 0 || hashes.is_empty() {
-            return Self::new(0, 0);
-        }
-        let num_probes = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
-        let raw_bits = (hashes.len().saturating_mul(bits_per_key)).max(64);
-        let num_bytes = raw_bits.div_ceil(8);
-        let num_bits = (num_bytes * 8) as u32;
-
-        let mut buf = vec![0u8; 8 + num_bytes];
-        buf[0] = num_probes;
-        buf[4..8].copy_from_slice(&(num_bytes as u32).to_le_bytes());
-        let bits = &mut buf[8..];
-        for &(h1, h2) in hashes {
-            let mut h = h1;
-            for _ in 0..num_probes {
-                let bit_idx = (h % num_bits) as usize;
-                bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
-                h = h.wrapping_add(h2);
-            }
-        }
-        let mut slice: &[u8] = &buf;
-        Self::decode(&mut slice).expect("valid encoded BloomFilter")
-    }
-
-    /// Builds a [`BloomFilter`] from packed 64-bit hashes without retaining raw keys (`P02`).
-    pub fn from_hashes64(hashes: &[u64], bits_per_key: usize) -> Self {
-        if bits_per_key == 0 || hashes.is_empty() {
-            return Self::new(0, 0);
-        }
-        let num_probes = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
-        let raw_bits = (hashes.len().saturating_mul(bits_per_key)).max(64);
-        let num_bytes = raw_bits.div_ceil(8);
-        let num_bits = (num_bytes * 8) as u32;
-
-        let mut buf = vec![0u8; 8 + num_bytes];
-        buf[0] = num_probes;
-        buf[4..8].copy_from_slice(&(num_bytes as u32).to_le_bytes());
-        let bits = &mut buf[8..];
-        for &packed in hashes {
-            let h1 = (packed >> 32) as u32;
-            let h2 = packed as u32;
-            let mut h = h1;
-            for _ in 0..num_probes {
-                let bit_idx = (h % num_bits) as usize;
-                bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
-                h = h.wrapping_add(h2);
-            }
-        }
-        let mut slice: &[u8] = &buf;
-        Self::decode(&mut slice).expect("valid encoded BloomFilter")
-    }
 }
 
 /// Writes a sorted stream of [`IndexEntry`] items into a new immutable `idx_<SeqID>.db` file.
@@ -727,7 +663,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
     }
 
     /// Adds a sorted raw entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to the segment
-    /// without constructing an intermediate [`IndexEntry`] (`P2`).
+    /// without constructing an intermediate [`IndexEntry`].
     pub fn add_raw_entry(
         &mut self,
         key: &[u8],
@@ -799,7 +735,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         self.flush_current_data_block()?;
         self.flush_write_buf()?;
 
-        // Build BloomFilter from precomputed 64-bit hashes and drop the hash vector immediately (`P02`)
+        // Build BloomFilter from precomputed 64-bit hashes and drop the hash vector immediately
         let bloom_hashes = core::mem::take(&mut self.bloom_hashes);
         let bloom = BloomFilter::from_hashes64(&bloom_hashes, self.bloom_bits_per_key);
         drop(bloom_hashes);
@@ -974,7 +910,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         slice = &slice[4..];
 
         // Validate `fp_count` against the number of 4 KB data blocks (`<= 1` fence pointer per block)
-        // and the remaining bytes in `slice` (`>= 6` bytes per fence pointer) BEFORE allocating (`S01`).
+        // and the remaining bytes in `slice` (`>= 6` bytes per fence pointer) BEFORE allocating.
         let max_possible_blocks = (meta_offset / (IDX_BLOCK_SIZE as u64)) as usize;
         let min_fp_bytes = fp_count.checked_mul(6).ok_or_else(|| {
             io::Error::new(
@@ -1109,7 +1045,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         &self.max_key
     }
 
-    /// Returns `true` if `key` lies within `[self.min_key, self.max_key]` (`PERF-02`).
+    /// Returns `true` if `key` lies within `[self.min_key, self.max_key]`.
     #[inline]
     pub fn may_contain_key(&self, key: &[u8]) -> bool {
         !self.fence_pointers.is_empty()
@@ -1117,7 +1053,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             && key <= self.max_key.as_slice()
     }
 
-    /// Returns `true` if `[self.min_key, self.max_key]` overlaps `[lower, upper]` (`PERF-02`).
+    /// Returns `true` if `[self.min_key, self.max_key]` overlaps `[lower, upper]`.
     #[inline]
     pub fn overlaps_range(&self, lower: &[u8], upper: Option<&[u8]>) -> bool {
         !self.fence_pointers.is_empty()
@@ -1284,7 +1220,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 
     /// Creates a bounded-memory reverse streaming cursor starting at `(upper_key, upper_inclusive)`,
-    /// seeking via sparse fence pointers and walking 4 KB data blocks backward on demand (`P-01`).
+    /// seeking via sparse fence pointers and walking 4 KB data blocks backward on demand.
     pub fn cursor_reverse_from(
         &self,
         upper_key: Option<(&[u8], bool)>,
@@ -1293,7 +1229,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 }
 
-/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`] (`P-01`, `P2`).
+/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`].
 pub struct IdxSegmentRevCursor<'a, F: PlatformFile> {
     seg: &'a IdxSegmentReader<F>,
     next_block_idx: Option<u32>,
@@ -1379,7 +1315,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
         Ok(cursor)
     }
 
-    /// Returns the raw key slice of the current entry without heap allocation (`P2`).
+    /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
         self.current_span
@@ -1387,7 +1323,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
             .map(|s| &self.block_buf[s.key_range.clone()])
     }
 
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf` (`P2`).
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
         self.current_span.as_ref().map(|s| RawIdxEntry {
@@ -1398,7 +1334,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
         })
     }
 
-    /// Advances the cursor to the previous entry in the segment without allocating (`P2`).
+    /// Advances the cursor to the previous entry in the segment without allocating.
     #[inline]
     pub fn advance(&mut self) -> io::Result<()> {
         if self.current_span.is_some() {
@@ -1440,7 +1376,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
     }
 }
 
-/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`] (`P2`).
+/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].
 ///
 /// Holds only a single 4 KB data block buffer (`[u8; IDX_BLOCK_SIZE]`) in stack/struct memory,
 /// enabling zero-allocation key/LSN inspection and $O(K \times 4\text{ KB})$ streaming K-way merges.
@@ -1527,7 +1463,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         Ok(cursor)
     }
 
-    /// Returns the raw key slice of the current entry without heap allocation (`P2`).
+    /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
         self.current_span
@@ -1535,7 +1471,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             .map(|s| &self.block_buf[s.key_range.clone()])
     }
 
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf` (`P2`).
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
         self.current_span.as_ref().map(|s| RawIdxEntry {
@@ -1546,7 +1482,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         })
     }
 
-    /// Advances the cursor to the next entry in the segment without allocating (`P2`).
+    /// Advances the cursor to the next entry in the segment without allocating.
     #[inline]
     pub fn advance(&mut self) -> io::Result<()> {
         if self.current_span.is_some() {
@@ -1708,4 +1644,127 @@ pub fn compact_idx_segments<F: PlatformFile>(
         new_segment,
         newly_dead_blob_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
+    use crate::pal::OsFs;
+    use crate::util::test_util::TempTestDir;
+
+    #[test]
+    fn idx_segment_fence_pointers_bloom_and_compaction() {
+        let tmp = TempTestDir::new("idx_compact");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        // Segment 1 (Older, LSN 1..=200)
+        let mut mt1 = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
+        for i in 0..200u32 {
+            let key = format!("user_key_{i:05}").into_bytes();
+            if i == 50 {
+                // Key 50 holds a BlobPtr in Segment 1 that will be overwritten in Segment 2
+                mt1.put_blob_ptr(
+                    key,
+                    BlobPtr {
+                        kind: BlobKind::Standard,
+                        table_id: 0,
+                        seg_id: 10,
+                        offset: 0,
+                        len: 16384,
+                        crc32c: 0x9999,
+                    },
+                    (i + 1) as u64,
+                );
+            } else {
+                mt1.put_inline(key, format!("val_v1_{i}").into_bytes(), (i + 1) as u64);
+            }
+        }
+        let seg1 = mt1.flush_to_segment(&fs, 1, 10).expect("flush seg 1");
+        assert!(seg1.num_blocks() >= 2);
+
+        // Reopen Segment 1 from disk to test Footer + Bloom + FencePointer deserialization
+        drop(seg1);
+        let seg1 = IdxSegmentReader::open(&fs, 1).expect("reopen seg 1");
+
+        // Verify `[min_key, max_key]` key-range metadata & pruning on `seg1`
+        assert_eq!(seg1.min_key(), b"user_key_00000");
+        assert_eq!(seg1.max_key(), b"user_key_00199");
+        assert!(!seg1.may_contain_key(b"aaa_before_min"));
+        assert!(!seg1.may_contain_key(b"zzz_after_max"));
+        assert!(seg1.may_contain_key(b"user_key_00042"));
+        assert!(!seg1.overlaps_range(b"zzz_0", Some(b"zzz_9")));
+        assert!(!seg1.overlaps_range(b"aaa_0", Some(b"aaa_9")));
+        assert!(seg1.overlaps_range(b"user_key_00100", Some(b"user_key_00150")));
+
+        // Point lookups on Segment 1
+        assert_eq!(
+            seg1.get(b"user_key_00042").unwrap(),
+            Some((43, IndexValue::Inline(b"val_v1_42".to_vec())))
+        );
+        assert_eq!(seg1.get(b"nonexistent_key").unwrap(), None);
+
+        // Segment 2 (Newer, LSN 500..): Overwrites key 50 and deletes key 100
+        let mut mt2 = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
+        mt2.put_inline(
+            b"user_key_00050".to_vec(),
+            b"val_v2_50_inline".to_vec(),
+            500,
+        );
+        mt2.delete(b"user_key_00100".to_vec(), 501);
+        let seg2 = mt2.flush_to_segment(&fs, 2, 10).expect("flush seg 2");
+
+        // Compact Segment 2 and Segment 1 into Segment 3 with drop_tombstones = true
+        let comp = compact_idx_segments(&fs, &[&seg2, &seg1], 3, 1, 10, true).expect("compact");
+        assert_eq!(comp.new_segment.record_count(), 199); // 200 - 1 deleted key (key 100)
+        assert_eq!(
+            comp.new_segment.get(b"user_key_00050").unwrap(),
+            Some((500, IndexValue::Inline(b"val_v2_50_inline".to_vec())))
+        );
+        assert_eq!(comp.new_segment.get(b"user_key_00100").unwrap(), None);
+
+        // Verify that overwriting key 50's BlobPtr reported 16384 newly dead blob bytes on seg_id 10!
+        assert_eq!(
+            comp.newly_dead_blob_bytes,
+            vec![(BlobKind::Standard, 0, 10, 16384)]
+        );
+
+        // Verify that a crafted index segment with an inflated `fp_count` (even with a
+        // valid recomputed footer_crc32c) is rejected before allocating `fence_pointers`.
+        drop(comp);
+        let seg_fname = crate::meta::format_idx_file_name(3);
+        let seg_file = fs
+            .open_file(&seg_fname, false, true, crate::pal::OpenHint::ImmutableRandom)
+            .unwrap();
+        let flen = seg_file.file_len().unwrap() as usize;
+        let mut raw_seg = vec![0u8; flen];
+        seg_file.read_exact_at(&mut raw_seg, 0).unwrap();
+
+        let footer_start = flen - 48;
+        let meta_offset =
+            u64::from_le_bytes(raw_seg[footer_start + 24..footer_start + 32].try_into().unwrap())
+                as usize;
+        // `meta_buf` starts with `[num_probes: u8 | reserved: [u8; 3] | bit_bytes_len: u32 LE | bits...]`,
+        // followed by `fp_count: u32`.
+        let bloom_byte_len =
+            u32::from_le_bytes(raw_seg[meta_offset + 4..meta_offset + 8].try_into().unwrap())
+                as usize;
+        let fp_count_pos = meta_offset + 8 + bloom_byte_len;
+        // Overwrite `fp_count` with `u32::MAX` and recompute both `meta_crc` and `footer_crc32c`
+        raw_seg[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let new_meta_crc = crate::util::crc32c::crc32c(&raw_seg[meta_offset..footer_start]);
+        raw_seg[footer_start + 36..footer_start + 40].copy_from_slice(&new_meta_crc.to_le_bytes());
+        let new_footer_crc =
+            crate::util::crc32c::crc32c(&raw_seg[footer_start..footer_start + 44]);
+        raw_seg[footer_start + 44..footer_start + 48]
+            .copy_from_slice(&new_footer_crc.to_le_bytes());
+        seg_file.write_all_at(&raw_seg, 0).unwrap();
+        drop(seg_file);
+
+        let err = match IdxSegmentReader::open(&fs, 3) {
+            Ok(_) => panic!("crafted huge fp_count with valid CRC must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
