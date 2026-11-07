@@ -4,6 +4,10 @@ This chapter documents the head-to-head empirical benchmarks (`examples/sqlite_v
 
 To ensure an apples-to-apples comparison, **both engines execute identical parameterized SQL statements (`INSERT OR REPLACE INTO ...`, `SELECT ... WHERE ...`) through the exact same native SQLite C API (`sqlite3_prepare_v2` / `sqlite3_step`)** on Windows 11 (`winsqlite3.dll`).
 
+<p align="center">
+  <img src="../assets/bench_hybrid_and_tpcb.svg" alt="Hybrid Desktop Workloads and TPC-B Comparison" width="100%"/>
+</p>
+
 ---
 
 ## 1. Benchmark 1: Small Synchronous Configuration Updates (`128 B` Payload, Full Durability)

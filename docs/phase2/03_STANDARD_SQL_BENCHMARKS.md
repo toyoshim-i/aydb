@@ -6,12 +6,20 @@ To evaluate `aydb` objectively beyond custom cache/config microbenchmarks, this 
 2. **YCSB (Yahoo! Cloud Serving Benchmark) Workloads `A` through `F` (Zipfian $\theta = 0.99$):** Evaluated at both **`256 B` (Inline Storage)** and **`2,048 B` (WiscKey Separated Blob Storage)** to expose the exact boundary where WiscKey outperforms B-Trees and where WiscKey incurs range-scan dereference overhead.
 3. **TPC-B (`pgbench`-style) 4-Table OLTP Benchmark:** Multi-statement ACID transactions across `branches`, `tellers`, `accounts`, and `history`.
 
+<p align="center">
+  <img src="../assets/bench_speedup_overview.svg" alt="aydb Relative Speedup Overview" width="100%"/>
+</p>
+
 ---
 
 ## 1. Suite 1: SQLite Official `"Speedtest1"` Standard Workload (`5,000` Indexed Rows)
 
 * **Schema:** `t1(id INT PRIMARY KEY, uval INT, category TEXT, payload TEXT)` with secondary index on `uval` (`120 B` payload).
 * **Note on Workload Structure:** In `Speedtest1`, Tests `100`, `230`, and `240` wrap thousands of mutations inside a **single giant `BEGIN ... COMMIT` transaction** where SQLite's native B-Tree mutates pages in its in-process user-space page cache without FFI boundary crossings per row.
+
+<p align="center">
+  <img src="../assets/bench_speedtest1_breakdown.svg" alt="SQLite Official Speedtest1 Execution Time Breakdown" width="100%"/>
+</p>
 
 | Speedtest1 Sub-Benchmark | Vanilla SQLite (`WAL`) | `aydb` Virtual Table | Relative Speed (`aydb` vs. SQLite) | Architectural Analysis |
 | :--- | ---: | ---: | ---: | :--- |
@@ -38,6 +46,10 @@ To bring `aydb` ahead of Vanilla SQLite on total `Speedtest1` execution time (`9
 ## 2. Suite 2: YCSB Workloads `A` through `F` (Zipfian $\theta = 0.99$)
 
 YCSB evaluates realistic autocommit request streams across 6 industry-standard access mixes (`4,000` initial rows, `5,000` operations per workload, Zipfian skew $\theta = 0.99$). We run the entire YCSB suite twice: once at **`256 B` (Inline Storage)** and once at **`2,048 B` (WiscKey Out-of-Line Blob Storage)**.
+
+<p align="center">
+  <img src="../assets/bench_ycsb_throughput.svg" alt="YCSB Workloads A-F Throughput Comparison" width="100%"/>
+</p>
 
 ### 2.1 YCSB at `256 B` Value Size (Below `1024 B` Inline Threshold)
 

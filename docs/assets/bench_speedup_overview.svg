@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 580" width="100%" height="100%" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="aydbGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="aydbHotGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4f46e5"/>
+      <stop offset="100%" stop-color="#ec4899"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="580" rx="12" fill="#0f172a"/>
+  <rect x="1" y="1" width="958" height="578" rx="11" fill="none" stroke="#334155" stroke-width="1.5"/>
+
+  <!-- Title & Subtitle -->
+  <text x="32" y="38" fill="#f8fafc" font-size="19" font-weight="700">aydb Relative Speedup vs. Vanilla SQLite (WAL Mode = 1.0x Baseline)</text>
+  <text x="32" y="62" fill="#94a3b8" font-size="13">Higher is better — Measured on Windows NTFS via identical SQL queries over sqlite3_module</text>
+
+  <!-- Dedicated Legend Row (y = 78..92, generous spacing between items) -->
+  <rect x="32" y="78" width="14" height="14" rx="3" fill="url(#aydbHotGrad)"/>
+  <text x="52" y="90" fill="#e2e8f0" font-size="12" font-weight="600">aydb Write-Heavy / Sync ACID</text>
+  <rect x="300" y="78" width="14" height="14" rx="3" fill="url(#aydbGrad)"/>
+  <text x="320" y="90" fill="#e2e8f0" font-size="12" font-weight="600">aydb Read / Scan / Bounded Blob Cache</text>
+  <line x1="630" y1="85" x2="660" y2="85" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <text x="668" y="90" fill="#fbbf24" font-size="12" font-weight="700">Vanilla SQLite Baseline (1.0x)</text>
+
+  <!-- Chart Area: x from 260 to 685 (width = 425px for 0x..25x -> 1x = 17px). Right label space: 685..940 -->
+  <g stroke="#1e293b" stroke-width="1">
+    <line x1="260" y1="120" x2="260" y2="525" stroke="#475569"/>
+    <line x1="345" y1="120" x2="345" y2="525"/>
+    <line x1="430" y1="120" x2="430" y2="525"/>
+    <line x1="515" y1="120" x2="515" y2="525"/>
+    <line x1="600" y1="120" x2="600" y2="525"/>
+    <line x1="685" y1="120" x2="685" y2="525"/>
+  </g>
+
+  <!-- X-axis Labels -->
+  <g fill="#94a3b8" font-size="12" text-anchor="middle">
+    <text x="260" y="548">0x</text>
+    <text x="345" y="548">5x</text>
+    <text x="430" y="548">10x</text>
+    <text x="515" y="548">15x</text>
+    <text x="600" y="548">20x</text>
+    <text x="685" y="548">25x</text>
+  </g>
+
+  <!-- Rows (12 items, y step = 33, starting y = 128, scale: 1x = 17px) -->
+  <!-- 1. Sync Config Updates (128B): 22.16x -> width = 377 -->
+  <text x="248" y="144" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">Sync Config Updates (128 B)</text>
+  <rect x="260" y="128" width="377" height="22" rx="4" fill="url(#aydbHotGrad)"/>
+  <text x="647" y="144" fill="#f8fafc" font-size="12.5" font-weight="700">22.16x (12,808 vs 578 tx/s)</text>
+
+  <!-- 2. TPC-B Full Sync: 19.65x -> width = 334 -->
+  <text x="248" y="177" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">TPC-B OLTP (Full Sync)</text>
+  <rect x="260" y="161" width="334" height="22" rx="4" fill="url(#aydbHotGrad)"/>
+  <text x="604" y="177" fill="#f8fafc" font-size="12.5" font-weight="700">19.65x (11,417 vs 581 TPS)</text>
+
+  <!-- 3. YCSB Workload A (50/50 R/U, 256B): 10.60x -> width = 180 -->
+  <text x="248" y="210" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">YCSB-A: 50/50 R/U (256 B)</text>
+  <rect x="260" y="194" width="180" height="22" rx="4" fill="url(#aydbHotGrad)"/>
+  <text x="450" y="210" fill="#f8fafc" font-size="12.5" font-weight="700">10.60x (323K vs 30.5K ops/s)</text>
+
+  <!-- 4. YCSB Workload F (50/50 RMW, 256B): 10.35x -> width = 176 -->
+  <text x="248" y="243" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">YCSB-F: 50/50 RMW (256 B)</text>
+  <rect x="260" y="227" width="176" height="22" rx="4" fill="url(#aydbHotGrad)"/>
+  <text x="446" y="243" fill="#f8fafc" font-size="12.5" font-weight="700">10.35x (294K vs 28.5K ops/s)</text>
+
+  <!-- 5. LRU Cache-Hit SELECTs: 9.49x -> width = 161 -->
+  <text x="248" y="276" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">LRU Cache-Hit SELECTs</text>
+  <rect x="260" y="260" width="161" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="431" y="276" fill="#f8fafc" font-size="12.5" font-weight="700">9.49x (215K vs 22.7K ops/s, 0 MB write)</text>
+
+  <!-- 6. YCSB Workload A (2KB Blob): 8.10x -> width = 138 -->
+  <text x="248" y="309" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">YCSB-A: 50/50 R/U (2 KB Blob)</text>
+  <rect x="260" y="293" width="138" height="22" rx="4" fill="url(#aydbHotGrad)"/>
+  <text x="408" y="309" fill="#f8fafc" font-size="12.5" font-weight="700">8.10x (108K vs 13.3K ops/s)</text>
+
+  <!-- 7. TPC-B Buffered: 7.54x -> width = 128 -->
+  <text x="248" y="342" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">TPC-B OLTP (Buffered)</text>
+  <rect x="260" y="326" width="128" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="398" y="342" fill="#f8fafc" font-size="12.5" font-weight="700">7.54x (117K vs 15.6K TPS)</text>
+
+  <!-- 8. YCSB Workload D (Read Latest, 256B): 5.75x -> width = 98 -->
+  <text x="248" y="375" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">YCSB-D: Read Latest (256 B)</text>
+  <rect x="260" y="359" width="98" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="368" y="375" fill="#f8fafc" font-size="12.5" font-weight="700">5.75x (848K vs 147K ops/s)</text>
+
+  <!-- 9. YCSB Workload C (100% Read, 256B): 4.31x -> width = 73 -->
+  <text x="248" y="408" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">YCSB-C: 100% Point Read (256 B)</text>
+  <rect x="260" y="392" width="73" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="343" y="408" fill="#f8fafc" font-size="12.5" font-weight="700">4.31x (1.23M vs 286K ops/s)</text>
+
+  <!-- 10. Speedtest1 #130 (PK SELECT): 3.33x -> width = 57 -->
+  <text x="248" y="441" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">Speedtest1 #130 (PK SELECT)</text>
+  <rect x="260" y="425" width="57" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="327" y="441" fill="#f8fafc" font-size="12.5" font-weight="700">3.33x (4.75 ms vs 15.83 ms)</text>
+
+  <!-- 11. 16 KB Blob Cache (4 MB Cap): 2.64x -> width = 45 -->
+  <text x="248" y="474" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">16 KB Blob Cache (4 MB Cap)</text>
+  <rect x="260" y="458" width="45" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="315" y="474" fill="#f8fafc" font-size="12.5" font-weight="700">2.64x (153.4 vs 58.0 MB/s, 0.5x disk)</text>
+
+  <!-- 12. Speedtest1 Full Suite Total: 1.12x -> width = 19 -->
+  <text x="248" y="507" fill="#f1f5f9" font-size="13" font-weight="600" text-anchor="end">Speedtest1 Full Suite Total</text>
+  <rect x="260" y="491" width="19" height="22" rx="4" fill="url(#aydbGrad)"/>
+  <text x="290" y="507" fill="#38bdf8" font-size="12.5" font-weight="700">1.12x Overall Win (56.29 ms vs 62.85 ms)</text>
+
+  <!-- 1.0x SQLite Baseline Line (drawn at x = 260 + 17 = 277) -->
+  <line x1="277" y1="115" x2="277" y2="528" stroke="#f59e0b" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="277" y="111" fill="#fbbf24" font-size="11" font-weight="700" text-anchor="middle">1.0x</text>
+</svg>

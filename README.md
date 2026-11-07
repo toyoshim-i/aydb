@@ -55,6 +55,24 @@ flowchart TB
 
 All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same Windows NTFS host:
 
+<p align="center">
+  <img src="docs/assets/bench_speedup_overview.svg" alt="aydb Relative Speedup Overview vs Vanilla SQLite WAL" width="100%"/>
+</p>
+
+<details>
+<summary><b>📊 View Detailed Benchmark Comparison Charts (YCSB A–F, Speedtest1 Breakdown, TPC-B &amp; Hybrid Workloads)</b></summary>
+<br/>
+<p align="center">
+  <img src="docs/assets/bench_ycsb_throughput.svg" alt="YCSB Workloads A-F Throughput Comparison" width="100%"/>
+</p>
+<p align="center">
+  <img src="docs/assets/bench_speedtest1_breakdown.svg" alt="SQLite Official Speedtest1 Execution Time Breakdown" width="100%"/>
+</p>
+<p align="center">
+  <img src="docs/assets/bench_hybrid_and_tpcb.svg" alt="Hybrid Desktop Workloads and TPC-B Comparison" width="100%"/>
+</p>
+</details>
+
 | Benchmark Suite | Workload Description | `aydb` | Vanilla SQLite (`WAL`) | Speedup |
 | :--- | :--- | ---: | ---: | ---: |
 | **SQLite `Speedtest1`** | Official 5,000-row full SQL workload suite (Tests 100–240 total) | **`56.29 ms`** | `62.85 ms` | **`1.12×` faster** |
