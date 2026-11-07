@@ -47,10 +47,15 @@ impl CappedTableState {
 
 /// Bounded in-memory tracker that coalesces read-path `AccessTick` updates in RAM
 /// without issuing disk writes on `get_row()` / `SELECT`.
+///
+/// Uses a two-level `BTreeMap<u16, HashMap<Vec<u8>, u64>>` so all read hits on existing
+/// hot keys, peeks (`peek_hot_tick`), lazy promotions (`take_hot_tick`), and overwrites/deletes
+/// (`remove_key`) probe by `&[u8]` (`Borrow<[u8]>`) with zero heap allocations (`P-04`).
 pub struct AccessTracker {
     next_tick: AtomicU64,
-    /// Maps `(table_id, pk_bytes)` -> `latest_access_tick` for recently read keys.
-    hot_ticks: HashMap<(u16, Vec<u8>), u64>,
+    /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys (`P-04`).
+    hot_ticks: std::collections::BTreeMap<u16, HashMap<Vec<u8>, u64>>,
+    total_entries: usize,
     max_entries: usize,
 }
 
@@ -58,7 +63,8 @@ impl AccessTracker {
     pub fn new(initial_tick: u64, max_entries: usize) -> Self {
         Self {
             next_tick: AtomicU64::new(initial_tick.max(1)),
-            hot_ticks: HashMap::with_capacity(max_entries.min(4096)),
+            hot_ticks: std::collections::BTreeMap::new(),
+            total_entries: 0,
             max_entries: max_entries.max(64),
         }
     }
@@ -87,54 +93,86 @@ impl AccessTracker {
     }
 
     /// Records a read hit in RAM (`O(1)` hash map update, zero disk I/O).
+    /// Updates existing hot keys in place with zero heap allocation (`P-04`).
     /// Returns the newly assigned `AccessTick`.
     pub fn record_read_hit(&mut self, table_id: u16, pk: &[u8]) -> u64 {
         let tick = self.next_tick();
-        if self.hot_ticks.len() >= self.max_entries
-            && !self.hot_ticks.contains_key(&(table_id, pk.to_vec()))
-        {
-            // Evict the oldest half of tracked in-memory ticks if bounded capacity is reached
-            let mut ticks: Vec<u64> = self.hot_ticks.values().copied().collect();
-            ticks.sort_unstable();
-            let median = ticks[ticks.len() / 2];
-            self.hot_ticks.retain(|_, &mut v| v > median);
+        if let Some(table_map) = self.hot_ticks.get_mut(&table_id) {
+            if let Some(slot) = table_map.get_mut(pk) {
+                *slot = tick;
+                return tick;
+            }
         }
-        self.hot_ticks.insert((table_id, pk.to_vec()), tick);
+        if self.total_entries >= self.max_entries {
+            // Evict the oldest half of tracked in-memory ticks if bounded capacity is reached
+            let mut ticks: Vec<u64> = self
+                .hot_ticks
+                .values()
+                .flat_map(|m| m.values().copied())
+                .collect();
+            if !ticks.is_empty() {
+                ticks.sort_unstable();
+                let median = ticks[ticks.len() / 2];
+                let mut kept = 0usize;
+                for m in self.hot_ticks.values_mut() {
+                    m.retain(|_, &mut v| v > median);
+                    kept += m.len();
+                }
+                self.total_entries = kept;
+            }
+        }
+        let table_map = self
+            .hot_ticks
+            .entry(table_id)
+            .or_insert_with(|| HashMap::with_capacity(self.max_entries.min(4096)));
+        if table_map.insert(pk.to_vec(), tick).is_none() {
+            self.total_entries += 1;
+        }
         tick
     }
 
-    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)`.
+    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation (`P-04`).
     #[inline]
     pub fn take_hot_tick(&mut self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        if self.hot_ticks.is_empty() {
+        if self.total_entries == 0 {
             return None;
         }
-        self.hot_ticks.remove(&(table_id, pk.to_vec()))
+        let removed = self.hot_ticks.get_mut(&table_id)?.remove(pk);
+        if removed.is_some() {
+            self.total_entries = self.total_entries.saturating_sub(1);
+        }
+        removed
     }
 
-    /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)`.
+    /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation (`P-04`).
     #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        if self.hot_ticks.is_empty() {
+        if self.total_entries == 0 {
             return None;
         }
-        self.hot_ticks.get(&(table_id, pk.to_vec())).copied()
+        self.hot_ticks.get(&table_id)?.get(pk).copied()
     }
 
-    /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete).
+    /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete)
+    /// with zero allocation (`P-04`).
     #[inline]
     pub fn remove_key(&mut self, table_id: u16, pk: &[u8]) {
-        if !self.hot_ticks.is_empty() {
-            self.hot_ticks.remove(&(table_id, pk.to_vec()));
+        if self.total_entries == 0 {
+            return;
+        }
+        if let Some(table_map) = self.hot_ticks.get_mut(&table_id) {
+            if table_map.remove(pk).is_some() {
+                self.total_entries = self.total_entries.saturating_sub(1);
+            }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.hot_ticks.len()
+        self.total_entries
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hot_ticks.is_empty()
+        self.total_entries == 0
     }
 }
 
@@ -186,5 +224,43 @@ mod tests {
             assert_eq!(dec_col, pair[0]);
             assert_eq!(dec_pk, b"pk_999");
         }
+    }
+
+    #[test]
+    fn p04_access_tracker_two_level_map_borrows_slice_and_bounds_capacity() {
+        let mut tracker = AccessTracker::new(100, 64);
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+
+        let t1 = tracker.record_read_hit(1, b"pk_a");
+        assert_eq!(t1, 100);
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.peek_hot_tick(1, b"pk_a"), Some(100));
+        assert_eq!(tracker.peek_hot_tick(2, b"pk_a"), None);
+
+        // Updating an existing hot key in place must not grow `len()`
+        let t2 = tracker.record_read_hit(1, b"pk_a");
+        assert_eq!(t2, 101);
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.peek_hot_tick(1, b"pk_a"), Some(101));
+
+        // Taking the hot tick removes it and decrements `len()`
+        assert_eq!(tracker.take_hot_tick(1, b"pk_a"), Some(101));
+        assert_eq!(tracker.len(), 0);
+        assert!(tracker.is_empty());
+
+        // `remove_key` on overwrite/delete removes the entry cleanly
+        tracker.record_read_hit(3, b"pk_del");
+        assert_eq!(tracker.len(), 1);
+        tracker.remove_key(3, b"pk_del");
+        assert_eq!(tracker.len(), 0);
+
+        // Exceeding `max_entries` (64) evicts the oldest half while keeping recent entries
+        for i in 0..80u32 {
+            let key = format!("k_{i:04}");
+            tracker.record_read_hit((i % 4) as u16, key.as_bytes());
+        }
+        assert!(tracker.len() <= 64);
+        assert!(tracker.peek_hot_tick(3, b"k_0079").is_some());
     }
 }

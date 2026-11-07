@@ -1081,6 +1081,137 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     ) -> io::Result<IdxSegmentCursor<'_, F>> {
         IdxSegmentCursor::new_from(self, lower_key, lower_inclusive)
     }
+
+    /// Creates a bounded-memory reverse streaming cursor starting at `(upper_key, upper_inclusive)`,
+    /// seeking via sparse fence pointers and walking 4 KB data blocks backward on demand (`P-01`).
+    pub fn cursor_reverse_from(
+        &self,
+        upper_key: Option<(&[u8], bool)>,
+    ) -> io::Result<IdxSegmentRevCursor<'_, F>> {
+        IdxSegmentRevCursor::new_from(self, upper_key)
+    }
+}
+
+/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`] (`P-01`).
+pub struct IdxSegmentRevCursor<'a, F: PlatformFile> {
+    seg: &'a IdxSegmentReader<F>,
+    next_block_idx: Option<u32>,
+    block_buf: [u8; IDX_BLOCK_SIZE],
+    entry_idx: usize,
+    num_entries_in_block: usize,
+    current: Option<IndexEntry>,
+}
+
+impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
+    fn new_from(
+        seg: &'a IdxSegmentReader<F>,
+        upper_key: Option<(&[u8], bool)>,
+    ) -> io::Result<Self> {
+        let mut cursor = Self {
+            seg,
+            next_block_idx: None,
+            block_buf: [0u8; IDX_BLOCK_SIZE],
+            entry_idx: 0,
+            num_entries_in_block: 0,
+            current: None,
+        };
+        if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
+            return Ok(cursor);
+        }
+
+        let Some((ub_key, ub_inclusive)) = upper_key else {
+            cursor.next_block_idx = Some(seg.num_blocks - 1);
+            cursor.advance_to_prev()?;
+            return Ok(cursor);
+        };
+
+        let pos = seg.fence_pointers.partition_point(|fp| {
+            if ub_inclusive {
+                fp.first_key.as_ref() <= ub_key
+            } else {
+                fp.first_key.as_ref() < ub_key
+            }
+        });
+        if pos == 0 {
+            return Ok(cursor);
+        }
+        let mut b = seg.fence_pointers[pos - 1].block_idx;
+
+        loop {
+            seg.file
+                .read_exact_at(&mut cursor.block_buf, (b as u64) * (IDX_BLOCK_SIZE as u64))?;
+            let reader = IdxBlockReader::open_verified(&cursor.block_buf)?;
+            cursor.num_entries_in_block = reader.num_entries();
+
+            // Binary-search for the first entry strictly after `(ub_key, ub_inclusive)`
+            let mut low = 0usize;
+            let mut high = cursor.num_entries_in_block;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let k = reader.key_at(mid)?;
+                let within = if ub_inclusive {
+                    k <= ub_key
+                } else {
+                    k < ub_key
+                };
+                if within {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+
+            if low > 0 {
+                let target_idx = low - 1;
+                let entry = reader.decode_entry_at(target_idx)?;
+                cursor.entry_idx = target_idx;
+                cursor.next_block_idx = b.checked_sub(1);
+                cursor.current = Some(entry);
+                break;
+            }
+
+            if b == 0 {
+                break;
+            }
+            b -= 1;
+        }
+        Ok(cursor)
+    }
+
+    #[inline]
+    pub fn peek(&self) -> Option<&IndexEntry> {
+        self.current.as_ref()
+    }
+
+    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
+        let prev = self.current.take();
+        if prev.is_some() {
+            self.advance_to_prev()?;
+        }
+        Ok(prev)
+    }
+
+    fn advance_to_prev(&mut self) -> io::Result<()> {
+        while self.entry_idx == 0 {
+            let Some(b) = self.next_block_idx else {
+                self.current = None;
+                return Ok(());
+            };
+            self.next_block_idx = b.checked_sub(1);
+            self.seg
+                .file
+                .read_exact_at(&mut self.block_buf, (b as u64) * (IDX_BLOCK_SIZE as u64))?;
+            let reader = IdxBlockReader::open_verified(&self.block_buf)?;
+            self.num_entries_in_block = reader.num_entries();
+            self.entry_idx = self.num_entries_in_block;
+        }
+
+        self.entry_idx -= 1;
+        let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
+        let entry = reader.decode_entry_at(self.entry_idx)?;
+        self.current = Some(entry);
+        Ok(())
+    }
 }
 
 /// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].

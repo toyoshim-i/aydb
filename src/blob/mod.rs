@@ -23,14 +23,25 @@ pub const DEFAULT_MAX_BLOB_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 const BLOB_RECORD_MAGIC: &[u8; 4] = b"AYBL";
 const BLOB_RECORD_HEADER_LEN: usize = 16;
+/// Maximum user-space write buffer size (`256 KB`) in [`BlobSegmentWriter`] before flushing
+/// coalesced blob records to the OS file handle (`P-03`).
+const BLOB_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
+/// Maximum blob frame size (`16 KB`) read via a stack buffer in [`BlobSegmentReader::append_blob_into`]
+/// to avoid redundant `Vec::resize` zero-filling and `copy_within` payload shifting (`P-03`).
+const BLOB_STACK_READ_MAX_LEN: usize = 16 * 1024;
 
 /// Append-only writer for a single standard or per-table LRU blob segment file.
+///
+/// Reuses an internal staging buffer (`write_buf`) to eliminate per-blob heap allocations and
+/// coalesce multi-row blob writes into fewer OS `WriteFile` / `pwrite` syscalls (`P-03`).
 pub struct BlobSegmentWriter<F: PlatformFile> {
     file: Arc<F>,
     kind: BlobKind,
     table_id: u16,
     seq_id: u64,
     write_offset: u64,
+    buf_start_offset: u64,
+    write_buf: Vec<u8>,
 }
 
 impl<F: PlatformFile> BlobSegmentWriter<F> {
@@ -57,6 +68,8 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             },
             seq_id,
             write_offset,
+            buf_start_offset: write_offset,
+            write_buf: Vec::with_capacity(64 * 1024),
         })
     }
 
@@ -72,12 +85,32 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         self.write_offset
     }
 
+    /// Returns the file offset up to which buffered blob records have been flushed to the OS handle.
+    #[inline]
+    pub fn flushed_offset(&self) -> u64 {
+        self.buf_start_offset
+    }
+
     pub fn file(&self) -> &Arc<F> {
         &self.file
     }
 
+    /// Flushes any staged blob records in `write_buf` to the underlying OS file handle (`P-03`).
+    #[inline]
+    pub fn flush_buffer(&mut self) -> io::Result<()> {
+        if !self.write_buf.is_empty() {
+            self.file
+                .write_all_at(&self.write_buf, self.buf_start_offset)?;
+            self.buf_start_offset += self.write_buf.len() as u64;
+            self.write_buf.clear();
+        }
+        Ok(())
+    }
+
     /// Appends `[Magic "AYBL" (4B) | BlobCRC32C (4B) | KeyLen (4B) | ValLen (4B) | Key | Value]`
     /// to the blob segment and returns its [`BlobPtr`].
+    ///
+    /// Stages records into the reusable `write_buf` without allocating a fresh `Vec<u8>` per blob (`P-03`).
     pub fn append_blob(&mut self, key: &[u8], value: &[u8]) -> io::Result<BlobPtr> {
         let total_len = BLOB_RECORD_HEADER_LEN
             .checked_add(key.len())
@@ -97,19 +130,34 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             )
         })?;
 
-        let mut buf = Vec::with_capacity(total_len);
-        buf.extend_from_slice(BLOB_RECORD_MAGIC);
-        buf.extend_from_slice(&0u32.to_le_bytes()); // placeholder for CRC32C at 4..8
-        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(key);
-        buf.extend_from_slice(value);
+        if !self.write_buf.is_empty()
+            && self.write_buf.len().saturating_add(total_len) > BLOB_WRITE_BUFFER_CAPACITY
+        {
+            self.flush_buffer()?;
+        }
+        if self.write_buf.is_empty() {
+            self.buf_start_offset = self.write_offset;
+        }
 
-        let payload_crc = crc32c(&buf[8..]);
-        buf[4..8].copy_from_slice(&payload_crc.to_le_bytes());
+        let rec_start = self.write_buf.len();
+        self.write_buf.reserve(total_len);
+        self.write_buf.extend_from_slice(BLOB_RECORD_MAGIC);
+        self.write_buf.extend_from_slice(&0u32.to_le_bytes()); // placeholder for CRC32C at +4..+8
+        self.write_buf
+            .extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.write_buf
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.write_buf.extend_from_slice(key);
+        self.write_buf.extend_from_slice(value);
 
-        self.file.write_all_at(&buf, self.write_offset)?;
+        let payload_crc = crc32c(&self.write_buf[rec_start + 8..rec_start + total_len]);
+        self.write_buf[rec_start + 4..rec_start + 8]
+            .copy_from_slice(&payload_crc.to_le_bytes());
+
         self.write_offset += total_len as u64;
+        if self.write_buf.len() >= BLOB_WRITE_BUFFER_CAPACITY {
+            self.flush_buffer()?;
+        }
 
         Ok(BlobPtr {
             kind: self.kind,
@@ -121,8 +169,9 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         })
     }
 
-    /// Flushes buffered blob writes to physical storage (used during checkpointing).
-    pub fn sync_durable(&self) -> io::Result<()> {
+    /// Flushes buffered blob writes to the OS file handle and syncs to physical storage (used during checkpointing).
+    pub fn sync_durable(&mut self) -> io::Result<()> {
+        self.flush_buffer()?;
         self.file.sync_durable()
     }
 }
@@ -188,7 +237,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     }
 
     /// Appends the verified blob payload referenced by `ptr` onto the end of `out` in place
-    /// without allocating an intermediate frame buffer (`PERF-06`).
+    /// without allocating an intermediate frame buffer (`PERF-06`, `P-03`).
     pub fn append_blob_into(
         &self,
         ptr: &BlobPtr,
@@ -198,6 +247,54 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         let len = ptr.len as usize;
         if len < BLOB_RECORD_HEADER_LEN {
             return Ok(false);
+        }
+
+        // Fast path (`P-03`): for typical blobs (`<= 16 KB`), read into a stack buffer so we
+        // avoid `Vec::resize` user-space zero-filling and `copy_within` overlapping memmove!
+        if len <= BLOB_STACK_READ_MAX_LEN {
+            let mut stack_buf = [0u8; BLOB_STACK_READ_MAX_LEN];
+            let buf = &mut stack_buf[..len];
+            match self.file.read_exact_at(buf, ptr.offset as u64) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(false);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+
+            if &buf[0..4] != BLOB_RECORD_MAGIC {
+                return Ok(false);
+            }
+            let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            if stored_crc != ptr.crc32c {
+                return Ok(false);
+            }
+            if crc32c(&buf[8..]) != ptr.crc32c {
+                return Ok(false);
+            }
+
+            let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+            let val_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+            if BLOB_RECORD_HEADER_LEN
+                .checked_add(key_len)
+                .and_then(|n| n.checked_add(val_len))
+                != Some(len)
+            {
+                return Ok(false);
+            }
+
+            let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
+            if let Some(exp_k) = expected_key {
+                if key_slice != exp_k {
+                    return Ok(false);
+                }
+            }
+
+            let val_start = BLOB_RECORD_HEADER_LEN + key_len;
+            out.extend_from_slice(&buf[val_start..val_start + val_len]);
+            return Ok(true);
         }
 
         let orig_len = out.len();
@@ -266,5 +363,70 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     /// Used by the WAL recovery coordinator (`recover_two_streams`) to filter out uncommitted blobs.
     pub fn validate_blob_ptr(&self, ptr: &BlobPtr) -> bool {
         matches!(self.read_blob(ptr, None), Ok(Some(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pal::OsFs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BLOB_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TempTestDir {
+        path: PathBuf,
+    }
+
+    impl TempTestDir {
+        fn new(prefix: &str) -> Self {
+            let id = BLOB_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("aydb_blob_test_{prefix}_{pid}_{id}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self { path: dir }
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn p03_buffered_blob_writer_and_fast_stack_or_large_reads() {
+        let dir = TempTestDir::new("p03_blob");
+        let fs = OsFs::open(&dir.path, true).unwrap();
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let val_small = vec![0xA5u8; 2048];
+        let val_large = vec![0x5Au8; 24_000]; // exceeds 16 KB stack read threshold
+
+        let ptr1 = writer.append_blob(b"k1", &val_small).unwrap();
+        let ptr2 = writer.append_blob(b"k2", &val_large).unwrap();
+        // Before `flush_buffer()`, staged bytes are in `write_buf` (`flushed_offset == 0`)
+        assert_eq!(writer.flushed_offset(), 0);
+        assert_eq!(writer.current_len(), (ptr1.len + ptr2.len) as u64);
+
+        writer.flush_buffer().unwrap();
+        assert_eq!(writer.flushed_offset(), writer.current_len());
+
+        let reader = BlobSegmentReader::new(writer.file().clone(), 1);
+        let mut slab = Vec::new();
+        assert!(reader.append_blob_into(&ptr1, Some(b"k1"), &mut slab).unwrap());
+        assert_eq!(slab, val_small);
+        assert!(reader.append_blob_into(&ptr2, Some(b"k2"), &mut slab).unwrap());
+        assert_eq!(&slab[..2048], val_small.as_slice());
+        assert_eq!(&slab[2048..], val_large.as_slice());
+
+        // Key mismatch must leave `slab` untouched and return `Ok(false)`
+        let prev_len = slab.len();
+        assert!(!reader.append_blob_into(&ptr1, Some(b"wrong"), &mut slab).unwrap());
+        assert_eq!(slab.len(), prev_len);
+        assert!(!reader.append_blob_into(&ptr2, Some(b"wrong"), &mut slab).unwrap());
+        assert_eq!(slab.len(), prev_len);
     }
 }

@@ -126,6 +126,7 @@ struct TxMetaSnapshot {
     lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
     capped_tables: HashMap<u16, CappedTableState>,
     active_vtab_ids: HashMap<u16, String>,
+    table_has_row_meta: BTreeMap<u16, bool>,
     dropped_tables_len: usize,
 }
 
@@ -189,6 +190,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     in_committed_read_view: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing (`AUD-03`).
     active_vtab_ids: HashMap<u16, String>,
+    /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys (`P-02`).
+    /// Standard uncapped tables without secondary indexes resolve to `false` once and skip
+    /// all `'t'` negative point lookups on `UPDATE` and `DELETE`!
+    table_has_row_meta: BTreeMap<u16, bool>,
     /// Highest LSN appended to `buf_wal` (`AUD-08`).
     last_buf_append_lsn: u64,
     /// Highest LSN in `buf_wal` synced to durable storage (`AUD-08`).
@@ -560,6 +565,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             dropped_tables_in_tx: Vec::new(),
             in_committed_read_view: false,
             active_vtab_ids: HashMap::new(),
+            table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
         };
@@ -586,6 +592,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Registers or updates a Capped Table with a strict `max_bytes` quota and automatic LRU eviction.
     pub fn register_capped_table(&mut self, table_id: u16, max_bytes: u64) -> io::Result<()> {
+        self.table_has_row_meta.insert(table_id, true);
         let was_present = self.capped_tables.contains_key(&table_id);
         let entry = self
             .capped_tables
@@ -774,7 +781,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let was_capped = self.capped_tables.remove(&table_id).is_some();
-        if let Some(old_w) = self.active_lru_writers.remove(&table_id) {
+        self.table_has_row_meta.insert(table_id, false);
+        if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
             let _ = old_w.sync_durable();
             if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
                 b.file_len = old_w.current_len();
@@ -876,7 +884,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             old_blob_ptr = Some(old_ptr);
         }
 
-        if existing != ExistingRowStatus::NotFound {
+        if existing != ExistingRowStatus::NotFound && self.may_have_row_meta(table_id)? {
             if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
                 had_old_meta = true;
                 old_meta_blob_ptr = m_ptr;
@@ -974,6 +982,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let need_meta = is_capped || !secondary_keys.is_empty();
         if need_meta {
+            self.table_has_row_meta.insert(table_id, true);
             let meta_bytes = RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys);
             if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
                 let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
@@ -1081,21 +1090,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut old_logical_size = 0u64;
         let mut old_meta_blob_ptr = None;
 
-        let meta_key = encode_row_meta_key(table_id, pk);
-        if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
-            old_meta_blob_ptr = m_ptr;
-            old_logical_size = old_meta.logical_size as u64;
-            if old_meta.recorded_tick > 0 {
-                records.push(WalRecord::Delete {
-                    key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                });
+        if self.may_have_row_meta(table_id)? {
+            let meta_key = encode_row_meta_key(table_id, pk);
+            if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
+                old_meta_blob_ptr = m_ptr;
+                old_logical_size = old_meta.logical_size as u64;
+                if old_meta.recorded_tick > 0 {
+                    records.push(WalRecord::Delete {
+                        key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
+                    });
+                }
+                for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
+                    records.push(WalRecord::Delete {
+                        key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
+                    });
+                }
+                records.push(WalRecord::Delete { key: meta_key });
             }
-            for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                records.push(WalRecord::Delete {
-                    key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                });
-            }
-            records.push(WalRecord::Delete { key: meta_key });
         }
 
         self.access_tracker.remove_key(table_id, pk);
@@ -1296,6 +1307,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Some((ub, false)) => Bound::Excluded(ub),
                 None => Bound::Unbounded,
             };
+            let mut pending_blobs = Vec::new();
+            let mut last_pk: Option<Vec<u8>> = None;
             for (k, entry) in self.memtable.iter_range(lo, hi) {
                 if !k.starts_with(&prefix) {
                     break;
@@ -1314,14 +1327,105 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         let start = slab_out.len();
                         slab_out.extend_from_slice(v);
                         spans_out.push((start, slab_out.len()));
+                        last_pk = Some(k[3..].to_vec());
+                        if spans_out.len() >= limit {
+                            break;
+                        }
+                    }
+                    IndexValue::Blob(ptr) => {
+                        pending_blobs.push((k.clone(), *ptr));
+                        if spans_out.len() + pending_blobs.len() >= limit {
+                            break;
+                        }
+                    }
+                    IndexValue::Tombstone => {}
+                }
+            }
+            if !pending_blobs.is_empty() {
+                // Re-scan if any blobs were mixed with inline entries to preserve exact key order
+                slab_out.clear();
+                spans_out.clear();
+                last_pk = None;
+                let entries: Vec<(Vec<u8>, IndexValue)> = self
+                    .memtable
+                    .iter_range(lo, hi)
+                    .take_while(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(_, e)| !matches!(e.value, IndexValue::Tombstone))
+                    .map(|(k, e)| (k.clone(), e.value.clone()))
+                    .collect();
+                for (k, val) in entries {
+                    match val {
+                        IndexValue::Inline(v) => {
+                            let start = slab_out.len();
+                            slab_out.extend_from_slice(&v);
+                            spans_out.push((start, slab_out.len()));
+                            last_pk = Some(k[3..].to_vec());
+                            if spans_out.len() >= limit {
+                                break;
+                            }
+                        }
+                        IndexValue::Blob(ptr) => {
+                            let start = slab_out.len();
+                            if self.dereference_blob_append_into(&ptr, &k, slab_out)? {
+                                spans_out.push((start, slab_out.len()));
+                                last_pk = Some(k[3..].to_vec());
+                                if spans_out.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                        IndexValue::Tombstone => {}
+                    }
+                }
+            }
+            if !keys_only {
+                if let Some(lpk) = last_pk {
+                    pks_out.push(lpk);
+                }
+            }
+            return Ok(());
+        }
+
+        let merged = if reverse {
+            self.scan_merged_prefix_range_reverse(
+                &prefix,
+                seek_key,
+                lo_inc,
+                upper_key_slice,
+                limit,
+            )?
+        } else {
+            self.scan_merged_prefix_range(&prefix, seek_key, lo_inc, upper_key_slice, limit)?
+        };
+
+        let mut last_pk: Option<Vec<u8>> = None;
+        for entry in merged {
+            if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
+                continue;
+            }
+            if keys_only {
+                if !matches!(entry.value, IndexValue::Tombstone) {
+                    pks_out.push(entry.key[3..].to_vec());
+                    if pks_out.len() >= limit {
+                        break;
+                    }
+                }
+            } else {
+                match entry.value {
+                    IndexValue::Inline(v) => {
+                        let start = slab_out.len();
+                        slab_out.extend_from_slice(&v);
+                        spans_out.push((start, slab_out.len()));
+                        last_pk = Some(entry.key[3..].to_vec());
                         if spans_out.len() >= limit {
                             break;
                         }
                     }
                     IndexValue::Blob(ptr) => {
                         let start = slab_out.len();
-                        if self.dereference_blob_append_into(ptr, k, slab_out)? {
+                        if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
                             spans_out.push((start, slab_out.len()));
+                            last_pk = Some(entry.key[3..].to_vec());
                             if spans_out.len() >= limit {
                                 break;
                             }
@@ -1330,87 +1434,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     IndexValue::Tombstone => {}
                 }
             }
-            return Ok(());
         }
-
-        let merge_limit = if reverse { usize::MAX } else { limit };
-        let merged = self.scan_merged_prefix_range(
-            &prefix,
-            seek_key,
-            lo_inc,
-            upper_key_slice,
-            merge_limit,
-        )?;
-
-        if reverse {
-            for entry in merged.into_iter().rev() {
-                if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
-                    continue;
-                }
-                if keys_only {
-                    if !matches!(entry.value, IndexValue::Tombstone) {
-                        pks_out.push(entry.key[3..].to_vec());
-                        if pks_out.len() >= limit {
-                            break;
-                        }
-                    }
-                } else {
-                    match entry.value {
-                        IndexValue::Inline(v) => {
-                            let start = slab_out.len();
-                            slab_out.extend_from_slice(&v);
-                            spans_out.push((start, slab_out.len()));
-                            if spans_out.len() >= limit {
-                                break;
-                            }
-                        }
-                        IndexValue::Blob(ptr) => {
-                            let start = slab_out.len();
-                            if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
-                                spans_out.push((start, slab_out.len()));
-                                if spans_out.len() >= limit {
-                                    break;
-                                }
-                            }
-                        }
-                        IndexValue::Tombstone => {}
-                    }
-                }
-            }
-        } else {
-            for entry in merged {
-                if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
-                    continue;
-                }
-                if keys_only {
-                    if !matches!(entry.value, IndexValue::Tombstone) {
-                        pks_out.push(entry.key[3..].to_vec());
-                        if pks_out.len() >= limit {
-                            break;
-                        }
-                    }
-                } else {
-                    match entry.value {
-                        IndexValue::Inline(v) => {
-                            let start = slab_out.len();
-                            slab_out.extend_from_slice(&v);
-                            spans_out.push((start, slab_out.len()));
-                            if spans_out.len() >= limit {
-                                break;
-                            }
-                        }
-                        IndexValue::Blob(ptr) => {
-                            let start = slab_out.len();
-                            if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
-                                spans_out.push((start, slab_out.len()));
-                                if spans_out.len() >= limit {
-                                    break;
-                                }
-                            }
-                        }
-                        IndexValue::Tombstone => {}
-                    }
-                }
+        if !keys_only {
+            if let Some(lpk) = last_pk {
+                pks_out.push(lpk);
             }
         }
         Ok(())
@@ -1480,14 +1507,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Some((ub, false)) => Bound::Excluded(ub.as_slice()),
                 None => Bound::Unbounded,
             };
+            let entries: Vec<(Vec<u8>, IndexValue)> = self
+                .memtable
+                .iter_range(lo, hi)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .filter(|(_, e)| !matches!(e.value, IndexValue::Tombstone))
+                .map(|(k, e)| (k.clone(), e.value.clone()))
+                .collect();
             let mut rows = Vec::new();
-            for (k, entry) in self.memtable.iter_range(lo, hi) {
-                if !k.starts_with(&prefix) {
-                    break;
-                }
-                let val_opt = match &entry.value {
-                    IndexValue::Inline(v) => Some(v.clone()),
-                    IndexValue::Blob(ptr) => self.dereference_blob(ptr, k)?,
+            for (k, value) in entries {
+                let val_opt = match value {
+                    IndexValue::Inline(v) => Some(v),
+                    IndexValue::Blob(ptr) => self.dereference_blob(&ptr, &k)?,
                     IndexValue::Tombstone => None,
                 };
                 if let Some(val) = val_opt {
@@ -1705,7 +1736,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.tx_preparing = false;
 
-        // 2. Sync active blob writers (`Write-Blob-Before-WAL` & prefix durability `F06`/`F07`).
+        // 2. Flush/sync active blob writers (`Write-Blob-Before-WAL` & prefix durability `F06`/`F07`, `P-03`).
+        self.flush_active_blob_buffers()?;
         if effective_durability == WriteDurability::SyncTransactional {
             self.sync_active_blob_writers()?;
             if self.last_buf_append_lsn > self.last_buf_synced_lsn {
@@ -1939,6 +1971,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .collect(),
             capped_tables: self.capped_tables.clone(),
             active_vtab_ids: self.active_vtab_ids.clone(),
+            table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
         }
     }
@@ -1962,6 +1995,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.capped_tables = snap.capped_tables.clone();
         self.active_vtab_ids = snap.active_vtab_ids.clone();
+        self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
     }
 
@@ -1980,6 +2014,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if durability == WriteDurability::SyncTransactional {
             self.sync_active_blob_writers()?;
+        } else {
+            self.flush_active_blob_buffers()?;
         }
 
         const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
@@ -2763,6 +2799,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    fn flush_active_blob_buffers(&mut self) -> io::Result<()> {
+        if let Some(w) = &mut self.active_std_writer {
+            w.flush_buffer()?;
+            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                b.file_len = w.current_len();
+            }
+        }
+        for w in self.active_lru_writers.values_mut() {
+            w.flush_buffer()?;
+            if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
+                b.file_len = w.current_len();
+            }
+        }
+        Ok(())
+    }
+
     fn sync_active_blob_writers(&mut self) -> io::Result<()> {
         if let Some(w) = &mut self.active_std_writer {
             w.sync_durable()?;
@@ -2798,7 +2850,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     })
                     .unwrap_or(true);
                 if roll {
-                    if let Some(old_w) = self.active_std_writer.take() {
+                    if let Some(mut old_w) = self.active_std_writer.take() {
                         old_w.sync_durable()?;
                         if let Some(b) = self.std_blobs.get_mut(&old_w.seq_id()) {
                             b.file_len = old_w.current_len();
@@ -2848,7 +2900,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     })
                     .unwrap_or(true);
                 if roll {
-                    if let Some(old_w) = self.active_lru_writers.remove(&table_id) {
+                    if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
                         old_w.sync_durable()?;
                         if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
                             b.file_len = old_w.current_len();
@@ -3035,7 +3087,42 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    fn dereference_blob(&self, ptr: &BlobPtr, expected_key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    fn ensure_blob_flushed(&mut self, ptr: &BlobPtr) -> io::Result<()> {
+        match ptr.kind {
+            BlobKind::Standard => {
+                if let Some(w) = &mut self.active_std_writer {
+                    if w.seq_id() == ptr.seg_id
+                        && (ptr.offset as u64).saturating_add(ptr.len as u64) > w.flushed_offset()
+                    {
+                        w.flush_buffer()?;
+                        if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                            b.file_len = w.current_len();
+                        }
+                    }
+                }
+            }
+            BlobKind::Lru => {
+                if let Some(w) = self.active_lru_writers.get_mut(&ptr.table_id) {
+                    if w.seq_id() == ptr.seg_id
+                        && (ptr.offset as u64).saturating_add(ptr.len as u64) > w.flushed_offset()
+                    {
+                        w.flush_buffer()?;
+                        if let Some(b) = self.lru_blobs.get_mut(&(ptr.table_id, w.seq_id())) {
+                            b.file_len = w.current_len();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn dereference_blob(
+        &mut self,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        self.ensure_blob_flushed(ptr)?;
         match ptr.kind {
             BlobKind::Standard => {
                 let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
@@ -3053,11 +3140,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn dereference_blob_append_into(
-        &self,
+        &mut self,
         ptr: &BlobPtr,
         expected_key: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
+        self.ensure_blob_flushed(ptr)?;
         let reader = match ptr.kind {
             BlobKind::Standard => {
                 let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
@@ -3136,6 +3224,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let batch = WalBatch::new(lsn, records);
         let encoded = batch.encode();
+        self.flush_active_blob_buffers()?;
         self.append_raw_wal_batch_with_rotation(&encoded, durability)?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
         self.memtable.apply_wal_batch_owned(batch);
@@ -3217,8 +3306,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(ExistingRowStatus::NotFound)
     }
 
+    /// Lazily determines whether `table_id` may contain any `'t'` (`NS_ROW_META`) records (`P-02`).
+    ///
+    /// On standard uncapped tables without secondary indexes, the first `UPDATE`/`DELETE` after
+    /// `StorageEngine::open` runs a single 1-item prefix probe and caches `false` in
+    /// `self.table_has_row_meta`, skipping all negative `'t'` lookups on subsequent mutations!
+    fn may_have_row_meta(&mut self, table_id: u16) -> io::Result<bool> {
+        if self.capped_tables.contains_key(&table_id) {
+            return Ok(true);
+        }
+        if let Some(&has) = self.table_has_row_meta.get(&table_id) {
+            return Ok(has);
+        }
+        let prefix = encode_namespace_prefix(table_id, NS_ROW_META);
+        let has = !self
+            .scan_merged_prefix_range(&prefix, &prefix, true, None, 1)?
+            .is_empty();
+        self.table_has_row_meta.insert(table_id, has);
+        Ok(has)
+    }
+
     fn get_row_meta_with_ptr(
-        &self,
+        &mut self,
         meta_key: &[u8],
     ) -> io::Result<Option<(RowMetaRecord, Option<BlobPtr>)>> {
         let Some((_lsn, val)) = self.lookup_raw_entry(meta_key)? else {
@@ -3390,6 +3499,173 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             let Some(target_key_slice) = min_key else {
+                break;
+            };
+            let target_key = target_key_slice.to_vec();
+
+            let mut best_entry: Option<IndexEntry> = None;
+
+            if !mem_exhausted {
+                if let Some(&(k, _)) = mem_iter.peek() {
+                    if k.as_slice() == target_key.as_slice() {
+                        let (k, mem_entry) = mem_iter.next().unwrap();
+                        best_entry = Some(IndexEntry {
+                            key: k.clone(),
+                            lsn: mem_entry.lsn,
+                            value: mem_entry.value.clone(),
+                        });
+                    }
+                }
+            }
+
+            for cur in &mut seg_cursors {
+                while cur
+                    .peek()
+                    .map(|e| e.key.as_slice() == target_key.as_slice())
+                    .unwrap_or(false)
+                {
+                    let seg_entry = cur.next_entry()?.unwrap();
+                    match &mut best_entry {
+                        None => best_entry = Some(seg_entry),
+                        Some(existing) => {
+                            if seg_entry.lsn > existing.lsn {
+                                *existing = seg_entry;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(winner) = best_entry {
+                if !matches!(winner.value, IndexValue::Tombstone) {
+                    out.push(winner);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Performs a bounded-memory reverse streaming K-way merge across `self.memtable` and all
+    /// `self.idx_segments` within `[seek_key, upper_key_bound]` under `prefix`, returning up to
+    /// `limit` live entries in descending key order (`P-01`).
+    fn scan_merged_prefix_range_reverse(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        lower_inclusive: bool,
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
+    ) -> io::Result<Vec<IndexEntry>> {
+        use std::ops::Bound;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (eff_lo_key, eff_lo_inc) = if seek_key >= prefix {
+            (seek_key, lower_inclusive)
+        } else {
+            (prefix, true)
+        };
+
+        if let Some((ub, ub_inc)) = upper_key_bound {
+            if eff_lo_key > ub || (eff_lo_key == ub && (!eff_lo_inc || !ub_inc)) {
+                return Ok(Vec::new());
+            }
+        }
+
+        let in_lower_and_prefix = |key: &[u8]| -> bool {
+            if !key.starts_with(prefix) {
+                return false;
+            }
+            if eff_lo_inc {
+                key >= eff_lo_key
+            } else {
+                key > eff_lo_key
+            }
+        };
+
+        let prefix_succ_opt: Option<Vec<u8>> = if upper_key_bound.is_none() && !prefix.is_empty() {
+            let mut s = prefix.to_vec();
+            while s.last() == Some(&0xFF) {
+                s.pop();
+            }
+            if let Some(last) = s.last_mut() {
+                *last += 1;
+                Some(s)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let lo_bound = if eff_lo_inc {
+            Bound::Included(eff_lo_key)
+        } else {
+            Bound::Excluded(eff_lo_key)
+        };
+        let hi_bound = match upper_key_bound {
+            Some((ub, true)) => Bound::Included(ub),
+            Some((ub, false)) => Bound::Excluded(ub),
+            None => match &prefix_succ_opt {
+                Some(succ) if succ.as_slice() > eff_lo_key => Bound::Excluded(succ.as_slice()),
+                _ => Bound::Unbounded,
+            },
+        };
+        let mut mem_iter = self.memtable.iter_range(lo_bound, hi_bound).rev().peekable();
+        let mut mem_exhausted = false;
+
+        let seg_upper_arg: Option<(&[u8], bool)> = match upper_key_bound {
+            Some(u) => Some(u),
+            None => prefix_succ_opt.as_deref().map(|s| (s, false)),
+        };
+        let upper_for_overlap = seg_upper_arg.map(|(ub, _)| ub);
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
+        for seg in &self.idx_segments {
+            if !seg.overlaps_range(eff_lo_key, upper_for_overlap) {
+                continue;
+            }
+            if !prefix.is_empty()
+                && seg.min_key() > prefix
+                && !seg.min_key().starts_with(prefix)
+            {
+                continue;
+            }
+            seg_cursors.push(seg.cursor_reverse_from(seg_upper_arg)?);
+        }
+
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let mut max_key: Option<&[u8]> = None;
+
+            if !mem_exhausted {
+                if let Some(&(k, _)) = mem_iter.peek() {
+                    if in_lower_and_prefix(k.as_slice()) {
+                        max_key = Some(k.as_slice());
+                    } else {
+                        mem_exhausted = true;
+                    }
+                } else {
+                    mem_exhausted = true;
+                }
+            }
+
+            for cur in &seg_cursors {
+                if let Some(entry) = cur.peek() {
+                    if in_lower_and_prefix(entry.key.as_slice()) {
+                        match max_key {
+                            None => max_key = Some(entry.key.as_slice()),
+                            Some(mk) if entry.key.as_slice() > mk => {
+                                max_key = Some(entry.key.as_slice());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let Some(target_key_slice) = max_key else {
                 break;
             };
             let target_key = target_key_slice.to_vec();
@@ -5415,6 +5691,143 @@ mod tests {
                 engine.get_row(7, b"shared_k").unwrap(),
                 Some(b"committed_v1".to_vec()),
                 "R-07: rolling back Connection 1 after Connection 2's EagerWriteOnRead read must restore committed_v1"
+            );
+        }
+    }
+
+    #[test]
+    fn p01_p02_p03_reverse_streaming_scan_row_meta_skip_and_tx_blob_read() {
+        let dir = TempTestDir::new("stage3_p01_p02_p03");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+
+        {
+            let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+
+            // 1. P-02: Uncapped table without secondary indexes (`table_id = 10`) must cache
+            //    `may_have_row_meta(10) == false` on the first update/delete!
+            engine
+                .put_row(10, b"k1", b"v1", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            engine.flush_memtable().unwrap();
+            engine
+                .put_row(10, b"k1", b"v2", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            assert_eq!(
+                engine.table_has_row_meta.get(&10),
+                Some(&false),
+                "P-02: uncapped table without secondary indexes must cache table_has_row_meta = false"
+            );
+
+            // Table with secondary indexes (`table_id = 11`) must record `table_has_row_meta = true`
+            engine
+                .put_row(
+                    11,
+                    b"sk1",
+                    b"sv1",
+                    &[(1, b"idx_a".to_vec())],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            assert_eq!(engine.table_has_row_meta.get(&11), Some(&true));
+            engine.flush_memtable().unwrap();
+
+            // 2. P-03: Reading an uncommitted >1KB blob inside `tx_depth > 0` before WAL flush
+            //    must transparently flush `BlobSegmentWriter`'s write buffer so `get_row` succeeds!
+            engine.begin_transaction();
+            let blob_payload = vec![0x7Bu8; 2048];
+            engine
+                .put_row(
+                    10,
+                    b"tx_blob",
+                    &blob_payload,
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            assert_eq!(engine.get_row(10, b"tx_blob").unwrap(), Some(blob_payload));
+            engine.commit_transaction().unwrap();
+
+            // 3. P-01: Populate `table_id = 12` across multiple SSTable segments + MemTable
+            //    and verify reverse streaming merge (`scan_range_into_slab(..., reverse = true, ...)`).
+            for i in 0..30i32 {
+                let pk = (i as u32).to_be_bytes();
+                let val = format!("seg1_{i:02}").into_bytes();
+                engine
+                    .put_row(12, &pk, &val, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            engine.flush_memtable().unwrap();
+            for i in 15..45i32 {
+                let pk = (i as u32).to_be_bytes();
+                let val = format!("seg2_{i:02}").into_bytes();
+                engine
+                    .put_row(12, &pk, &val, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            engine.flush_memtable().unwrap();
+            // Overwrite a few and delete #44 in MemTable
+            engine
+                .put_row(
+                    12,
+                    &40u32.to_be_bytes(),
+                    b"mem_40",
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            engine
+                .delete_row(12, &44u32.to_be_bytes(), WriteDurability::BufferedFast)
+                .unwrap();
+
+            let mut pks = Vec::new();
+            let mut slab = Vec::new();
+            let mut spans = Vec::new();
+            engine
+                .scan_range_into_slab(
+                    12,
+                    Some((&10u32.to_be_bytes(), true)),
+                    Some((&44u32.to_be_bytes(), true)),
+                    true,
+                    5,
+                    false,
+                    &mut pks,
+                    &mut slab,
+                    &mut spans,
+                )
+                .unwrap();
+            assert_eq!(spans.len(), 5);
+            // Expected top 5 keys in `[10, 44]` after deleting 44: 43, 42, 41, 40 (mem_40), 39
+            let got_vals: Vec<String> = spans
+                .iter()
+                .map(|&(s, e)| String::from_utf8(slab[s..e].to_vec()).unwrap())
+                .collect();
+            assert_eq!(
+                got_vals,
+                vec!["seg2_43", "seg2_42", "seg2_41", "mem_40", "seg2_39"]
+            );
+            assert_eq!(pks.last().map(|v| v.as_slice()), Some(39u32.to_be_bytes().as_slice()));
+        }
+
+        // Reopen from disk and verify `may_have_row_meta` lazily detects `'t'` on table 11
+        // and absence of `'t'` on table 10!
+        {
+            let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+            assert!(!engine.may_have_row_meta(10).unwrap());
+            assert!(engine.may_have_row_meta(11).unwrap());
+            // Updating `sk1` on table 11 must clean up old secondary key `idx_a`
+            engine
+                .put_row(
+                    11,
+                    b"sk1",
+                    b"sv2",
+                    &[(1, b"idx_b".to_vec())],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            assert!(engine.lookup_by_secondary_index(11, 1, b"idx_a").unwrap().is_empty());
+            assert_eq!(
+                engine.lookup_by_secondary_index(11, 1, b"idx_b").unwrap(),
+                vec![b"sk1".to_vec()]
             );
         }
     }

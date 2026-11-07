@@ -57,6 +57,11 @@ const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
 const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
 const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
 const RANGE_FLAG_KEYS_ONLY: c_int = 0x20;
+const RANGE_FLAG_REVERSE: c_int = 0x40;
+
+/// Maximum number of rows fetched per streaming cursor batch (`P-01`), bounding `cursor.slab`
+/// to $O(1)$ memory regardless of table size while eliminating full-scan materialization on `LIMIT` queries.
+const CURSOR_STREAM_CHUNK_ROWS: usize = 256;
 
 /// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close (`C-04`).
 const MAX_ROWID_MAP_ENTRIES: usize = 262_144;
@@ -268,16 +273,23 @@ struct AydbVTab {
 #[repr(C)]
 struct AydbCursor {
     base: sqlite3_vtab_cursor,
-    /// Contiguous reusable byte slab holding all scanned `row_bytes` for the active cursor pass.
+    /// Contiguous reusable byte slab holding scanned `row_bytes` for the current cursor batch (`P-01`).
     slab: Vec<u8>,
     /// `(start_offset, end_offset)` into `slab` for each row (`PERF-04`).
     spans: Vec<(usize, usize)>,
-    /// Primary key bytes per row when `keys_only` is `true` (`P02`).
+    /// Primary key bytes per row when `keys_only` is `true` (`P02`), or the last fetched PK in
+    /// the current streaming batch when `keys_only` is `false` (`P-01`).
     pks: Vec<Vec<u8>>,
     /// True when the active scan only needs primary keys (`RANGE_FLAG_KEYS_ONLY`, `P02`),
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
     pos: usize,
+    /// True when more chunks may remain in the current range/full scan (`P-01`).
+    streaming_active: bool,
+    stream_lower: Option<(Vec<u8>, bool)>,
+    stream_upper: Option<(Vec<u8>, bool)>,
+    stream_reverse: bool,
+    stream_last_pk: Option<Vec<u8>>,
 }
 
 /// Computes a 64-bit synthetic `rowid` from `encoded_pk` with full 64-bit entropy using two
@@ -751,11 +763,16 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
-        // Check if `ORDER BY pk ASC` can be satisfied directly by the memcomparable PK scan
-        let order_by_pk_asc = info.nOrderBy == 1 && {
+        // Check if `ORDER BY pk ASC` or `ORDER BY pk DESC` can be satisfied directly by the memcomparable PK scan (`P-01`)
+        let mut order_by_pk_consumed = false;
+        let mut order_by_pk_reverse = false;
+        if info.nOrderBy == 1 {
             let ob = &*info.aOrderBy;
-            (ob.iColumn == vtab.pk_col_idx as i32 || ob.iColumn == -1) && ob.desc == 0
-        };
+            if ob.iColumn == vtab.pk_col_idx as i32 || ob.iColumn == -1 {
+                order_by_pk_consumed = true;
+                order_by_pk_reverse = ob.desc != 0;
+            }
+        }
 
         // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected (`P02`)
         let can_use_keys_only = info.colUsed == 0
@@ -781,8 +798,11 @@ unsafe extern "system" fn vtab_best_index(
                 usages[i].omit = 0;
                 flags |= fl;
             }
-            if order_by_pk_asc {
+            if order_by_pk_consumed {
                 info.orderByConsumed = 1;
+                if order_by_pk_reverse {
+                    flags |= RANGE_FLAG_REVERSE;
+                }
             }
             info.idxNum = PLAN_PK_RANGE | (flags << 8);
             info.estimatedCost = 25.0;
@@ -792,13 +812,16 @@ unsafe extern "system" fn vtab_best_index(
 
         // 4. Fallback: Full Table Scan (`C-03`: let SQLite's VDBE enforce LIMIT/OFFSET after any
         //    residual WHERE predicates like `LIKE`, `OR`, or expressions not passed in `aConstraint`)
-        let full_scan_flags = if can_use_keys_only {
+        let mut full_scan_flags = if can_use_keys_only {
             RANGE_FLAG_KEYS_ONLY
         } else {
             0
         };
-        if order_by_pk_asc {
+        if order_by_pk_consumed {
             info.orderByConsumed = 1;
+            if order_by_pk_reverse {
+                full_scan_flags |= RANGE_FLAG_REVERSE;
+            }
         }
         info.idxNum = PLAN_FULL_SCAN | (full_scan_flags << 8);
         info.estimatedCost = 10_000.0;
@@ -824,6 +847,11 @@ unsafe extern "system" fn vtab_open(
             pks: Vec::new(),
             keys_only: false,
             pos: 0,
+            streaming_active: false,
+            stream_lower: None,
+            stream_upper: None,
+            stream_reverse: false,
+            stream_last_pk: None,
         });
         *pp_cursor = Box::into_raw(cursor) as *mut sqlite3_vtab_cursor;
         SQLITE_OK
@@ -869,6 +897,11 @@ unsafe extern "system" fn vtab_filter(
         cursor.pks.clear();
         cursor.keys_only = false;
         cursor.pos = 0;
+        cursor.streaming_active = false;
+        cursor.stream_lower = None;
+        cursor.stream_upper = None;
+        cursor.stream_reverse = false;
+        cursor.stream_last_pk = None;
 
         let mut eng = match vtab.engine.lock() {
             Ok(g) => g,
@@ -1040,13 +1073,14 @@ unsafe extern "system" fn vtab_filter(
                         None
                     };
                     let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
                     cursor.keys_only = keys_only;
                     if let Err(e) = eng.scan_range_into_slab(
                         vtab.table_id,
                         lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                         upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                        false,
-                        usize::MAX,
+                        reverse,
+                        CURSOR_STREAM_CHUNK_ROWS,
                         keys_only,
                         &mut cursor.pks,
                         &mut cursor.slab,
@@ -1054,23 +1088,52 @@ unsafe extern "system" fn vtab_filter(
                     ) {
                         return io_err_to_sqlite_rc(&e);
                     }
+                    let fetched_rows = if keys_only {
+                        cursor.pks.len()
+                    } else {
+                        cursor.spans.len()
+                    };
+                    if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+                        if let Some(last_pk) = cursor.pks.last().cloned() {
+                            cursor.streaming_active = true;
+                            cursor.stream_lower = lower_bound;
+                            cursor.stream_upper = upper_bound;
+                            cursor.stream_reverse = reverse;
+                            cursor.stream_last_pk = Some(last_pk);
+                        }
+                    }
                 }
                 _ => {
                     let flags = idx_num >> 8;
                     let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
                     cursor.keys_only = keys_only;
                     if let Err(e) = eng.scan_range_into_slab(
                         vtab.table_id,
                         None,
                         None,
-                        false,
-                        usize::MAX,
+                        reverse,
+                        CURSOR_STREAM_CHUNK_ROWS,
                         keys_only,
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
                     ) {
                         return io_err_to_sqlite_rc(&e);
+                    }
+                    let fetched_rows = if keys_only {
+                        cursor.pks.len()
+                    } else {
+                        cursor.spans.len()
+                    };
+                    if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+                        if let Some(last_pk) = cursor.pks.last().cloned() {
+                            cursor.streaming_active = true;
+                            cursor.stream_lower = None;
+                            cursor.stream_upper = None;
+                            cursor.stream_reverse = reverse;
+                            cursor.stream_last_pk = Some(last_pk);
+                        }
                     }
                 }
             }
@@ -1085,6 +1148,81 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let cursor = &mut *(p_cursor as *mut AydbCursor);
         cursor.pos += 1;
+        let len = if cursor.keys_only {
+            cursor.pks.len()
+        } else {
+            cursor.spans.len()
+        };
+        if cursor.pos >= len && cursor.streaming_active {
+            let Some(last_pk) = cursor.stream_last_pk.take() else {
+                cursor.streaming_active = false;
+                return SQLITE_OK;
+            };
+            let vtab = &*(cursor.base.pVtab as *const AydbVTab);
+            cursor.slab.clear();
+            cursor.spans.clear();
+            cursor.pks.clear();
+            cursor.pos = 0;
+
+            let mut eng = match vtab.engine.lock() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            let conn_id = vtab.db as usize;
+            let keys_only = cursor.keys_only;
+            let reverse = cursor.stream_reverse;
+            let lower_ref = if reverse {
+                cursor
+                    .stream_lower
+                    .as_ref()
+                    .map(|(b, inc)| (b.as_slice(), *inc))
+            } else {
+                Some((last_pk.as_slice(), false))
+            };
+            let upper_ref = if reverse {
+                Some((last_pk.as_slice(), false))
+            } else {
+                cursor
+                    .stream_upper
+                    .as_ref()
+                    .map(|(b, inc)| (b.as_slice(), *inc))
+            };
+
+            let rc = eng.with_committed_read_for_conn(conn_id, |eng| {
+                if let Err(e) = eng.scan_range_into_slab(
+                    vtab.table_id,
+                    lower_ref,
+                    upper_ref,
+                    reverse,
+                    CURSOR_STREAM_CHUNK_ROWS,
+                    keys_only,
+                    &mut cursor.pks,
+                    &mut cursor.slab,
+                    &mut cursor.spans,
+                ) {
+                    return io_err_to_sqlite_rc(&e);
+                }
+                SQLITE_OK
+            });
+            if rc != SQLITE_OK {
+                cursor.streaming_active = false;
+                return rc;
+            }
+            let fetched_rows = if keys_only {
+                cursor.pks.len()
+            } else {
+                cursor.spans.len()
+            };
+            if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+                if let Some(next_last_pk) = cursor.pks.last().cloned() {
+                    cursor.stream_last_pk = Some(next_last_pk);
+                } else {
+                    cursor.streaming_active = false;
+                }
+            } else {
+                cursor.streaming_active = false;
+            }
+        }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -3416,6 +3554,115 @@ mod tests {
                     SqlValue::Text("first".into())
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn stage3_p01_chunked_streaming_cursor_and_order_by_pk_desc_pushdown() {
+        let dir = TempTestDir::new("stage3_p01_stream");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE p01_stream USING aydb(
+                table_id = 97,
+                columns = 'id INT PRIMARY KEY, payload BLOB'
+            );
+            BEGIN;",
+        )
+        .unwrap();
+
+        // Insert 1,000 rows (> 3x `CURSOR_STREAM_CHUNK_ROWS = 256`) across SSTable + MemTable
+        let blob_2k = vec![0x3Cu8; 2048];
+        {
+            let mut ins = conn
+                .prepare("INSERT INTO p01_stream VALUES (?1, ?2)")
+                .unwrap();
+            for i in 1..=600i64 {
+                ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(blob_2k.clone())])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        engine.lock().unwrap().flush_memtable().unwrap();
+
+        conn.execute_batch("BEGIN;").unwrap();
+        {
+            let mut ins = conn
+                .prepare("INSERT INTO p01_stream VALUES (?1, ?2)")
+                .unwrap();
+            for i in 601..=1_000i64 {
+                ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(blob_2k.clone())])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        // 1. Verify full streaming scan in ASC order across all 4 chunks (`1000` rows)
+        let count_rows = conn
+            .query_all("SELECT count(*), sum(length(payload)) FROM p01_stream", &[])
+            .unwrap();
+        assert_eq!(
+            count_rows,
+            vec![vec![
+                SqlValue::Integer(1_000),
+                SqlValue::Integer(1_000 * 2048)
+            ]]
+        );
+
+        // 2. Verify `ORDER BY id DESC` pushdown (`orderByConsumed = 1`, zero temp B-tree in EXPLAIN QUERY PLAN)
+        let eqp = conn
+            .query_all(
+                "EXPLAIN QUERY PLAN SELECT id, length(payload) FROM p01_stream ORDER BY id DESC LIMIT 5",
+                &[],
+            )
+            .unwrap();
+        let eqp_text = format!("{eqp:?}");
+        assert!(
+            !eqp_text.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "P-01: ORDER BY id DESC must be consumed by vtab_best_index without temp B-tree sort: {eqp_text}"
+        );
+
+        let top5_desc = conn
+            .query_all(
+                "SELECT id FROM p01_stream ORDER BY id DESC LIMIT 5",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            top5_desc,
+            vec![
+                vec![SqlValue::Integer(1_000)],
+                vec![SqlValue::Integer(999)],
+                vec![SqlValue::Integer(998)],
+                vec![SqlValue::Integer(997)],
+                vec![SqlValue::Integer(996)],
+            ]
+        );
+
+        // 3. Verify multi-chunk `ORDER BY id DESC` over a range (`WHERE id >= 100 AND id <= 750 ORDER BY id DESC`)
+        let desc_range = conn
+            .query_all(
+                "SELECT id, length(payload) FROM p01_stream WHERE id >= 100 AND id <= 750 ORDER BY id DESC",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(desc_range.len(), 651);
+        assert_eq!(
+            desc_range[0],
+            vec![SqlValue::Integer(750), SqlValue::Integer(2048)]
+        );
+        assert_eq!(
+            desc_range[256],
+            vec![SqlValue::Integer(750 - 256), SqlValue::Integer(2048)]
+        );
+        assert_eq!(
+            desc_range[650],
+            vec![SqlValue::Integer(100), SqlValue::Integer(2048)]
         );
     }
 }
