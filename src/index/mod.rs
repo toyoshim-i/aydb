@@ -247,6 +247,16 @@ impl<'a> IdxBlockReader<'a> {
     }
 
     #[inline]
+    fn from_verified_buf(buf: &'a [u8; IDX_BLOCK_SIZE], num_entries: usize) -> Self {
+        let dir_start = IDX_BLOCK_USABLE_SIZE - (num_entries * 2);
+        Self {
+            buf,
+            num_entries,
+            dir_start,
+        }
+    }
+
+    #[inline]
     pub fn num_entries(&self) -> usize {
         self.num_entries
     }
@@ -397,6 +407,44 @@ pub struct FencePointer {
     pub block_idx: u32,
 }
 
+impl BloomFilter {
+    /// Computes the `(h1, h2)` double-hashing probe pair for `key`.
+    #[inline]
+    pub fn hash_pair(key: &[u8]) -> (u32, u32) {
+        const SEED_H1: u32 = 0x1357_9BDF;
+        const SEED_H2: u32 = 0x2468_ACE0;
+        let h1 = crate::util::crc32c::crc32c_append(SEED_H1, key);
+        let h2 = crate::util::crc32c::crc32c_append(SEED_H2, key).rotate_left(17) | 1;
+        (h1, h2)
+    }
+
+    /// Builds a [`BloomFilter`] from precomputed `(h1, h2)` hash pairs without retaining raw keys.
+    pub fn from_hash_pairs(hashes: &[(u32, u32)], bits_per_key: usize) -> Self {
+        if bits_per_key == 0 || hashes.is_empty() {
+            return Self::new(0, 0);
+        }
+        let num_probes = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
+        let raw_bits = (hashes.len().saturating_mul(bits_per_key)).max(64);
+        let num_bytes = raw_bits.div_ceil(8);
+        let num_bits = (num_bytes * 8) as u32;
+
+        let mut buf = vec![0u8; 8 + num_bytes];
+        buf[0] = num_probes;
+        buf[4..8].copy_from_slice(&(num_bytes as u32).to_le_bytes());
+        let bits = &mut buf[8..];
+        for &(h1, h2) in hashes {
+            let mut h = h1;
+            for _ in 0..num_probes {
+                let bit_idx = (h % num_bits) as usize;
+                bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
+                h = h.wrapping_add(h2);
+            }
+        }
+        let mut slice: &[u8] = &buf;
+        Self::decode(&mut slice).expect("valid encoded BloomFilter")
+    }
+}
+
 /// Writes a sorted stream of [`IndexEntry`] items into a new immutable `idx_<SeqID>.db` file.
 pub struct IdxSegmentBuilder<F: PlatformFile> {
     file: Arc<F>,
@@ -405,7 +453,7 @@ pub struct IdxSegmentBuilder<F: PlatformFile> {
     bloom_bits_per_key: usize,
     block_builder: IdxBlockBuilder,
     fence_pointers: Vec<FencePointer>,
-    keys_for_bloom: Vec<Vec<u8>>,
+    bloom_hashes: Vec<(u32, u32)>,
     num_blocks: u32,
     record_count: u32,
     write_offset: u64,
@@ -427,7 +475,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             bloom_bits_per_key,
             block_builder: IdxBlockBuilder::new(),
             fence_pointers: Vec::new(),
-            keys_for_bloom: Vec::new(),
+            bloom_hashes: Vec::new(),
             num_blocks: 0,
             record_count: 0,
             write_offset: 0,
@@ -441,7 +489,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         }
         self.block_builder.add_entry(entry)?;
         if self.bloom_bits_per_key > 0 {
-            self.keys_for_bloom.push(entry.key.clone());
+            self.bloom_hashes.push(BloomFilter::hash_pair(&entry.key));
         }
         self.record_count += 1;
         Ok(())
@@ -475,11 +523,8 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
     pub fn finish(mut self) -> io::Result<IdxSegmentReader<F>> {
         self.flush_current_data_block()?;
 
-        // Build BloomFilter from collected keys
-        let mut bloom = BloomFilter::new(self.keys_for_bloom.len(), self.bloom_bits_per_key);
-        for k in &self.keys_for_bloom {
-            bloom.insert(k);
-        }
+        // Build BloomFilter from precomputed (h1, h2) hash pairs
+        let bloom = BloomFilter::from_hash_pairs(&self.bloom_hashes, self.bloom_bits_per_key);
 
         // Encode Filter + Sparse Fence Pointers metadata section
         let meta_offset = self.write_offset;
@@ -760,6 +805,11 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         }
 
         let effective_start = if seek_key > prefix { seek_key } else { prefix };
+        if let Some((ub, inclusive)) = upper_key_bound {
+            if effective_start > ub || (!inclusive && effective_start == ub) {
+                return Ok(out);
+            }
+        }
         let start_pos = self
             .fence_pointers
             .partition_point(|fp| fp.first_key.as_ref() < effective_start);
@@ -795,6 +845,148 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         }
         Ok(out)
     }
+
+    /// Creates a bounded-memory streaming cursor over all entries in this segment, reading
+    /// one 4 KB data block at a time on demand.
+    pub fn cursor_all(&self) -> io::Result<IdxSegmentCursor<'_, F>> {
+        IdxSegmentCursor::new_all(self)
+    }
+
+    /// Creates a bounded-memory streaming cursor starting at `(lower_key, lower_inclusive)`,
+    /// seeking via sparse fence pointers and reading one 4 KB data block at a time on demand.
+    pub fn cursor_from(
+        &self,
+        lower_key: &[u8],
+        lower_inclusive: bool,
+    ) -> io::Result<IdxSegmentCursor<'_, F>> {
+        IdxSegmentCursor::new_from(self, lower_key, lower_inclusive)
+    }
+}
+
+/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].
+///
+/// Holds only a single 4 KB data block buffer (`[u8; IDX_BLOCK_SIZE]`) in stack/struct memory,
+/// enabling $O(K \times 4\text{ KB})$ streaming K-way merges for range scans and compaction.
+pub struct IdxSegmentCursor<'a, F: PlatformFile> {
+    seg: &'a IdxSegmentReader<F>,
+    next_block_idx: u32,
+    block_buf: [u8; IDX_BLOCK_SIZE],
+    entry_idx: usize,
+    num_entries_in_block: usize,
+    current: Option<IndexEntry>,
+}
+
+impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
+    fn new_all(seg: &'a IdxSegmentReader<F>) -> io::Result<Self> {
+        let mut cursor = Self {
+            seg,
+            next_block_idx: 0,
+            block_buf: [0u8; IDX_BLOCK_SIZE],
+            entry_idx: 0,
+            num_entries_in_block: 0,
+            current: None,
+        };
+        cursor.advance_to_next()?;
+        Ok(cursor)
+    }
+
+    fn new_from(
+        seg: &'a IdxSegmentReader<F>,
+        lower_key: &[u8],
+        lower_inclusive: bool,
+    ) -> io::Result<Self> {
+        let mut cursor = Self {
+            seg,
+            next_block_idx: 0,
+            block_buf: [0u8; IDX_BLOCK_SIZE],
+            entry_idx: 0,
+            num_entries_in_block: 0,
+            current: None,
+        };
+        if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
+            return Ok(cursor);
+        }
+
+        let start_pos = seg
+            .fence_pointers
+            .partition_point(|fp| fp.first_key.as_ref() < lower_key);
+        cursor.next_block_idx = start_pos.saturating_sub(1) as u32;
+
+        while cursor.next_block_idx < seg.num_blocks {
+            let b = cursor.next_block_idx;
+            cursor.next_block_idx += 1;
+            seg.file
+                .read_exact_at(&mut cursor.block_buf, (b as u64) * (IDX_BLOCK_SIZE as u64))?;
+            let reader = IdxBlockReader::open_verified(&cursor.block_buf)?;
+            cursor.num_entries_in_block = reader.num_entries();
+
+            // Binary-search the u16 offset directory for the first key satisfying the lower bound
+            let mut low = 0usize;
+            let mut high = cursor.num_entries_in_block;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let k = reader.key_at(mid)?;
+                let before = if lower_inclusive {
+                    k < lower_key
+                } else {
+                    k <= lower_key
+                };
+                if before {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+
+            if low < cursor.num_entries_in_block {
+                let first_entry = reader.decode_entry_at(low)?;
+                cursor.entry_idx = low + 1;
+                cursor.current = Some(first_entry);
+                break;
+            } else {
+                cursor.entry_idx = cursor.num_entries_in_block;
+            }
+        }
+        Ok(cursor)
+    }
+
+    /// Returns a reference to the current [`IndexEntry`] without advancing the cursor.
+    #[inline]
+    pub fn peek(&self) -> Option<&IndexEntry> {
+        self.current.as_ref()
+    }
+
+    /// Consumes and returns the current [`IndexEntry`], advancing the cursor to the next entry.
+    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
+        let prev = self.current.take();
+        if prev.is_some() {
+            self.advance_to_next()?;
+        }
+        Ok(prev)
+    }
+
+    fn advance_to_next(&mut self) -> io::Result<()> {
+        while self.entry_idx >= self.num_entries_in_block {
+            if self.next_block_idx >= self.seg.num_blocks {
+                self.current = None;
+                return Ok(());
+            }
+            let b = self.next_block_idx;
+            self.next_block_idx += 1;
+            self.seg
+                .file
+                .read_exact_at(&mut self.block_buf, (b as u64) * (IDX_BLOCK_SIZE as u64))?;
+            let reader = IdxBlockReader::open_verified(&self.block_buf)?;
+            self.num_entries_in_block = reader.num_entries();
+            self.entry_idx = 0;
+        }
+
+        let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
+        let entry = reader.decode_entry_at(self.entry_idx)?;
+        self.entry_idx += 1;
+        self.current = Some(entry);
+        Ok(())
+    }
 }
 
 /// Summary returned after multi-way merge compaction of `idx` segments.
@@ -807,8 +999,9 @@ pub struct CompactionResult<F: PlatformFile> {
 }
 
 /// Merges multiple `IdxSegmentReader` instances into a single sorted `idx_<new_seq_id>.db`
-/// segment, keeping only the highest-`lsn` version of each key and accumulating dead blob bytes
-/// for any overwritten or deleted `BlobPtr` without copying live blobs!
+/// segment using a bounded-memory streaming K-way merge ($O(K \times 4\text{ KB})$ RAM), keeping
+/// only the highest-`lsn` version of each key and accumulating dead blob bytes for any overwritten
+/// or deleted `BlobPtr` without copying live blobs!
 pub fn compact_idx_segments<F: PlatformFile>(
     fs: &impl PlatformFs<File = F>,
     inputs: &[&IdxSegmentReader<F>],
@@ -817,29 +1010,54 @@ pub fn compact_idx_segments<F: PlatformFile>(
     bloom_bits_per_key: usize,
     drop_tombstones: bool,
 ) -> io::Result<CompactionResult<F>> {
-    let mut merged_map: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
-    let mut dead_blob_map: BTreeMap<( u8, u16, u64), u64> = BTreeMap::new();
+    let mut cursors: Vec<IdxSegmentCursor<'_, F>> = Vec::with_capacity(inputs.len());
+    for &seg in inputs {
+        cursors.push(seg.cursor_all()?);
+    }
 
-    for seg in inputs {
-        for entry in seg.scan_all()? {
-            match merged_map.get_mut(&entry.key) {
-                None => {
-                    merged_map.insert(entry.key.clone(), entry);
+    let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
+    let mut dead_blob_map: BTreeMap<(u8, u16, u64), u64> = BTreeMap::new();
+
+    loop {
+        let mut min_key: Option<&[u8]> = None;
+        for cur in &cursors {
+            if let Some(entry) = cur.peek() {
+                match min_key {
+                    None => min_key = Some(entry.key.as_slice()),
+                    Some(mk) if entry.key.as_slice() < mk => {
+                        min_key = Some(entry.key.as_slice());
+                    }
+                    _ => {}
                 }
-                Some(existing) => {
-                    if entry.lsn > existing.lsn {
-                        // `existing` was overwritten by `entry`; if `existing` held a BlobPtr,
-                        // its blob bytes are now dead!
-                        if let IndexValue::Blob(old_ptr) = &existing.value {
-                            *dead_blob_map
-                                .entry((old_ptr.kind as u8, old_ptr.table_id, old_ptr.seg_id))
-                                .or_insert(0) += old_ptr.len as u64;
-                        }
-                        *existing = entry;
-                    } else {
-                        // `entry` is older than `existing`; if `entry` held a BlobPtr,
-                        // its blob bytes are now dead!
-                        if let IndexValue::Blob(old_ptr) = &entry.value {
+            }
+        }
+
+        let Some(target_key_slice) = min_key else {
+            break;
+        };
+        let target_key = target_key_slice.to_vec();
+
+        let mut winning_entry: Option<IndexEntry> = None;
+        for cur in &mut cursors {
+            while cur
+                .peek()
+                .map(|e| e.key.as_slice() == target_key.as_slice())
+                .unwrap_or(false)
+            {
+                let entry = cur.next_entry()?.unwrap();
+                match &mut winning_entry {
+                    None => {
+                        winning_entry = Some(entry);
+                    }
+                    Some(existing) => {
+                        if entry.lsn > existing.lsn {
+                            if let IndexValue::Blob(old_ptr) = &existing.value {
+                                *dead_blob_map
+                                    .entry((old_ptr.kind as u8, old_ptr.table_id, old_ptr.seg_id))
+                                    .or_insert(0) += old_ptr.len as u64;
+                            }
+                            *existing = entry;
+                        } else if let IndexValue::Blob(old_ptr) = &entry.value {
                             *dead_blob_map
                                 .entry((old_ptr.kind as u8, old_ptr.table_id, old_ptr.seg_id))
                                 .or_insert(0) += old_ptr.len as u64;
@@ -848,14 +1066,13 @@ pub fn compact_idx_segments<F: PlatformFile>(
                 }
             }
         }
-    }
 
-    let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
-    for (_key, entry) in merged_map {
-        if drop_tombstones && entry.value == IndexValue::Tombstone {
-            continue;
+        if let Some(entry) = winning_entry {
+            if drop_tombstones && entry.value == IndexValue::Tombstone {
+                continue;
+            }
+            builder.add_entry(&entry)?;
         }
-        builder.add_entry(&entry)?;
     }
 
     let new_segment = builder.finish()?;

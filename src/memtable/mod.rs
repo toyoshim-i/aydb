@@ -155,6 +155,11 @@ impl MemTable {
             return out;
         }
         let start = if seek_key > prefix { seek_key } else { prefix };
+        if let Some((ub, inclusive)) = upper_key_bound {
+            if start > ub || (!inclusive && start == ub) {
+                return out;
+            }
+        }
         let upper = match upper_key_bound {
             Some((ub, true)) => Bound::Included(ub),
             Some((ub, false)) => Bound::Excluded(ub),

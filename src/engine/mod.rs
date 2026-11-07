@@ -683,6 +683,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             None => None,
         };
 
+        let lo_inc = lower_bound.map(|(_, inc)| inc).unwrap_or(true);
+        if let Some((ub, ub_inc)) = upper_key_slice {
+            if seek_key > ub || (seek_key == ub && (!lo_inc || !ub_inc)) {
+                return Ok(());
+            }
+        }
+
         if self.idx_segments.is_empty() {
             let lo = match lower_bound {
                 Some((_, false)) => Bound::Excluded(seek_key),
@@ -749,7 +756,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             Some((lb_pk, _)) => encode_primary_row_key(table_id, lb_pk),
             None => prefix.to_vec(),
         };
+        let lo_inc = lower_bound.map(|(_, inc)| inc).unwrap_or(true);
         let upper_full = upper_bound.map(|(ub_pk, inc)| (encode_primary_row_key(table_id, ub_pk), inc));
+
+        if let Some((ref ub, ub_inc)) = upper_full {
+            if seek_key.as_slice() > ub.as_slice()
+                || (seek_key.as_slice() == ub.as_slice() && (!lo_inc || !ub_inc))
+            {
+                return Ok(Vec::new());
+            }
+        }
 
         if self.idx_segments.is_empty() {
             let lo = match lower_bound {
@@ -781,17 +797,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(rows);
         }
 
-        // Fetch enough entries from the merged prefix scan to satisfy `limit` live rows
-        let fetch_cap = if limit == usize::MAX {
-            usize::MAX
-        } else {
-            limit.saturating_add(16)
-        };
         let merged = self.scan_merged_prefix_range(
             &prefix,
             &seek_key,
+            lo_inc,
             upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
-            fetch_cap,
+            limit,
         )?;
         let mut rows = Vec::with_capacity(merged.len().min(limit));
 
@@ -799,25 +810,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let Some(pk) = decode_primary_row_key(table_id, &entry.key) else {
                 continue;
             };
-            if let Some((lb_pk, inclusive)) = lower_bound {
-                if inclusive {
-                    if pk < lb_pk {
-                        continue;
-                    }
-                } else if pk <= lb_pk {
-                    continue;
-                }
-            }
-            if let Some((ub_pk, inclusive)) = upper_bound {
-                if inclusive {
-                    if pk > ub_pk {
-                        break;
-                    }
-                } else if pk >= ub_pk {
-                    break;
-                }
-            }
-
             let val_opt = match entry.value {
                 IndexValue::Inline(v) => Some(v),
                 IndexValue::Blob(ptr) => self.dereference_blob(&ptr, &entry.key)?,
@@ -1524,39 +1516,143 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         seek_key: &[u8],
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
-        self.scan_merged_prefix_range(prefix, seek_key, None, limit)
+        self.scan_merged_prefix_range(prefix, seek_key, true, None, limit)
     }
 
+    /// Performs a bounded-memory streaming K-way merge across `self.memtable` and all
+    /// `self.idx_segments` within `[seek_key, upper_key_bound]` under `prefix`.
+    ///
+    /// Resolves the highest-`lsn` version of each key on the fly, discards
+    /// `IndexValue::Tombstone` entries before counting toward `limit`, and returns up to
+    /// `limit` live entries in ascending key order.
     fn scan_merged_prefix_range(
         &self,
         prefix: &[u8],
         seek_key: &[u8],
+        lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
-        if self.idx_segments.is_empty() {
-            return Ok(self
-                .memtable
-                .scan_prefix_range(prefix, seek_key, upper_key_bound, limit));
+        use std::ops::Bound;
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
-        let mut merged_map: BTreeMap<Vec<u8>, (u64, IndexValue)> = BTreeMap::new();
-        for seg in &self.idx_segments {
-            for entry in seg.scan_prefix_range(prefix, seek_key, upper_key_bound, limit)? {
-                merged_map.insert(entry.key, (entry.lsn, entry.value));
+        let (eff_lo_key, eff_lo_inc) = if seek_key >= prefix {
+            (seek_key, lower_inclusive)
+        } else {
+            (prefix, true)
+        };
+
+        if let Some((ub, ub_inc)) = upper_key_bound {
+            if eff_lo_key > ub || (eff_lo_key == ub && (!eff_lo_inc || !ub_inc)) {
+                return Ok(Vec::new());
             }
         }
-        for entry in self
-            .memtable
-            .scan_prefix_range(prefix, seek_key, upper_key_bound, limit)
-        {
-            merged_map.insert(entry.key, (entry.lsn, entry.value));
+
+        let in_upper_and_prefix = |key: &[u8]| -> bool {
+            if !key.starts_with(prefix) {
+                return false;
+            }
+            if let Some((ub, ub_inc)) = upper_key_bound {
+                if ub_inc {
+                    if key > ub {
+                        return false;
+                    }
+                } else if key >= ub {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let lo_bound = if eff_lo_inc {
+            Bound::Included(eff_lo_key)
+        } else {
+            Bound::Excluded(eff_lo_key)
+        };
+        let hi_bound = match upper_key_bound {
+            Some((ub, true)) => Bound::Included(ub),
+            Some((ub, false)) => Bound::Excluded(ub),
+            None => Bound::Unbounded,
+        };
+        let mut mem_iter = self.memtable.iter_range(lo_bound, hi_bound).peekable();
+
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
+        for seg in &self.idx_segments {
+            seg_cursors.push(seg.cursor_from(eff_lo_key, eff_lo_inc)?);
         }
-        Ok(merged_map
-            .into_iter()
-            .take(limit)
-            .map(|(key, (lsn, value))| IndexEntry { key, lsn, value })
-            .collect())
+
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let mut min_key: Option<&[u8]> = None;
+
+            if let Some(&(k, _)) = mem_iter.peek() {
+                if in_upper_and_prefix(k.as_slice()) {
+                    min_key = Some(k.as_slice());
+                } else {
+                    while mem_iter.next().is_some() {}
+                }
+            }
+
+            for cur in &seg_cursors {
+                if let Some(entry) = cur.peek() {
+                    if in_upper_and_prefix(entry.key.as_slice()) {
+                        match min_key {
+                            None => min_key = Some(entry.key.as_slice()),
+                            Some(mk) if entry.key.as_slice() < mk => {
+                                min_key = Some(entry.key.as_slice());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let Some(target_key_slice) = min_key else {
+                break;
+            };
+            let target_key = target_key_slice.to_vec();
+
+            let mut best_entry: Option<IndexEntry> = None;
+
+            if let Some(&(k, _)) = mem_iter.peek() {
+                if k.as_slice() == target_key.as_slice() {
+                    let (k, mem_entry) = mem_iter.next().unwrap();
+                    best_entry = Some(IndexEntry {
+                        key: k.clone(),
+                        lsn: mem_entry.lsn,
+                        value: mem_entry.value.clone(),
+                    });
+                }
+            }
+
+            for cur in &mut seg_cursors {
+                while cur
+                    .peek()
+                    .map(|e| e.key.as_slice() == target_key.as_slice())
+                    .unwrap_or(false)
+                {
+                    let seg_entry = cur.next_entry()?.unwrap();
+                    match &mut best_entry {
+                        None => best_entry = Some(seg_entry),
+                        Some(existing) => {
+                            if seg_entry.lsn > existing.lsn {
+                                *existing = seg_entry;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(winner) = best_entry {
+                if !matches!(winner.value, IndexValue::Tombstone) {
+                    out.push(winner);
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     fn reconcile_capped_tables_after_recovery(&mut self) -> io::Result<()> {
@@ -1761,6 +1857,138 @@ mod tests {
                 .unwrap()
                 .current_logical_bytes
                 <= 3_200
+        );
+    }
+
+    #[test]
+    fn inverted_and_empty_range_queries_do_not_panic() {
+        let tmp = TempTestDir::new("inverted_range");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+        for i in 1..=10u8 {
+            engine
+                .put_row(1, &[i], &[i * 10], &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+
+        // 1. Test MemTable-only path (`idx_segments.is_empty()`)
+        assert!(
+            engine
+                .scan_table_range(1, Some((&[8], true)), Some((&[3], true)), 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .scan_table_range(1, Some((&[5], false)), Some((&[5], false)), 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .scan_table_range(1, Some((&[5], true)), Some((&[5], false)), 50)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        engine
+            .scan_table_values_into(
+                1,
+                Some((&[8], true)),
+                Some((&[3], true)),
+                50,
+                &mut slab,
+                &mut spans,
+            )
+            .unwrap();
+        assert!(spans.is_empty());
+
+        // 2. Flush to SSTable and test multi-segment path
+        engine.flush_memtable().unwrap();
+        assert!(
+            engine
+                .scan_table_range(1, Some((&[8], true)), Some((&[3], true)), 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .scan_table_range(1, Some((&[5], false)), Some((&[5], false)), 50)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_segment_range_scan_and_lru_eviction_skip_tombstone_windows() {
+        let tmp = TempTestDir::new("tombstone_window");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+        // Segment 1: 120 live rows k_000..k_119
+        for i in 0..120u32 {
+            let k = format!("k_{i:03}").into_bytes();
+            let v = format!("val_{i:03}").into_bytes();
+            engine
+                .put_row(1, &k, &v, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Segment 2: 100 tombstones shadowing k_000..k_099
+        for i in 0..100u32 {
+            let k = format!("k_{i:03}").into_bytes();
+            engine
+                .delete_row(1, &k, WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Scan with limit = 5 must skip all 100 tombstones and return k_100..k_104
+        let rows = engine.scan_table_range(1, None, None, 5).unwrap();
+        assert_eq!(rows.len(), 5);
+        for (idx, (pk, val)) in rows.iter().enumerate() {
+            let expected_i = 100 + idx;
+            assert_eq!(pk, &format!("k_{expected_i:03}").into_bytes());
+            assert_eq!(val, &format!("val_{expected_i:03}").into_bytes());
+        }
+
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        engine
+            .scan_table_values_into(1, None, None, 5, &mut slab, &mut spans)
+            .unwrap();
+        assert_eq!(spans.len(), 5);
+
+        // Capped table 2: verify eviction succeeds even when >64 tombstones precede live LRU entries
+        engine.register_capped_table(2, 100_000).unwrap();
+        for i in 0..100u32 {
+            let k = format!("lru_{i:03}").into_bytes();
+            engine
+                .put_row(2, &k, &[0xAB; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Delete first 80 keys (> EVICT_SCAN_WINDOW = 64) and flush so 80 tombstones sit at the head of 'l'
+        for i in 0..80u32 {
+            let k = format!("lru_{i:03}").into_bytes();
+            engine
+                .delete_row(2, &k, WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Lower quota to 1,000 bytes (fits at most 4 rows of ~207 B) and verify eviction reclaims past the 80 tombstones
+        engine.register_capped_table(2, 1_000).unwrap();
+        let st = engine.capped_table_state(2).unwrap();
+        assert!(
+            st.current_logical_bytes <= 1_000,
+            "eviction must advance past 80 tombstones and bring table within quota (got {})",
+            st.current_logical_bytes
         );
     }
 }
