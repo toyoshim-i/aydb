@@ -163,6 +163,265 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
     buf
 }
 
+/// Encodes a slice of raw `sqlite3_value*` pointers (`argv[2 .. 2 + col_count]`) directly into
+/// a compact binary row byte vector without allocating intermediate `SqlValue` structs!
+/// Also extracts the primary key bytes (`pk_col_idx`) and any secondary index `(index_id, col_key_bytes)`.
+///
+/// # Safety
+/// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
+pub unsafe fn encode_sqlite_values_direct(
+    values: *mut *mut sqlite3_value,
+    col_count: usize,
+    pk_col_idx: usize,
+    secondary_indexes: &[(usize, u16)],
+) -> (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>) {
+    unsafe {
+        let dir_start = 4;
+        let payload_start = dir_start + col_count * 5;
+
+        let mut total_payload = 0usize;
+        for i in 0..col_count {
+            let vptr = *values.add(i);
+            total_payload += match sqlite3_value_type(vptr) {
+                SQLITE_NULL => 0,
+                SQLITE_INTEGER | SQLITE_FLOAT => 8,
+                SQLITE_TEXT | SQLITE_BLOB | _ => 4 + (sqlite3_value_bytes(vptr).max(0) as usize),
+            };
+        }
+
+        let mut buf = vec![0u8; payload_start + total_payload];
+        buf[0..2].copy_from_slice(&(col_count as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&0u16.to_le_bytes());
+
+        let mut write_pos = payload_start;
+        for i in 0..col_count {
+            let vptr = *values.add(i);
+            let dir_pos = dir_start + i * 5;
+            let offset_u32 = write_pos as u32;
+            buf[dir_pos + 1..dir_pos + 5].copy_from_slice(&offset_u32.to_le_bytes());
+
+            match sqlite3_value_type(vptr) {
+                SQLITE_NULL => {
+                    buf[dir_pos] = 0;
+                }
+                SQLITE_INTEGER => {
+                    buf[dir_pos] = 1;
+                    let v = sqlite3_value_int64(vptr);
+                    buf[write_pos..write_pos + 8].copy_from_slice(&v.to_le_bytes());
+                    write_pos += 8;
+                }
+                SQLITE_FLOAT => {
+                    buf[dir_pos] = 2;
+                    let v = sqlite3_value_double(vptr);
+                    buf[write_pos..write_pos + 8].copy_from_slice(&v.to_le_bytes());
+                    write_pos += 8;
+                }
+                SQLITE_TEXT => {
+                    buf[dir_pos] = 3;
+                    let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                    buf[write_pos..write_pos + 4].copy_from_slice(&(len as u32).to_le_bytes());
+                    let ptr = sqlite3_value_text(vptr);
+                    if !ptr.is_null() && len > 0 {
+                        let slice = core::slice::from_raw_parts(ptr, len);
+                        buf[write_pos + 4..write_pos + 4 + len].copy_from_slice(slice);
+                    }
+                    write_pos += 4 + len;
+                }
+                SQLITE_BLOB | _ => {
+                    buf[dir_pos] = 4;
+                    let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                    buf[write_pos..write_pos + 4].copy_from_slice(&(len as u32).to_le_bytes());
+                    let ptr = sqlite3_value_blob(vptr) as *const u8;
+                    if !ptr.is_null() && len > 0 {
+                        let slice = core::slice::from_raw_parts(ptr, len);
+                        buf[write_pos + 4..write_pos + 4 + len].copy_from_slice(slice);
+                    }
+                    write_pos += 4 + len;
+                }
+            }
+        }
+
+        let pk_bytes = sqlite_value_to_key_bytes(*values.add(pk_col_idx));
+        let mut sec_keys = Vec::with_capacity(secondary_indexes.len());
+        for &(col_idx, index_id) in secondary_indexes {
+            if col_idx < col_count {
+                sec_keys.push((index_id, sqlite_value_to_key_bytes(*values.add(col_idx))));
+            }
+        }
+
+        (pk_bytes, buf, sec_keys)
+    }
+}
+
+/// Converts a raw `*mut sqlite3_value` directly into memcomparable key bytes without intermediate
+/// string/vec allocations.
+///
+/// # Safety
+/// `vptr` must be a valid non-null `*mut sqlite3_value`.
+#[inline]
+pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
+    unsafe {
+        match sqlite3_value_type(vptr) {
+            SQLITE_NULL => Vec::new(),
+            SQLITE_INTEGER => encode_i64_memcomparable(sqlite3_value_int64(vptr)).to_vec(),
+            SQLITE_FLOAT => sqlite3_value_double(vptr).to_be_bytes().to_vec(),
+            SQLITE_TEXT => {
+                let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                let ptr = sqlite3_value_text(vptr);
+                if ptr.is_null() || len == 0 {
+                    Vec::new()
+                } else {
+                    core::slice::from_raw_parts(ptr, len).to_vec()
+                }
+            }
+            SQLITE_BLOB | _ => {
+                let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                let ptr = sqlite3_value_blob(vptr) as *const u8;
+                if ptr.is_null() || len == 0 {
+                    Vec::new()
+                } else {
+                    core::slice::from_raw_parts(ptr, len).to_vec()
+                }
+            }
+        }
+    }
+}
+
+/// Projects column `col_idx` from `row_bytes` directly into `ctx` (`sqlite3_result_*`) with
+/// **zero Rust heap allocations** (`0` `String` / `Vec` allocations)!
+///
+/// # Safety
+/// `ctx` must be a valid non-null `*mut sqlite3_context`.
+#[inline]
+pub unsafe fn project_column_zero_copy(
+    row_bytes: &[u8],
+    col_idx: usize,
+    ctx: *mut sqlite3_context,
+) -> io::Result<()> {
+    unsafe {
+        if row_bytes.len() < 4 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "row_bytes shorter than 4-byte header",
+            ));
+        }
+        let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
+        if col_idx >= col_count {
+            sqlite3_result_null(ctx);
+            return Ok(());
+        }
+
+        let dir_pos = 4 + col_idx * 5;
+        if dir_pos + 5 > row_bytes.len() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "truncated column directory",
+            ));
+        }
+        let type_tag = row_bytes[dir_pos];
+        let offset =
+            u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
+
+        match type_tag {
+            0 => sqlite3_result_null(ctx),
+            1 => {
+                if offset + 8 > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Integer"));
+                }
+                let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+                sqlite3_result_int64(ctx, v);
+            }
+            2 => {
+                if offset + 8 > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Float"));
+                }
+                let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+                sqlite3_result_double(ctx, v);
+            }
+            3 => {
+                if offset + 4 > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text len"));
+                }
+                let len =
+                    u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                if offset + 4 + len > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text"));
+                }
+                let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
+                sqlite3_result_text(ctx, ptr as *const _, len as i32, sqlite_transient());
+            }
+            4 => {
+                if offset + 4 > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob len"));
+                }
+                let len =
+                    u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                if offset + 4 + len > row_bytes.len() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob"));
+                }
+                let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
+                sqlite3_result_blob(ctx, ptr as *const _, len as i32, sqlite_transient());
+            }
+            other => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unknown column type_tag {other}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extracts the memcomparable key bytes for column `col_idx` directly from `row_bytes`
+/// without decoding other columns (used when cleaning up old secondary indexes on overwrite/delete).
+pub fn extract_column_key_bytes(row_bytes: &[u8], col_idx: usize) -> io::Result<Vec<u8>> {
+    if row_bytes.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
+    if col_idx >= col_count {
+        return Ok(Vec::new());
+    }
+    let dir_pos = 4 + col_idx * 5;
+    if dir_pos + 5 > row_bytes.len() {
+        return Ok(Vec::new());
+    }
+    let type_tag = row_bytes[dir_pos];
+    let offset =
+        u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
+
+    match type_tag {
+        0 => Ok(Vec::new()),
+        1 => {
+            if offset + 8 > row_bytes.len() {
+                return Ok(Vec::new());
+            }
+            let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+            Ok(encode_i64_memcomparable(v).to_vec())
+        }
+        2 => {
+            if offset + 8 > row_bytes.len() {
+                return Ok(Vec::new());
+            }
+            let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+            Ok(v.to_be_bytes().to_vec())
+        }
+        3 | 4 => {
+            if offset + 4 > row_bytes.len() {
+                return Ok(Vec::new());
+            }
+            let len =
+                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            if offset + 4 + len > row_bytes.len() {
+                return Ok(Vec::new());
+            }
+            Ok(row_bytes[offset + 4..offset + 4 + len].to_vec())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Projects a single column `col_idx` from a packed row byte slice in $O(1)$ time without
 /// decoding any other columns in the row!
 pub fn decode_column_at(row_bytes: &[u8], col_idx: usize) -> io::Result<SqlValue> {

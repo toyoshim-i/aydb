@@ -122,43 +122,61 @@ impl WalBatch {
         Self { lsn, records }
     }
 
-    /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut records_buf = Vec::with_capacity(128);
-        for rec in &self.records {
+    /// Appends serialized record bytes for `records` into `buf`.
+    pub fn append_records_to_buf(records: &[WalRecord], buf: &mut Vec<u8>) {
+        let mut extra = 0usize;
+        for rec in records {
+            extra += match rec {
+                WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
+                WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),
+                WalRecord::Delete { key } => 5 + key.len(),
+            };
+        }
+        buf.reserve(extra);
+        for rec in records {
             match rec {
                 WalRecord::PutInline { key, value } => {
-                    records_buf.push(1u8);
-                    records_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    records_buf.extend_from_slice(key);
-                    records_buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                    records_buf.extend_from_slice(value);
+                    buf.push(1u8);
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(value);
                 }
                 WalRecord::PutBlobPtr { key, blob_ptr } => {
-                    records_buf.push(2u8);
-                    records_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    records_buf.extend_from_slice(key);
-                    records_buf.push(blob_ptr.kind as u8);
-                    records_buf.extend_from_slice(&blob_ptr.table_id.to_le_bytes());
-                    records_buf.extend_from_slice(&blob_ptr.seg_id.to_le_bytes());
-                    records_buf.extend_from_slice(&blob_ptr.offset.to_le_bytes());
-                    records_buf.extend_from_slice(&blob_ptr.len.to_le_bytes());
-                    records_buf.extend_from_slice(&blob_ptr.crc32c.to_le_bytes());
+                    buf.push(2u8);
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.push(blob_ptr.kind as u8);
+                    buf.extend_from_slice(&blob_ptr.table_id.to_le_bytes());
+                    buf.extend_from_slice(&blob_ptr.seg_id.to_le_bytes());
+                    buf.extend_from_slice(&blob_ptr.offset.to_le_bytes());
+                    buf.extend_from_slice(&blob_ptr.len.to_le_bytes());
+                    buf.extend_from_slice(&blob_ptr.crc32c.to_le_bytes());
                 }
                 WalRecord::Delete { key } => {
-                    records_buf.push(3u8);
-                    records_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    records_buf.extend_from_slice(key);
+                    buf.push(3u8);
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
                 }
             }
         }
+    }
 
-        let batch_crc = crc32c(&records_buf);
-        let mut out = Vec::with_capacity(16 + records_buf.len());
-        out.extend_from_slice(&self.lsn.to_le_bytes());
-        out.extend_from_slice(&batch_crc.to_le_bytes());
-        out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
-        out.extend_from_slice(&records_buf);
+    /// Fills in the 16-byte `[lsn (8B) | batch_crc32c (4B) | record_count (4B)]` header at `buf[0..16]`.
+    pub fn finalize_encoded_buf(lsn: u64, record_count: u32, buf: &mut [u8]) {
+        let batch_crc = crc32c(&buf[16..]);
+        buf[0..8].copy_from_slice(&lsn.to_le_bytes());
+        buf[8..12].copy_from_slice(&batch_crc.to_le_bytes());
+        buf[12..16].copy_from_slice(&record_count.to_le_bytes());
+    }
+
+    /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`
+    /// in a single allocation without intermediate copying.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&[0u8; 16]);
+        Self::append_records_to_buf(&self.records, &mut out);
+        Self::finalize_encoded_buf(self.lsn, self.records.len() as u32, &mut out);
         out
     }
 
@@ -292,6 +310,8 @@ pub struct WalStreamWriter<F: PlatformFile> {
     dirty_in_user_space: bool,
     /// Scratch buffer for the currently active 4 KB sector.
     sector_buf: [u8; WAL_SECTOR_SIZE],
+    /// Contiguous staging buffer for coalescing multi-sector batch writes into a single `write_all_at` syscall.
+    multi_sector_buf: Vec<u8>,
 }
 
 impl<F: PlatformFile> WalStreamWriter<F> {
@@ -333,6 +353,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             current_valid_bytes: 0,
             dirty_in_user_space: false,
             sector_buf: [0u8; WAL_SECTOR_SIZE],
+            multi_sector_buf: Vec::new(),
         })
     }
 
@@ -408,6 +429,8 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         let first_sector_idx = self.current_sector_idx;
         let mut sectors_touched = 0usize;
         let mut is_first_piece = true;
+        let mut staged_start_sector: Option<usize> = None;
+        self.multi_sector_buf.clear();
 
         while !remaining.is_empty() {
             let avail_payload = WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes;
@@ -436,31 +459,80 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
             match self.mode {
                 WalStreamMode::SyncSectorIsolated => {
-                    // In SyncSectorIsolated mode, every sector is immediately finalized,
-                    // written through to disk, and advanced to the next sector boundary.
-                    self.flush_and_advance_sector()?;
+                    self.seal_current_sector_in_memory();
+                    if staged_start_sector.is_none() && remaining.is_empty() {
+                        let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                        self.file.write_all_at(&self.sector_buf, offset)?;
+                    } else {
+                        if staged_start_sector.is_none() {
+                            staged_start_sector = Some(self.current_sector_idx);
+                        }
+                        self.multi_sector_buf.extend_from_slice(&self.sector_buf);
+                    }
+                    self.current_sector_idx += 1;
+                    self.current_valid_bytes = 0;
+                    self.dirty_in_user_space = false;
+                    self.sector_buf.fill(0);
                 }
                 WalStreamMode::BufferedImmediateOsCache => {
                     if !remaining.is_empty()
                         || WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes < FRAGMENT_HEADER_SIZE
                     {
-                        self.flush_and_advance_sector()?;
+                        self.seal_current_sector_in_memory();
+                        if staged_start_sector.is_none() && remaining.is_empty() {
+                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            self.file.write_all_at(&self.sector_buf, offset)?;
+                        } else {
+                            if staged_start_sector.is_none() {
+                                staged_start_sector = Some(self.current_sector_idx);
+                            }
+                            self.multi_sector_buf.extend_from_slice(&self.sector_buf);
+                        }
+                        self.current_sector_idx += 1;
+                        self.current_valid_bytes = 0;
+                        self.dirty_in_user_space = false;
+                        self.sector_buf.fill(0);
                     } else {
                         // Write the updated 4 KB sector into the OS Page Cache immediately
                         // while keeping the sector open for further dense packing.
-                        self.seal_and_write_current_sector()?;
+                        self.seal_current_sector_in_memory();
+                        if staged_start_sector.is_some() {
+                            self.multi_sector_buf.extend_from_slice(&self.sector_buf);
+                        } else {
+                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            self.file.write_all_at(&self.sector_buf, offset)?;
+                        }
                     }
                 }
                 WalStreamMode::BufferedUserSpaceCoalesced => {
                     if !remaining.is_empty()
                         || WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes < FRAGMENT_HEADER_SIZE
                     {
-                        self.flush_and_advance_sector()?;
+                        self.seal_current_sector_in_memory();
+                        if staged_start_sector.is_none() && remaining.is_empty() {
+                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            self.file.write_all_at(&self.sector_buf, offset)?;
+                        } else {
+                            if staged_start_sector.is_none() {
+                                staged_start_sector = Some(self.current_sector_idx);
+                            }
+                            self.multi_sector_buf.extend_from_slice(&self.sector_buf);
+                        }
+                        self.current_sector_idx += 1;
+                        self.current_valid_bytes = 0;
+                        self.dirty_in_user_space = false;
+                        self.sector_buf.fill(0);
                     } else {
                         self.dirty_in_user_space = true;
                     }
                 }
             }
+        }
+
+        if let Some(start_sec) = staged_start_sector {
+            let offset = (start_sec * WAL_SECTOR_SIZE) as u64;
+            self.file.write_all_at(&self.multi_sector_buf, offset)?;
+            self.multi_sector_buf.clear();
         }
 
         Ok(WalAppendOutcome::Appended {
@@ -509,7 +581,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         if valid > 0 { sec_idx + 1 } else { sec_idx }
     }
 
-    fn seal_and_write_current_sector(&mut self) -> io::Result<()> {
+    fn seal_current_sector_in_memory(&mut self) {
         // Zero out any trailing padding bytes in `16 + current_valid_bytes .. 4096`.
         let pad_start = WAL_SECTOR_HEADER_SIZE + self.current_valid_bytes;
         self.sector_buf[pad_start..WAL_SECTOR_SIZE].fill(0);
@@ -520,7 +592,10 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
         let sector_crc = crc32c(&self.sector_buf[4..WAL_SECTOR_SIZE]);
         self.sector_buf[0..4].copy_from_slice(&sector_crc.to_le_bytes());
+    }
 
+    fn seal_and_write_current_sector(&mut self) -> io::Result<()> {
+        self.seal_current_sector_in_memory();
         let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
         self.file.write_all_at(&self.sector_buf, offset)
     }

@@ -102,6 +102,25 @@ impl MemTable {
         }
     }
 
+    /// Consumes a [`WalBatch`] and moves its `key` and `value` vectors directly into this
+    /// `MemTable` without cloning!
+    pub fn apply_wal_batch_owned(&mut self, batch: WalBatch) {
+        let lsn = batch.lsn;
+        for rec in batch.records {
+            match rec {
+                WalRecord::PutInline { key, value } => {
+                    self.put_inline(key, value, lsn);
+                }
+                WalRecord::PutBlobPtr { key, blob_ptr } => {
+                    self.put_blob_ptr(key, blob_ptr, lsn);
+                }
+                WalRecord::Delete { key } => {
+                    self.delete(key, lsn);
+                }
+            }
+        }
+    }
+
     /// Point lookup in the `MemTable`.
     pub fn get(&self, key: &[u8]) -> Option<&MemEntry> {
         self.map.get(key)
@@ -130,27 +149,20 @@ impl MemTable {
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> Vec<IndexEntry> {
+        use std::ops::Bound;
         let mut out = Vec::new();
         if limit == 0 {
             return out;
         }
-        let start = if seek_key > prefix {
-            seek_key.to_vec()
-        } else {
-            prefix.to_vec()
+        let start = if seek_key > prefix { seek_key } else { prefix };
+        let upper = match upper_key_bound {
+            Some((ub, true)) => Bound::Included(ub),
+            Some((ub, false)) => Bound::Excluded(ub),
+            None => Bound::Unbounded,
         };
-        for (k, entry) in self.map.range(start..) {
+        for (k, entry) in self.map.range::<[u8], _>((Bound::Included(start), upper)) {
             if !k.starts_with(prefix) {
                 break;
-            }
-            if let Some((ub, inclusive)) = upper_key_bound {
-                if inclusive {
-                    if k.as_slice() > ub {
-                        break;
-                    }
-                } else if k.as_slice() >= ub {
-                    break;
-                }
             }
             out.push(IndexEntry {
                 key: k.clone(),
@@ -162,6 +174,16 @@ impl MemTable {
             }
         }
         out
+    }
+
+    /// Zero-allocation range iterator over `(key, MemEntry)` in the `MemTable`.
+    #[inline]
+    pub fn iter_range<'a>(
+        &'a self,
+        lower: std::ops::Bound<&'a [u8]>,
+        upper: std::ops::Bound<&'a [u8]>,
+    ) -> std::collections::btree_map::Range<'a, Vec<u8>, MemEntry> {
+        self.map.range::<[u8], _>((lower, upper))
     }
 
     /// Flushes the sorted contents of this `MemTable` to a new immutable `idx_<seq_id>.db`

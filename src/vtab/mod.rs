@@ -12,9 +12,11 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{StorageEngine, WriteDurability};
+use crate::lru::encode_i64_memcomparable;
 use crate::pal::OsFs;
 use crate::util::crc32c::crc32c;
 use crate::vtab::ffi::{
@@ -31,7 +33,10 @@ use crate::vtab::ffi::{
     sqlite3_step, sqlite3_stmt, sqlite3_value, sqlite3_value_int64, sqlite3_value_type,
     sqlite3_vtab, sqlite3_vtab_cursor,
 };
-pub use crate::vtab::row_codec::{SqlValue, decode_all_columns, decode_column_at, encode_row};
+pub use crate::vtab::row_codec::{
+    SqlValue, decode_all_columns, decode_column_at, encode_row, encode_sqlite_values_direct,
+    extract_column_key_bytes, project_column_zero_copy, sqlite_value_to_key_bytes,
+};
 
 const PLAN_FULL_SCAN: c_int = 0;
 const PLAN_PK_POINT: c_int = 1;
@@ -63,7 +68,7 @@ static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xBegin: Some(vtab_begin_tx),
     xSync: Some(vtab_noop_tx),
     xCommit: Some(vtab_commit_tx),
-    xRollback: Some(vtab_commit_tx),
+    xRollback: Some(vtab_rollback_tx),
     xFindFunction: None,
     xRename: None,
     xSavepoint: None,
@@ -85,17 +90,23 @@ struct AydbVTab {
     durability: WriteDurability,
     col_names: Vec<String>,
     pk_col_idx: usize,
-    /// Maps `col_idx` -> `index_id` (`1..=N`) for secondary indexed columns.
-    secondary_indexes: HashMap<usize, u16>,
+    /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
+    secondary_indexes: Vec<(usize, u16)>,
+    /// Fast flag set to `true` only if a non-8-byte (non-integer) primary key has been stored.
+    /// When `false`, `rowid_to_pk` is never locked on queries, inserts, updates, or deletes!
+    has_non_int_pks: AtomicBool,
     /// Maps synthetic 64-bit `rowid` -> `encoded_pk` so SQLite `DELETE` / `UPDATE` by `rowid`
-    /// can resolve the target primary key when the table is not declared `WITHOUT ROWID`.
+    /// can resolve the target primary key when the table uses a `TEXT` / `BLOB` primary key.
     rowid_to_pk: Mutex<HashMap<i64, Vec<u8>>>,
 }
 
 #[repr(C)]
 struct AydbCursor {
     base: sqlite3_vtab_cursor,
-    rows: Vec<(i64, Vec<u8>, Vec<u8>)>, // `(rowid, encoded_pk, encoded_row_bytes)`
+    /// Contiguous reusable byte slab holding all scanned `row_bytes` for the active cursor pass.
+    slab: Vec<u8>,
+    /// `(start_offset, end_offset)` into `slab` for each row.
+    spans: Vec<(u32, u32)>,
     pos: usize,
 }
 
@@ -108,6 +119,30 @@ fn pk_to_rowid(encoded_pk: &[u8]) -> i64 {
         let h2 = crc32c(&h1.to_le_bytes()) as u64;
         ((h1 << 32) | h2) as i64
     }
+}
+
+/// Extracts the `rowid` (`i64`) from `row_bytes` at `vtab.pk_col_idx`.
+/// For integer PKs (`type_tag == 1`), reads the 8-byte `i64` directly in $O(1)$ with zero allocation.
+/// For non-integer PKs (`TEXT`/`BLOB`), computes the synthetic `rowid` and registers `(rid, pk)` in `rowid_to_pk`.
+#[inline]
+fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
+    let dir_pos = 4 + vtab.pk_col_idx * 5;
+    if dir_pos + 5 <= row_bytes.len() && row_bytes[dir_pos] == 1 {
+        let offset =
+            u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
+        if offset + 8 <= row_bytes.len() {
+            return i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+        }
+    }
+    let pk = extract_column_key_bytes(row_bytes, vtab.pk_col_idx).unwrap_or_default();
+    let rid = pk_to_rowid(&pk);
+    if pk.len() != 8 {
+        vtab.has_non_int_pks.store(true, Ordering::Relaxed);
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.insert(rid, pk);
+        }
+    }
+    rid
 }
 
 unsafe extern "system" fn destroy_aux_context(ptr: *mut c_void) {
@@ -193,7 +228,7 @@ unsafe extern "system" fn vtab_create_or_connect(
         }
 
         // Parse secondary index column names
-        let mut secondary_indexes = HashMap::new();
+        let mut secondary_indexes = Vec::new();
         let mut next_idx_id = 1u16;
         for idx_col in indexes_spec.split(',') {
             let target = idx_col.trim();
@@ -204,7 +239,7 @@ unsafe extern "system" fn vtab_create_or_connect(
                 .iter()
                 .position(|c| c.eq_ignore_ascii_case(target))
             {
-                secondary_indexes.insert(pos, next_idx_id);
+                secondary_indexes.push((pos, next_idx_id));
                 next_idx_id += 1;
             }
         }
@@ -241,6 +276,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             col_names,
             pk_col_idx,
             secondary_indexes,
+            has_non_int_pks: AtomicBool::new(false),
             rowid_to_pk: Mutex::new(HashMap::new()),
         });
 
@@ -295,7 +331,11 @@ unsafe extern "system" fn vtab_best_index(
             }
             let col = constraints[i].iColumn;
             if col >= 0 {
-                if let Some(&index_id) = vtab.secondary_indexes.get(&(col as usize)) {
+                if let Some(&(_, index_id)) = vtab
+                    .secondary_indexes
+                    .iter()
+                    .find(|&&(c, _)| c == col as usize)
+                {
                     usages[i].argvIndex = 1;
                     usages[i].omit = 1;
                     info.idxNum = PLAN_SECONDARY_EQ | ((index_id as c_int) << 8);
@@ -394,7 +434,8 @@ unsafe extern "system" fn vtab_open(
             base: sqlite3_vtab_cursor {
                 pVtab: core::ptr::null_mut(),
             },
-            rows: Vec::new(),
+            slab: Vec::with_capacity(512),
+            spans: Vec::with_capacity(16),
             pos: 0,
         });
         *pp_cursor = Box::into_raw(cursor) as *mut sqlite3_vtab_cursor;
@@ -421,14 +462,11 @@ unsafe extern "system" fn vtab_filter(
     unsafe {
         let cursor = &mut *(p_cursor as *mut AydbCursor);
         let vtab = &*(cursor.base.pVtab as *const AydbVTab);
-        cursor.rows.clear();
+        cursor.slab.clear();
+        cursor.spans.clear();
         cursor.pos = 0;
 
         let mut eng = match vtab.engine.lock() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
-        };
-        let mut rmap = match vtab.rowid_to_pk.lock() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -440,19 +478,37 @@ unsafe extern "system" fn vtab_filter(
                     return SQLITE_ERROR;
                 }
                 let val_ptr = *argv.offset(0);
-                let sql_val = SqlValue::from_sqlite_value(val_ptr);
-                let pk_bytes = if let SqlValue::Integer(rid) = sql_val {
-                    rmap.get(&rid)
-                        .cloned()
-                        .unwrap_or_else(|| sql_val.to_key_bytes())
+                if sqlite3_value_type(val_ptr) == SQLITE_INTEGER {
+                    let rid = sqlite3_value_int64(val_ptr);
+                    if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                        if let Ok(rmap) = vtab.rowid_to_pk.lock() {
+                            if let Some(mapped_pk) = rmap.get(&rid) {
+                                if let Ok(true) = eng.get_row_into(
+                                    vtab.table_id,
+                                    mapped_pk,
+                                    &mut cursor.slab,
+                                    &mut cursor.spans,
+                                ) {
+                                    return SQLITE_OK;
+                                }
+                            }
+                        }
+                    }
+                    let pk_arr = encode_i64_memcomparable(rid);
+                    let _ = eng.get_row_into(
+                        vtab.table_id,
+                        &pk_arr,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    );
                 } else {
-                    sql_val.to_key_bytes()
-                };
-
-                if let Ok(Some(row_bytes)) = eng.get_row(vtab.table_id, &pk_bytes) {
-                    let rid = pk_to_rowid(&pk_bytes);
-                    rmap.insert(rid, pk_bytes.clone());
-                    cursor.rows.push((rid, pk_bytes, row_bytes));
+                    let pk_bytes = sqlite_value_to_key_bytes(val_ptr);
+                    let _ = eng.get_row_into(
+                        vtab.table_id,
+                        &pk_bytes,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    );
                 }
             }
             PLAN_SECONDARY_EQ => {
@@ -460,14 +516,15 @@ unsafe extern "system" fn vtab_filter(
                     return SQLITE_ERROR;
                 }
                 let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
-                let col_val = SqlValue::from_sqlite_value(*argv.offset(0)).to_key_bytes();
+                let col_val = sqlite_value_to_key_bytes(*argv.offset(0));
                 if let Ok(pks) = eng.lookup_by_secondary_index(vtab.table_id, index_id, &col_val) {
                     for pk in pks {
-                        if let Ok(Some(row_bytes)) = eng.get_row(vtab.table_id, &pk) {
-                            let rid = pk_to_rowid(&pk);
-                            rmap.insert(rid, pk.clone());
-                            cursor.rows.push((rid, pk, row_bytes));
-                        }
+                        let _ = eng.get_row_into(
+                            vtab.table_id,
+                            &pk,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                        );
                     }
                 }
             }
@@ -479,7 +536,7 @@ unsafe extern "system" fn vtab_filter(
                     != 0
                     && arg_pos < argc
                 {
-                    let b = SqlValue::from_sqlite_value(*argv.offset(arg_pos as isize)).to_key_bytes();
+                    let b = sqlite_value_to_key_bytes(*argv.offset(arg_pos as isize));
                     arg_pos += 1;
                     Some((b, (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0))
                 } else {
@@ -490,7 +547,7 @@ unsafe extern "system" fn vtab_filter(
                     != 0
                     && arg_pos < argc
                 {
-                    let b = SqlValue::from_sqlite_value(*argv.offset(arg_pos as isize)).to_key_bytes();
+                    let b = sqlite_value_to_key_bytes(*argv.offset(arg_pos as isize));
                     arg_pos += 1;
                     Some((b, (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0))
                 } else {
@@ -503,27 +560,24 @@ unsafe extern "system" fn vtab_filter(
                     usize::MAX
                 };
 
-                if let Ok(range_rows) = eng.scan_table_range(
+                let _ = eng.scan_table_values_into(
                     vtab.table_id,
                     lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                     upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                     limit,
-                ) {
-                    for (pk, row_bytes) in range_rows {
-                        let rid = pk_to_rowid(&pk);
-                        rmap.insert(rid, pk.clone());
-                        cursor.rows.push((rid, pk, row_bytes));
-                    }
-                }
+                    &mut cursor.slab,
+                    &mut cursor.spans,
+                );
             }
             _ => {
-                if let Ok(all_rows) = eng.scan_table(vtab.table_id) {
-                    for (pk, row_bytes) in all_rows {
-                        let rid = pk_to_rowid(&pk);
-                        rmap.insert(rid, pk.clone());
-                        cursor.rows.push((rid, pk, row_bytes));
-                    }
-                }
+                let _ = eng.scan_table_values_into(
+                    vtab.table_id,
+                    None,
+                    None,
+                    usize::MAX,
+                    &mut cursor.slab,
+                    &mut cursor.spans,
+                );
             }
         }
 
@@ -542,7 +596,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
 unsafe extern "system" fn vtab_eof(p_cursor: *mut sqlite3_vtab_cursor) -> c_int {
     unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
-        if cursor.pos >= cursor.rows.len() {
+        if cursor.pos >= cursor.spans.len() {
             1
         } else {
             0
@@ -557,19 +611,19 @@ unsafe extern "system" fn vtab_column(
 ) -> c_int {
     unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
-        if cursor.pos >= cursor.rows.len() {
+        if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
-        let (rid, _, ref row_bytes) = cursor.rows[cursor.pos];
+        let (start, end) = cursor.spans[cursor.pos];
+        let row_bytes = &cursor.slab[start as usize..end as usize];
         if i_col < 0 {
+            let vtab = &*(cursor.base.pVtab as *const AydbVTab);
+            let rid = extract_rowid_from_row(row_bytes, vtab);
             sqlite3_result_int64(p_ctx, rid);
             return SQLITE_OK;
         }
-        match decode_column_at(row_bytes, i_col as usize) {
-            Ok(val) => {
-                val.set_sqlite_result(p_ctx);
-                SQLITE_OK
-            }
+        match project_column_zero_copy(row_bytes, i_col as usize, p_ctx) {
+            Ok(()) => SQLITE_OK,
             Err(_) => SQLITE_ERROR,
         }
     }
@@ -581,10 +635,13 @@ unsafe extern "system" fn vtab_rowid(
 ) -> c_int {
     unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
-        if cursor.pos >= cursor.rows.len() {
+        if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
-        *p_rowid = cursor.rows[cursor.pos].0;
+        let (start, end) = cursor.spans[cursor.pos];
+        let row_bytes = &cursor.slab[start as usize..end as usize];
+        let vtab = &*(cursor.base.pVtab as *const AydbVTab);
+        *p_rowid = extract_rowid_from_row(row_bytes, vtab);
         SQLITE_OK
     }
 }
@@ -601,26 +658,31 @@ unsafe extern "system" fn vtab_update(
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
-        let mut rmap = match vtab.rowid_to_pk.lock() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
-        };
 
         // Case 1: DELETE (`argc == 1`)
         if argc == 1 {
             let arg0 = *argv.offset(0);
-            let old_pk = if sqlite3_value_type(arg0) == SQLITE_INTEGER {
+            if sqlite3_value_type(arg0) == SQLITE_INTEGER {
                 let rid = sqlite3_value_int64(arg0);
-                rmap.remove(&rid)
-                    .unwrap_or_else(|| SqlValue::from_sqlite_value(arg0).to_key_bytes())
+                if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                        if let Some(old_pk) = rmap.remove(&rid) {
+                            if eng.delete_row(vtab.table_id, &old_pk, vtab.durability).is_err() {
+                                return SQLITE_ERROR;
+                            }
+                            return SQLITE_OK;
+                        }
+                    }
+                }
+                let old_pk = encode_i64_memcomparable(rid);
+                if eng.delete_row(vtab.table_id, &old_pk, vtab.durability).is_err() {
+                    return SQLITE_ERROR;
+                }
             } else {
-                SqlValue::from_sqlite_value(arg0).to_key_bytes()
-            };
-            if eng
-                .delete_row(vtab.table_id, &old_pk, vtab.durability)
-                .is_err()
-            {
-                return SQLITE_ERROR;
+                let old_pk = sqlite_value_to_key_bytes(arg0);
+                if eng.delete_row(vtab.table_id, &old_pk, vtab.durability).is_err() {
+                    return SQLITE_ERROR;
+                }
             }
             return SQLITE_OK;
         }
@@ -631,45 +693,47 @@ unsafe extern "system" fn vtab_update(
             return SQLITE_ERROR;
         }
 
+        let (new_pk, row_bytes, sec_keys) = encode_sqlite_values_direct(
+            argv.offset(2),
+            num_cols,
+            vtab.pk_col_idx,
+            &vtab.secondary_indexes,
+        );
+
         let arg0 = *argv.offset(0);
-        let is_update = sqlite3_value_type(arg0) != SQLITE_NULL;
-        let old_pk_opt = if is_update {
+        if sqlite3_value_type(arg0) != SQLITE_NULL {
             if sqlite3_value_type(arg0) == SQLITE_INTEGER {
                 let rid = sqlite3_value_int64(arg0);
-                rmap.get(&rid).cloned()
+                let mut resolved_in_map = false;
+                if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                    if let Ok(rmap) = vtab.rowid_to_pk.lock() {
+                        if let Some(old_pk) = rmap.get(&rid) {
+                            resolved_in_map = true;
+                            if old_pk.as_slice() != new_pk.as_slice() {
+                                let _ = eng.delete_row(vtab.table_id, old_pk, vtab.durability);
+                            }
+                        }
+                    }
+                }
+                if !resolved_in_map {
+                    let old_pk = encode_i64_memcomparable(rid);
+                    if old_pk.as_slice() != new_pk.as_slice() {
+                        let _ = eng.delete_row(vtab.table_id, &old_pk, vtab.durability);
+                    }
+                }
             } else {
-                Some(SqlValue::from_sqlite_value(arg0).to_key_bytes())
-            }
-        } else {
-            None
-        };
-
-        let mut cols = Vec::with_capacity(num_cols);
-        for c in 0..num_cols {
-            let vptr = *argv.offset((2 + c) as isize);
-            cols.push(SqlValue::from_sqlite_value(vptr));
-        }
-
-        let new_pk = cols[vtab.pk_col_idx].to_key_bytes();
-        if let Some(old_pk) = old_pk_opt {
-            if old_pk != new_pk {
-                let _ = eng.delete_row(vtab.table_id, &old_pk, vtab.durability);
+                let old_pk = sqlite_value_to_key_bytes(arg0);
+                if old_pk != new_pk {
+                    let _ = eng.delete_row(vtab.table_id, &old_pk, vtab.durability);
+                }
             }
         }
 
-        let mut sec_keys = Vec::with_capacity(vtab.secondary_indexes.len());
-        for (&col_idx, &index_id) in &vtab.secondary_indexes {
-            if col_idx < cols.len() {
-                sec_keys.push((index_id, cols[col_idx].to_key_bytes()));
-            }
-        }
-
-        let row_bytes = encode_row(&cols);
         if eng
-            .put_row(
+            .put_row_owned(
                 vtab.table_id,
                 &new_pk,
-                &row_bytes,
+                row_bytes,
                 &sec_keys,
                 vtab.durability,
             )
@@ -679,7 +743,12 @@ unsafe extern "system" fn vtab_update(
         }
 
         let rid = pk_to_rowid(&new_pk);
-        rmap.insert(rid, new_pk);
+        if new_pk.len() != 8 {
+            vtab.has_non_int_pks.store(true, Ordering::Relaxed);
+            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                rmap.insert(rid, new_pk);
+            }
+        }
         if !p_rowid.is_null() {
             *p_rowid = rid;
         }
@@ -702,6 +771,18 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         let vtab = &*(p_vtab as *const AydbVTab);
         if let Ok(mut eng) = vtab.engine.lock() {
             if eng.commit_transaction().is_err() {
+                return SQLITE_ERROR;
+            }
+        }
+        SQLITE_OK
+    }
+}
+
+unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
+    unsafe {
+        let vtab = &*(p_vtab as *const AydbVTab);
+        if let Ok(mut eng) = vtab.engine.lock() {
+            if eng.rollback_transaction().is_err() {
                 return SQLITE_ERROR;
             }
         }
@@ -1153,5 +1234,19 @@ mod tests {
                 ],
             ]
         );
+
+        // 6. Verify ACID ROLLBACK restores pre-transaction state cleanly
+        conn.execute_batch(
+            "BEGIN;
+             DELETE FROM http_cache WHERE url = 'https://site.example/1';
+             UPDATE http_cache SET status = 999 WHERE url = 'https://site.example/3';
+             ROLLBACK;",
+        )
+        .unwrap();
+
+        let after_rollback = conn
+            .query_all("SELECT url, status FROM http_cache ORDER BY url", &[])
+            .unwrap();
+        assert_eq!(after_rollback, after_mut);
     }
 }

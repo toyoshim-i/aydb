@@ -17,9 +17,9 @@ use crate::index::{
 };
 use crate::lru::{
     AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, RowMetaRecord,
-    decode_lru_queue_key, decode_primary_row_key, decode_secondary_index_key, encode_lru_queue_key,
-    encode_namespace_prefix, encode_primary_row_key, encode_row_meta_key,
-    encode_secondary_index_exact_prefix, encode_secondary_index_key,
+    decode_lru_queue_key, decode_primary_row_key, encode_lru_queue_key, encode_namespace_prefix,
+    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_exact_prefix,
+    encode_secondary_index_key,
 };
 use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
 use crate::meta::{
@@ -32,6 +32,13 @@ use crate::wal::{
     WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalStreamMode, WalStreamWriter,
     recover_two_streams,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingRowStatus {
+    NotFound,
+    Inline,
+    Blob(BlobPtr),
+}
 
 /// Durability guarantee requested for a write or delete operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,10 +126,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     capped_tables: HashMap<u16, CappedTableState>,
     /// Bounded in-memory `AccessTick` tracker.
     access_tracker: AccessTracker,
-    /// Transaction nesting depth (`xBegin` / `xCommit`). While `tx_depth > 0`, `WalRecord` items
-    /// are coalesced into `pending_tx_records` and committed as a single atomic `WalBatch` on `commit_transaction`!
+    /// Transaction nesting depth (`xBegin` / `xCommit`). While `tx_depth > 0`, serialized
+    /// `WalRecord` bytes are accumulated directly into `pending_tx_buf` and committed as a
+    /// single atomic `WalBatch` on `commit_transaction`!
     tx_depth: usize,
-    pending_tx_records: Vec<WalRecord>,
+    pending_tx_buf: Vec<u8>,
+    pending_tx_record_count: u32,
     pending_tx_sync: bool,
 }
 
@@ -305,7 +314,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             capped_tables,
             access_tracker: AccessTracker::new(1, 65_536),
             tx_depth: 0,
-            pending_tx_records: Vec::new(),
+            pending_tx_buf: Vec::new(),
+            pending_tx_record_count: 0,
             pending_tx_sync: false,
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
@@ -354,6 +364,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         secondary_keys: &[(u16, Vec<u8>)],
         durability: WriteDurability,
     ) -> io::Result<()> {
+        self.put_row_owned(table_id, pk, value.to_vec(), secondary_keys, durability)
+    }
+
+    /// Owned-value variant of [`put_row`] that moves `value: Vec<u8>` directly into the `MemTable`
+    /// without cloning when stored inline.
+    pub fn put_row_owned(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        value: Vec<u8>,
+        secondary_keys: &[(u16, Vec<u8>)],
+        durability: WriteDurability,
+    ) -> io::Result<()> {
         let row_key = encode_primary_row_key(table_id, pk);
         let is_capped = self.capped_tables.contains_key(&table_id);
         let logical_size = (pk.len() + value.len()) as u32;
@@ -363,15 +386,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut records = Vec::with_capacity(3 + secondary_keys.len() * 2);
         let mut old_logical_size = 0u64;
 
-        if let Some((_lsn, old_idx_val)) = self.lookup_raw_entry(&row_key)? {
-            if let IndexValue::Blob(old_ptr) = old_idx_val {
-                self.record_dead_blob_bytes(&old_ptr);
-            }
+        let existing = self.check_existing_row(&row_key)?;
+        if let ExistingRowStatus::Blob(old_ptr) = existing {
+            self.record_dead_blob_bytes(&old_ptr);
         }
 
-        let meta_key = encode_row_meta_key(table_id, pk);
-        if let Some((_lsn, IndexValue::Inline(meta_bytes))) = self.lookup_raw_entry(&meta_key)? {
-            if let Ok(old_meta) = RowMetaRecord::from_bytes(&meta_bytes) {
+        if existing != ExistingRowStatus::NotFound {
+            let meta_key = encode_row_meta_key(table_id, pk);
+            if let Some(old_meta) = self.get_row_meta(&meta_key)? {
                 old_logical_size = old_meta.logical_size as u64;
                 if is_capped && old_meta.recorded_tick > 0 {
                     records.push(WalRecord::Delete {
@@ -393,7 +415,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else {
                 BlobKind::Standard
             };
-            let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, value)?;
+            let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, &value)?;
             records.push(WalRecord::PutBlobPtr {
                 key: row_key,
                 blob_ptr: ptr,
@@ -401,7 +423,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             records.push(WalRecord::PutInline {
                 key: row_key,
-                value: value.to_vec(),
+                value,
             });
         }
 
@@ -427,14 +449,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         if is_capped || !secondary_keys.is_empty() {
-            let meta_rec = RowMetaRecord {
-                recorded_tick: assigned_tick,
-                logical_size,
-                secondary_keys: secondary_keys.to_vec(),
-            };
             records.push(WalRecord::PutInline {
-                key: meta_key,
-                value: meta_rec.to_bytes(),
+                key: encode_row_meta_key(table_id, pk),
+                value: RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys),
             });
         }
 
@@ -448,7 +465,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .saturating_sub(old_logical_size)
                 .saturating_add(logical_size as u64);
         }
-        self.reclaim_fully_dead_blob_segments()?;
+        if matches!(existing, ExistingRowStatus::Blob(_)) {
+            self.reclaim_fully_dead_blob_segments()?;
+        }
         if is_capped {
             self.evict_until_within_quota(table_id, durability)?;
         }
@@ -492,13 +511,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<bool> {
         let row_key = encode_primary_row_key(table_id, pk);
-        let Some((_lsn, old_idx_val)) = self.lookup_raw_entry(&row_key)? else {
-            return Ok(false);
-        };
-        if matches!(old_idx_val, IndexValue::Tombstone) {
+        let existing = self.check_existing_row(&row_key)?;
+        if existing == ExistingRowStatus::NotFound {
             return Ok(false);
         }
-        if let IndexValue::Blob(old_ptr) = old_idx_val {
+        if let ExistingRowStatus::Blob(old_ptr) = existing {
             self.record_dead_blob_bytes(&old_ptr);
         }
 
@@ -506,19 +523,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut old_logical_size = 0u64;
 
         let meta_key = encode_row_meta_key(table_id, pk);
-        if let Some((_lsn, IndexValue::Inline(meta_bytes))) = self.lookup_raw_entry(&meta_key)? {
-            if let Ok(old_meta) = RowMetaRecord::from_bytes(&meta_bytes) {
-                old_logical_size = old_meta.logical_size as u64;
-                if old_meta.recorded_tick > 0 {
-                    records.push(WalRecord::Delete {
-                        key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                    });
-                }
-                for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                    records.push(WalRecord::Delete {
-                        key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                    });
-                }
+        if let Some(old_meta) = self.get_row_meta(&meta_key)? {
+            old_logical_size = old_meta.logical_size as u64;
+            if old_meta.recorded_tick > 0 {
+                records.push(WalRecord::Delete {
+                    key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
+                });
+            }
+            for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
+                records.push(WalRecord::Delete {
+                    key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
+                });
             }
             records.push(WalRecord::Delete { key: meta_key });
         }
@@ -529,13 +544,191 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
             ct.current_logical_bytes = ct.current_logical_bytes.saturating_sub(old_logical_size);
         }
-        self.reclaim_fully_dead_blob_segments()?;
+        if matches!(existing, ExistingRowStatus::Blob(_)) {
+            self.reclaim_fully_dead_blob_segments()?;
+        }
         Ok(true)
     }
 
     /// Scans all live rows `(pk, value)` in `table_id` in ascending memcomparable primary-key order.
     pub fn scan_table(&mut self, table_id: u16) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_table_range(table_id, None, None, usize::MAX)
+    }
+
+    /// Point lookup of a row (`pk`) in `table_id`, appending its payload directly into `slab`
+    /// and recording its `(start, end)` offset in `spans` with zero intermediate `Vec<u8>` allocations!
+    pub fn get_row_into(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(u32, u32)>,
+    ) -> io::Result<bool> {
+        let mut stack_buf = [0u8; 64];
+        let heap_buf;
+        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
+            let tb = table_id.to_be_bytes();
+            stack_buf[0] = tb[0];
+            stack_buf[1] = tb[1];
+            stack_buf[2] = NS_PRIMARY_ROW;
+            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
+            &stack_buf[..3 + pk.len()]
+        } else {
+            heap_buf = encode_primary_row_key(table_id, pk);
+            &heap_buf
+        };
+
+        let mut hit = false;
+        if let Some(mem_entry) = self.memtable.get(row_key) {
+            match &mem_entry.value {
+                IndexValue::Inline(bytes) => {
+                    let start = slab.len() as u32;
+                    slab.extend_from_slice(bytes);
+                    spans.push((start, slab.len() as u32));
+                    hit = true;
+                }
+                IndexValue::Blob(ptr) => {
+                    let ptr_copy = *ptr;
+                    if let Some(bytes) = self.dereference_blob(&ptr_copy, row_key)? {
+                        let start = slab.len() as u32;
+                        slab.extend_from_slice(&bytes);
+                        spans.push((start, slab.len() as u32));
+                        hit = true;
+                    }
+                }
+                IndexValue::Tombstone => {}
+            }
+        } else {
+            for seg in self.idx_segments.iter().rev() {
+                if let Some((_lsn, val)) = seg.get(row_key)? {
+                    match val {
+                        IndexValue::Inline(bytes) => {
+                            let start = slab.len() as u32;
+                            slab.extend_from_slice(&bytes);
+                            spans.push((start, slab.len() as u32));
+                            hit = true;
+                        }
+                        IndexValue::Blob(ptr) => {
+                            if let Some(bytes) = self.dereference_blob(&ptr, row_key)? {
+                                let start = slab.len() as u32;
+                                slab.extend_from_slice(&bytes);
+                                spans.push((start, slab.len() as u32));
+                                hit = true;
+                            }
+                        }
+                        IndexValue::Tombstone => {}
+                    }
+                    break;
+                }
+            }
+        }
+
+        if hit && self.capped_tables.contains_key(&table_id) {
+            match self.config.lru_read_tracking {
+                LruReadTrackingMode::CoalescedLazyPromotion => {
+                    self.access_tracker.record_read_hit(table_id, pk);
+                }
+                LruReadTrackingMode::EagerWriteOnRead => {
+                    self.eager_promote_lru_on_read(table_id, pk)?;
+                }
+            }
+        }
+
+        Ok(hit)
+    }
+
+    /// Scans up to `limit` live row payloads in `table_id` within `lower_bound` and `upper_bound`
+    /// directly into `slab` and `spans`, avoiding per-row `Vec<u8>` heap allocations!
+    pub fn scan_table_values_into(
+        &mut self,
+        table_id: u16,
+        lower_bound: Option<(&[u8], bool)>,
+        upper_bound: Option<(&[u8], bool)>,
+        limit: usize,
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(u32, u32)>,
+    ) -> io::Result<()> {
+        use std::ops::Bound;
+        if limit == 0 {
+            return Ok(());
+        }
+        let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
+        let mut lb_stack = [0u8; 64];
+        let lb_heap;
+        let seek_key: &[u8] = match lower_bound {
+            Some((lb_pk, _)) if 3 + lb_pk.len() <= lb_stack.len() => {
+                lb_stack[0..3].copy_from_slice(&prefix);
+                lb_stack[3..3 + lb_pk.len()].copy_from_slice(lb_pk);
+                &lb_stack[..3 + lb_pk.len()]
+            }
+            Some((lb_pk, _)) => {
+                lb_heap = encode_primary_row_key(table_id, lb_pk);
+                &lb_heap
+            }
+            None => &prefix,
+        };
+
+        let mut ub_stack = [0u8; 64];
+        let ub_heap;
+        let upper_key_slice: Option<(&[u8], bool)> = match upper_bound {
+            Some((ub_pk, inc)) if 3 + ub_pk.len() <= ub_stack.len() => {
+                ub_stack[0..3].copy_from_slice(&prefix);
+                ub_stack[3..3 + ub_pk.len()].copy_from_slice(ub_pk);
+                Some((&ub_stack[..3 + ub_pk.len()], inc))
+            }
+            Some((ub_pk, inc)) => {
+                ub_heap = encode_primary_row_key(table_id, ub_pk);
+                Some((&ub_heap, inc))
+            }
+            None => None,
+        };
+
+        if self.idx_segments.is_empty() {
+            let lo = match lower_bound {
+                Some((_, false)) => Bound::Excluded(seek_key),
+                _ => Bound::Included(seek_key),
+            };
+            let hi = match upper_key_slice {
+                Some((ub, true)) => Bound::Included(ub),
+                Some((ub, false)) => Bound::Excluded(ub),
+                None => Bound::Unbounded,
+            };
+            for (k, entry) in self.memtable.iter_range(lo, hi) {
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+                match &entry.value {
+                    IndexValue::Inline(v) => {
+                        let start = slab.len() as u32;
+                        slab.extend_from_slice(v);
+                        spans.push((start, slab.len() as u32));
+                        if spans.len() >= limit {
+                            break;
+                        }
+                    }
+                    IndexValue::Blob(ptr) => {
+                        if let Some(v) = self.dereference_blob(ptr, k)? {
+                            let start = slab.len() as u32;
+                            slab.extend_from_slice(&v);
+                            spans.push((start, slab.len() as u32));
+                            if spans.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    IndexValue::Tombstone => {}
+                }
+            }
+            return Ok(());
+        }
+
+        let pairs = self.scan_table_range(table_id, lower_bound, upper_bound, limit)?;
+        for (_, v) in pairs {
+            let start = slab.len() as u32;
+            slab.extend_from_slice(&v);
+            spans.push((start, slab.len() as u32));
+        }
+        Ok(())
     }
 
     /// Scans up to `limit` live rows `(pk, value)` in `table_id` within `lower_bound` and `upper_bound`
@@ -547,6 +740,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::ops::Bound;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -556,6 +750,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             None => prefix.to_vec(),
         };
         let upper_full = upper_bound.map(|(ub_pk, inc)| (encode_primary_row_key(table_id, ub_pk), inc));
+
+        if self.idx_segments.is_empty() {
+            let lo = match lower_bound {
+                Some((_, false)) => Bound::Excluded(seek_key.as_slice()),
+                _ => Bound::Included(seek_key.as_slice()),
+            };
+            let hi = match &upper_full {
+                Some((ub, true)) => Bound::Included(ub.as_slice()),
+                Some((ub, false)) => Bound::Excluded(ub.as_slice()),
+                None => Bound::Unbounded,
+            };
+            let mut rows = Vec::new();
+            for (k, entry) in self.memtable.iter_range(lo, hi) {
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+                let val_opt = match &entry.value {
+                    IndexValue::Inline(v) => Some(v.clone()),
+                    IndexValue::Blob(ptr) => self.dereference_blob(ptr, k)?,
+                    IndexValue::Tombstone => None,
+                };
+                if let Some(val) = val_opt {
+                    rows.push((k[3..].to_vec(), val));
+                    if rows.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(rows);
+        }
 
         // Fetch enough entries from the merged prefix scan to satisfy `limit` live rows
         let fetch_cap = if limit == usize::MAX {
@@ -616,16 +840,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         index_id: u16,
         col_val: &[u8],
     ) -> io::Result<Vec<Vec<u8>>> {
+        use std::ops::Bound;
         let prefix = encode_secondary_index_exact_prefix(table_id, index_id, col_val);
+        if self.idx_segments.is_empty() {
+            let mut pks = Vec::new();
+            for (k, entry) in self
+                .memtable
+                .iter_range(Bound::Included(prefix.as_slice()), Bound::Unbounded)
+            {
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+                if !matches!(entry.value, IndexValue::Tombstone) {
+                    pks.push(k[prefix.len()..].to_vec());
+                }
+            }
+            return Ok(pks);
+        }
+
         let merged = self.scan_merged_prefix(&prefix)?;
         let mut pks = Vec::with_capacity(merged.len());
         for entry in merged {
             if matches!(entry.value, IndexValue::Tombstone) {
                 continue;
             }
-            if let Some((_dec_col, pk)) = decode_secondary_index_key(table_id, index_id, &entry.key)?
-            {
-                pks.push(pk);
+            if entry.key.starts_with(&prefix) {
+                pks.push(entry.key[prefix.len()..].to_vec());
             }
         }
         Ok(pks)
@@ -653,11 +893,51 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_tx_buf`
+    /// mutations and restoring `MemTable` from the committed WAL streams since `checkpoint_lsn`.
+    pub fn rollback_transaction(&mut self) -> io::Result<()> {
+        self.tx_depth = 0;
+        self.pending_tx_record_count = 0;
+        self.pending_tx_buf.clear();
+        self.pending_tx_sync = false;
+
+        self.buf_wal.flush_buffered_to_os()?;
+        let st = self.meta_mgr.state().clone();
+        let std_blobs = &self.std_blobs;
+        let lru_blobs = &self.lru_blobs;
+        let rec = recover_two_streams(
+            &**self.sync_wal.file(),
+            st.sync_wal_epoch,
+            &**self.buf_wal.file(),
+            st.buf_wal_epoch,
+            st.checkpoint_lsn,
+            |ptr| match ptr.kind {
+                BlobKind::Standard => std_blobs
+                    .get(&ptr.seg_id)
+                    .map(|b| b.reader.validate_blob_ptr(ptr))
+                    .unwrap_or(false),
+                BlobKind::Lru => lru_blobs
+                    .get(&(ptr.table_id, ptr.seg_id))
+                    .map(|b| b.reader.validate_blob_ptr(ptr))
+                    .unwrap_or(false),
+            },
+        )?;
+
+        let mut new_mem = MemTable::new(self.config.memtable_capacity_bytes);
+        for batch in &rec.merged_batches {
+            new_mem.apply_wal_batch(batch);
+        }
+        self.memtable = new_mem;
+        self.reconcile_capped_tables_after_recovery()?;
+        Ok(())
+    }
+
     fn flush_pending_tx_records(&mut self) -> io::Result<()> {
-        if self.pending_tx_records.is_empty() {
+        if self.pending_tx_record_count == 0 {
             return Ok(());
         }
-        let records = core::mem::take(&mut self.pending_tx_records);
+        let record_count = self.pending_tx_record_count;
+        self.pending_tx_record_count = 0;
         let durability = if self.pending_tx_sync {
             WriteDurability::SyncTransactional
         } else {
@@ -667,8 +947,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let lsn = self.next_lsn;
         self.next_lsn += 1;
-        let batch = WalBatch::new(lsn, records);
-        self.append_wal_batch_with_rotation(&batch, durability)
+        WalBatch::finalize_encoded_buf(lsn, record_count, &mut self.pending_tx_buf);
+        let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
+        let res = self.append_raw_wal_batch_with_rotation(&raw_buf, durability);
+        raw_buf.clear();
+        self.pending_tx_buf = raw_buf;
+        res
     }
 
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
@@ -1125,45 +1409,50 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<u64> {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
-        let batch = WalBatch::new(lsn, records);
-
-        // Always apply to MemTable immediately for read-your-own-writes visibility inside a transaction
-        self.memtable.apply_wal_batch(&batch);
 
         if self.tx_depth > 0 {
             if durability == WriteDurability::SyncTransactional {
                 self.pending_tx_sync = true;
             }
-            self.pending_tx_records.extend(batch.records);
-            // If pending records approach 256 KB during a huge bulk transaction, flush an intermediate batch
-            if self.pending_tx_records.len() >= 2048 {
+            if self.pending_tx_record_count == 0 {
+                self.pending_tx_buf.clear();
+                self.pending_tx_buf.extend_from_slice(&[0u8; 16]);
+            }
+            WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
+            self.pending_tx_record_count += records.len() as u32;
+            self.memtable
+                .apply_wal_batch_owned(WalBatch::new(lsn, records));
+            if self.pending_tx_buf.len() >= 4 * 1024 * 1024 {
                 self.flush_pending_tx_records()?;
             }
             return Ok(lsn);
         }
 
-        self.append_wal_batch_with_rotation(&batch, durability)?;
+        let batch = WalBatch::new(lsn, records);
+        let encoded = batch.encode();
+        self.memtable.apply_wal_batch_owned(batch);
+        self.append_raw_wal_batch_with_rotation(&encoded, durability)?;
         if self.memtable.should_flush() {
             self.flush_memtable()?;
         }
         Ok(lsn)
     }
 
-    fn append_wal_batch_with_rotation(
+    fn append_raw_wal_batch_with_rotation(
         &mut self,
-        batch: &WalBatch,
+        encoded: &[u8],
         durability: WriteDurability,
     ) -> io::Result<()> {
         let outcome = match durability {
-            WriteDurability::SyncTransactional => self.sync_wal.append_batch(batch)?,
-            WriteDurability::BufferedFast => self.buf_wal.append_batch(batch)?,
+            WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded)?,
+            WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded)?,
         };
 
         if outcome == WalAppendOutcome::RingFull {
             self.flush_memtable()?;
             let retry = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.append_batch(batch)?,
-                WriteDurability::BufferedFast => self.buf_wal.append_batch(batch)?,
+                WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded)?,
+                WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded)?,
             };
             if retry == WalAppendOutcome::RingFull {
                 return Err(io::Error::new(
@@ -1173,6 +1462,44 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
         Ok(())
+    }
+
+    fn check_existing_row(&self, key: &[u8]) -> io::Result<ExistingRowStatus> {
+        if let Some(mem_entry) = self.memtable.get(key) {
+            return Ok(match &mem_entry.value {
+                IndexValue::Tombstone => ExistingRowStatus::NotFound,
+                IndexValue::Inline(_) => ExistingRowStatus::Inline,
+                IndexValue::Blob(ptr) => ExistingRowStatus::Blob(*ptr),
+            });
+        }
+        for seg in self.idx_segments.iter().rev() {
+            if let Some((_lsn, val)) = seg.get(key)? {
+                return Ok(match val {
+                    IndexValue::Tombstone => ExistingRowStatus::NotFound,
+                    IndexValue::Inline(_) => ExistingRowStatus::Inline,
+                    IndexValue::Blob(ptr) => ExistingRowStatus::Blob(ptr),
+                });
+            }
+        }
+        Ok(ExistingRowStatus::NotFound)
+    }
+
+    fn get_row_meta(&self, meta_key: &[u8]) -> io::Result<Option<RowMetaRecord>> {
+        if let Some(mem_entry) = self.memtable.get(meta_key) {
+            return match &mem_entry.value {
+                IndexValue::Inline(bytes) => Ok(RowMetaRecord::from_bytes(bytes).ok()),
+                _ => Ok(None),
+            };
+        }
+        for seg in self.idx_segments.iter().rev() {
+            if let Some((_lsn, val)) = seg.get(meta_key)? {
+                return match val {
+                    IndexValue::Inline(bytes) => Ok(RowMetaRecord::from_bytes(&bytes).ok()),
+                    _ => Ok(None),
+                };
+            }
+        }
+        Ok(None)
     }
 
     fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
@@ -1207,6 +1534,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
+        if self.idx_segments.is_empty() {
+            return Ok(self
+                .memtable
+                .scan_prefix_range(prefix, seek_key, upper_key_bound, limit));
+        }
+
         let mut merged_map: BTreeMap<Vec<u8>, (u64, IndexValue)> = BTreeMap::new();
         for seg in &self.idx_segments {
             for entry in seg.scan_prefix_range(prefix, seek_key, upper_key_bound, limit)? {

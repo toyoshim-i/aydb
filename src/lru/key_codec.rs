@@ -194,17 +194,25 @@ pub struct RowMetaRecord {
 }
 
 impl RowMetaRecord {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(14 + self.secondary_keys.len() * 8);
-        out.extend_from_slice(&self.recorded_tick.to_be_bytes());
-        out.extend_from_slice(&self.logical_size.to_be_bytes());
-        out.extend_from_slice(&(self.secondary_keys.len() as u16).to_be_bytes());
-        for (idx_id, col_val) in &self.secondary_keys {
+    pub fn encode_slice(
+        recorded_tick: u64,
+        logical_size: u32,
+        secondary_keys: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(14 + secondary_keys.len() * 12);
+        out.extend_from_slice(&recorded_tick.to_be_bytes());
+        out.extend_from_slice(&logical_size.to_be_bytes());
+        out.extend_from_slice(&(secondary_keys.len() as u16).to_be_bytes());
+        for (idx_id, col_val) in secondary_keys {
             out.extend_from_slice(&idx_id.to_be_bytes());
             out.extend_from_slice(&(col_val.len() as u16).to_be_bytes());
             out.extend_from_slice(col_val);
         }
         out
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Self::encode_slice(self.recorded_tick, self.logical_size, &self.secondary_keys)
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {

@@ -104,18 +104,29 @@ impl AccessTracker {
     }
 
     /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)`.
+    #[inline]
     pub fn take_hot_tick(&mut self, table_id: u16, pk: &[u8]) -> Option<u64> {
+        if self.hot_ticks.is_empty() {
+            return None;
+        }
         self.hot_ticks.remove(&(table_id, pk.to_vec()))
     }
 
     /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)`.
+    #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
+        if self.hot_ticks.is_empty() {
+            return None;
+        }
         self.hot_ticks.get(&(table_id, pk.to_vec())).copied()
     }
 
     /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete).
+    #[inline]
     pub fn remove_key(&mut self, table_id: u16, pk: &[u8]) {
-        self.hot_ticks.remove(&(table_id, pk.to_vec()));
+        if !self.hot_ticks.is_empty() {
+            self.hot_ticks.remove(&(table_id, pk.to_vec()));
+        }
     }
 
     pub fn len(&self) -> usize {

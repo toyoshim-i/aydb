@@ -15,8 +15,8 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 
 | Engine & Durability Mode | Throughput | P50 Latency | P99 Latency | Physical Bytes Written |
 | :--- | ---: | ---: | ---: | ---: |
-| **Vanilla SQLite (`WAL`, `synchronous = FULL`)** | `565 tx/s` | `1,730.3 µs` | `3,408.4 µs` | `3,769.8 KB` |
-| **`aydb` Virtual Table (`wal_sync.db` `WRITE_THROUGH`)** | **`12,794 tx/s` (`22.6×` faster)** | **`78.3 µs` (`22.1×` lower)** | **`113.5 µs` (`30.0×` lower)** | **`1,200.0 KB` (`3.1×` less)** |
+| **Vanilla SQLite (`WAL`, `synchronous = FULL`)** | `578 tx/s` | `1,719.4 µs` | `1,961.4 µs` | `3,769.8 KB` |
+| **`aydb` Virtual Table (`wal_sync.db` `WRITE_THROUGH`)** | **`12,808 tx/s` (`22.2×` faster)** | **`75.7 µs` (`22.7×` lower)** | **`118.2 µs` (`16.6×` lower)** | **`1,200.0 KB` (`3.1×` less)** |
 
 ### Architectural Root Cause Analysis
 1. **Why Vanilla SQLite Takes `1,730 µs` per Sync Commit:**
@@ -35,8 +35,8 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 
 | Engine & Cache Eviction Architecture | Sustained Write Speed | P50 Latency | P99 Latency | Final Data Footprint on Disk |
 | :--- | ---: | ---: | ---: | ---: |
-| **Vanilla SQLite (`WAL` + B-Tree SQL LRU)** | `55.3 MB/s` | `120.3 µs` | `9,605.3 µs` | `8.18 MB` (`2.05×` quota bloat) |
-| **`aydb` Virtual Table (WiscKey + Copy-less GC)** | **`134.2 MB/s` (`2.43×` faster)** | **`29.6 µs` (`4.06×` lower)** | **`4,567.5 µs` (`2.10×` lower)** | **`3.98 MB` (Strict `4.0 MB` cap)** |
+| **Vanilla SQLite (`WAL` + B-Tree SQL LRU)** | `58.0 MB/s` | `117.7 µs` | `9,204.0 µs` | `8.18 MB` (`2.05×` quota bloat) |
+| **`aydb` Virtual Table (WiscKey + Copy-less GC)** | **`153.4 MB/s` (`2.64×` faster)** | **`20.2 µs` (`5.83×` lower)** | **`4,413.9 µs` (`2.09×` lower)** | **`3.98 MB` (Strict `4.0 MB` cap)** |
 
 ### Architectural Root Cause Analysis
 1. **B-Tree Overflow Page Churn vs. WiscKey Separation:**
@@ -54,5 +54,5 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 
 | SQL Read + LRU Tracking Strategy | Read Throughput | Average Read Latency | Disk Write I/O Generated |
 | :--- | ---: | ---: | ---: |
-| **Vanilla SQLite (`SELECT` + `UPDATE access_tick`)** | `22,156 ops/s` | `45.13 µs` | `0.03 MB` WAL + B-Tree Page Dirtying |
-| **`aydb` Virtual Table (`SELECT` w/ Lazy `AccessTracker`)** | **`203,340 ops/s` (`9.18×` faster)** | **`4.92 µs` (`9.17×` lower)** | **`0.00 MB` (Pure In-Memory Update)** |
+| **Vanilla SQLite (`SELECT` + `UPDATE access_tick`)** | `22,691 ops/s` | `44.07 µs` | `0.03 MB` WAL + B-Tree Page Dirtying |
+| **`aydb` Virtual Table (`SELECT` w/ Lazy `AccessTracker`)** | **`215,396 ops/s` (`9.49×` faster)** | **`4.64 µs` (`9.50×` lower)** | **`0.00 MB` (Pure In-Memory Update)** |
