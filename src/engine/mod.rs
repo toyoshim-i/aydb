@@ -119,6 +119,11 @@ pub struct StorageEngine<FS: PlatformFs> {
     capped_tables: HashMap<u16, CappedTableState>,
     /// Bounded in-memory `AccessTick` tracker.
     access_tracker: AccessTracker,
+    /// Transaction nesting depth (`xBegin` / `xCommit`). While `tx_depth > 0`, `WalRecord` items
+    /// are coalesced into `pending_tx_records` and committed as a single atomic `WalBatch` on `commit_transaction`!
+    tx_depth: usize,
+    pending_tx_records: Vec<WalRecord>,
+    pending_tx_sync: bool,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -299,6 +304,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_lru_writers: HashMap::new(),
             capped_tables,
             access_tracker: AccessTracker::new(1, 65_536),
+            tx_depth: 0,
+            pending_tx_records: Vec::new(),
+            pending_tx_sync: false,
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
@@ -527,13 +535,65 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Scans all live rows `(pk, value)` in `table_id` in ascending memcomparable primary-key order.
     pub fn scan_table(&mut self, table_id: u16) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_table_range(table_id, None, None, usize::MAX)
+    }
+
+    /// Scans up to `limit` live rows `(pk, value)` in `table_id` within `lower_bound` and `upper_bound`
+    /// (`(bound_pk_bytes, inclusive)`), seeking directly via Sparse Fence Pointers!
+    pub fn scan_table_range(
+        &mut self,
+        table_id: u16,
+        lower_bound: Option<(&[u8], bool)>,
+        upper_bound: Option<(&[u8], bool)>,
+        limit: usize,
+    ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
-        let merged = self.scan_merged_prefix(&prefix)?;
-        let mut rows = Vec::with_capacity(merged.len());
+        let seek_key = match lower_bound {
+            Some((lb_pk, _)) => encode_primary_row_key(table_id, lb_pk),
+            None => prefix.to_vec(),
+        };
+        let upper_full = upper_bound.map(|(ub_pk, inc)| (encode_primary_row_key(table_id, ub_pk), inc));
+
+        // Fetch enough entries from the merged prefix scan to satisfy `limit` live rows
+        let fetch_cap = if limit == usize::MAX {
+            usize::MAX
+        } else {
+            limit.saturating_add(16)
+        };
+        let merged = self.scan_merged_prefix_range(
+            &prefix,
+            &seek_key,
+            upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
+            fetch_cap,
+        )?;
+        let mut rows = Vec::with_capacity(merged.len().min(limit));
+
         for entry in merged {
             let Some(pk) = decode_primary_row_key(table_id, &entry.key) else {
                 continue;
             };
+            if let Some((lb_pk, inclusive)) = lower_bound {
+                if inclusive {
+                    if pk < lb_pk {
+                        continue;
+                    }
+                } else if pk <= lb_pk {
+                    continue;
+                }
+            }
+            if let Some((ub_pk, inclusive)) = upper_bound {
+                if inclusive {
+                    if pk > ub_pk {
+                        break;
+                    }
+                } else if pk >= ub_pk {
+                    break;
+                }
+            }
+
             let val_opt = match entry.value {
                 IndexValue::Inline(v) => Some(v),
                 IndexValue::Blob(ptr) => self.dereference_blob(&ptr, &entry.key)?,
@@ -541,6 +601,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             };
             if let Some(val) = val_opt {
                 rows.push((pk.to_vec(), val));
+                if rows.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(rows)
@@ -568,9 +631,50 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(pks)
     }
 
+    /// Begins an explicit batch transaction (`BEGIN`). Subsequent mutations apply immediately to
+    /// the in-memory `MemTable` (for read-your-own-writes visibility) while coalescing their
+    /// [`WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`commit_transaction`].
+    pub fn begin_transaction(&mut self) {
+        self.tx_depth += 1;
+    }
+
+    /// Commits an explicit batch transaction (`COMMIT`), writing all coalesced [`WalRecord`]
+    /// entries in a single [`WalBatch`] syscall!
+    pub fn commit_transaction(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.tx_depth -= 1;
+        }
+        if self.tx_depth == 0 {
+            self.flush_pending_tx_records()?;
+            if self.memtable.should_flush() {
+                self.flush_memtable()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_tx_records(&mut self) -> io::Result<()> {
+        if self.pending_tx_records.is_empty() {
+            return Ok(());
+        }
+        let records = core::mem::take(&mut self.pending_tx_records);
+        let durability = if self.pending_tx_sync {
+            WriteDurability::SyncTransactional
+        } else {
+            WriteDurability::BufferedFast
+        };
+        self.pending_tx_sync = false;
+
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+        let batch = WalBatch::new(lsn, records);
+        self.append_wal_batch_with_rotation(&batch, durability)
+    }
+
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
     /// WAL streams to `epoch + 1` in $O(1)$ without zero-filling, and atomically commits `boot_meta.db`.
     pub fn flush_memtable(&mut self) -> io::Result<()> {
+        self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
             return Ok(());
@@ -1023,16 +1127,43 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.next_lsn += 1;
         let batch = WalBatch::new(lsn, records);
 
+        // Always apply to MemTable immediately for read-your-own-writes visibility inside a transaction
+        self.memtable.apply_wal_batch(&batch);
+
+        if self.tx_depth > 0 {
+            if durability == WriteDurability::SyncTransactional {
+                self.pending_tx_sync = true;
+            }
+            self.pending_tx_records.extend(batch.records);
+            // If pending records approach 256 KB during a huge bulk transaction, flush an intermediate batch
+            if self.pending_tx_records.len() >= 2048 {
+                self.flush_pending_tx_records()?;
+            }
+            return Ok(lsn);
+        }
+
+        self.append_wal_batch_with_rotation(&batch, durability)?;
+        if self.memtable.should_flush() {
+            self.flush_memtable()?;
+        }
+        Ok(lsn)
+    }
+
+    fn append_wal_batch_with_rotation(
+        &mut self,
+        batch: &WalBatch,
+        durability: WriteDurability,
+    ) -> io::Result<()> {
         let outcome = match durability {
-            WriteDurability::SyncTransactional => self.sync_wal.append_batch(&batch)?,
-            WriteDurability::BufferedFast => self.buf_wal.append_batch(&batch)?,
+            WriteDurability::SyncTransactional => self.sync_wal.append_batch(batch)?,
+            WriteDurability::BufferedFast => self.buf_wal.append_batch(batch)?,
         };
 
         if outcome == WalAppendOutcome::RingFull {
             self.flush_memtable()?;
             let retry = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.append_batch(&batch)?,
-                WriteDurability::BufferedFast => self.buf_wal.append_batch(&batch)?,
+                WriteDurability::SyncTransactional => self.sync_wal.append_batch(batch)?,
+                WriteDurability::BufferedFast => self.buf_wal.append_batch(batch)?,
             };
             if retry == WalAppendOutcome::RingFull {
                 return Err(io::Error::new(
@@ -1041,12 +1172,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 ));
             }
         }
-
-        self.memtable.apply_wal_batch(&batch);
-        if self.memtable.should_flush() {
-            self.flush_memtable()?;
-        }
-        Ok(lsn)
+        Ok(())
     }
 
     fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
@@ -1071,13 +1197,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         seek_key: &[u8],
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
+        self.scan_merged_prefix_range(prefix, seek_key, None, limit)
+    }
+
+    fn scan_merged_prefix_range(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
+    ) -> io::Result<Vec<IndexEntry>> {
         let mut merged_map: BTreeMap<Vec<u8>, (u64, IndexValue)> = BTreeMap::new();
         for seg in &self.idx_segments {
-            for entry in seg.scan_prefix_from(prefix, seek_key, limit)? {
+            for entry in seg.scan_prefix_range(prefix, seek_key, upper_key_bound, limit)? {
                 merged_map.insert(entry.key, (entry.lsn, entry.value));
             }
         }
-        for entry in self.memtable.scan_prefix_from(prefix, seek_key, limit) {
+        for entry in self
+            .memtable
+            .scan_prefix_range(prefix, seek_key, upper_key_bound, limit)
+        {
             merged_map.insert(entry.key, (entry.lsn, entry.value));
         }
         Ok(merged_map

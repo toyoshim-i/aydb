@@ -52,6 +52,7 @@ pub const SQLITE_INDEX_CONSTRAINT_GT: c_uchar = 4;
 pub const SQLITE_INDEX_CONSTRAINT_LE: c_uchar = 8;
 pub const SQLITE_INDEX_CONSTRAINT_LT: c_uchar = 16;
 pub const SQLITE_INDEX_CONSTRAINT_GE: c_uchar = 32;
+pub const SQLITE_INDEX_CONSTRAINT_LIMIT: c_uchar = 73;
 
 pub const SQLITE_INDEX_SCAN_UNIQUE: c_int = 1;
 

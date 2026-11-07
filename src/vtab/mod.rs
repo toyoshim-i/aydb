@@ -20,8 +20,9 @@ use crate::util::crc32c::crc32c;
 use crate::vtab::ffi::{
     SQLITE_BLOB, SQLITE_DONE, SQLITE_ERROR, SQLITE_FLOAT, SQLITE_INDEX_CONSTRAINT_EQ,
     SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE,
-    SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK,
-    SQLITE_ROW, SQLITE_TEXT, sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    SQLITE_INDEX_CONSTRAINT_LIMIT, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
+    SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW, SQLITE_TEXT, sqlite_transient, sqlite3,
+    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
     sqlite3_bind_text, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
     sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text,
     sqlite3_column_type, sqlite3_context, sqlite3_create_module_v2, sqlite3_declare_vtab,
@@ -41,6 +42,7 @@ const RANGE_FLAG_LOWER_INCLUSIVE: c_int = 0x01;
 const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
 const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
 const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
+const RANGE_FLAG_HAS_LIMIT: c_int = 0x10;
 
 /// Static `sqlite3_module` method table registered with `sqlite3_create_module_v2`.
 static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
@@ -58,10 +60,10 @@ static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xColumn: Some(vtab_column),
     xRowid: Some(vtab_rowid),
     xUpdate: Some(vtab_update),
-    xBegin: Some(vtab_noop_tx),
+    xBegin: Some(vtab_begin_tx),
     xSync: Some(vtab_noop_tx),
-    xCommit: Some(vtab_noop_tx),
-    xRollback: Some(vtab_noop_tx),
+    xCommit: Some(vtab_commit_tx),
+    xRollback: Some(vtab_commit_tx),
     xFindFunction: None,
     xRename: None,
     xSavepoint: None,
@@ -304,11 +306,19 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
-        // 3. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on Primary Key
+        // 3. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on Primary Key + optional LIMIT
         let mut lower_idx: Option<(usize, c_int)> = None;
         let mut upper_idx: Option<(usize, c_int)> = None;
+        let mut limit_idx: Option<usize> = None;
         for i in 0..n {
-            if constraints[i].usable == 0 || constraints[i].iColumn != vtab.pk_col_idx as i32 {
+            if constraints[i].usable == 0 {
+                continue;
+            }
+            if constraints[i].op == SQLITE_INDEX_CONSTRAINT_LIMIT && limit_idx.is_none() {
+                limit_idx = Some(i);
+                continue;
+            }
+            if constraints[i].iColumn != vtab.pk_col_idx as i32 {
                 continue;
             }
             match constraints[i].op {
@@ -328,6 +338,12 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
+        // Check if `ORDER BY pk ASC` can be satisfied directly by the memcomparable PK scan
+        let order_by_pk_asc = info.nOrderBy == 1 && {
+            let ob = &*info.aOrderBy;
+            (ob.iColumn == vtab.pk_col_idx as i32 || ob.iColumn == -1) && ob.desc == 0
+        };
+
         if lower_idx.is_some() || upper_idx.is_some() {
             let mut flags = 0;
             let mut next_arg = 1;
@@ -340,7 +356,17 @@ unsafe extern "system" fn vtab_best_index(
             if let Some((i, fl)) = upper_idx {
                 usages[i].argvIndex = next_arg;
                 usages[i].omit = 1;
+                next_arg += 1;
                 flags |= fl;
+            }
+            if let Some(lim_i) = limit_idx {
+                if info.nOrderBy == 0 || order_by_pk_asc {
+                    usages[lim_i].argvIndex = next_arg;
+                    flags |= RANGE_FLAG_HAS_LIMIT;
+                }
+            }
+            if order_by_pk_asc {
+                info.orderByConsumed = 1;
             }
             info.idxNum = PLAN_PK_RANGE | (flags << 8);
             info.estimatedCost = 25.0;
@@ -349,6 +375,9 @@ unsafe extern "system" fn vtab_best_index(
         }
 
         // 4. Fallback: Full Table Scan
+        if order_by_pk_asc {
+            info.orderByConsumed = 1;
+        }
         info.idxNum = PLAN_FULL_SCAN;
         info.estimatedCost = 10_000.0;
         info.estimatedRows = 1_000;
@@ -462,31 +491,25 @@ unsafe extern "system" fn vtab_filter(
                     && arg_pos < argc
                 {
                     let b = SqlValue::from_sqlite_value(*argv.offset(arg_pos as isize)).to_key_bytes();
+                    arg_pos += 1;
                     Some((b, (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0))
                 } else {
                     None
                 };
+                let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && arg_pos < argc {
+                    let lim_val = sqlite3_value_int64(*argv.offset(arg_pos as isize));
+                    if lim_val > 0 { lim_val as usize } else { 0 }
+                } else {
+                    usize::MAX
+                };
 
-                if let Ok(all_rows) = eng.scan_table(vtab.table_id) {
-                    for (pk, row_bytes) in all_rows {
-                        if let Some((ref lb, inclusive)) = lower_bound {
-                            if inclusive {
-                                if &pk < lb {
-                                    continue;
-                                }
-                            } else if &pk <= lb {
-                                continue;
-                            }
-                        }
-                        if let Some((ref ub, inclusive)) = upper_bound {
-                            if inclusive {
-                                if &pk > ub {
-                                    break;
-                                }
-                            } else if &pk >= ub {
-                                break;
-                            }
-                        }
+                if let Ok(range_rows) = eng.scan_table_range(
+                    vtab.table_id,
+                    lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    limit,
+                ) {
+                    for (pk, row_bytes) in range_rows {
                         let rid = pk_to_rowid(&pk);
                         rmap.insert(rid, pk.clone());
                         cursor.rows.push((rid, pk, row_bytes));
@@ -659,6 +682,28 @@ unsafe extern "system" fn vtab_update(
         rmap.insert(rid, new_pk);
         if !p_rowid.is_null() {
             *p_rowid = rid;
+        }
+        SQLITE_OK
+    }
+}
+
+unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
+    unsafe {
+        let vtab = &*(p_vtab as *const AydbVTab);
+        if let Ok(mut eng) = vtab.engine.lock() {
+            eng.begin_transaction();
+        }
+        SQLITE_OK
+    }
+}
+
+unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
+    unsafe {
+        let vtab = &*(p_vtab as *const AydbVTab);
+        if let Ok(mut eng) = vtab.engine.lock() {
+            if eng.commit_transaction().is_err() {
+                return SQLITE_ERROR;
+            }
         }
         SQLITE_OK
     }

@@ -732,7 +732,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
 
     /// Scans all entries whose keys start with `prefix`.
     pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<IndexEntry>> {
-        self.scan_prefix_from(prefix, prefix, usize::MAX)
+        self.scan_prefix_range(prefix, prefix, None, usize::MAX)
     }
 
     /// Scans up to `limit` entries starting at `seek_key` whose keys still begin with `prefix`.
@@ -740,6 +740,18 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         &self,
         prefix: &[u8],
         seek_key: &[u8],
+        limit: usize,
+    ) -> io::Result<Vec<IndexEntry>> {
+        self.scan_prefix_range(prefix, seek_key, None, limit)
+    }
+
+    /// Scans up to `limit` entries starting at `seek_key`, stopping as soon as an entry
+    /// stops starting with `prefix` or exceeds `upper_key_bound` (`(bound_full_key, inclusive)`).
+    pub fn scan_prefix_range(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
         let mut out = Vec::new();
@@ -765,6 +777,15 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
                 }
                 if !entry.key.starts_with(prefix) {
                     return Ok(out);
+                }
+                if let Some((ub, inclusive)) = upper_key_bound {
+                    if inclusive {
+                        if entry.key.as_slice() > ub {
+                            return Ok(out);
+                        }
+                    } else if entry.key.as_slice() >= ub {
+                        return Ok(out);
+                    }
                 }
                 out.push(entry);
                 if out.len() >= limit {

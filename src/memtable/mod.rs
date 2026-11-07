@@ -119,6 +119,17 @@ impl MemTable {
         seek_key: &[u8],
         limit: usize,
     ) -> Vec<IndexEntry> {
+        self.scan_prefix_range(prefix, seek_key, None, limit)
+    }
+
+    /// Scans up to `limit` entries in the `MemTable` starting at `seek_key`, stopping at `upper_key_bound`.
+    pub fn scan_prefix_range(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
+    ) -> Vec<IndexEntry> {
         let mut out = Vec::new();
         if limit == 0 {
             return out;
@@ -131,6 +142,15 @@ impl MemTable {
         for (k, entry) in self.map.range(start..) {
             if !k.starts_with(prefix) {
                 break;
+            }
+            if let Some((ub, inclusive)) = upper_key_bound {
+                if inclusive {
+                    if k.as_slice() > ub {
+                        break;
+                    }
+                } else if k.as_slice() >= ub {
+                    break;
+                }
             }
             out.push(IndexEntry {
                 key: k.clone(),
