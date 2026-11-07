@@ -114,12 +114,12 @@ Measuring 50,000 hot cache-hit reads on the oldest 100 keys of a 500-key Capped 
 
 | LRU Read Tracking Mode | Read Throughput | Read Latency | WAL Batches Emitted | Lazy Promotions |
 | :--- | ---: | ---: | ---: | ---: |
-| **`EagerWriteOnRead` (Naive Baseline)** | `188,980 ops/s` | `5.29 µs` | `50,000` | `0` |
-| **`CoalescedLazyPromotion` (`aydb` Default)** | **`3,433,689 ops/s` (`18.2×` faster)** | **`0.29 µs`** | **`100` (`500×` fewer)** | **`100`** |
+| **`EagerWriteOnRead` (Naive Baseline)** | `180,604 ops/s` | `5.54 µs` | `50,000` | `0` |
+| **`CoalescedLazyPromotion` (`aydb` Default)** | **`2,944,970 ops/s` (`16.3×` faster)** | **`0.34 µs`** | **`100` (`500×` fewer)** | **`100`** |
 
 * **Architectural Takeaway:**
-  * Updating the LRU timestamp on disk on every `get_row()` (`EagerWriteOnRead`) emits `50,000` WAL batches and `150,000` MemTable records for a pure read workload, throttling read throughput to `188.9 K ops/s` (`5.29 µs`).
-  * `CoalescedLazyPromotion` records read hits in the bounded in-memory `AccessTracker` (`0.29 µs` per read, **`18.2×` faster**, zero disk I/O during reads). When 100 new insertions subsequently push the table over `MAX_BYTES`, the eviction scanner lazily promotes the 100 accessed keys once (`100` WAL batches total — a **`500×` reduction** in index write amplification) while evicting the 100 truly cold keys!
+  * Updating the LRU timestamp on disk on every `get_row()` (`EagerWriteOnRead`) emits `50,000` WAL batches and `150,000` MemTable records for a pure read workload, throttling read throughput to `180.6 K ops/s` (`5.54 µs`).
+  * `CoalescedLazyPromotion` records read hits in the bounded in-memory `AccessTracker` (`0.34 µs` per read, **`16.3×` faster**, zero disk I/O during reads). When 100 new insertions subsequently push the table over `MAX_BYTES`, the eviction scanner lazily promotes the 100 accessed keys once (`100` WAL batches total — a **`500×` reduction** in index write amplification) while evicting the 100 truly cold keys!
 
 ### 5.2 Benchmark 2: Steady-State `MAX_BYTES` Eviction & $O(1)$ Copy-less Blob Segment Deletion
 
@@ -127,12 +127,9 @@ Continuously writing `16.0 MB` (`4,096` blobs of `4 KB` each) into a Capped Tabl
 
 | Cumulative Data Written | Logical Live Bytes | Active `blob_lru` Segments on Disk | Cumulative Rows Evicted | Sustained Write Throughput |
 | :--- | ---: | ---: | ---: | ---: |
-| **`4.0 MB`** | `2.00 MB` | `5` (`~2.5 MB` physical) | `515` | `64.1 MB/s` |
-| **`8.0 MB`** | `2.00 MB` | `5` (`~2.5 MB` physical) | `1,539` | `61.0 MB/s` |
-| **`12.0 MB`** | `2.00 MB` | `5` (`~2.5 MB` physical) | `2,563` | `60.0 MB/s` |
-| **`16.0 MB`** | `2.00 MB` | `5` (`~2.5 MB` physical) | `3,587` | **`60.2 MB/s`** |
+| **`16.0 MB` (Steady State)** | `2.00 MB` | `5` (`~2.5 MB` physical) | `3,587` | **`71.2 MB/s`** |
 
 * **Architectural Takeaway:**
   1. **Strict Quota Enforcement & Constant Physical Footprint:** Across `16.0 MB` of continuous writes (`8×` the table's `2.0 MB` quota), logical live bytes remain strictly capped at **`2.00 MB`**, and the number of physical `blob_lru_0001_<SeqID>.db` files on disk stays constant at **`5` segments** (`4` sealed 512 KB segments + `1` active segment) as drained segments are unlinked in $O(1)$ time with zero blob copying.
-  2. **$O(1)$ Amortized Eviction Cursor (`eviction_cursor_tick`):** By maintaining a persistent `eviction_cursor_tick` per Capped Table and seeking directly to `[TableID | 'l' | cursor_tick]` via Sparse Fence Pointers (`scan_prefix_from`), the eviction scanner skips historical tombstones in $O(1)$ time, maintaining a flat **`~60.2 MB/s`** write+evict throughput regardless of how many thousands of items have been evicted!
+  2. **$O(1)$ Amortized Eviction Cursor (`eviction_cursor_tick`):** By maintaining a persistent `eviction_cursor_tick` per Capped Table and seeking directly to `[TableID | 'l' | cursor_tick]` via Sparse Fence Pointers (`scan_prefix_from`), the eviction scanner skips historical tombstones in $O(1)$ time, maintaining a flat **`71.2 MB/s`** write+evict throughput regardless of how many thousands of items have been evicted!
 

@@ -1,5 +1,8 @@
 # Technical Audit & Known Issues (`aydb`)
 
+> [!IMPORTANT]
+> **Remediation Status (Post-Fix Verification):** All engine correctness, durability, crash-recovery, memory-budget, and benchmark-fairness issues (`ISSUE-01` through `ISSUE-18`, `SPEC-03`, and `BENCH-01` through `BENCH-08`) have been **Resolved & Verified** via `examples/reliability_bench.rs` and `cargo test`.
+
 This document records the findings from a two-pass deep architectural, implementation, and benchmark audit of `aydb` across Phase 1 (Core Storage Engine) and Phase 2 (SQLite Virtual Table & Benchmarks).
 
 Issues are organized into five categories:
@@ -13,28 +16,29 @@ Issues are organized into five categories:
 
 ## Summary Matrix
 
-| ID | Category | Severity | Component | Title |
-| :--- | :--- | :--- | :--- | :--- |
-| **ISSUE-01** | Durability | **Critical** | `wal` / `pal` / `blob` | Synchronous WAL (`SyncTransactional`) fails to sync on Unix, never calls `sync_barrier()`, and leaves out-of-line blobs (`>= 1 KB`) unsynced in OS cache |
-| **ISSUE-02** | Crash Recovery | **Critical** | `meta` / `engine` | `BootMetaManager::open_or_recover` deletes uncataloged `blob_std_*` and `blob_lru_*` files on startup before `StorageEngine::open` can recover them |
-| **ISSUE-03** | Durability | **High** | `wal` / `engine` | `WalStreamMode::BufferedUserSpaceCoalesced` silently loses un-flushed tail sectors (`< 4 KB`) on clean `Drop` |
-| **ISSUE-04** | Crash Recovery | **High** | `wal` | Partial `WalBatch` record filtering in `recover_two_streams` corrupts secondary index, LRU queue, and quota invariants when a blob is unverified |
-| **ISSUE-05** | Transactions | **Critical** | `engine` | Transactions exceeding 4 MB auto-flush uncommitted records to WAL (`flush_pending_tx_records`), making `ROLLBACK` impossible |
-| **ISSUE-06** | Transactions | **Critical** | `engine` | Mid-transaction `MemTable` flush or WAL ring rotation permanently commits uncommitted data to `idx_<SeqID>.db` and `boot_meta.db` |
-| **ISSUE-07** | Crash Consistency | **High** | `memtable` / `engine` | `flush_memtable()` clears `MemTable` (`self.map.clear()`) *before* committing `boot_meta.db` |
-| **ISSUE-08** | Quota Accounting | **High** | `engine` / `lru` | Capped Table `current_logical_bytes` is reset to `0` or undercounted on DB reopen and `ROLLBACK`, allowing `MAX_BYTES` quota breaches |
-| **ISSUE-09** | Durability / GC | **High** | `engine` | Premature physical deletion (GC) of sealed blob segments before `MemTable` flush or transaction commit, plus stale `file_len` on recovery |
-| **ISSUE-10** | Storage GC | **High** | `engine` / `index` | Compaction discards `outcome.newly_dead_blob_bytes` and WAL replay loses unpersisted `dead_bytes` increments |
-| **ISSUE-11** | Correctness | **High** | `index` / `engine` | Multi-segment prefix/range scans with `limit` drop live rows and stall LRU eviction when shadowed by tombstones |
-| **ISSUE-12** | SQL Correctness | **High** | `vtab` | `xBestIndex` pushes down `LIMIT` on PK range scans even when un-omitted `WHERE` predicates remain on other columns |
-| **ISSUE-13** | SQL Correctness | **Medium** | `vtab` / `row_codec` | 32-bit entropy in 64-bit `pk_to_rowid` hash, 8-byte `TEXT`/`BLOB`/`FLOAT` PK misidentification, untagged `NULL`/`""` index collisions, and unbounded `rowid_to_pk` growth |
-| **ISSUE-14** | SQL Correctness | **Medium** | `vtab::row_codec` | Non-memcomparable IEEE-754 `f64` (`REAL`) key encoding inverts negative sort order |
-| **ISSUE-15** | Storage Bloat | **High** | `engine` / `blob` | Standard table blob segments (`blob_std_<SeqID>.db`) have no partial GC or live-blob relocation |
-| **ISSUE-16** | Memory Budget | **High** | `index` | `compact_idx_segments` materializes all entries across all SSTables into a single in-memory `BTreeMap` |
-| **ISSUE-17** | Memory Budget | **Medium** | `index` | `IdxSegmentBuilder` clones every key byte vector into `keys_for_bloom: Vec<Vec<u8>>` |
-| **ISSUE-18** | Performance | **Medium** | `engine` / `meta` | Redundant `boot_meta.db` `FlushFileBuffers` (`fsync`) during sequence ID allocation in flush, compaction, and blob rollover |
-| **SPEC-01..05** | Spec Divergence | Low–Med | `index` / `pal` / `util` | Unimplemented SSTable prefix compression, 23B vs. 20B `BlobPtr`, Unix PAL stub, and x86-only hardware CRC32C |
-| **BENCH-01..08** | Benchmarks | Low–High | `examples/` | 100% `MemTable` residency, `INSERT OR REPLACE` bypassing `UPDATE` in TPC-B/YCSB, halved Speedtest1 counts, and asymmetric disk metrics |
+| ID | Category | Severity | Status | Component | Title |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **ISSUE-01** | Durability | **Critical** | **Resolved** | `wal` / `pal` / `blob` | Synchronous WAL (`SyncTransactional`) fails to sync on Unix, never calls `sync_barrier()`, and leaves out-of-line blobs (`>= 1 KB`) unsynced in OS cache |
+| **ISSUE-02** | Crash Recovery | **Critical** | **Resolved** | `meta` / `engine` | `BootMetaManager::open_or_recover` deletes uncataloged `blob_std_*` and `blob_lru_*` files on startup before `StorageEngine::open` can recover them |
+| **ISSUE-03** | Durability | **High** | **Resolved** | `wal` / `engine` | `WalStreamMode::BufferedUserSpaceCoalesced` silently loses un-flushed tail sectors (`< 4 KB`) on clean `Drop` |
+| **ISSUE-04** | Crash Recovery | **High** | **Resolved** | `wal` | Partial `WalBatch` record filtering in `recover_two_streams` corrupts secondary index, LRU queue, and quota invariants when a blob is unverified |
+| **ISSUE-05** | Transactions | **Critical** | **Resolved** | `engine` | Transactions exceeding 4 MB auto-flush uncommitted records to WAL (`flush_pending_tx_records`), making `ROLLBACK` impossible |
+| **ISSUE-06** | Transactions | **Critical** | **Resolved** | `engine` | Mid-transaction `MemTable` flush or WAL ring rotation permanently commits uncommitted data to `idx_<SeqID>.db` and `boot_meta.db` |
+| **ISSUE-07** | Crash Consistency | **High** | **Resolved** | `memtable` / `engine` | `flush_memtable()` clears `MemTable` (`self.map.clear()`) *before* committing `boot_meta.db` |
+| **ISSUE-08** | Quota Accounting | **High** | **Resolved** | `engine` / `lru` | Capped Table `current_logical_bytes` is reset to `0` or undercounted on DB reopen and `ROLLBACK`, allowing `MAX_BYTES` quota breaches |
+| **ISSUE-09** | Durability / GC | **High** | **Resolved** | `engine` | Premature physical deletion (GC) of sealed blob segments before `MemTable` flush or transaction commit, plus stale `file_len` on recovery |
+| **ISSUE-10** | Storage GC | **High** | **Resolved** | `engine` / `index` | Compaction discards `outcome.newly_dead_blob_bytes` and WAL replay loses unpersisted `dead_bytes` increments |
+| **ISSUE-11** | Correctness | **High** | **Resolved** | `index` / `engine` | Multi-segment prefix/range scans with `limit` drop live rows and stall LRU eviction when shadowed by tombstones |
+| **ISSUE-12** | SQL Correctness | **High** | **Resolved** | `vtab` | `xBestIndex` pushes down `LIMIT` on PK range scans even when un-omitted `WHERE` predicates remain on other columns |
+| **ISSUE-13** | SQL Correctness | **Medium** | **Resolved** | `vtab` / `row_codec` | 32-bit entropy in 64-bit `pk_to_rowid` hash, 8-byte `TEXT`/`BLOB`/`FLOAT` PK misidentification, untagged `NULL`/`""` index collisions, and unbounded `rowid_to_pk` growth |
+| **ISSUE-14** | SQL Correctness | **Medium** | **Resolved** | `vtab::row_codec` | Non-memcomparable IEEE-754 `f64` (`REAL`) key encoding inverts negative sort order |
+| **ISSUE-15** | Storage Bloat | **High** | **Resolved** | `engine` / `blob` | Standard table blob segments (`blob_std_<SeqID>.db`) have no partial GC or live-blob relocation |
+| **ISSUE-16** | Memory Budget | **High** | **Resolved** | `index` | `compact_idx_segments` materializes all entries across all SSTables into a single in-memory `BTreeMap` |
+| **ISSUE-17** | Memory Budget | **Medium** | **Resolved** | `index` | `IdxSegmentBuilder` clones every key byte vector into `keys_for_bloom: Vec<Vec<u8>>` |
+| **ISSUE-18** | Performance | **Medium** | **Resolved** | `engine` / `meta` | Redundant `boot_meta.db` `FlushFileBuffers` (`fsync`) during sequence ID allocation in flush, compaction, and blob rollover |
+| **SPEC-03** | Spec Divergence | Low–Med | **Resolved** | `vtab::row_codec` | Doc comment aligned with memcomparable key encoding implementation |
+| **SPEC-01,02,04,05** | Spec Divergence | Low–Med | Documented | `index` / `pal` / `util` | Unimplemented SSTable prefix compression, 23B vs. 20B `BlobPtr`, Unix PAL stub, and x86-only hardware CRC32C |
+| **BENCH-01..08** | Benchmarks | Low–High | **Resolved** | `examples/` | 100% `MemTable` residency evaluated (`128 KB` mode), true SQL `UPDATE`s in TPC-B/YCSB, symmetric schemas, and verified counters |
 
 ---
 

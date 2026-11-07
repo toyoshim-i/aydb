@@ -75,19 +75,21 @@ All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Vir
 
 | Benchmark Suite | Workload Description | `aydb` | Vanilla SQLite (`WAL`) | Speedup |
 | :--- | :--- | ---: | ---: | ---: |
-| **SQLite `Speedtest1`** | Official 5,000-row full SQL workload suite (Tests 100–240 total) | **`56.29 ms`** | `62.85 ms` | **`1.12×` faster** |
-| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s | **`4.75 ms`** (`1,053K qps`) | `15.83 ms` (`316K qps`) | **`3.33×` faster** |
-| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE b = ?`) | **`6.77 ms`** (`739K qps`) | `16.66 ms` (`300K qps`) | **`2.46×` faster** |
-| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`4.22 ms`** (`237K qps`) | `5.80 ms` (`172K qps`) | **`1.37×` faster** |
-| **YCSB Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey) | **`323K` / `108K ops/s`** | `30.5K` / `13.3K ops/s` | **`10.60×` / `8.10×` faster** |
-| **YCSB Workload B** | 95% Read / 5% Update (`256 B` inline / `2 KB` WiscKey) | **`902K` / `172K ops/s`** | `213K` / `93.2K ops/s` | **`4.24×` / `1.85×` faster** |
-| **YCSB Workload C** | 100% Point Read (`256 B` inline) | **`1,234K ops/s`** | `286K ops/s` | **`4.31×` faster** |
-| **YCSB Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline) | **`294K ops/s`** | `28.5K ops/s` | **`10.35×` faster** |
-| **TPC-B (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` vs `synchronous=FULL`) | **`11,417 TPS`** (`87.6 µs`) | `581 TPS` (`1,721 µs`) | **`19.65×` faster** |
-| **TPC-B (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` vs `synchronous=NORMAL`) | **`117,368 TPS`** (`8.5 µs`) | `15,567 TPS` (`64.2 µs`) | **`7.54×` faster** |
-| **Hybrid Config Sync** | 1,000 Synchronous `128 B` Settings Updates | **`12,808 tx/s`** (`75.7 µs` P50) | `578 tx/s` (`1,719 µs` P50) | **`22.16×` faster** |
-| **Bounded Blob Cache** | 500 × `16 KB` Churn (`4.0 MB` Quota Enforcement) | **`153.4 MB/s`** (`3.98 MB` disk) | `58.0 MB/s` (`8.18 MB` disk) | **`2.64×` faster (`0.5×` space)** |
-| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking | **`215,396 ops/s`** (`0 MB` written) | `22,691 ops/s` (`~98 MB` WAL) | **`9.49×` faster** |
+| **SQLite `Speedtest1`** | Official 5,000-row full SQL workload suite (Tests 100–240 total) | **`63.12 ms`** | `70.06 ms` | **`1.11×` faster** |
+| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s | **`4.92 ms`** (`1,016K qps`) | `16.54 ms` (`302K qps`) | **`3.37×` faster** |
+| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE b = ?`) | **`7.31 ms`** (`684K qps`) | `18.65 ms` (`268K qps`) | **`2.55×` faster** |
+| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`4.15 ms`** (`241K qps`) | `6.04 ms` (`166K qps`) | **`1.46×` faster** |
+| **YCSB Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey) | **`278K`** / `81.8K ops/s` | `209K` / `134K ops/s` | **`1.33×`** / `0.61×` |
+| **YCSB Workload B** | 95% Read / 5% Update (`256 B` inline / `2 KB` WiscKey) | **`872K`** / `148K ops/s` | `259K` / `153K ops/s` | **`3.37×`** / `0.97×` |
+| **YCSB Workload C** | 100% Point Read (`256 B` inline / `2 KB` WiscKey) | **`1,216K`** / `171K ops/s` | `275K` / `172K ops/s` | **`4.42×`** / `1.00×` |
+| **YCSB Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey) | **`748K` / `162K ops/s`** | `191K` / `94.3K ops/s` | **`3.90×` / `1.72×` faster** |
+| **YCSB Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey) | **`225K`** / `20.6K ops/s` | `96.6K` / `40.6K ops/s` | **`2.33×`** / `0.51×` |
+| **YCSB Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey) | **`240K`** / `67.2K ops/s` | `154K` / `107K ops/s` | **`1.56×`** / `0.63×` |
+| **TPC-B (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` vs `synchronous=FULL`) | **`10,668 TPS`** (`93.7 µs`) | `566 TPS` (`1,767 µs`) | **`18.85×` faster** |
+| **TPC-B (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` vs `synchronous=NORMAL`) | **`112,610 TPS`** (`8.9 µs`) | `15,604 TPS` (`64.1 µs`) | **`7.22×` faster** |
+| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates | **`12,523 tx/s`** (`78.8 µs` P50) | `535 tx/s` (`1,858.0 µs` P50) | **`23.4×` faster** |
+| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`4.0 MB` Quota Enforcement) | **`167.1 MB/s`** (`3.98 MB` disk) | `69.0 MB/s` (`8.15 MB` disk) | **`2.42×` faster (`0.5×` space)** |
+| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking | **`193,852 ops/s`** (`0.00 MB` RAM) | `24,036 ops/s` (`0.03 MB` WAL) | **`8.06×` faster** |
 
 ---
 

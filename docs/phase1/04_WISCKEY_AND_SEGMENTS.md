@@ -166,22 +166,22 @@ Executed on Windows 11 NVMe via `cargo run --release --example wisckey_bench`.
 
 ### 5.1 Benchmark 1: WiscKey KV Separation vs. Inline Storage (`INLINE_THRESHOLD` Validation)
 
-Measuring 4-way merge compaction and point-read latency across 4 segments $\times$ 1,500 keys:
+Measuring 4-way merge compaction and point-read latency across 4 segments $\times$ 1,500 partitioned keys:
 
 | Value Size | Storage Mode | Point Read Latency | 4-Way Compaction Time | Compaction Write Volume | In-Heap Index (Fence + Bloom) |
 | :--- | :--- | ---: | ---: | ---: | ---: |
-| **128 B** | **Inline** | `3.74 µs` | `6.28 ms` | `0.23 MB` | `3.76 KB` |
-| **128 B** | **WiscKey** | `6.38 µs` | `5.25 ms` | `0.07 MB` | `2.43 KB` |
-| **512 B** | **Inline** | `3.83 µs` | `11.51 ms` | `0.84 MB` | `8.97 KB` |
-| **512 B** | **WiscKey** | `6.67 µs` | `4.86 ms` | `0.07 MB` | `2.43 KB` |
-| **1024 B** | **Inline** | `3.84 µs` | `20.71 ms` | `1.96 MB` | `18.43 KB` |
-| **1024 B** | **WiscKey** | `6.87 µs` | `4.94 ms` | `0.07 MB` | `2.43 KB` |
-| **2048 B** | **Inline** | `5.12 µs` | `48.28 ms` | `5.88 MB` | `51.64 KB` |
-| **2048 B** | **WiscKey** | `7.30 µs` | `4.60 ms` | `0.07 MB` | `2.43 KB` |
+| **128 B** | **Inline** | `3.91 µs` | `5.11 ms` | `0.91 MB` | `14.99 KB` |
+| **128 B** | **WiscKey** | `6.94 µs` | `3.42 ms` | `0.28 MB` | `9.62 KB` |
+| **512 B** | **Inline** | `4.26 µs` | `12.34 ms` | `3.37 MB` | `35.81 KB` |
+| **512 B** | **WiscKey** | `7.83 µs` | `3.84 ms` | `0.28 MB` | `9.62 KB` |
+| **1024 B** | **Inline** | `4.60 µs` | `28.15 ms` | `7.85 MB` | `73.73 KB` |
+| **1024 B** | **WiscKey** | `8.34 µs` | `2.98 ms` | `0.28 MB` | `9.62 KB` |
+| **2048 B** | **Inline** | `9.50 µs` | `80.12 ms` | `23.54 MB` | `206.54 KB` |
+| **2048 B** | **WiscKey** | `8.28 µs` | `2.74 ms` | `0.28 MB` | `9.62 KB` |
 
 * **Architectural Takeaway:**
-  * At **128 B**, Inline storage avoids a second `pread` (`3.74 µs` vs. `6.38 µs`) while adding minimal compaction overhead (`6.28 ms`).
-  * At **1024 B (`INLINE_THRESHOLD`)** and **2048 B**, Inline compaction write volume explodes to `1.96 MB` (`28×` WiscKey) and `5.88 MB` (`84×` WiscKey), slowing compaction by **`4.2×` to `10.5×`** and bloating in-heap sparse fence pointers by **`7.6×` to `21.3×`** (`51.64 KB` vs. `2.43 KB`) because each 4 KB block can only fit 1–3 entries! Meanwhile, WiscKey keeps compaction write volume (`0.07 MB`), compaction latency (`~4.8 ms`), and heap index footprint (`2.43 KB`) **completely invariant to value size**.
+  * At **128 B**, Inline storage avoids a second `pread` (`3.91 µs` vs. `6.94 µs`) while adding minimal compaction overhead (`5.11 ms`).
+  * At **1024 B (`INLINE_THRESHOLD`)** and **2048 B**, Inline compaction write volume explodes to `7.85 MB` (`28×` WiscKey) and `23.54 MB` (`84×` WiscKey), slowing compaction by **`9.4×` to `29.2×`** and bloating in-heap sparse fence pointers by **`7.7×` to `21.5×`** (`206.54 KB` vs. `9.62 KB`) because each 4 KB block can only fit 1–3 entries! Meanwhile, WiscKey keeps compaction write volume (`0.28 MB`), compaction latency (`~2.7–3.8 ms`), and heap index footprint (`9.62 KB`) **completely invariant to value size**.
 
 ### 5.2 Benchmark 2: Bloom Filter `bits_per_key` Trade-off Across 10 Active Segments
 
