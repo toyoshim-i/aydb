@@ -19,13 +19,13 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 
 | Engine & Durability Mode | Throughput | P50 Latency | P99 Latency | Physical Bytes Written |
 | :--- | ---: | ---: | ---: | ---: |
-| **Vanilla SQLite (`WAL`, `synchronous = FULL`)** | `535 tx/s` | `1,858.0 µs` | `2,203.2 µs` | `3,769.8 KB` |
-| **`aydb` Virtual Table (`wal_sync.db` `WRITE_THROUGH`)** | **`12,523 tx/s` (`23.4×` faster)** | **`78.8 µs` (`23.6×` lower)** | **`125.2 µs` (`17.6×` lower)** | **`1,200.0 KB` (`3.1×` less)** |
+| **Vanilla SQLite (`WAL`, `synchronous = FULL`)** | `539 tx/s` | `1,832.0 µs` | `2,261.6 µs` | `3,769.8 KB` |
+| **`aydb` Virtual Table (`wal_sync.db` `WRITE_THROUGH`)** | **`11,976 tx/s` (`22.2×` faster)** | **`76.0 µs` (`24.1×` lower)** | **`120.6 µs` (`18.8×` lower)** | **`1,200.0 KB` (`3.1×` less)** |
 
 ### Architectural Root Cause Analysis
-1. **Why Vanilla SQLite Takes `1,858 µs` per Sync Commit:**
+1. **Why Vanilla SQLite Takes `1,832 µs` per Sync Commit:**
    * Even for a `128 B` row, SQLite's B-Tree + WAL must write an entire 4 KB database page image + 24-byte WAL frame header to the `-wal` file, extend the `-wal` file's NTFS `ValidDataLength (VDL)` (triggering a synchronous NTFS `$LogFile` metadata transaction), and invoke `FlushFileBuffers()`, which stalls the calling thread until the full storage flush barrier completes.
-2. **Why `aydb` Completes in `78.8 µs` (`23.4×` Faster):**
+2. **Why `aydb` Completes in `76.0 µs` (`22.2×` Faster):**
    * `aydb` pre-zeroes `wal_sync.db` (`2 MB`) at initialization so `VDL == EOF` permanently, and writes only a single 4 KB sector per transaction directly through `FILE_FLAG_WRITE_THROUGH` (`Force Unit Access` + `sync_barrier()`) without mutating NTFS file-length metadata or invoking a full-handle `FlushFileBuffers()` barrier.
 
 ---
@@ -35,28 +35,28 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 * **Workload:** Continuously inserting `2,000` HTTP cache responses of **`16 KB` each (`32.0 MB` total)** via SQL into a table capped at **`4.0 MB` (`~256` live blobs — an `8×` full cache turnover)**.
 * **Compared Configurations:**
   1. **Vanilla SQLite (`WAL`, `synchronous = NORMAL`):** Standard table `http_cache(url PRIMARY KEY, access_tick, body BLOB)` executing insert + LRU eviction inside a single transaction (`BEGIN ... COMMIT`) without an extra secondary index.
-  2. **`aydb` Virtual Table (`max_bytes = 4194304`, `durability = 'buffered'`):** Automatic WiscKey separation (`16 KB` blobs routed to `blob_lru_0001_<SeqID>.db`), lazy LRU eviction, and $O(1)$ copy-less blob segment deletion.
+  2. **`aydb` Virtual Table (`max_bytes = 4194304`, `durability = 'buffered'`, `WalStreamMode::BufferedImmediateOsCache`):** Automatic WiscKey separation (`16 KB` blobs routed to `blob_lru_0001_<SeqID>.db`), lazy LRU eviction, and crash-safe $O(1)$ copy-less blob segment deletion (`AUD-06`: syncing `wal_buf.db` before unlinking 100% evicted sealed segments).
 
 | Engine & Cache Eviction Architecture | Sustained Write Speed | P50 Latency | P99 Latency | Final Data Footprint on Disk |
 | :--- | ---: | ---: | ---: | ---: |
-| **Vanilla SQLite (`WAL` + SQL LRU)** | `69.0 MB/s` | `100.8 µs` | `5,530.7 µs` | `8.15 MB` (`2.04×` quota bloat) |
-| **`aydb` Virtual Table (WiscKey + Copy-less GC)** | **`167.1 MB/s` (`2.42×` faster)** | **`29.1 µs` (`3.46×` lower)** | **`2,584.4 µs` (`2.14×` lower)** | **`3.98 MB` (Strict `4.0 MB` cap)** |
+| **Vanilla SQLite (`WAL` + SQL LRU)** | `68.8 MB/s` | `96.0 µs` | `8,409.4 µs` | `8.15 MB` (`2.04×` quota bloat) |
+| **`aydb` Virtual Table (WiscKey + Copy-less GC)** | **`89.9 MB/s` (`1.31×` faster)** | **`30.6 µs` (`3.14×` lower)** | **`5,201.2 µs` (`1.62×` lower)** | **`3.98 MB` (Strict `4.0 MB` cap)** |
 
 ### Architectural Root Cause Analysis
 1. **B-Tree Overflow Page Churn vs. WiscKey Separation:**
-   * In Vanilla SQLite, a `16 KB` blob spans 4 linked B-Tree overflow pages (`4 × 4 KB`). Inserting and deleting blobs continuously fragments the B-Tree freelist, writes full `16 KB` page images into both the `-wal` file and the main `.sqlite` database during WAL checkpoints (`5.5 ms` P99 stalls), and leaves the database + WAL footprint bloated at **`8.15 MB`** (`2.04×` the `4.0 MB` logical cap).
-   * In `aydb`, `16 KB` blobs are appended sequentially once to `blob_lru_0001_<SeqID>.db`, while the index and WAL store only a **23-byte `BlobPtr`**. When older `1.0 MB` `blob_lru` segments reach 100% evicted bytes, `aydb` unlinks the segment file in $O(1)$ time with zero blob copying, keeping the physical data footprint at **`3.98 MB`**.
+   * In Vanilla SQLite, a `16 KB` blob spans 4 linked B-Tree overflow pages (`4 × 4 KB`). Inserting and deleting blobs continuously fragments the B-Tree freelist, writes full `16 KB` page images into both the `-wal` file and the main `.sqlite` database during WAL checkpoints (`8.4 ms` P99 stalls), and leaves the database + WAL footprint bloated at **`8.15 MB`** (`2.04×` the `4.0 MB` logical cap).
+   * In `aydb`, `16 KB` blobs are appended sequentially once to `blob_lru_0001_<SeqID>.db`, while the index and WAL store only a **23-byte `BlobPtr`**. When older `1.0 MB` `blob_lru` segments reach 100% evicted bytes, `aydb` ensures the eviction tombstones in `wal_buf.db` are durable (`AUD-06`) and unlinks the segment file in $O(1)$ time with zero blob copying, keeping the physical data footprint at **`3.98 MB`**.
 
 ---
 
 ## 3. Benchmark 3: Read-Heavy Cache Hits with LRU Timestamp Tracking (`20,000` `SELECT` Queries)
 
-* **Workload:** `20,000` SQL point-read hits (`SELECT body FROM http_cache WHERE url = ?1`) over `200` cached `4 KB` blobs while maintaining accurate LRU recency order across matching column schemas.
+* **Workload:** `20,000` SQL point-read hits (`SELECT body FROM http_cache WHERE url = ?1`) over `200` cached `4 KB` blobs (`~800 KB` working set in `blob_lru_0001_*.db`) while maintaining accurate LRU recency order across matching column schemas.
 * **Compared Configurations:**
   1. **Vanilla SQLite:** `SELECT body FROM http_cache WHERE url = ?1` followed by `UPDATE http_cache SET access_tick = ?1 WHERE url = ?2` so SQLite's `idx_http_cache_tick` index reflects the read hit.
   2. **`aydb` Virtual Table:** `SELECT body FROM http_cache WHERE url = ?1` alone—because `xFilter` (Plan 1: `PLAN_PK_POINT`) calls `engine.get_row()`, which automatically updates the in-memory `AccessTracker` in $O(1)$ with zero disk writes!
 
 | SQL Read + LRU Tracking Strategy | Read Throughput | Average Read Latency | Disk Write I/O Generated |
 | :--- | ---: | ---: | ---: |
-| **Vanilla SQLite (`SELECT` + `UPDATE access_tick`)** | `24,036 ops/s` | `41.60 µs` | `0.03 MB` WAL + B-Tree Page Dirtying |
-| **`aydb` Virtual Table (`SELECT` w/ Lazy `AccessTracker`)** | **`193,852 ops/s` (`8.06×` faster)** | **`5.16 µs` (`8.06×` lower)** | **`0.00 MB` (Pure In-Memory Update)** |
+| **Vanilla SQLite (`SELECT` + `UPDATE access_tick`)** | `21,603 ops/s` | `46.29 µs` | `0.03 MB` WAL + B-Tree Page Dirtying |
+| **`aydb` Virtual Table (`SELECT` w/ Lazy `AccessTracker`)** | **`206,093 ops/s` (`9.54×` faster)** | **`4.85 µs` (`9.54×` lower)** | **`0.00 MB` (Pure In-Memory Update)** |

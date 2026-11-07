@@ -27,47 +27,47 @@
   <text x="42" y="108" fill="#f8fafc" font-size="13.5" font-weight="700">1. Synchronous ACID Throughput (tx/s)</text>
   <text x="42" y="126" fill="#94a3b8" font-size="11.5">4 KB WRITE_THROUGH Sector vs. SQLite WAL Full Sync</text>
 
-  <!-- 128 B Config Sync: bar starts at x=165, width=130 -> ends at x=295. Text at x=303..440 -->
+  <!-- 128 B Config Sync: bar starts at x=165, width=125 -> ends at x=290. Text at x=298..440 -->
   <text x="42" y="156" fill="#e2e8f0" font-size="12" font-weight="600">128 B Config Sync</text>
-  <rect x="165" y="143" width="130" height="16" rx="3" fill="url(#aydbCard)"/>
-  <text x="303" y="155" fill="#38bdf8" font-size="11.5" font-weight="700">12,523 tx/s (23.4x)</text>
+  <rect x="165" y="143" width="125" height="16" rx="3" fill="url(#aydbCard)"/>
+  <text x="298" y="155" fill="#38bdf8" font-size="11.5" font-weight="700">11,976 tx/s (22.2x)</text>
   <rect x="165" y="164" width="6" height="14" rx="2" fill="url(#sqliteCard)"/>
-  <text x="178" y="175" fill="#94a3b8" font-size="11">SQLite: 535 tx/s (1,858 µs P50)</text>
+  <text x="178" y="175" fill="#94a3b8" font-size="11">SQLite: 539 tx/s (1,832 µs P50)</text>
 
-  <!-- TPC-B Full Sync: bar starts at x=165, width=111 -> ends at x=276. Text at x=284..430 -->
+  <!-- TPC-B Full Sync: bar starts at x=165, width=109 -> ends at x=274. Text at x=282..430 -->
   <text x="42" y="212" fill="#e2e8f0" font-size="12" font-weight="600">TPC-B (Full Sync)</text>
-  <rect x="165" y="199" width="111" height="16" rx="3" fill="url(#aydbCard)"/>
-  <text x="284" y="211" fill="#38bdf8" font-size="11.5" font-weight="700">10,668 TPS (18.9x)</text>
+  <rect x="165" y="199" width="109" height="16" rx="3" fill="url(#aydbCard)"/>
+  <text x="282" y="211" fill="#38bdf8" font-size="11.5" font-weight="700">10,495 TPS (18.2x)</text>
   <rect x="165" y="220" width="6" height="14" rx="2" fill="url(#sqliteCard)"/>
-  <text x="178" y="231" fill="#94a3b8" font-size="11">SQLite: 566 TPS (1,767 µs avg)</text>
+  <text x="178" y="231" fill="#94a3b8" font-size="11">SQLite: 578 TPS (1,730 µs avg)</text>
 
   <!-- ==================== CARD 2 (Top-Right, x: 492..936, right edge = 936) ==================== -->
   <rect x="492" y="82" width="444" height="180" rx="8" fill="#1e293b" stroke="#334155"/>
   <text x="510" y="108" fill="#f8fafc" font-size="13.5" font-weight="700">2. Buffered 4-Table OLTP: TPC-B (TPS)</text>
   <text x="510" y="126" fill="#94a3b8" font-size="11.5">3 UPDATEs + 1 INSERT + 1 SELECT per Transaction</text>
 
-  <!-- TPC-B Buffered: bar starts at x=630, width=165 -> ends at x=795. Text at x=803..910 -->
+  <!-- TPC-B Buffered: bar starts at x=630, width=155 -> ends at x=785. Text at x=793..910 -->
   <text x="510" y="164" fill="#e2e8f0" font-size="12" font-weight="600">aydb (Buffered)</text>
-  <rect x="630" y="150" width="165" height="20" rx="3" fill="url(#aydbCard)"/>
-  <text x="803" y="164" fill="#38bdf8" font-size="12" font-weight="700">112.6K TPS</text>
+  <rect x="630" y="150" width="155" height="20" rx="3" fill="url(#aydbCard)"/>
+  <text x="793" y="164" fill="#38bdf8" font-size="12" font-weight="700">100.3K TPS</text>
 
   <text x="510" y="200" fill="#cbd5e1" font-size="12" font-weight="600">SQLite (NORMAL)</text>
   <rect x="630" y="186" width="23" height="20" rx="3" fill="url(#sqliteCard)"/>
-  <text x="661" y="200" fill="#94a3b8" font-size="12" font-weight="600">15.6K TPS</text>
+  <text x="661" y="200" fill="#94a3b8" font-size="12" font-weight="600">15.3K TPS</text>
 
-  <text x="510" y="238" fill="#34d399" font-size="11.5" font-weight="700">Result: 7.22x Faster (8.9 µs vs. 64.1 µs per 4-table tx)</text>
+  <text x="510" y="238" fill="#34d399" font-size="11.5" font-weight="700">Result: 6.56x Faster (43.2K TPS / 2.72x from 128KB SST)</text>
 
   <!-- ==================== CARD 3 (Bottom-Left, x: 24..468, right edge = 468) ==================== -->
   <rect x="24" y="278" width="444" height="180" rx="8" fill="#1e293b" stroke="#334155"/>
   <text x="42" y="304" fill="#f8fafc" font-size="13.5" font-weight="700">3. Bounded 16 KB Blob Cache (4.0 MB Cap)</text>
   <text x="42" y="322" fill="#94a3b8" font-size="11.5">WiscKey + Copy-Less LRU vs. SQLite Overflow Pages</text>
 
-  <!-- Write Bandwidth: bar starts at x=165, width=130 -> ends at x=295. Text at x=303..440 -->
+  <!-- Write Bandwidth: bar starts at x=165, width=90 -> ends at x=255. Text at x=263..440 -->
   <text x="42" y="354" fill="#e2e8f0" font-size="12" font-weight="600">Write Bandwidth</text>
-  <rect x="165" y="341" width="130" height="15" rx="3" fill="url(#aydbCard)"/>
-  <text x="303" y="353" fill="#38bdf8" font-size="11.5" font-weight="700">167.1 MB/s (2.42x)</text>
-  <rect x="165" y="361" width="54" height="13" rx="2" fill="url(#sqliteCard)"/>
-  <text x="227" y="372" fill="#94a3b8" font-size="11">SQLite: 69.0 MB/s</text>
+  <rect x="165" y="341" width="90" height="15" rx="3" fill="url(#aydbCard)"/>
+  <text x="263" y="353" fill="#38bdf8" font-size="11.5" font-weight="700">89.9 MB/s (1.31x)</text>
+  <rect x="165" y="361" width="69" height="13" rx="2" fill="url(#sqliteCard)"/>
+  <text x="242" y="372" fill="#94a3b8" font-size="11">SQLite: 68.8 MB/s</text>
 
   <!-- Live Payload Footprint: SQLite bar starts at x=165, width=115 -> ends at x=280. Text at x=288..450 -->
   <text x="42" y="408" fill="#e2e8f0" font-size="12" font-weight="600">Disk Footprint</text>
@@ -81,14 +81,14 @@
   <text x="510" y="304" fill="#f8fafc" font-size="13.5" font-weight="700">4. 20,000 Cache-Hit SELECTs w/ LRU Tracking</text>
   <text x="510" y="322" fill="#94a3b8" font-size="11.5">In-Memory AccessTracker vs. On-Read last_access UPDATE</text>
 
-  <!-- Bar starts at x=630, width=170 -> ends at x=800. Text at x=808..910 -->
+  <!-- Bar starts at x=630, width=172 -> ends at x=802. Text at x=810..910 -->
   <text x="510" y="360" fill="#e2e8f0" font-size="12" font-weight="600">aydb (Zero-Write)</text>
-  <rect x="630" y="346" width="170" height="20" rx="3" fill="url(#aydbCard)"/>
-  <text x="808" y="360" fill="#38bdf8" font-size="12" font-weight="700">193.9K qps</text>
+  <rect x="630" y="346" width="172" height="20" rx="3" fill="url(#aydbCard)"/>
+  <text x="810" y="360" fill="#38bdf8" font-size="12" font-weight="700">206.1K qps</text>
 
   <text x="510" y="396" fill="#cbd5e1" font-size="12" font-weight="600">SQLite (B-Tree)</text>
-  <rect x="630" y="382" width="21" height="20" rx="3" fill="url(#sqliteCard)"/>
-  <text x="659" y="396" fill="#94a3b8" font-size="12" font-weight="600">24.0K qps</text>
+  <rect x="630" y="382" width="18" height="20" rx="3" fill="url(#sqliteCard)"/>
+  <text x="656" y="396" fill="#94a3b8" font-size="12" font-weight="600">21.6K qps</text>
 
-  <text x="510" y="434" fill="#34d399" font-size="11.5" font-weight="700">Result: 8.06x Faster | 0.00 MB RAM (vs. 0.03 MB WAL)</text>
+  <text x="510" y="434" fill="#34d399" font-size="11.5" font-weight="700">Result: 9.54x Faster | 0.00 MB RAM (vs. 0.03 MB WAL)</text>
 </svg>

@@ -961,11 +961,299 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ============================================================================
+// Suite 7: Technical Audit Report Regression Verification (AUD-01 .. AUD-05, USE-01, USE-02)
+// ============================================================================
+
+pub fn suite_7_audit_regressions(base_dir: &Path) {
+    println!("\n==========================================================================================");
+    println!("SUITE 7: Technical Audit Report Regression Suite (AUD-01..05, USE-01..02)");
+    println!("==========================================================================================");
+    println!(
+        "{:<54} | {:>14} | {:>20}",
+        "Audit Regression Scenario", "Status", "Observed Result"
+    );
+    println!("{}", "-".repeat(94));
+
+    // 7A (AUD-01): Multi-restart WAL recovery after torn/dangling fragments without losing subsequent writes
+    {
+        // Part 1: BufferedUserSpaceCoalesced dangling `First` fragment + restart + subsequent writes
+        let fs1 = Arc::new(FaultInjectingFs::new());
+        let mut cfg1 = EngineConfig::default();
+        cfg1.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+        {
+            let mut eng = StorageEngine::open(Arc::clone(&fs1), cfg1.clone()).unwrap();
+            let val = vec![0x41u8; 900];
+            for i in 0..9 {
+                let k = format!("k_{i:02}").into_bytes();
+                eng.put_row(1, &k, &val, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            std::mem::forget(eng); // Crash with 8 rows in OS cache + dangling `First` fragment in sector 2
+        }
+        {
+            let mut eng = StorageEngine::open(Arc::clone(&fs1), cfg1.clone()).unwrap();
+            for i in 0..3 {
+                let k = format!("post_{i:02}").into_bytes();
+                eng.put_row(1, &k, b"after_restart", &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+        }
+        let mut eng1_final = StorageEngine::open(Arc::clone(&fs1), cfg1).unwrap();
+        let mut post_survived = 0usize;
+        for i in 0..3 {
+            let k = format!("post_{i:02}").into_bytes();
+            if eng1_final.get_row(1, &k).unwrap().as_deref() == Some(b"after_restart".as_slice()) {
+                post_survived += 1;
+            }
+        }
+
+        // Part 2: BufferedImmediateOsCache mid-stream corrupted sector + restart + delete & insert
+        let fs2 = Arc::new(FaultInjectingFs::new());
+        let cfg2 = EngineConfig::default();
+        {
+            let mut eng = StorageEngine::open(Arc::clone(&fs2), cfg2.clone()).unwrap();
+            let val = vec![0x42u8; 900];
+            for i in 0..40 {
+                let k = format!("r_{i:02}").into_bytes();
+                eng.put_row(1, &k, &val, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            std::mem::forget(eng);
+        }
+        // Corrupt sector 2 (offset 8192) of wal_buf.db
+        {
+            let f = fs2
+                .open_file("wal_buf.db", false, true, OpenHint::MutableBufferedLog)
+                .unwrap();
+            f.write_all_at(&[0xFFu8; 64], 2 * 4096).unwrap();
+        }
+        {
+            let mut eng = StorageEngine::open(Arc::clone(&fs2), cfg2.clone()).unwrap();
+            eng.delete_row(1, b"r_00", WriteDurability::BufferedFast)
+                .unwrap();
+            eng.put_row(1, b"r_new", b"survived", &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        let mut eng2_final = StorageEngine::open(Arc::clone(&fs2), cfg2).unwrap();
+        let del_ok = eng2_final.get_row(1, b"r_00").unwrap().is_none();
+        let ins_ok =
+            eng2_final.get_row(1, b"r_new").unwrap().as_deref() == Some(b"survived".as_slice());
+
+        let ok = post_survived == 3 && del_ok && ins_ok;
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "7A. Post-Recovery WAL Epoch Rotation (AUD-01)",
+            if ok { "PASS" } else { "FAIL (AUD-01)" },
+            if ok {
+                "100% Writes Survived"
+            } else {
+                "Post-Crash Writes Lost"
+            }
+        );
+    }
+
+    // 7B (AUD-02): Oversized PK rejection & near-4KB row/meta auto-spill without wedging flush_memtable
+    {
+        let fs = Arc::new(FaultInjectingFs::new());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 4096;
+        let mut eng = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+        // Oversized PK (> 2048 B) must be rejected with InvalidInput
+        let oversized_pk = vec![b'x'; 5000];
+        let pk_rejected = match eng.put_row(1, &oversized_pk, b"v", &[], WriteDurability::BufferedFast) {
+            Err(e) => e.kind() == io::ErrorKind::InvalidInput,
+            Ok(()) => false,
+        };
+
+        // Row with large PK (1500 B) + value (3000 B) + secondary keys whose combined size > 4 KB block
+        let pk = vec![b'k'; 1500];
+        let val = vec![b'v'; 3000];
+        let sec = vec![
+            (1u16, vec![b's'; 1500]),
+            (2u16, vec![b't'; 1500]),
+            (3u16, vec![b'u'; 1500]),
+        ];
+        let put_ok = eng
+            .put_row(1, &pk, &val, &sec, WriteDurability::BufferedFast)
+            .is_ok();
+        let flush_ok = eng.flush_memtable().is_ok();
+        let compact_ok = eng.compact().is_ok();
+        let read_ok = eng.get_row(1, &pk).unwrap().as_deref() == Some(val.as_slice());
+
+        let ok = pk_rejected && put_ok && flush_ok && compact_ok && read_ok;
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "7B. 4KB Block Guard & Meta Blob Spill (AUD-02)",
+            if ok { "PASS" } else { "FAIL (AUD-02)" },
+            if ok {
+                "Flushed & Compacted"
+            } else {
+                "Flush Wedged!"
+            }
+        );
+    }
+
+    // 7C (AUD-03 & AUD-05): SQL VTab PK uniqueness, ON CONFLICT, type-tagged keys, and auto table_id
+    {
+        let sub = base_dir.join("suite7_vtab_aud03_05");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t_a USING aydb(columns='k TEXT PRIMARY KEY, v TEXT');
+             CREATE VIRTUAL TABLE t_b USING aydb(columns='k TEXT PRIMARY KEY, v TEXT');
+             INSERT INTO t_a VALUES ('abc', 'first');",
+        )
+        .unwrap();
+
+        // Plain duplicate INSERT must fail with SQLITE_CONSTRAINT
+        let dup_failed = conn
+            .execute_batch("INSERT INTO t_a VALUES ('abc', 'second');")
+            .is_err();
+
+        // INSERT OR IGNORE preserves 'first'; INSERT OR REPLACE updates to 'replaced'
+        conn.execute_batch("INSERT OR IGNORE INTO t_a VALUES ('abc', 'ignored');")
+            .unwrap();
+        let v_after_ignore = conn
+            .query_all("SELECT v FROM t_a WHERE k = 'abc'", &[])
+            .unwrap();
+        let ignore_ok = v_after_ignore == vec![vec![SqlValue::Text("first".to_string())]];
+
+        conn.execute_batch("INSERT OR REPLACE INTO t_a VALUES ('abc', 'replaced');")
+            .unwrap();
+        let v_after_replace = conn
+            .query_all("SELECT v FROM t_a WHERE k = 'abc'", &[])
+            .unwrap();
+        let replace_ok = v_after_replace == vec![vec![SqlValue::Text("replaced".to_string())]];
+
+        // Type-tagged key isolation: 'abc' vs X'616263', '' vs X''
+        conn.execute_batch(
+            "INSERT INTO t_a VALUES (X'616263', 'blob_abc'), ('', 'empty_text'), (X'', 'empty_blob');",
+        )
+        .unwrap();
+        let count_a = conn.query_all("SELECT COUNT(*) FROM t_a", &[]).unwrap();
+        let count_b = conn.query_all("SELECT COUNT(*) FROM t_b", &[]).unwrap();
+        let counts_ok = count_a == vec![vec![SqlValue::Integer(4)]]
+            && count_b == vec![vec![SqlValue::Integer(0)]];
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+
+        let ok = dup_failed && ignore_ok && replace_ok && counts_ok;
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "7C. VTab PK Uniqueness & Type Tags (AUD-03, AUD-05)",
+            if ok { "PASS" } else { "FAIL (AUD-03/05)" },
+            if ok {
+                "Isolated & Enforced"
+            } else {
+                "Key Collision/Leak"
+            }
+        );
+    }
+
+    // 7D (AUD-04, USE-01, USE-02): Multi-chunk (>512 KB) tx crash atomicity, SAVEPOINT, & DROP TABLE
+    {
+        // Part 1: Multi-chunk (>512 KB) transaction torn before final TxCommit chunk must roll back 100%
+        let fs = Arc::new(FaultInjectingFs::new());
+        {
+            let mut eng = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+            eng.put_row(1, b"baseline", b"intact", &[], WriteDurability::BufferedFast)
+                .unwrap();
+
+            eng.begin_transaction();
+            let payload = vec![0x55u8; 900];
+            for i in 0..800 {
+                let k = format!("big_tx_{i:04}").into_bytes();
+                eng.put_row(1, &k, &payload, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.commit_transaction().unwrap();
+            std::mem::forget(eng);
+        }
+        // Corrupt the final WAL sector containing TxCommit in wal_buf.db so chunk 1 is intact but chunk 2 is torn
+        {
+            let f = fs
+                .open_file("wal_buf.db", false, true, OpenHint::MutableBufferedLog)
+                .unwrap();
+            // Chunk 1 is ~512 KB (~128 sectors); corrupt sector 160 in the 2nd chunk
+            f.write_all_at(&[0xFFu8; 64], 160 * 4096).unwrap();
+        }
+        let mut recovered = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+        let baseline_ok =
+            recovered.get_row(1, b"baseline").unwrap().as_deref() == Some(b"intact".as_slice());
+        let partial_leaked = recovered.get_row(1, b"big_tx_0000").unwrap().is_some();
+
+        // Part 2: SQL SAVEPOINT / ROLLBACK TO (USE-01) and DROP TABLE cleanup (USE-02)
+        let sub = base_dir.join("suite7_vtab_use01_02");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let os_fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(os_fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE items USING aydb(table_id=10, columns='id INT PRIMARY KEY, name TEXT');
+             BEGIN;
+             INSERT INTO items VALUES (1, 'kept');
+             SAVEPOINT sp_inner;
+             INSERT INTO items VALUES (2, 'discarded');
+             ROLLBACK TO sp_inner;
+             RELEASE sp_inner;
+             COMMIT;",
+        )
+        .unwrap();
+        let sp_rows = conn.query_all("SELECT id FROM items", &[]).unwrap();
+        let sp_ok = sp_rows == vec![vec![SqlValue::Integer(1)]];
+
+        conn.execute_batch(
+            "DROP TABLE items;
+             CREATE VIRTUAL TABLE items USING aydb(table_id=10, columns='id INT PRIMARY KEY, name TEXT');",
+        )
+        .unwrap();
+        let after_drop = conn.query_all("SELECT COUNT(*) FROM items", &[]).unwrap();
+        let drop_ok = after_drop == vec![vec![SqlValue::Integer(0)]];
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+
+        let ok = baseline_ok && !partial_leaked && sp_ok && drop_ok;
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "7D. >512KB Tx Atomicity, SAVEPOINT & DROP (AUD-04)",
+            if ok { "PASS" } else { "FAIL (AUD-04)" },
+            if ok {
+                "Atomic & Cleaned"
+            } else {
+                "Partial Tx/Drop Leak"
+            }
+        );
+    }
+}
+
 fn main() {
+    let base_dir = std::env::temp_dir().join(format!("aydb_rel_suite7_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base_dir);
+    std::fs::create_dir_all(&base_dir).unwrap();
+
     bench_suite_1_power_loss_sync_durability();
     bench_suite_2_process_crash_wal_modes();
     bench_suite_3_transaction_rollback_invariants();
     bench_suite_4_post_crash_blob_leak();
     bench_suite_5_io_fault_countdown();
     bench_suite_6_vtab_key_and_rowid_integrity();
+    suite_7_audit_regressions(&base_dir);
+
+    let _ = std::fs::remove_dir_all(&base_dir);
 }

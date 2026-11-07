@@ -11,7 +11,7 @@
 //!    - Test 210: Full-Table Aggregation & `GROUP BY` (`SELECT category, COUNT(*), SUM(uval) ...`)
 //!    - Test 230: 2,500 Random `UPDATE`s on Indexed Table
 //!    - Test 240: 2,500 Random `DELETE`s + Re-`INSERT`s (Churn)
-//!    - Evaluated with `WalStreamMode::BufferedUserSpaceCoalesced` on `aydb` vs. `PRAGMA synchronous = NORMAL` on SQLite.
+//!    - Evaluated with `WalStreamMode::BufferedImmediateOsCache` on `aydb` vs. `PRAGMA synchronous = NORMAL` on SQLite.
 //!
 //! 2. **YCSB (Yahoo! Cloud Serving Benchmark) Workloads A through F (Zipfian $\theta = 0.99$):**
 //!    - Workload A (Update Heavy): 50% Read / 50% Update
@@ -284,13 +284,13 @@ fn bench_speedtest1_suite(root: &PathBuf) {
         res
     };
 
-    // Run on aydb Virtual Table
+    // Run on aydb Virtual Table (BufferedImmediateOsCache — OS page cache parity with SQLite synchronous = NORMAL)
     let ay_timings = {
         let sub = root.join("speedtest_aydb");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
-        cfg.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+        cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
         let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
 
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -807,6 +807,241 @@ fn bench_tpcb_suite(root: &PathBuf) {
     }
 }
 
+// =========================================================================
+// SUITE 4: On-Disk SSTable Evaluation (`memtable_capacity_bytes = 128 KB`, BENCH-01 / BENCH-02)
+// =========================================================================
+
+fn bench_on_disk_sstable_suite(root: &PathBuf) {
+    println!("\n==========================================================================================");
+    println!("SUITE 4: On-Disk SSTable Evaluation (memtable_capacity_bytes = 128 KB, idx_*.db SSTables)");
+    println!("==========================================================================================");
+    println!(
+        "{:<44} | {:>16} | {:>16} | {:>10}",
+        "On-Disk SSTable Workload (128 KB MemTable)",
+        "Vanilla SQLite",
+        "aydb (SSTables)",
+        "Ratio"
+    );
+    println!("{}", "-".repeat(94));
+
+    // 4A. Speedtest1 Total with 128 KB MemTable
+    let sq_st = {
+        let sub = root.join("sstable_st_sq");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let conn = SqliteConnection::open_file(&sub.join("speedtest.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE t1 (id INTEGER PRIMARY KEY, uval INTEGER, category TEXT, payload TEXT);
+             CREATE INDEX idx_t1_uval ON t1(uval);",
+        )
+        .unwrap();
+        let r = run_speedtest1_on_connection(&conn);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+        r.t100_bulk_insert_ms
+            + r.t130_pk_point_select_ms
+            + r.t140_sec_idx_select_ms
+            + r.t160_pk_range_select_ms
+            + r.t210_full_agg_group_ms
+            + r.t230_random_update_ms
+            + r.t240_delete_reinsert_ms
+    };
+    let ay_st = {
+        let sub = root.join("sstable_st_ay");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 128 * 1024;
+        cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t1 USING aydb(
+                table_id = 1,
+                durability = 'buffered',
+                columns = 'id INT PRIMARY KEY, uval INT, category TEXT, payload TEXT',
+                indexes = 'uval'
+            );",
+        )
+        .unwrap();
+        let r = run_speedtest1_on_connection(&conn);
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+        r.t100_bulk_insert_ms
+            + r.t130_pk_point_select_ms
+            + r.t140_sec_idx_select_ms
+            + r.t160_pk_range_select_ms
+            + r.t210_full_agg_group_ms
+            + r.t230_random_update_ms
+            + r.t240_delete_reinsert_ms
+    };
+    println!(
+        "{:<44} | {:>13.2} ms | {:>13.2} ms | {:>9.2}x",
+        "Speedtest1 Total (Tests 100-240, 128 KB MT)",
+        sq_st,
+        ay_st,
+        sq_st / ay_st
+    );
+
+    // 4B. YCSB 256 B with 128 KB MemTable (Workloads B & C)
+    let sq_ycsb = {
+        let sub = root.join("sstable_ycsb_sq");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let conn = SqliteConnection::open_file(&sub.join("ycsb.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE usertable (ycsb_key TEXT PRIMARY KEY, field0 BLOB);",
+        )
+        .unwrap();
+        let r = run_ycsb_on_connection(&conn, 256);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+        r
+    };
+    let ay_ycsb = {
+        let sub = root.join("sstable_ycsb_ay");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 128 * 1024;
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE usertable USING aydb(
+                table_id = 1,
+                durability = 'buffered',
+                columns = 'ycsb_key TEXT PRIMARY KEY, field0 BLOB'
+            );",
+        )
+        .unwrap();
+        let r = run_ycsb_on_connection(&conn, 256);
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+        r
+    };
+    println!(
+        "{:<44} | {:>11.0} op/s | {:>11.0} op/s | {:>9.2}x",
+        "YCSB 256B Workload C (100% Point Read)",
+        sq_ycsb[2].1,
+        ay_ycsb[2].1,
+        ay_ycsb[2].1 / sq_ycsb[2].1
+    );
+    println!(
+        "{:<44} | {:>11.0} op/s | {:>11.0} op/s | {:>9.2}x",
+        "YCSB 256B Workload B (95% Read / 5% Update)",
+        sq_ycsb[1].1,
+        ay_ycsb[1].1,
+        ay_ycsb[1].1 / sq_ycsb[1].1
+    );
+
+    // 4C. TPC-B Buffered & Full Sync with 128 KB MemTable
+    let sq_tpcb_buf = {
+        let sub = root.join("sstable_tpcb_sq_buf");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let conn = SqliteConnection::open_file(&sub.join("tpcb.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER);
+             CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER);
+             CREATE TABLE accounts (aid INTEGER PRIMARY KEY, bid INTEGER, abalance INTEGER);
+             CREATE TABLE history (hid INTEGER PRIMARY KEY, tid INTEGER, bid INTEGER, aid INTEGER, delta INTEGER);",
+        )
+        .unwrap();
+        let tps = run_tpcb_transactions(&conn, 1_000);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+        tps
+    };
+    let ay_tpcb_buf = {
+        let sub = root.join("sstable_tpcb_ay_buf");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 128 * 1024;
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE branches USING aydb(table_id=1, durability='buffered', columns='bid INT PRIMARY KEY, bbalance INT');
+             CREATE VIRTUAL TABLE tellers USING aydb(table_id=2, durability='buffered', columns='tid INT PRIMARY KEY, bid INT, tbalance INT');
+             CREATE VIRTUAL TABLE accounts USING aydb(table_id=3, durability='buffered', columns='aid INT PRIMARY KEY, bid INT, abalance INT');
+             CREATE VIRTUAL TABLE history USING aydb(table_id=4, durability='buffered', columns='hid INT PRIMARY KEY, tid INT, bid INT, aid INT, delta INT');",
+        )
+        .unwrap();
+        let tps = run_tpcb_transactions(&conn, 1_000);
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+        tps
+    };
+    println!(
+        "{:<44} | {:>12.0} TPS | {:>12.0} TPS | {:>9.2}x",
+        "TPC-B Buffered (128 KB MT, wal_buf vs NORMAL)",
+        sq_tpcb_buf,
+        ay_tpcb_buf,
+        ay_tpcb_buf / sq_tpcb_buf
+    );
+
+    let sq_tpcb_full = {
+        let sub = root.join("sstable_tpcb_sq_full");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let conn = SqliteConnection::open_file(&sub.join("tpcb_full.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER);
+             CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER);
+             CREATE TABLE accounts (aid INTEGER PRIMARY KEY, bid INTEGER, abalance INTEGER);
+             CREATE TABLE history (hid INTEGER PRIMARY KEY, tid INTEGER, bid INTEGER, aid INTEGER, delta INTEGER);",
+        )
+        .unwrap();
+        let tps = run_tpcb_transactions(&conn, 150);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+        tps
+    };
+    let ay_tpcb_full = {
+        let sub = root.join("sstable_tpcb_ay_full");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 128 * 1024;
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE branches USING aydb(table_id=1, durability='sync', columns='bid INT PRIMARY KEY, bbalance INT');
+             CREATE VIRTUAL TABLE tellers USING aydb(table_id=2, durability='sync', columns='tid INT PRIMARY KEY, bid INT, tbalance INT');
+             CREATE VIRTUAL TABLE accounts USING aydb(table_id=3, durability='sync', columns='aid INT PRIMARY KEY, bid INT, abalance INT');
+             CREATE VIRTUAL TABLE history USING aydb(table_id=4, durability='sync', columns='hid INT PRIMARY KEY, tid INT, bid INT, aid INT, delta INT');",
+        )
+        .unwrap();
+        let tps = run_tpcb_transactions(&conn, 150);
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+        tps
+    };
+    println!(
+        "{:<44} | {:>12.0} TPS | {:>12.0} TPS | {:>9.2}x",
+        "TPC-B Full Sync (128 KB MT, wal_sync vs FULL)",
+        sq_tpcb_full,
+        ay_tpcb_full,
+        ay_tpcb_full / sq_tpcb_full
+    );
+}
+
 fn main() {
     let dir = std::env::temp_dir().join(format!("aydb_standard_sql_bench_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -815,6 +1050,7 @@ fn main() {
     bench_speedtest1_suite(&dir);
     bench_ycsb_suite(&dir);
     bench_tpcb_suite(&dir);
+    bench_on_disk_sstable_suite(&dir);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
