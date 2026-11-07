@@ -21,12 +21,12 @@ use crate::pal::OsFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::ffi::{
     SQLITE_BLOB, SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_DONE, SQLITE_ERROR,
-    SQLITE_FLOAT, SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
-    SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LIMIT,
-    SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR,
-    SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, sqlite_transient, sqlite3,
-    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
-    sqlite3_bind_text, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
+    SQLITE_FLOAT, SQLITE_FULL, SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ,
+    SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE,
+    SQLITE_INDEX_CONSTRAINT_LIMIT, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
+    SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT,
+    sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64,
+    sqlite3_bind_null, sqlite3_bind_text, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
     sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text,
     sqlite3_column_type, sqlite3_context, sqlite3_create_module_v2, sqlite3_declare_vtab,
     sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_index_info, sqlite3_int64,
@@ -35,10 +35,13 @@ use crate::vtab::ffi::{
     sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
 };
 pub use crate::vtab::row_codec::{
-    KEY_TAG_FLOAT, KEY_TAG_INTEGER, KEY_TAG_NULL, SqlValue, decode_all_columns, decode_column_at,
-    decode_f64_memcomparable, decode_i64_tagged_key, encode_f64_memcomparable,
+    ColCollation, ColumnAffinity, KEY_TAG_FLOAT, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
+    KEY_TAG_FLOAT_LT_I64_MIN, KEY_TAG_INTEGER, KEY_TAG_NULL, SqlValue, decode_all_columns,
+    decode_column_at, decode_f64_memcomparable, decode_i64_tagged_key,
+    encode_canonical_numeric_key_from_f64, encode_f64_memcomparable, encode_f64_unified_key,
     encode_i64_tagged_key, encode_row, encode_sqlite_values_direct, extract_column_key_bytes,
-    project_column_zero_copy, sqlite_value_to_key_bytes,
+    extract_column_key_bytes_with_collation, f64_to_exact_i64, parse_sqlite_numeric_str,
+    project_column_zero_copy, sqlite_value_to_key_bytes, sqlite_value_to_key_bytes_with_schema,
 };
 
 const PLAN_FULL_SCAN: c_int = 0;
@@ -92,37 +95,6 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
         }
     }
     parts
-}
-
-/// SQLite column type affinity (SQLite Datatypes Section 3.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnAffinity {
-    Integer,
-    Text,
-    Blob,
-    Real,
-    Numeric,
-}
-
-impl ColumnAffinity {
-    /// Parses a column's declared type string according to SQLite's 5 affinity rules.
-    pub fn from_type_str(type_str: &str) -> Self {
-        let upper = type_str.trim().to_ascii_uppercase();
-        if upper.is_empty() {
-            return Self::Blob;
-        }
-        if upper.contains("INT") {
-            Self::Integer
-        } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
-            Self::Text
-        } else if upper.contains("BLOB") {
-            Self::Blob
-        } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
-            Self::Real
-        } else {
-            Self::Numeric
-        }
-    }
 }
 
 /// Collision-free bidirectional map between synthetic 64-bit SQLite `rowid`s and non-integer `encoded_pk` bytes.
@@ -221,8 +193,11 @@ struct AydbVTab {
     table_name: String,
     durability: WriteDurability,
     col_names: Vec<String>,
+    col_affinities: Vec<ColumnAffinity>,
+    col_collations: Vec<ColCollation>,
     pk_col_idx: usize,
     pk_affinity: ColumnAffinity,
+    pk_collation: ColCollation,
     /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
     secondary_indexes: Vec<(usize, u16)>,
     /// Fast flag set to `true` only if a non-integer primary key has been stored.
@@ -282,7 +257,8 @@ fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
             return i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
         }
     }
-    let pk = extract_column_key_bytes(row_bytes, vtab.pk_col_idx).unwrap_or_default();
+    let pk = extract_column_key_bytes_with_collation(row_bytes, vtab.pk_col_idx, vtab.pk_collation)
+        .unwrap_or_default();
     vtab.has_non_int_pks.store(true, Ordering::Relaxed);
     if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
         rmap.get_or_assign_rowid(&pk)
@@ -292,14 +268,19 @@ fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
 }
 
 /// Converts a SQLite range bound value into a storage-class-tagged key for `PLAN_PK_RANGE`,
-/// coercing numeric bounds (`FLOAT` on `INTEGER` PK or `INTEGER` on `REAL` PK) so mixed
-/// numeric comparisons scan the correct key range (`USE-05`).
+/// applying the column's declared [`ColumnAffinity`] and [`ColCollation`] (`USE-05`, `F04`, `F05`).
+///
+/// Because `Integer(q)` (`9` bytes: `[0x10, encode_i64(q)]`) and `Float(q.0)` (`17` bytes:
+/// `[0x10, encode_i64(q), 0..0]`) share the same mathematical value `q`, an upper or lower bound
+/// at an exact integer `q` adjusts inclusivity so both representations are included or excluded
+/// consistently!
 ///
 /// Returns `Ok(Some((key_bytes, is_inclusive)))` for a normal bound, `Ok(None)` if the bound
 /// is unbounded in that direction, or `Err(())` if the range is unsatisfiable (empty result).
 unsafe fn pk_range_bound_to_key(
     val_ptr: *mut sqlite3_value,
     pk_affinity: ColumnAffinity,
+    pk_collation: ColCollation,
     is_lower: bool,
     is_inclusive: bool,
 ) -> Result<Option<(Vec<u8>, bool)>, ()> {
@@ -307,54 +288,41 @@ unsafe fn pk_range_bound_to_key(
     if val_type == SQLITE_NULL {
         return Err(());
     }
-    if pk_affinity == ColumnAffinity::Integer && val_type == SQLITE_FLOAT {
+    if val_type == SQLITE_FLOAT {
         let f = unsafe { sqlite3_value_double(val_ptr) };
         if f.is_nan() {
             return Err(());
         }
-        if is_lower {
-            if f > (i64::MAX as f64) {
-                return Err(());
+    }
+
+    let key = unsafe {
+        sqlite_value_to_key_bytes_with_schema(val_ptr, pk_affinity, pk_collation, false)
+    };
+
+    // If the bound is an exact integer `q` (either `9`-byte `[0x10, q]` or `17`-byte `[0x10, q, 0..0]`),
+    // ensure both `9`-byte `Integer(q)` and `17`-byte `Float(q.0)` are handled identically:
+    // - Lower inclusive (`>= q`): start at 9-byte `[0x10, q]` (inclusive) -> includes both!
+    // - Lower exclusive (`> q`): start after 17-byte `[0x10, q, 0..0]` (exclusive) -> excludes both!
+    // - Upper inclusive (`<= q`): end at 17-byte `[0x10, q, 0..0]` (inclusive) -> includes both!
+    // - Upper exclusive (`< q`): end before 9-byte `[0x10, q]` (exclusive) -> excludes both!
+    if key.first().copied() == Some(KEY_TAG_INTEGER) {
+        if key.len() == 9 {
+            if (is_lower && !is_inclusive) || (!is_lower && is_inclusive) {
+                let mut ext = Vec::with_capacity(17);
+                ext.extend_from_slice(&key);
+                ext.extend_from_slice(&0u64.to_be_bytes());
+                return Ok(Some((ext, is_inclusive)));
             }
-            if f <= (i64::MIN as f64) {
-                return Ok(Some((encode_i64_tagged_key(i64::MIN).to_vec(), true)));
+            return Ok(Some((key, is_inclusive)));
+        } else if key.len() == 17 && key[9..17] == [0u8; 8] {
+            if (is_lower && is_inclusive) || (!is_lower && !is_inclusive) {
+                return Ok(Some((key[0..9].to_vec(), is_inclusive)));
             }
-            if f.fract() == 0.0 {
-                return Ok(Some((
-                    encode_i64_tagged_key(f as i64).to_vec(),
-                    is_inclusive,
-                )));
-            }
-            let ceil_i = f.ceil() as i64;
-            return Ok(Some((encode_i64_tagged_key(ceil_i).to_vec(), true)));
-        } else {
-            if f < (i64::MIN as f64) {
-                return Err(());
-            }
-            if f >= (i64::MAX as f64) {
-                return Ok(Some((encode_i64_tagged_key(i64::MAX).to_vec(), true)));
-            }
-            if f.fract() == 0.0 {
-                return Ok(Some((
-                    encode_i64_tagged_key(f as i64).to_vec(),
-                    is_inclusive,
-                )));
-            }
-            let floor_i = f.floor() as i64;
-            return Ok(Some((encode_i64_tagged_key(floor_i).to_vec(), true)));
+            return Ok(Some((key, is_inclusive)));
         }
     }
-    if pk_affinity == ColumnAffinity::Real && val_type == SQLITE_INTEGER {
-        let i = unsafe { sqlite3_value_int64(val_ptr) };
-        let mut out = Vec::with_capacity(9);
-        out.push(KEY_TAG_FLOAT);
-        out.extend_from_slice(&encode_f64_memcomparable(i as f64));
-        return Ok(Some((out, is_inclusive)));
-    }
-    Ok(Some((
-        unsafe { sqlite_value_to_key_bytes(val_ptr) },
-        is_inclusive,
-    )))
+
+    Ok(Some((key, is_inclusive)))
 }
 
 unsafe extern "system" fn destroy_aux_context(ptr: *mut c_void) {
@@ -434,23 +402,62 @@ unsafe extern "system" fn vtab_create_or_connect(
             }
         }
 
-        // Parse column names, identify PRIMARY KEY column index, and determine PK affinity (`USE-03`)
+        // Parse column names, identify PRIMARY KEY column index, and determine affinity & collation (`USE-03`, `F04`)
         let mut col_names = Vec::new();
         let mut col_affinities = Vec::new();
+        let mut col_collations = Vec::new();
         let mut pk_col_idx = 0usize;
         for (idx, col_def) in split_top_level_commas(&columns_spec).into_iter().enumerate() {
             let trimmed = col_def.trim();
-            let mut tokens = trimmed.split_whitespace();
-            if let Some(name_tok) = tokens.next() {
-                col_names.push(name_tok.to_string());
-                let rest = tokens.collect::<Vec<_>>().join(" ");
-                let upper = rest.to_ascii_uppercase();
-                let type_part = upper.replace("PRIMARY KEY", "").replace("NOT NULL", "");
-                col_affinities.push(ColumnAffinity::from_type_str(&type_part));
-                if upper.contains("PRIMARY KEY") {
-                    pk_col_idx = idx;
-                }
+            let raw_tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if raw_tokens.is_empty() {
+                continue;
             }
+            col_names.push(raw_tokens[0].to_string());
+
+            let mut collation = ColCollation::Binary;
+            let mut type_tokens = Vec::new();
+            let mut t_idx = 1usize;
+            while t_idx < raw_tokens.len() {
+                let tok_upper = raw_tokens[t_idx].to_ascii_uppercase();
+                if tok_upper == "COLLATE" {
+                    if t_idx + 1 >= raw_tokens.len() {
+                        return SQLITE_ERROR;
+                    }
+                    let coll_name = raw_tokens[t_idx + 1]
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                    let Some(parsed_coll) = ColCollation::from_name(coll_name) else {
+                        return SQLITE_ERROR;
+                    };
+                    collation = parsed_coll;
+                    t_idx += 2;
+                    continue;
+                }
+                if tok_upper == "PRIMARY"
+                    && t_idx + 1 < raw_tokens.len()
+                    && raw_tokens[t_idx + 1].eq_ignore_ascii_case("KEY")
+                {
+                    pk_col_idx = idx;
+                    t_idx += 2;
+                    continue;
+                }
+                if tok_upper == "NOT"
+                    && t_idx + 1 < raw_tokens.len()
+                    && raw_tokens[t_idx + 1].eq_ignore_ascii_case("NULL")
+                {
+                    t_idx += 2;
+                    continue;
+                }
+                if tok_upper == "UNIQUE" {
+                    t_idx += 1;
+                    continue;
+                }
+                type_tokens.push(tok_upper);
+                t_idx += 1;
+            }
+            let type_part = type_tokens.join(" ");
+            col_affinities.push(ColumnAffinity::from_type_str(&type_part));
+            col_collations.push(collation);
         }
         if col_names.is_empty() {
             return SQLITE_ERROR;
@@ -459,6 +466,10 @@ unsafe extern "system" fn vtab_create_or_connect(
             .get(pk_col_idx)
             .copied()
             .unwrap_or(ColumnAffinity::Blob);
+        let pk_collation = col_collations
+            .get(pk_col_idx)
+            .copied()
+            .unwrap_or(ColCollation::Binary);
 
         // Parse secondary index column names
         let mut secondary_indexes = Vec::new();
@@ -526,8 +537,11 @@ unsafe extern "system" fn vtab_create_or_connect(
             table_name,
             durability,
             col_names,
+            col_affinities,
+            col_collations,
             pk_col_idx,
             pk_affinity,
+            pk_collation,
             secondary_indexes,
             has_non_int_pks: AtomicBool::new(pk_affinity != ColumnAffinity::Integer),
             open_cursors: AtomicUsize::new(0),
@@ -849,14 +863,48 @@ unsafe extern "system" fn vtab_filter(
                             }
                         }
                     } else {
-                        let pk_bytes = sqlite_value_to_key_bytes(val_ptr);
-                        if let Err(e) = eng.get_row_into(
+                        let pk_bytes = sqlite_value_to_key_bytes_with_schema(
+                            val_ptr,
+                            vtab.pk_affinity,
+                            vtab.pk_collation,
+                            false,
+                        );
+                        let found = match eng.get_row_into(
                             vtab.table_id,
                             &pk_bytes,
                             &mut cursor.slab,
                             &mut cursor.spans,
                         ) {
-                            return io_err_to_sqlite_rc(&e);
+                            Ok(b) => b,
+                            Err(e) => return io_err_to_sqlite_rc(&e),
+                        };
+                        // In SQLite (`10 == 10.0` across all affinities including `BLOB`),
+                        // if `pk_bytes` is an exact-integer number (`9`-byte `Integer(q)` or
+                        // `17`-byte `Float(q.0)`), also probe the dual exact-integer representation
+                        // if not found under the primary representation (`F04`, `F05`).
+                        if !found && pk_bytes.first().copied() == Some(KEY_TAG_INTEGER) {
+                            if pk_bytes.len() == 9 {
+                                let mut alt = Vec::with_capacity(17);
+                                alt.extend_from_slice(&pk_bytes);
+                                alt.extend_from_slice(&0u64.to_be_bytes());
+                                if let Err(e) = eng.get_row_into(
+                                    vtab.table_id,
+                                    &alt,
+                                    &mut cursor.slab,
+                                    &mut cursor.spans,
+                                ) {
+                                    return io_err_to_sqlite_rc(&e);
+                                }
+                            } else if pk_bytes.len() == 17 && pk_bytes[9..17] == [0u8; 8] {
+                                if let Err(e) = eng.get_row_into(
+                                    vtab.table_id,
+                                    &pk_bytes[0..9],
+                                    &mut cursor.slab,
+                                    &mut cursor.spans,
+                                ) {
+                                    return io_err_to_sqlite_rc(&e);
+                                }
+                            }
                         }
                     }
                 }
@@ -869,7 +917,24 @@ unsafe extern "system" fn vtab_filter(
                         return SQLITE_OK;
                     }
                     let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
-                    let col_val = sqlite_value_to_key_bytes(val_ptr);
+                    let sec_col_idx = vtab
+                        .secondary_indexes
+                        .iter()
+                        .find(|&&(_, id)| id == index_id)
+                        .map(|&(c, _)| c)
+                        .unwrap_or(0);
+                    let sec_aff = vtab
+                        .col_affinities
+                        .get(sec_col_idx)
+                        .copied()
+                        .unwrap_or(ColumnAffinity::Blob);
+                    let sec_coll = vtab
+                        .col_collations
+                        .get(sec_col_idx)
+                        .copied()
+                        .unwrap_or(ColCollation::Binary);
+                    let col_val =
+                        sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
                     let pks =
                         match eng.lookup_by_secondary_index(vtab.table_id, index_id, &col_val) {
                             Ok(pks) => pks,
@@ -897,7 +962,13 @@ unsafe extern "system" fn vtab_filter(
                         let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
                         let val_ptr = *argv.offset(arg_pos as isize);
                         arg_pos += 1;
-                        match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, true, inc) {
+                        match pk_range_bound_to_key(
+                            val_ptr,
+                            vtab.pk_affinity,
+                            vtab.pk_collation,
+                            true,
+                            inc,
+                        ) {
                             Ok(bound) => bound,
                             Err(()) => return SQLITE_OK,
                         }
@@ -912,7 +983,13 @@ unsafe extern "system" fn vtab_filter(
                         let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
                         let val_ptr = *argv.offset(arg_pos as isize);
                         arg_pos += 1;
-                        match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, false, inc) {
+                        match pk_range_bound_to_key(
+                            val_ptr,
+                            vtab.pk_affinity,
+                            vtab.pk_collation,
+                            false,
+                            inc,
+                        ) {
                             Ok(bound) => bound,
                             Err(()) => return SQLITE_OK,
                         }
@@ -1068,7 +1145,12 @@ unsafe extern "system" fn vtab_update(
                     }
                 }
             } else {
-                let old_pk = sqlite_value_to_key_bytes(arg0);
+                let old_pk = sqlite_value_to_key_bytes_with_schema(
+                    arg0,
+                    vtab.pk_affinity,
+                    vtab.pk_collation,
+                    false,
+                );
                 if vtab.has_non_int_pks.load(Ordering::Relaxed) {
                     if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
                         rmap.remove_by_pk(&old_pk);
@@ -1092,48 +1174,95 @@ unsafe extern "system" fn vtab_update(
         let pk_val_ptr = *argv.offset(2 + vtab.pk_col_idx as isize);
         let pk_val_type = sqlite3_value_type(pk_val_ptr);
 
-        // Handle `SQLITE_NULL` primary key (`USE-05`)
+        // Handle `SQLITE_NULL` primary key (`USE-05`, `F08`)
         let pk_override = if pk_val_type == SQLITE_NULL {
             if is_insert && vtab.pk_affinity == ColumnAffinity::Integer {
                 let mut candidate = vtab.next_auto_rowid.load(Ordering::Relaxed);
                 if candidate <= 0 {
                     candidate = 1;
                 }
-                loop {
+                let mut found_free = None;
+                // 1. Bounded sequential probe using checked arithmetic (`F08`)
+                for _ in 0..1024 {
                     let probe_key = encode_i64_tagged_key(candidate);
                     match eng.row_exists(vtab.table_id, &probe_key) {
-                        Ok(true) => candidate = candidate.saturating_add(1),
-                        Ok(false) => break,
+                        Ok(false) => {
+                            found_free = Some(candidate);
+                            break;
+                        }
+                        Ok(true) => match candidate.checked_add(1) {
+                            Some(next) => candidate = next,
+                            None => break,
+                        },
                         Err(e) => return io_err_to_sqlite_rc(&e),
                     }
                 }
-                vtab.next_auto_rowid
-                    .store(candidate.saturating_add(1), Ordering::Relaxed);
-                Some(candidate)
+                // 2. If `i64::MAX` was reached (or 1024 consecutive IDs were occupied),
+                //    probe up to 64 deterministic pseudo-random positive `i64` candidates (`1..=i64::MAX`),
+                //    matching SQLite's fallback rowid generator, and return `SQLITE_FULL` if exhausted (`F08`).
+                if found_free.is_none() {
+                    let mut state = (eng.next_lsn() ^ 0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(vtab.table_id as u64);
+                    for attempt in 0..64u64 {
+                        state = state
+                            .wrapping_add(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(attempt);
+                        let mut z = state;
+                        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                        z ^= z >> 31;
+                        let rand_pos = ((z & 0x7FFF_FFFF_FFFF_FFFF) as i64).max(1);
+                        let probe_key = encode_i64_tagged_key(rand_pos);
+                        match eng.row_exists(vtab.table_id, &probe_key) {
+                            Ok(false) => {
+                                found_free = Some(rand_pos);
+                                break;
+                            }
+                            Ok(true) => {}
+                            Err(e) => return io_err_to_sqlite_rc(&e),
+                        }
+                    }
+                }
+                let Some(chosen) = found_free else {
+                    return SQLITE_FULL;
+                };
+                if let Some(next) = chosen.checked_add(1) {
+                    vtab.next_auto_rowid.fetch_max(next, Ordering::Relaxed);
+                }
+                Some(chosen)
             } else {
                 return SQLITE_CONSTRAINT;
             }
         } else {
-            if vtab.pk_affinity == ColumnAffinity::Integer && pk_val_type == SQLITE_INTEGER {
-                let explicit_id = sqlite3_value_int64(pk_val_ptr);
-                if explicit_id >= 0 {
-                    vtab.next_auto_rowid
-                        .fetch_max(explicit_id.saturating_add(1), Ordering::Relaxed);
-                }
-            }
             None
         };
-
-        let pk_is_int = vtab.pk_affinity == ColumnAffinity::Integer
-            && (pk_val_type == SQLITE_INTEGER || pk_override.is_some());
 
         let (new_pk, row_bytes, sec_keys) = encode_sqlite_values_direct(
             argv.offset(2),
             num_cols,
             vtab.pk_col_idx,
             pk_override,
+            &vtab.col_affinities,
+            &vtab.col_collations,
             &vtab.secondary_indexes,
         );
+
+        let coerced_int_pk = if vtab.pk_affinity == ColumnAffinity::Integer {
+            decode_i64_tagged_key(&new_pk)
+        } else {
+            None
+        };
+        if pk_override.is_none() {
+            if let Some(explicit_id) = coerced_int_pk {
+                if explicit_id >= 0 {
+                    if let Some(next) = explicit_id.checked_add(1) {
+                        vtab.next_auto_rowid.fetch_max(next, Ordering::Relaxed);
+                    } else {
+                        vtab.next_auto_rowid.fetch_max(i64::MAX, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
 
         // Resolve `old_pk` if this is an UPDATE (`!is_insert`)
         let mut old_pk_opt: Option<(Vec<u8>, Option<i64>)> = None;
@@ -1151,7 +1280,15 @@ unsafe extern "system" fn vtab_update(
                     old_pk_opt = Some((encode_i64_tagged_key(rid).to_vec(), None));
                 }
             } else {
-                old_pk_opt = Some((sqlite_value_to_key_bytes(arg0), None));
+                old_pk_opt = Some((
+                    sqlite_value_to_key_bytes_with_schema(
+                        arg0,
+                        vtab.pk_affinity,
+                        vtab.pk_collation,
+                        false,
+                    ),
+                    None,
+                ));
             }
         }
 
@@ -1205,8 +1342,8 @@ unsafe extern "system" fn vtab_update(
 
         let rid = if let Some(auto_id) = pk_override {
             auto_id
-        } else if pk_is_int {
-            sqlite3_value_int64(pk_val_ptr)
+        } else if let Some(int_id) = coerced_int_pk {
+            int_id
         } else {
             vtab.has_non_int_pks.store(true, Ordering::Relaxed);
             if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
@@ -2570,5 +2707,188 @@ mod tests {
                 SqlValue::Text("other committed".into())
             ]]
         );
+    }
+
+    #[test]
+    fn f04_f05_f08_affinity_collation_unified_numeric_sorting_and_max_rowid() {
+        let tmp = TempTestDir::new("f04_f05_f08");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let shared = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(shared).unwrap();
+
+        // 1. F04: INTEGER PRIMARY KEY affinity coercion on lookup (`WHERE id=1.0`, `WHERE id='1'`, `WHERE +id=1.0`)
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t_int USING aydb(
+                table_id = 70,
+                columns = 'id INTEGER PRIMARY KEY, score INT, label TEXT',
+                indexes = 'score'
+            );
+            INSERT INTO t_int VALUES (1, 100, 'one'), (2, 200, 'two');",
+        )
+        .unwrap();
+
+        for sql in [
+            "SELECT id FROM t_int WHERE id = 1.0",
+            "SELECT id FROM t_int WHERE id = '1'",
+            "SELECT id FROM t_int WHERE +id = 1.0",
+            "SELECT id FROM t_int WHERE score = 100.0",
+            "SELECT id FROM t_int WHERE score = '100'",
+        ] {
+            assert_eq!(
+                conn.query_all(sql, &[]).unwrap(),
+                vec![vec![SqlValue::Integer(1)]],
+                "F04 query failed: {sql}"
+            );
+        }
+
+        // Inserting '3' or 4.0 into INTEGER PRIMARY KEY stores integer values
+        conn.execute_batch("INSERT INTO t_int VALUES ('3', '300', 'three'), (4.0, 400.0, 'four');")
+            .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT id, score FROM t_int WHERE id >= 3 ORDER BY id", &[])
+                .unwrap(),
+            vec![
+                vec![SqlValue::Integer(3), SqlValue::Integer(300)],
+                vec![SqlValue::Integer(4), SqlValue::Integer(400)],
+            ]
+        );
+
+        // 2. F04: COLLATE NOCASE and COLLATE RTRIM on primary key and secondary index, plus rejecting unknown collations
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t_coll USING aydb(
+                table_id = 71,
+                columns = 'k TEXT PRIMARY KEY COLLATE NOCASE, tag TEXT COLLATE RTRIM',
+                indexes = 'tag'
+            );
+            INSERT INTO t_coll VALUES ('Alice', 'admin   ');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_all("SELECT k FROM t_coll WHERE k = 'alice'", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Text("Alice".into())]]
+        );
+        assert_eq!(
+            conn.query_all("SELECT k FROM t_coll WHERE +k = 'ALICE'", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Text("Alice".into())]]
+        );
+        assert_eq!(
+            conn.query_all("SELECT k, tag FROM t_coll WHERE tag = 'admin'", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Text("Alice".into()),
+                SqlValue::Text("admin   ".into())
+            ]]
+        );
+        // Duplicate under NOCASE must fail with SQLITE_CONSTRAINT
+        assert!(
+            conn.execute_batch("INSERT INTO t_coll VALUES ('ALICE', 'other');")
+                .is_err(),
+            "F04: duplicate COLLATE NOCASE key must fail uniqueness check"
+        );
+        // Unsupported collation in CREATE VIRTUAL TABLE must be rejected
+        assert!(
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE bad_coll USING aydb(
+                    table_id = 72,
+                    columns = 'k TEXT PRIMARY KEY COLLATE NOSUCHCOLLATION'
+                );"
+            )
+            .is_err(),
+            "F04: unknown collation must be rejected at table creation"
+        );
+
+        // 3. F05: Unified exact numeric sorting across mixed INTEGER and REAL values (including 2^53 + 1)
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE m_num USING aydb(
+                table_id = 73,
+                columns = 'k BLOB PRIMARY KEY, v TEXT'
+            );
+            INSERT INTO m_num VALUES
+                (10, 'ten'),
+                (1.5, 'one_half'),
+                (-1.5, 'neg_one_half'),
+                (-10, 'neg_ten'),
+                (0, 'zero'),
+                (9007199254740993, 'two53_plus_1'),
+                (9007199254740992, 'two53'),
+                (-9007199254740992, 'neg_two53'),
+                (-9007199254740993, 'neg_two53_minus_1');",
+        )
+        .unwrap();
+
+        let sorted_mixed = conn
+            .query_all("SELECT k FROM m_num ORDER BY k", &[])
+            .unwrap();
+        assert_eq!(
+            sorted_mixed,
+            vec![
+                vec![SqlValue::Integer(-9_007_199_254_740_993)],
+                vec![SqlValue::Integer(-9_007_199_254_740_992)],
+                vec![SqlValue::Integer(-10)],
+                vec![SqlValue::Float(-1.5)],
+                vec![SqlValue::Integer(0)],
+                vec![SqlValue::Float(1.5)],
+                vec![SqlValue::Integer(10)],
+                vec![SqlValue::Integer(9_007_199_254_740_992)],
+                vec![SqlValue::Integer(9_007_199_254_740_993)],
+            ]
+        );
+
+        // Range scan with LIMIT pushdown on mixed numeric BLOB PK
+        let top3_gt_neg2 = conn
+            .query_all("SELECT k FROM m_num WHERE k > -2 ORDER BY k LIMIT 3", &[])
+            .unwrap();
+        assert_eq!(
+            top3_gt_neg2,
+            vec![
+                vec![SqlValue::Float(-1.5)],
+                vec![SqlValue::Integer(0)],
+                vec![SqlValue::Float(1.5)],
+            ]
+        );
+
+        // Point lookup of integer 10 using 10.0 on BLOB primary key
+        assert_eq!(
+            conn.query_all("SELECT v FROM m_num WHERE k = 10.0", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Text("ten".into())]]
+        );
+
+        // 4. F08: Explicit i64::MAX insertion followed by NULL auto-ID insertion must not hang!
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE max_id_t USING aydb(
+                table_id = 74,
+                columns = 'id INTEGER PRIMARY KEY, label TEXT'
+            );
+            INSERT INTO max_id_t VALUES (9223372036854775807, 'max_int');
+            INSERT INTO max_id_t VALUES (NULL, 'after_max_1');
+            INSERT INTO max_id_t VALUES (NULL, 'after_max_2');",
+        )
+        .unwrap();
+
+        let rows_after_max = conn
+            .query_all("SELECT id, label FROM max_id_t ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows_after_max.len(), 3);
+        assert_eq!(
+            rows_after_max[2],
+            vec![SqlValue::Integer(i64::MAX), SqlValue::Text("max_int".into())]
+        );
+        // Both auto-generated IDs must be valid positive integers < i64::MAX and distinct
+        let id1 = match rows_after_max[0][0] {
+            SqlValue::Integer(v) => v,
+            _ => panic!("expected integer PK"),
+        };
+        let id2 = match rows_after_max[1][0] {
+            SqlValue::Integer(v) => v,
+            _ => panic!("expected integer PK"),
+        };
+        assert!(id1 > 0 && id1 < id2 && id2 < i64::MAX);
     }
 }

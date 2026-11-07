@@ -36,6 +36,7 @@ pub const SQLITE_NOMEM: c_int = 7;
 pub const SQLITE_READONLY: c_int = 8;
 pub const SQLITE_IOERR: c_int = 10;
 pub const SQLITE_CORRUPT: c_int = 11;
+pub const SQLITE_FULL: c_int = 13;
 pub const SQLITE_CONSTRAINT: c_int = 19;
 pub const SQLITE_MISMATCH: c_int = 20;
 pub const SQLITE_MISUSE: c_int = 21;
