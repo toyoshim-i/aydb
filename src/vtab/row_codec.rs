@@ -12,6 +12,37 @@ use crate::vtab::ffi::{
     sqlite3_value_type,
 };
 
+/// Encodes an IEEE-754 `f64` into an 8-byte order-preserving big-endian representation:
+/// - Normalizes `-0.0` to `+0.0`.
+/// - Positive/zero floats (`sign bit == 0`) flip the sign bit (`bits ^ (1 << 63)`).
+/// - Negative floats (`sign bit == 1`) flip all 64 bits (`!bits`).
+#[inline]
+pub fn encode_f64_memcomparable(v: f64) -> [u8; 8] {
+    let bits = if v == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        v.to_bits()
+    };
+    let transformed = if (bits & (1u64 << 63)) == 0 {
+        bits ^ (1u64 << 63)
+    } else {
+        !bits
+    };
+    transformed.to_be_bytes()
+}
+
+/// Decodes an 8-byte order-preserving big-endian representation back into an IEEE-754 `f64`.
+#[inline]
+pub fn decode_f64_memcomparable(bytes: [u8; 8]) -> f64 {
+    let transformed = u64::from_be_bytes(bytes);
+    let bits = if (transformed & (1u64 << 63)) != 0 {
+        transformed ^ (1u64 << 63)
+    } else {
+        !transformed
+    };
+    f64::from_bits(bits)
+}
+
 /// A dynamically typed SQL column value matching SQLite's 5 fundamental storage classes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
@@ -87,8 +118,10 @@ impl SqlValue {
         }
     }
 
-    /// Encodes this value into a standalone memcomparable primary/secondary key component.
-    /// - `Integer(i)` -> 1-byte tag `0x10` + 8-byte sign-flipped big-endian (`encode_i64_memcomparable(i)`).
+    /// Encodes this value into a standalone memcomparable primary/secondary key component:
+    /// - `Null` -> empty byte vector (`Vec::new()`).
+    /// - `Integer(i)` -> 8-byte sign-flipped big-endian (`encode_i64_memcomparable(i)`).
+    /// - `Float(f)` -> 8-byte IEEE-754 order-preserving big-endian (`encode_f64_memcomparable(f)`).
     /// - `Text(s)` -> raw UTF-8 bytes (so string primary keys have zero tag overhead and preserve
     ///   exact lexicographical order).
     /// - `Blob(b)` -> raw bytes.
@@ -96,7 +129,7 @@ impl SqlValue {
         match self {
             Self::Null => Vec::new(),
             Self::Integer(v) => encode_i64_memcomparable(*v).to_vec(),
-            Self::Float(v) => v.to_be_bytes().to_vec(),
+            Self::Float(v) => encode_f64_memcomparable(*v).to_vec(),
             Self::Text(s) => s.as_bytes().to_vec(),
             Self::Blob(b) => b.clone(),
         }
@@ -264,7 +297,7 @@ pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
         match sqlite3_value_type(vptr) {
             SQLITE_NULL => Vec::new(),
             SQLITE_INTEGER => encode_i64_memcomparable(sqlite3_value_int64(vptr)).to_vec(),
-            SQLITE_FLOAT => sqlite3_value_double(vptr).to_be_bytes().to_vec(),
+            SQLITE_FLOAT => encode_f64_memcomparable(sqlite3_value_double(vptr)).to_vec(),
             SQLITE_TEXT => {
                 let len = sqlite3_value_bytes(vptr).max(0) as usize;
                 let ptr = sqlite3_value_text(vptr);
@@ -405,7 +438,7 @@ pub fn extract_column_key_bytes(row_bytes: &[u8], col_idx: usize) -> io::Result<
                 return Ok(Vec::new());
             }
             let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-            Ok(v.to_be_bytes().to_vec())
+            Ok(encode_f64_memcomparable(v).to_vec())
         }
         3 | 4 => {
             if offset + 4 > row_bytes.len() {
@@ -504,4 +537,59 @@ pub fn decode_all_columns(row_bytes: &[u8]) -> io::Result<Vec<SqlValue>> {
         out.push(decode_column_at(row_bytes, i)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memcomparable_f64_preserves_order_and_normalizes_neg_zero() {
+        assert_eq!(
+            encode_f64_memcomparable(-0.0),
+            encode_f64_memcomparable(0.0)
+        );
+        assert_eq!(decode_f64_memcomparable(encode_f64_memcomparable(-0.0)), 0.0);
+
+        let vals = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -1_000_000.5,
+            -10.0,
+            -2.0,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            2.0,
+            10.0,
+            1_000_000.5,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for pair in vals.windows(2) {
+            let a = encode_f64_memcomparable(pair[0]);
+            let b = encode_f64_memcomparable(pair[1]);
+            assert!(a < b, "{} should encode smaller than {}", pair[0], pair[1]);
+            assert_eq!(decode_f64_memcomparable(a), pair[0]);
+            assert_eq!(decode_f64_memcomparable(b), pair[1]);
+        }
+
+        let row = encode_row(&[SqlValue::Float(-2.5), SqlValue::Float(2.5)]);
+        assert_eq!(
+            extract_column_key_bytes(&row, 0).unwrap(),
+            encode_f64_memcomparable(-2.5).to_vec()
+        );
+        assert_eq!(
+            extract_column_key_bytes(&row, 1).unwrap(),
+            encode_f64_memcomparable(2.5).to_vec()
+        );
+        assert!(
+            SqlValue::Float(-2.5).to_key_bytes() < SqlValue::Float(-1.0).to_key_bytes()
+        );
+        assert!(
+            SqlValue::Float(-1.0).to_key_bytes() < SqlValue::Float(0.0).to_key_bytes()
+        );
+    }
 }
