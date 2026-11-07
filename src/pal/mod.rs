@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 pub mod path;
 
+/// Process-level lock file name created inside the database directory on Unix (`flock`).
+pub const DB_LOCK_FILE_NAME: &str = "db.lock";
+
 #[cfg(windows)]
 pub mod windows;
 #[cfg(windows)]

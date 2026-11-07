@@ -20,7 +20,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use super::path::{normalize_db_root_path, validate_flat_file_name};
-use super::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+use super::{DB_LOCK_FILE_NAME, OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 
 type HANDLE = *mut core::ffi::c_void;
 type BOOL = i32;
@@ -232,8 +232,13 @@ impl WinPlatformFile {
             OpenHint::MutableSyncLog => {
                 flags |= FILE_FLAG_WRITE_THROUGH;
             }
-            OpenHint::MutableBufferedLog | OpenHint::ImmutableSequential => {
+            OpenHint::MutableBufferedLog => {
                 flags |= FILE_FLAG_SEQUENTIAL_SCAN;
+            }
+            OpenHint::ImmutableSequential => {
+                // `blob_*.db` files serve random point lookups (`get_row` / `get_row_into`), so
+                // omit `FILE_FLAG_SEQUENTIAL_SCAN` to avoid aggressive read-ahead and premature
+                // page eviction in the Windows Cache Manager (`PERF-06`).
             }
             OpenHint::ImmutableRandom => {
                 flags |= FILE_FLAG_RANDOM_ACCESS;
@@ -551,7 +556,9 @@ impl PlatformFs for WinPlatformFs {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 if let Some(s) = entry.file_name().to_str() {
-                    names.push(s.to_owned());
+                    if s != DB_LOCK_FILE_NAME {
+                        names.push(s.to_owned());
+                    }
                 }
             }
         }

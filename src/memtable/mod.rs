@@ -70,6 +70,36 @@ impl MemTable {
         self.highest_lsn
     }
 
+    pub fn set_highest_lsn(&mut self, lsn: u64) {
+        self.highest_lsn = lsn;
+    }
+
+    /// Restores `key` to its pre-mutation state (`prev`) during transaction/savepoint rollback
+    /// in $O(\log N)$ time while maintaining exact `approximate_bytes` accounting (`PERF-03`).
+    pub fn restore_entry(&mut self, key: Vec<u8>, prev: Option<MemEntry>) {
+        let klen = key.len();
+        match prev {
+            Some(prev_entry) => {
+                let prev_cost = prev_entry.approx_heap_bytes(klen);
+                if let Some(cur_entry) = self.map.insert(key, prev_entry) {
+                    let cur_cost = cur_entry.approx_heap_bytes(klen);
+                    self.approximate_bytes = self
+                        .approximate_bytes
+                        .saturating_sub(cur_cost)
+                        .saturating_add(prev_cost);
+                } else {
+                    self.approximate_bytes = self.approximate_bytes.saturating_add(prev_cost);
+                }
+            }
+            None => {
+                if let Some(cur_entry) = self.map.remove(&key) {
+                    let cur_cost = cur_entry.approx_heap_bytes(klen);
+                    self.approximate_bytes = self.approximate_bytes.saturating_sub(cur_cost);
+                }
+            }
+        }
+    }
+
     /// Inserts or updates a key with an inline value (`< INLINE_THRESHOLD`).
     pub fn put_inline(&mut self, key: Vec<u8>, value: Vec<u8>, lsn: u64) {
         self.upsert(key, IndexValue::Inline(value), lsn);
@@ -314,6 +344,42 @@ mod tests {
                 .is_none()
         );
 
+        // PERF-06: Verify `read_blob_into` reuses the caller's `out: &mut Vec<u8>` buffer
+        // capacity across calls and validates CRC32C + `expected_key`!
+        let mut reusable_buf = Vec::with_capacity(16384);
+        let orig_cap = reusable_buf.capacity();
+        assert!(
+            reader
+                .read_blob_into(&ptr1, Some(b"http://example.com/a.png"), &mut reusable_buf)
+                .unwrap()
+        );
+        assert_eq!(reusable_buf, payload);
+        assert_eq!(reusable_buf.capacity(), orig_cap);
+
+        assert!(
+            !reader
+                .read_blob_into(
+                    &ptr1,
+                    Some(b"http://example.com/wrong.png"),
+                    &mut reusable_buf
+                )
+                .unwrap()
+        );
+        assert!(reusable_buf.is_empty());
+
+        let mut bad_crc_ptr = ptr1;
+        bad_crc_ptr.crc32c ^= 0xDEAD_BEEF;
+        assert!(
+            !reader
+                .read_blob_into(
+                    &bad_crc_ptr,
+                    Some(b"http://example.com/a.png"),
+                    &mut reusable_buf
+                )
+                .unwrap()
+        );
+        assert!(reusable_buf.is_empty());
+
         // Unflushed / beyond-EOF pointer (simulating power loss before blob reached disk) must return Ok(None)
         let dangling_ptr = BlobPtr {
             kind: BlobKind::Standard,
@@ -360,6 +426,16 @@ mod tests {
         // Reopen Segment 1 from disk to test Footer + Bloom + FencePointer deserialization
         drop(seg1);
         let seg1 = IdxSegmentReader::open(&fs, 1).expect("reopen seg 1");
+
+        // PERF-02: Verify `[min_key, max_key]` key-range metadata & pruning on `seg1`
+        assert_eq!(seg1.min_key(), b"user_key_00000");
+        assert_eq!(seg1.max_key(), b"user_key_00199");
+        assert!(!seg1.may_contain_key(b"aaa_before_min"));
+        assert!(!seg1.may_contain_key(b"zzz_after_max"));
+        assert!(seg1.may_contain_key(b"user_key_00042"));
+        assert!(!seg1.overlaps_range(b"zzz_0", Some(b"zzz_9")));
+        assert!(!seg1.overlaps_range(b"aaa_0", Some(b"aaa_9")));
+        assert!(seg1.overlaps_range(b"user_key_00100", Some(b"user_key_00150")));
 
         // Point lookups on Segment 1
         assert_eq!(

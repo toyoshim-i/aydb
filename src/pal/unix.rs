@@ -1,13 +1,27 @@
 //! Unix (Linux / macOS) Platform Abstraction Layer (`UnixPlatformFile` / `UnixPlatformFs`).
 
+use core::ffi::c_int;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::path::{normalize_db_root_path, validate_flat_file_name};
-use super::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+use super::{DB_LOCK_FILE_NAME, OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+
+#[cfg(target_os = "macos")]
+const F_FULLFSYNC: c_int = 51;
+
+unsafe extern "C" {
+    fn flock(fd: c_int, operation: c_int) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
 
 /// Unix implementation of [`PlatformFile`].
 #[derive(Debug)]
@@ -76,6 +90,13 @@ impl PlatformFile for UnixPlatformFile {
     }
 
     fn sync_durable(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let rc = unsafe { fcntl(self.file.as_raw_fd(), F_FULLFSYNC) };
+            if rc != -1 {
+                return Ok(());
+            }
+        }
         self.file.sync_all()
     }
 
@@ -88,12 +109,34 @@ impl PlatformFile for UnixPlatformFile {
 #[derive(Debug, Clone)]
 pub struct UnixPlatformFs {
     root: PathBuf,
+    _lock_file: Arc<File>,
 }
 
 impl UnixPlatformFs {
     pub fn open(root: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let normalized = normalize_db_root_path(root.as_ref(), create)?;
-        Ok(Self { root: normalized })
+        let lock_path = normalized.join(DB_LOCK_FILE_NAME);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let rc = unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            root: normalized,
+            _lock_file: Arc::new(lock_file),
+        })
+    }
+
+    /// Flushes directory metadata to non-volatile storage so newly created or unlinked
+    /// segment/manifest directory entries survive sudden power loss (`AUD-10`).
+    pub fn sync_dir(&self) -> io::Result<()> {
+        let dir = File::open(&self.root)?;
+        dir.sync_all()
     }
 }
 
@@ -109,7 +152,11 @@ impl PlatformFs for UnixPlatformFs {
     ) -> io::Result<Arc<Self::File>> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(rel_name);
+        let existed = full_path.exists();
         let file = UnixPlatformFile::open_internal(&full_path, create, writable, false, hint)?;
+        if create && (!existed || hint == OpenHint::MutableSyncLog) {
+            self.sync_dir()?;
+        }
         Ok(Arc::new(file))
     }
 
@@ -117,7 +164,10 @@ impl PlatformFs for UnixPlatformFs {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(rel_name);
         match std::fs::remove_file(full_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.sync_dir()?;
+                Ok(())
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
@@ -129,7 +179,9 @@ impl PlatformFs for UnixPlatformFs {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 if let Some(s) = entry.file_name().to_str() {
-                    names.push(s.to_owned());
+                    if s != DB_LOCK_FILE_NAME {
+                        names.push(s.to_owned());
+                    }
                 }
             }
         }

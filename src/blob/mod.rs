@@ -167,33 +167,73 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         ptr: &BlobPtr,
         expected_key: Option<&[u8]>,
     ) -> io::Result<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        if self.read_blob_into(ptr, expected_key, &mut out)? {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads and verifies the blob payload referenced by `ptr` directly into `out` (clearing `out`
+    /// first while reusing its heap allocation) with zero intermediate `Vec<u8>` allocations (`PERF-06`).
+    pub fn read_blob_into(
+        &self,
+        ptr: &BlobPtr,
+        expected_key: Option<&[u8]>,
+        out: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        out.clear();
+        self.append_blob_into(ptr, expected_key, out)
+    }
+
+    /// Appends the verified blob payload referenced by `ptr` onto the end of `out` in place
+    /// without allocating an intermediate frame buffer (`PERF-06`).
+    pub fn append_blob_into(
+        &self,
+        ptr: &BlobPtr,
+        expected_key: Option<&[u8]>,
+        out: &mut Vec<u8>,
+    ) -> io::Result<bool> {
         let len = ptr.len as usize;
         if len < BLOB_RECORD_HEADER_LEN {
-            return Ok(None);
+            return Ok(false);
         }
 
-        let mut buf = vec![0u8; len];
-        match self.file.read_exact_at(&mut buf, ptr.offset as u64) {
+        let orig_len = out.len();
+        out.resize(orig_len + len, 0);
+        match self
+            .file
+            .read_exact_at(&mut out[orig_len..orig_len + len], ptr.offset as u64)
+        {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // Power loss occurred before the buffered blob write reached physical disk.
-                return Ok(None);
+                out.truncate(orig_len);
+                return Ok(false);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                out.truncate(orig_len);
+                return Err(e);
+            }
         }
 
+        let buf = &out[orig_len..orig_len + len];
         if &buf[0..4] != BLOB_RECORD_MAGIC {
-            return Ok(None);
+            out.truncate(orig_len);
+            return Ok(false);
         }
 
         let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         if stored_crc != ptr.crc32c {
-            return Ok(None);
+            out.truncate(orig_len);
+            return Ok(false);
         }
 
         let actual_crc = crc32c(&buf[8..]);
         if actual_crc != ptr.crc32c {
-            return Ok(None);
+            out.truncate(orig_len);
+            return Ok(false);
         }
 
         let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
@@ -204,18 +244,22 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             .and_then(|n| n.checked_add(val_len))
             != Some(len)
         {
-            return Ok(None);
+            out.truncate(orig_len);
+            return Ok(false);
         }
 
         let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
         if let Some(exp_k) = expected_key {
             if key_slice != exp_k {
-                return Ok(None);
+                out.truncate(orig_len);
+                return Ok(false);
             }
         }
 
-        let val_start = BLOB_RECORD_HEADER_LEN + key_len;
-        Ok(Some(buf[val_start..val_start + val_len].to_vec()))
+        let val_start = orig_len + BLOB_RECORD_HEADER_LEN + key_len;
+        out.copy_within(val_start..val_start + val_len, orig_len);
+        out.truncate(orig_len + val_len);
+        Ok(true)
     }
 
     /// Validates whether `ptr` points to an intact, CRC-verified blob record on disk.

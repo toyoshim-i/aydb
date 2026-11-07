@@ -475,6 +475,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
             // if any managed segment/manifest file or non-empty WAL file already exists, refuse
             // to initialize a blank state or run the orphan sweep (`AUD-09`).
             for fname in fs.list_files()? {
+                if fname == crate::pal::DB_LOCK_FILE_NAME {
+                    continue;
+                }
                 if is_managed_segment_or_manifest(&fname) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -859,6 +862,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         let files_on_disk = self.fs.list_files()?;
         for fname in files_on_disk {
+            if fname == crate::pal::DB_LOCK_FILE_NAME {
+                continue;
+            }
             if is_managed_segment_or_manifest(&fname) && !referenced.contains(&fname) {
                 self.state.queue_pending_delete(fname);
             }

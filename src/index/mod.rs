@@ -454,6 +454,7 @@ pub struct IdxSegmentBuilder<F: PlatformFile> {
     block_builder: IdxBlockBuilder,
     fence_pointers: Vec<FencePointer>,
     bloom_hashes: Vec<(u32, u32)>,
+    last_key: Vec<u8>,
     num_blocks: u32,
     record_count: u32,
     write_offset: u64,
@@ -476,6 +477,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             block_builder: IdxBlockBuilder::new(),
             fence_pointers: Vec::new(),
             bloom_hashes: Vec::new(),
+            last_key: Vec::new(),
             num_blocks: 0,
             record_count: 0,
             write_offset: 0,
@@ -491,6 +493,8 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         if self.bloom_bits_per_key > 0 {
             self.bloom_hashes.push(BloomFilter::hash_pair(&entry.key));
         }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(&entry.key);
         self.record_count += 1;
         Ok(())
     }
@@ -526,7 +530,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         // Build BloomFilter from precomputed (h1, h2) hash pairs
         let bloom = BloomFilter::from_hash_pairs(&self.bloom_hashes, self.bloom_bits_per_key);
 
-        // Encode Filter + Sparse Fence Pointers metadata section
+        // Encode Filter + Sparse Fence Pointers + max_key metadata section
         let meta_offset = self.write_offset;
         let mut meta_buf = Vec::with_capacity(256);
         bloom.encode(&mut meta_buf);
@@ -536,6 +540,8 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             meta_buf.extend_from_slice(&fp.block_idx.to_le_bytes());
             meta_buf.extend_from_slice(&fp.first_key);
         }
+        meta_buf.extend_from_slice(&(self.last_key.len() as u16).to_le_bytes());
+        meta_buf.extend_from_slice(&self.last_key);
         let meta_len = meta_buf.len() as u32;
         let meta_crc = crc32c(&meta_buf);
 
@@ -559,6 +565,12 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         self.write_offset += meta_buf.len() as u64;
         self.file.sync_durable()?;
 
+        let min_key = self
+            .fence_pointers
+            .first()
+            .map(|fp| fp.first_key.to_vec())
+            .unwrap_or_default();
+
         Ok(IdxSegmentReader {
             file: self.file,
             seq_id: self.seq_id,
@@ -568,6 +580,8 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             record_count: self.record_count,
             bloom,
             fence_pointers: self.fence_pointers,
+            min_key,
+            max_key: self.last_key,
         })
     }
 }
@@ -585,6 +599,8 @@ pub struct IdxSegmentReader<F: PlatformFile> {
     record_count: u32,
     bloom: BloomFilter,
     fence_pointers: Vec<FencePointer>,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
 }
 
 impl<F: PlatformFile> IdxSegmentReader<F> {
@@ -689,6 +705,43 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             });
         }
 
+        let min_key = fence_pointers
+            .first()
+            .map(|fp| fp.first_key.to_vec())
+            .unwrap_or_default();
+        let max_key = if slice.len() >= 2 {
+            let max_klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
+            slice = &slice[2..];
+            if slice.len() < max_klen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated max_key in idx segment metadata",
+                ));
+            }
+            slice[..max_klen].to_vec()
+        } else if num_blocks > 0 && !fence_pointers.is_empty() {
+            let last_block_idx = num_blocks - 1;
+            let mut block_buf = [0u8; IDX_BLOCK_SIZE];
+            file.read_exact_at(
+                &mut block_buf,
+                (last_block_idx as u64) * (IDX_BLOCK_SIZE as u64),
+            )?;
+            if let Ok(reader) = IdxBlockReader::open_verified(&block_buf) {
+                if reader.num_entries() > 0 {
+                    reader
+                        .key_at(reader.num_entries() - 1)
+                        .map(|k| k.to_vec())
+                        .unwrap_or_else(|_| fence_pointers.last().unwrap().first_key.to_vec())
+                } else {
+                    min_key.clone()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             file,
             seq_id,
@@ -698,6 +751,8 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             record_count,
             bloom,
             fence_pointers,
+            min_key,
+            max_key,
         })
     }
 
@@ -721,6 +776,34 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         self.record_count
     }
 
+    /// Returns the smallest key stored in this segment (empty if the segment has no entries).
+    #[inline]
+    pub fn min_key(&self) -> &[u8] {
+        &self.min_key
+    }
+
+    /// Returns the largest key stored in this segment (empty if the segment has no entries).
+    #[inline]
+    pub fn max_key(&self) -> &[u8] {
+        &self.max_key
+    }
+
+    /// Returns `true` if `key` lies within `[self.min_key, self.max_key]` (`PERF-02`).
+    #[inline]
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        !self.fence_pointers.is_empty()
+            && key >= self.min_key.as_slice()
+            && key <= self.max_key.as_slice()
+    }
+
+    /// Returns `true` if `[self.min_key, self.max_key]` overlaps `[lower, upper]` (`PERF-02`).
+    #[inline]
+    pub fn overlaps_range(&self, lower: &[u8], upper: Option<&[u8]>) -> bool {
+        !self.fence_pointers.is_empty()
+            && self.max_key.as_slice() >= lower
+            && upper.is_none_or(|u| self.min_key.as_slice() <= u)
+    }
+
     /// Returns the total process heap memory (in bytes) consumed by this segment's
     /// in-memory Bloom filter and Sparse Fence Pointers.
     pub fn heap_bytes_used(&self) -> usize {
@@ -733,12 +816,12 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 
     /// Point lookup for `key`.
-    /// 1. Checks in-heap [`BloomFilter`] in ~10 ns.
+    /// 1. Checks in-heap `[min_key, max_key]` key-range bounds and [`BloomFilter`] in ~10 ns.
     /// 2. Binary-searches in-heap [`FencePointer`] table in $O(\log B)$.
     /// 3. Reads a single 4 KB data block from the OS Page Cache and binary-searches its
     ///    `u16` offset directory in $O(\log K)$.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
-        if !self.bloom.may_contain(key) {
+        if !self.may_contain_key(key) || !self.bloom.may_contain(key) {
             return Ok(None);
         }
 
@@ -809,6 +892,15 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             if effective_start > ub || (!inclusive && effective_start == ub) {
                 return Ok(out);
             }
+        }
+        if !self.overlaps_range(effective_start, upper_key_bound.map(|(ub, _)| ub)) {
+            return Ok(out);
+        }
+        if !prefix.is_empty()
+            && self.min_key.as_slice() > prefix
+            && !self.min_key.starts_with(prefix)
+        {
+            return Ok(out);
         }
         let start_pos = self
             .fence_pointers
