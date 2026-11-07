@@ -138,18 +138,24 @@ impl MemTable {
     pub fn apply_wal_batch_owned(&mut self, batch: WalBatch) {
         let lsn = batch.lsn;
         for rec in batch.records {
-            match rec {
-                WalRecord::PutInline { key, value } => {
-                    self.put_inline(key, value, lsn);
-                }
-                WalRecord::PutBlobPtr { key, blob_ptr } => {
-                    self.put_blob_ptr(key, blob_ptr, lsn);
-                }
-                WalRecord::Delete { key } => {
-                    self.delete(key, lsn);
-                }
-                WalRecord::TxBegin | WalRecord::TxCommit => {}
+            self.apply_single_wal_record(lsn, rec);
+        }
+    }
+
+    /// Applies a single [`WalRecord`] at `lsn` into this `MemTable` without cloning (`R-02`).
+    #[inline]
+    pub fn apply_single_wal_record(&mut self, lsn: u64, rec: WalRecord) {
+        match rec {
+            WalRecord::PutInline { key, value } => {
+                self.put_inline(key, value, lsn);
             }
+            WalRecord::PutBlobPtr { key, blob_ptr } => {
+                self.put_blob_ptr(key, blob_ptr, lsn);
+            }
+            WalRecord::Delete { key } => {
+                self.delete(key, lsn);
+            }
+            WalRecord::TxBegin | WalRecord::TxCommit => {}
         }
     }
 

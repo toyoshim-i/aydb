@@ -25,8 +25,11 @@ const IDX_BLOCK_TRAILER_SIZE: usize = 8;
 /// Usable byte region before the 8-byte trailer (`0..4088`).
 const IDX_BLOCK_USABLE_SIZE: usize = IDX_BLOCK_SIZE - IDX_BLOCK_TRAILER_SIZE;
 
-/// Maximum encoded size of a single `(key + header + inline_value + u16 offset)` inside a 4 KB block.
+/// Maximum encoded size of a single `(key + header + inline_value)` before the 2-byte `u16` offset slot inside a 4 KB block.
 pub const MAX_SINGLE_BLOCK_ENTRY_BYTES: usize = IDX_BLOCK_USABLE_SIZE - 2;
+
+/// Encoded byte length of a `BlobPtr` inside an `IndexEntry` (`23` bytes).
+pub const BLOB_PTR_ENCODED_LEN: usize = 23;
 
 /// Default Bloom filter bits per key (`10` bits/key -> ~0.9% false-positive rate).
 pub const DEFAULT_BLOOM_BITS_PER_KEY: usize = 10;
@@ -85,6 +88,39 @@ impl IndexEntry {
     pub fn block_footprint_bytes(&self) -> usize {
         // 11B entry header (`key_len: u16 | type: u8 | lsn: u64`) + key + value_payload + 2B offset
         11 + self.key.len() + self.value.encoded_payload_len() + 2
+    }
+
+    /// Returns `true` if an `IndexValue::Inline` entry with `(key_len, val_len)` fits in a single
+    /// 4 KB index block (`11 + key_len + 2 + val_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    #[inline]
+    pub const fn inline_fits_in_block(key_len: usize, val_len: usize) -> bool {
+        match key_len.checked_add(val_len) {
+            Some(kv) => match kv.checked_add(13) {
+                Some(total) => total <= MAX_SINGLE_BLOCK_ENTRY_BYTES,
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Returns `true` if an `IndexValue::Blob` entry with `key_len` fits in a single 4 KB index
+    /// block (`11 + key_len + 23 <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    #[inline]
+    pub const fn blob_ptr_fits_in_block(key_len: usize) -> bool {
+        match key_len.checked_add(11 + BLOB_PTR_ENCODED_LEN) {
+            Some(total) => total <= MAX_SINGLE_BLOCK_ENTRY_BYTES,
+            None => false,
+        }
+    }
+
+    /// Returns `true` if an `IndexValue::Tombstone` entry with `key_len` fits in a single 4 KB
+    /// index block (`11 + key_len <= MAX_SINGLE_BLOCK_ENTRY_BYTES`, `R-03`).
+    #[inline]
+    pub const fn tombstone_fits_in_block(key_len: usize) -> bool {
+        match key_len.checked_add(11) {
+            Some(total) => total <= MAX_SINGLE_BLOCK_ENTRY_BYTES,
+            None => false,
+        }
     }
 }
 

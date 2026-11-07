@@ -21,6 +21,8 @@ unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
     #[cfg(target_os = "macos")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int;
 }
 
 /// Unix implementation of [`PlatformFile`].
@@ -69,7 +71,22 @@ impl PlatformFile for UnixPlatformFile {
     fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
         let current_len = self.file_len()?;
         if current_len < target_len {
-            self.file.set_len(target_len)?;
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(len_i64) = i64::try_from(target_len) {
+                    let rc = unsafe { posix_fallocate(self.file.as_raw_fd(), 0, len_i64) };
+                    if rc != 0 {
+                        // Fall back to `set_len` if the underlying filesystem does not support fallocate
+                        self.file.set_len(target_len)?;
+                    }
+                } else {
+                    self.file.set_len(target_len)?;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.file.set_len(target_len)?;
+            }
         }
         if strategy == PreallocStrategy::PhysicalZeroFill && current_len < target_len {
             const CHUNK_SIZE: usize = 256 * 1024;

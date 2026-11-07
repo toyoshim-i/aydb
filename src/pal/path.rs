@@ -8,12 +8,37 @@ use std::path::{Component, Path, PathBuf};
 
 /// Normalizes a database root directory path into an absolute, extended-length path
 /// on Windows (or canonical path on Unix), creating the directory if `create` is true.
+///
+/// Resolves relative paths and applies the `\\?\` extended-length prefix *before* calling
+/// `std::fs::create_dir_all` so directories deeper than `MAX_PATH` (260 characters) can be
+/// created on Windows even when `LongPathsEnabled` is not set in the registry (`O-02`).
 pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> {
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let clean_abs = clean_lexical_path(&abs_path);
+    let prefixed = ensure_extended_length_prefix(clean_abs);
     if create {
-        std::fs::create_dir_all(path)?;
+        std::fs::create_dir_all(&prefixed)?;
     }
-    let canonical = std::fs::canonicalize(path)?;
+    let canonical = std::fs::canonicalize(&prefixed)?;
     Ok(ensure_extended_length_prefix(canonical))
+}
+
+fn clean_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Ensures that a Windows path uses the `\\?\` or `\\?\UNC\` extended-length prefix.
@@ -75,5 +100,32 @@ pub fn validate_flat_file_name(rel_name: &str) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             format!("invalid flat file name: {rel_name}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn o02_normalize_db_root_path_creates_deep_long_paths_exceeding_max_path() {
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("aydb_o02_long_path_{pid}"));
+        let base_prefixed = ensure_extended_length_prefix(clean_lexical_path(&base));
+        let _ = std::fs::remove_dir_all(&base_prefixed);
+
+        let mut deep = base.clone();
+        for i in 0..8 {
+            deep.push(format!("segment_{i:02}_{}", "a".repeat(32)));
+        }
+        assert!(
+            deep.as_os_str().len() > 280,
+            "test path must exceed legacy MAX_PATH (260 chars)"
+        );
+
+        let normalized = normalize_db_root_path(&deep, true)
+            .expect("O-02: normalize_db_root_path must create paths > 260 chars");
+        assert!(normalized.exists());
+        let _ = std::fs::remove_dir_all(&base_prefixed);
     }
 }

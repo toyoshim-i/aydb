@@ -44,6 +44,7 @@ const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x0800_0000;
 const FILE_FLAG_RANDOM_ACCESS: DWORD = 0x1000_0000;
 
+const ERROR_SHARING_VIOLATION: DWORD = 32;
 const ERROR_HANDLE_EOF: DWORD = 38;
 const ERROR_IO_PENDING: DWORD = 997;
 
@@ -248,20 +249,30 @@ impl WinPlatformFile {
             }
         }
 
-        let handle = unsafe {
-            CreateFileW(
-                wide_path.as_ptr(),
-                access,
-                FILE_SHARE_NONE, // dwShareMode = 0 (Exclusive handle & SMB RWH Lease)
-                ptr::null(),
-                disposition,
-                flags,
-                ptr::null_mut(),
-            )
-        };
-
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
+        let mut handle = INVALID_HANDLE_VALUE;
+        for retry in 0..=4u32 {
+            handle = unsafe {
+                CreateFileW(
+                    wide_path.as_ptr(),
+                    access,
+                    FILE_SHARE_NONE, // dwShareMode = 0 (Exclusive handle & SMB RWH Lease)
+                    ptr::null(),
+                    disposition,
+                    flags,
+                    ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break;
+            }
+            let err = unsafe { GetLastError() };
+            // If an antivirus / EDR minifilter briefly holds a scan handle on a freshly written
+            // segment or manifest file, retry with short exponential backoff (`O-01`).
+            if err == ERROR_SHARING_VIOLATION && retry < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(1u64 << retry));
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
         }
 
         if hint == OpenHint::BackgroundBulk {

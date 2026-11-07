@@ -473,13 +473,26 @@ pub struct BootMetaManager<F: PlatformFs> {
     file: Arc<F::File>,
     active_slot: SlotIndex,
     state: BootMetaState,
+    standby_manifest_id: Option<u64>,
 }
 
 impl<F: PlatformFs> BootMetaManager<F> {
     /// Opens `boot_meta.db` (creating and pre-allocating it if missing), runs the 4-state
     /// crash-recovery truth table across Slot A and Slot B, and sweeps orphaned or pending-delete
-    /// segment files.
+    /// segment files immediately.
     pub fn open_or_recover(fs: Arc<F>) -> io::Result<Self> {
+        let mut mgr = Self::open_or_recover_deferred_sweep(fs)?;
+        mgr.sweep_orphans()?;
+        Ok(mgr)
+    }
+
+    /// Opens `boot_meta.db` and runs the 4-state crash-recovery truth table across Slot A and
+    /// Slot B **without** sweeping orphan segment files yet (`R-01`).
+    ///
+    /// Used by `StorageEngine::open` so uncataloged `blob_std_*` / `blob_lru_*` segments created
+    /// during the active WAL epoch (or in a torn opposite slot) can be discovered and validated
+    /// during Two-Stream WAL recovery before `sweep_orphans()` deletes truly unreferenced files.
+    pub fn open_or_recover_deferred_sweep(fs: Arc<F>) -> io::Result<Self> {
         let file = fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
         if file.file_len()? < BOOT_META_FILE_SIZE {
             file.preallocate(BOOT_META_FILE_SIZE, PreallocStrategy::PhysicalZeroFill)?;
@@ -533,6 +546,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 // Set active_slot to SlotB so the initial write below lands in SlotA (offset 0).
                 active_slot: SlotIndex::SlotB,
                 state: initial_state,
+                standby_manifest_id: None,
             };
             mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
             mgr.active_slot = SlotIndex::SlotA;
@@ -570,15 +584,20 @@ impl<F: PlatformFs> BootMetaManager<F> {
             }
         };
 
-        let mut mgr = Self {
+        Ok(Self {
             fs,
             file,
             active_slot: winning_slot,
             state: winning_state,
-        };
+            standby_manifest_id,
+        })
+    }
 
-        mgr.sweep_orphans_and_pending_deletes(standby_manifest_id)?;
-        Ok(mgr)
+    /// Sweeps any unreferenced `idx_*`, `blob_std_*`, `blob_lru_*`, or `manifest_*` files on disk
+    /// and processes `pending_delete_files` (`R-01`).
+    pub fn sweep_orphans(&mut self) -> io::Result<()> {
+        let standby_mf = self.standby_manifest_id;
+        self.sweep_orphans_and_pending_deletes(standby_mf)
     }
 
     /// Returns the underlying `boot_meta.db` file handle.
@@ -632,6 +651,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         self.active_slot = target_slot;
         self.state = next_state;
+        self.standby_manifest_id = prev_manifest_id;
 
         // Best-effort deletion pass over pending_delete_files.
         self.try_process_pending_deletes();
