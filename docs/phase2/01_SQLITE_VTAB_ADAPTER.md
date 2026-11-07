@@ -20,10 +20,10 @@ CREATE VIRTUAL TABLE http_cache USING aydb(
 
 `aydb`'s `xCreate` / `xConnect` callback parses the key-value arguments passed in `argv[3..]`:
 
-1. **`table_id` (`u16`, optional):** Unique 16-bit table identifier (`!= 0`) inside the `StorageEngine` namespace. If omitted, `StorageEngine::register_or_resolve_vtab` resolves or auto-assigns a collision-free `table_id` persisted in the engine catalog (`[0, 0, 'c', table_name]`, `AUD-03`).
+1. **`table_id` (`u16`, optional):** Unique 16-bit table identifier (`!= 0`) inside the `StorageEngine` namespace. If omitted, `StorageEngine::register_or_resolve_vtab` resolves or auto-assigns a collision-free `table_id` persisted in the engine catalog (`[0, 0, 'c', table_name]`).
 2. **`max_bytes` (`u64`, optional, default `0` = unbounded):** If `> 0`, registers `table_id` as a Capped Table (`engine.register_capped_table(table_id, max_bytes)`) with automatic LRU eviction and dedicated `blob_lru_<TblID>_<SeqID>.db` storage.
 3. **`durability` (`'sync'` or `'buffered'`, default `'buffered'`):** Controls whether mutations on this virtual table commit via `WriteDurability::SyncTransactional` (`wal_sync.db`) or `WriteDurability::BufferedFast` (`wal_buf.db`).
-4. **`columns` (SQL column list):** Parsed using top-level comma splitting (`split_top_level_commas`, preserving parenthesized type modifiers like `DECIMAL(10, 2)`, `USE-03`) to identify column names, affinities (`INT`, `TEXT`, `BLOB`, `REAL`, `NUMERIC`), and the `PRIMARY KEY` column index (`pk_col_idx`). The adapter constructs a standard `CREATE TABLE x(...)` statement and passes it to `sqlite3_declare_vtab(db, c_sql)`.
+4. **`columns` (SQL column list):** Parsed using top-level comma splitting (`split_top_level_commas`, preserving parenthesized type modifiers like `DECIMAL(10, 2)`) to identify column names, affinities (`INT`, `TEXT`, `BLOB`, `REAL`, `NUMERIC`), and the `PRIMARY KEY` column index (`pk_col_idx`). The adapter constructs a standard `CREATE TABLE x(...)` statement and passes it to `sqlite3_declare_vtab(db, c_sql)`.
 5. **`indexes` (comma-separated column names, optional):** Assigns deterministic `IndexID`s (`1, 2, ...`) to the specified secondary index columns so `xUpdate` automatically maintains `[TableID | 'i' | IndexID | EncodedCol | EncodedPK]` entries and `xBestIndex` pushes down equality predicates (`WHERE content_type = ?`).
 
 ---

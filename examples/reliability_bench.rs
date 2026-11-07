@@ -157,7 +157,7 @@ impl PlatformFile for SimFile {
     fn sync_barrier(&self) -> io::Result<()> {
         // On Windows, `MutableSyncLog` (`wal_sync.db`) opens with `FILE_FLAG_WRITE_THROUGH` so
         // each write bypasses the OS cache; on Linux/macOS (`UnixPlatformFile`), `sync_barrier()`
-        // issues `fdatasync` / `fcntl(F_FULLFSYNC)` (`N-03`) to flush written sectors to stable
+        // issues `fdatasync` / `fcntl(F_FULLFSYNC)` to flush written sectors to stable
         // media. Thus `sync_barrier()` transitions buffered pages into `durable_bytes`.
         self.sync_durable()
     }
@@ -504,7 +504,7 @@ fn bench_suite_3_transaction_rollback_invariants() {
         );
     }
 
-    // Scenario 3B: Sealed Blob Segment Overwrite + Rollback (ISSUE-02)
+    // Scenario 3B: Sealed Blob Segment Overwrite + Rollback
     {
         let fs = Arc::new(FaultInjectingFs::new());
         let mut cfg = EngineConfig::default();
@@ -534,11 +534,11 @@ fn bench_suite_3_transaction_rollback_invariants() {
             Ok(Some(ref v)) if v == &orig_blob => ("PASS", "Blob Intact"),
             Ok(Some(_)) => ("FAIL", "Wrong Blob Data"),
             Ok(None) => ("FAIL", "Blob Vanished"),
-            Err(_) => ("FAIL (ISSUE-02)", "I/O Err (File Deleted)"),
+            Err(_) => ("FAIL", "I/O Err (File Deleted)"),
         };
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "3B. Sealed Blob Overwrite + Rollback (ISSUE-02)",
+            "3B. Sealed Blob Overwrite + Rollback",
             status,
             note
         );
@@ -581,7 +581,7 @@ fn bench_suite_3_transaction_rollback_invariants() {
         );
     }
 
-    // Scenario 3D: Tombstone-Shadowed Multi-Segment Range Scan with `limit` (ISSUE-01)
+    // Scenario 3D: Tombstone-Shadowed Multi-Segment Range Scan with `limit`
     {
         let fs = Arc::new(FaultInjectingFs::new());
         let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
@@ -608,8 +608,8 @@ fn bench_suite_3_transaction_rollback_invariants() {
         let ok = rows.len() == 1 && rows[0].0 == b"k_20";
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "3D. Multi-Segment Range Scan w/ Tombstones (ISSUE-01)",
-            if ok { "PASS" } else { "FAIL (ISSUE-01)" },
+            "3D. Multi-Segment Range Scan w/ Tombstones",
+            if ok { "PASS" } else { "FAIL" },
             if ok {
                 "1/1 Row Found".to_string()
             } else {
@@ -620,12 +620,12 @@ fn bench_suite_3_transaction_rollback_invariants() {
 }
 
 // ============================================================================
-// Suite 4: Post-Crash Blob Garbage Collection & Storage Leak (ISSUE-02 / ISSUE-03)
+// Suite 4: Post-Crash Blob Garbage Collection & Storage Leak
 // ============================================================================
 
 fn bench_suite_4_post_crash_blob_leak() {
     println!("\n==========================================================================================");
-    println!("SUITE 4: Post-Crash Blob GC & Recovery Consistency (ISSUE-02 & ISSUE-03)");
+    println!("SUITE 4: Post-Crash Blob GC & Recovery Consistency");
     println!("==========================================================================================");
     println!(
         "{:<54} | {:>14} | {:>20}",
@@ -666,7 +666,7 @@ fn bench_suite_4_post_crash_blob_leak() {
         let reopen_res = StorageEngine::open(Arc::clone(&fs), cfg);
         let (status, detail) = match reopen_res {
             Ok(_) => ("PASS", "Opened Cleanly".to_string()),
-            Err(e) => ("FAIL (ISSUE-02)", format!("Unopenable ({:?})", e.kind())),
+            Err(e) => ("FAIL", format!("Unopenable ({:?})", e.kind())),
         };
         println!(
             "{:<54} | {:>14} | {:>20}",
@@ -733,7 +733,7 @@ fn bench_suite_4_post_crash_blob_leak() {
             if leaked_sealed == 0 {
                 "PASS"
             } else {
-                "FAIL (ISSUE-03)"
+                "FAIL"
             },
             format!("{leaked_sealed} Segs Leaked Forever")
         );
@@ -809,12 +809,12 @@ fn bench_suite_5_io_fault_countdown() {
 }
 
 // ============================================================================
-// Suite 6: SQLite VTab Key Encoding & Rowid Integrity (ISSUE-04 & ISSUE-05)
+// Suite 6: SQLite VTab Key Encoding & Rowid Integrity
 // ============================================================================
 
 fn bench_suite_6_vtab_key_and_rowid_integrity() {
     println!("\n==========================================================================================");
-    println!("SUITE 6: SQLite VTab Key Encoding & Rowid Integrity (ISSUE-04 & ISSUE-05)");
+    println!("SUITE 6: SQLite VTab Key Encoding & Rowid Integrity");
     println!("==========================================================================================");
     println!(
         "{:<54} | {:>14} | {:>20}",
@@ -833,7 +833,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module(engine).unwrap();
 
-    // 6A: REAL (f64) Primary Key Index Order (ISSUE-05)
+    // 6A: REAL (f64) Primary Key Index Order
     conn.execute_batch(
         "CREATE VIRTUAL TABLE real_t USING aydb(table_id=1, columns='k REAL PRIMARY KEY, v TEXT');
          INSERT INTO real_t VALUES (-10.0, 'a'), (-2.0, 'b'), (-1.0, 'c'), (0.0, 'd'), (1.0, 'e'), (10.0, 'f');",
@@ -851,8 +851,8 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     let ok_order = scanned_floats == expected_floats;
     println!(
         "{:<54} | {:>14} | {:>20}",
-        "6A. REAL (f64) PK Index Scan Sort Order (ISSUE-05)",
-        if ok_order { "PASS" } else { "FAIL (ISSUE-05)" },
+        "6A. REAL (f64) PK Index Scan Sort Order",
+        if ok_order { "PASS" } else { "FAIL" },
         if ok_order {
             "Sorted Correctly"
         } else {
@@ -860,7 +860,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
         }
     );
 
-    // 6B: 32-Bit Entropy Collision in 64-Bit `pk_to_rowid` Hash (ISSUE-04)
+    // 6B: 32-Bit Entropy Collision in 64-Bit `pk_to_rowid` Hash
     // Find two ordinary TEXT keys whose 32-bit CRC32C collides (takes ~2 ms via birthday bound),
     // insert both, and delete one by its SQLite `rowid`.
     let mut seen_crc: HashMap<u32, String> = HashMap::with_capacity(100_000);
@@ -917,8 +917,8 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     let ok_collision = bob_still_exists && alice_deleted;
     println!(
         "{:<54} | {:>14} | {:>20}",
-        "6B. TEXT PK 64-Bit `rowid` Hash Collision (ISSUE-04)",
-        if ok_collision { "PASS" } else { "FAIL (ISSUE-04)" },
+        "6B. TEXT PK 64-Bit `rowid` Hash Collision",
+        if ok_collision { "PASS" } else { "FAIL" },
         if ok_collision {
             "Correct Row Deleted"
         } else {
@@ -966,20 +966,20 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
 }
 
 // ============================================================================
-// Suite 7: Technical Audit Report Regression Verification (AUD-01 .. AUD-05, USE-01, USE-02)
+// Suite 7: Technical Architecture & Edge-Case Regression Verification
 // ============================================================================
 
 pub fn suite_7_audit_regressions(base_dir: &Path) {
     println!("\n==========================================================================================");
-    println!("SUITE 7: Technical Audit Report Regression Suite (AUD-01..05, USE-01..02)");
+    println!("SUITE 7: Technical Architecture & Edge-Case Regressions");
     println!("==========================================================================================");
     println!(
         "{:<54} | {:>14} | {:>20}",
-        "Audit Regression Scenario", "Status", "Observed Result"
+        "Technical Regression Scenario", "Status", "Observed Result"
     );
     println!("{}", "-".repeat(94));
 
-    // 7A (AUD-01): Multi-restart WAL recovery after torn/dangling fragments without losing subsequent writes
+    // 7A: Multi-restart WAL recovery after torn/dangling fragments without losing subsequent writes
     {
         // Part 1: BufferedUserSpaceCoalesced dangling `First` fragment + restart + subsequent writes
         let fs1 = Arc::new(FaultInjectingFs::new());
@@ -1047,8 +1047,8 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let ok = post_survived == 3 && del_ok && ins_ok;
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "7A. Post-Recovery WAL Epoch Rotation (AUD-01)",
-            if ok { "PASS" } else { "FAIL (AUD-01)" },
+            "7A. Post-Recovery WAL Epoch Rotation",
+            if ok { "PASS" } else { "FAIL" },
             if ok {
                 "100% Writes Survived"
             } else {
@@ -1057,7 +1057,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         );
     }
 
-    // 7B (AUD-02): Oversized PK rejection & near-4KB row/meta auto-spill without wedging flush_memtable
+    // 7B: Oversized PK rejection & near-4KB row/meta auto-spill without wedging flush_memtable
     {
         let fs = Arc::new(FaultInjectingFs::new());
         let mut cfg = EngineConfig::default();
@@ -1089,8 +1089,8 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let ok = pk_rejected && put_ok && flush_ok && compact_ok && read_ok;
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "7B. 4KB Block Guard & Meta Blob Spill (AUD-02)",
-            if ok { "PASS" } else { "FAIL (AUD-02)" },
+            "7B. 4KB Block Guard & Meta Blob Spill",
+            if ok { "PASS" } else { "FAIL" },
             if ok {
                 "Flushed & Compacted"
             } else {
@@ -1099,7 +1099,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         );
     }
 
-    // 7C (AUD-03 & AUD-05): SQL VTab PK uniqueness, ON CONFLICT, type-tagged keys, and auto table_id
+    // 7C: SQL VTab PK uniqueness, ON CONFLICT, type-tagged keys, and auto table_id
     {
         let sub = base_dir.join("suite7_vtab_aud03_05");
         let _ = std::fs::remove_dir_all(&sub);
@@ -1154,8 +1154,8 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let ok = dup_failed && ignore_ok && replace_ok && counts_ok;
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "7C. VTab PK Uniqueness & Type Tags (AUD-03, AUD-05)",
-            if ok { "PASS" } else { "FAIL (AUD-03/05)" },
+            "7C. VTab PK Uniqueness & Type Tags",
+            if ok { "PASS" } else { "FAIL" },
             if ok {
                 "Isolated & Enforced"
             } else {
@@ -1164,7 +1164,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         );
     }
 
-    // 7D (AUD-04, USE-01, USE-02): Multi-chunk (>512 KB) tx crash atomicity, SAVEPOINT, & DROP TABLE
+    // 7D: Multi-chunk (>512 KB) tx crash atomicity, SAVEPOINT, & DROP TABLE
     {
         // Part 1: Multi-chunk (>512 KB) transaction torn before final TxCommit chunk must roll back 100%
         let fs = Arc::new(FaultInjectingFs::new());
@@ -1196,7 +1196,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
             recovered.get_row(1, b"baseline").unwrap().as_deref() == Some(b"intact".as_slice());
         let partial_leaked = recovered.get_row(1, b"big_tx_0000").unwrap().is_some();
 
-        // Part 2: SQL SAVEPOINT / ROLLBACK TO (USE-01) and DROP TABLE cleanup (USE-02)
+        // Part 2: SQL SAVEPOINT / ROLLBACK TO and DROP TABLE cleanup
         let sub = base_dir.join("suite7_vtab_use01_02");
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
@@ -1235,8 +1235,8 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let ok = baseline_ok && !partial_leaked && sp_ok && drop_ok;
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "7D. >512KB Tx Atomicity, SAVEPOINT & DROP (AUD-04)",
-            if ok { "PASS" } else { "FAIL (AUD-04)" },
+            "7D. >512KB Tx Atomicity, SAVEPOINT & DROP",
+            if ok { "PASS" } else { "FAIL" },
             if ok {
                 "Atomic & Cleaned"
             } else {
@@ -1247,20 +1247,20 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
 }
 
 // ============================================================================
-// Suite 8: Follow-Up Audit Regressions (F01..F08, P01, P02, S01)
+// Suite 8: Transaction Isolation, 2PC & Engine Boundary Regressions
 // ============================================================================
 
 pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
     println!("\n==========================================================================================");
-    println!("SUITE 8: Follow-Up Audit Regressions (F01..F08, P01, P02, S01)");
+    println!("SUITE 8: Transaction Isolation, 2PC & Engine Boundary Regressions");
     println!("==========================================================================================");
     println!(
         "{:<54} | {:>14} | {:>20}",
-        "Follow-Up Audit Regression Scenario", "Status", "Observed Result"
+        "Boundary Regression Scenario", "Status", "Observed Result"
     );
     println!("{}", "-".repeat(94));
 
-    // 8A (F01 & F07): Cross-connection transaction isolation & two-phase xSync prepare + rollback
+    // 8A: Cross-connection transaction isolation & two-phase xSync prepare + rollback
     {
         let sub = base_dir.join("suite8_f01_f07");
         let _ = std::fs::remove_dir_all(&sub);
@@ -1336,16 +1336,16 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
                     SqlValue::Text("other committed".to_string()),
                 ]]
             && two_phase_ok;
-        assert!(ok, "8A (F01 & F07) regression check failed");
+        assert!(ok, "8A cross-connection isolation regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8A. Cross-Conn Isolation & 2PC Prepare (F01, F07)",
+            "8A. Cross-Conn Isolation & 2PC Prepare",
             "PASS",
             "Isolated & 2PC Safe"
         );
     }
 
-    // 8B (F02 & F03): Deferred mid-tx checkpointing & atomic multi-chunk WAL recovery on invalid blob
+    // 8B: Deferred mid-tx checkpointing & atomic multi-chunk WAL recovery on invalid blob
     {
         let sub_kv = base_dir.join("suite8_f02_kv");
         let _ = std::fs::remove_dir_all(&sub_kv);
@@ -1366,7 +1366,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         drop(eng_reopen);
         let _ = std::fs::remove_dir_all(&sub_kv);
 
-        // F03: Multi-chunk (`TxBegin`..`TxCommit`) WAL recovery rejects entire transaction if any chunk has invalid blob
+        // Multi-chunk (`TxBegin`..`TxCommit`) WAL recovery rejects entire transaction if any chunk has invalid blob
         let recovered_lsns = {
             use aydb::wal::*;
             let sub_wal = base_dir.join("suite8_f03_wal");
@@ -1429,16 +1429,16 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let ok = in_mem_after_rollback.is_none()
             && after_reopen.is_none()
             && recovered_lsns.is_empty();
-        assert!(ok, "8B (F02 & F03) regression check failed");
+        assert!(ok, "8B deferred tx flush regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8B. Deferred Tx Flush & Atomic Multi-Chunk WAL (F02/03)",
+            "8B. Deferred Tx Flush & Atomic Multi-Chunk WAL",
             "PASS",
             "0 Leaked / 0 Partial"
         );
     }
 
-    // 8C (F04, F05 & F08): SQLite affinity, collation (NOCASE & RTRIM), unified numeric ORDER BY, & max auto-rowid
+    // 8C: SQLite affinity, collation (NOCASE & RTRIM), unified numeric ORDER BY, & max auto-rowid
     {
         let sub = base_dir.join("suite8_f04_f05_f08");
         let _ = std::fs::remove_dir_all(&sub);
@@ -1505,16 +1505,16 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
 
         let ok = affinity_ok && collation_ok && numeric_order_ok && max_rowid_ok;
-        assert!(ok, "8C (F04, F05 & F08) regression check failed");
+        assert!(ok, "8C affinity, collation & rowid regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8C. Affinity, Collation, Numeric Order & Rowid (F04-08)",
+            "8C. Affinity, Collation, Numeric Order & Rowid",
             "PASS",
             "100% SQLite-Aligned"
         );
     }
 
-    // 8D (P01, P02 & S01): Size-tiered partial auto-compaction, keys-only COUNT(*), & crafted fp_count rejection
+    // 8D: Size-tiered partial auto-compaction, keys-only COUNT(*), & defensive index bounds rejection
     {
         let sub = base_dir.join("suite8_p01_p02_s01");
         let _ = std::fs::remove_dir_all(&sub);
@@ -1522,7 +1522,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let mut cfg = EngineConfig::default();
         cfg.auto_compact_segment_threshold = 4;
 
-        // P01: Build a large base segment (~48 KB), then flush 3 tiny segments; auto-compaction
+        // Size-tiered compaction: Build a large base segment (~48 KB), then flush 3 tiny segments; auto-compaction
         // must merge only the 3 tiny suffix segments (`start_idx = 1`, leaving 2 segments total)
         // and preserve tombstones shadowing the base segment!
         let tiered_ok = {
@@ -1551,7 +1551,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
             eng.active_idx_segment_count() == 2 && eng.get_row(1, b"base_0005").unwrap().is_none()
         };
 
-        // P02: Keys-only projection (`SELECT COUNT(*)` & `SELECT id`) reads zero out-of-line blobs
+        // Keys-only projection (`SELECT COUNT(*)` & `SELECT id`) reads zero out-of-line blobs
         let sub_p02 = base_dir.join("suite8_p02_keys_only");
         let _ = std::fs::remove_dir_all(&sub_p02);
         std::fs::create_dir_all(&sub_p02).unwrap();
@@ -1604,7 +1604,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         };
         let _ = std::fs::remove_dir_all(&sub_p02);
 
-        // S01: Defensive rejection of crafted/inflated `fp_count` index trailer with valid CRC32C
+        // Defensive rejection of crafted/inflated `fp_count` index trailer with valid CRC32C
         let s01_ok = {
             use aydb::index::IdxSegmentReader;
             use aydb::meta::format_idx_file_name;
@@ -1640,10 +1640,10 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
 
         let ok = tiered_ok && keys_only_ok && s01_ok;
-        assert!(ok, "8D (P01, P02 & S01) regression check failed");
+        assert!(ok, "8D tiered compaction regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8D. Tiered Compaction, Zero-Blob & Bounds (P01/02/S01)",
+            "8D. Tiered Compaction, Zero-Blob & Bounds",
             "PASS",
             "Bounded & Verified"
         );
@@ -1651,28 +1651,28 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
 }
 
 // ============================================================================
-// SUITE 9: Multi-Angle Audit Report Regressions (R-01..07, C-01..05, P-01..04, O-01..02)
+// SUITE 9: Reliability, Compatibility & Platform Edge-Case Regressions
 // ============================================================================
 
 pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
     println!();
     println!("==========================================================================================");
     println!(
-        "SUITE 9: Multi-Angle Audit Regressions (R-01..07, C-01..05, P-01..04, O-01..02)"
+        "SUITE 9: Reliability, Compatibility & Platform Regressions"
     );
     println!("==========================================================================================");
     println!(
         "{:<54} | {:>14} | {:>20}",
-        "Multi-Angle Audit Regression Scenario", "Status", "Observed Result"
+        "Edge-Case Regression Scenario", "Status", "Observed Result"
     );
     println!(
         "----------------------------------------------------------------------------------------------"
     );
 
     // ------------------------------------------------------------------------
-    // 9A: R-01 (uncataloged blob_std_* survives open & catalogs into boot_meta.db),
-    //     R-02 (multi-mutation to same blob key in 1 WalBatch does not double-count dead_bytes),
-    //     R-04 (unreferenced tail bytes credited to dead_bytes on recovery for O(1) unlink)
+    // 9A: Uncataloged blob_std_* survives open & catalogs into boot_meta.db,
+    //     multi-mutation to same blob key in 1 WalBatch does not double-count dead_bytes,
+    //     and unreferenced tail bytes credited to dead_bytes on recovery for O(1) unlink
     // ------------------------------------------------------------------------
     {
         let sub = base_dir.join("s9a_r01_r02_r04");
@@ -1704,7 +1704,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             std::fs::write(&boot_path, &bm).unwrap();
         }
 
-        // Reopen: R-01 guarantees blob_std_0001.db is discovered before WAL recovery, its row
+        // Reopen: Discovers blob_std_0001.db before WAL recovery, its row
         // survives, the truly unreferenced orphan blob is swept, and blob_std_0001.db is cataloged
         // into boot_meta.db!
         let r01_ok = {
@@ -1713,7 +1713,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             let val_ok = engine.get_row(1, b"r01_k").unwrap() == Some(blob_r01.clone());
             let orphan_swept = !fs.list_files().unwrap().contains(&orphan_blob);
 
-            // R-02: Flush two blob keys into blob_std, then mutate `r02_mut` twice in a single
+            // Multi-mutation in 1 batch: Flush two blob keys into blob_std, then mutate `r02_mut` twice in a single
             // explicit transaction (WalBatch) and drop before flushing MemTable!
             engine
                 .put_row(
@@ -1769,7 +1769,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             let live_ok = engine.get_row(1, b"r02_live").unwrap() == Some(vec![0x11u8; 2048]);
             let mut_gone = engine.get_row(1, b"r02_mut").unwrap().is_none();
 
-            // R-04: Register capped table 4, write a 2 KB blob row, flush, and append 4,096
+            // Register capped table 4, write a 2 KB blob row, flush, and append 4,096
             // unreferenced tail bytes to blob_lru_0004_*.db before reopening.
             engine.register_capped_table(4, 100_000).unwrap();
             engine
@@ -1811,21 +1811,21 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         assert!(
             r01_ok && r02_ok && r04_ok,
-            "9A (R-01, R-02 & R-04) failed: r01={r01_ok}, r02={r02_ok}, r04={r04_ok}"
+            "9A recovery sweep check failed: r01={r01_ok}, r02={r02_ok}, r04={r04_ok}"
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9A. Recovery Sweep & Dead-Byte Dedupe (R-01/02/04)",
+            "9A. Recovery Sweep & Dead-Byte Dedupe",
             "PASS",
             "Cataloged & Reclaimed"
         );
     }
 
     // ------------------------------------------------------------------------
-    // 9B: R-03 (exact 4 KB inline block capacity boundary 4088 vs 4089),
-    //     R-05 (CREATE VIRTUAL TABLE inside rolled-back transaction),
-    //     R-06 (DROP TABLE of capped table inside committed transaction),
-    //     R-07 (concurrent read with EagerWriteOnRead during active transaction)
+    // 9B: Exact 4 KB inline block capacity boundary 4088 vs 4089,
+    //     CREATE VIRTUAL TABLE inside rolled-back transaction,
+    //     DROP TABLE of capped table inside committed transaction,
+    //     and concurrent read with EagerWriteOnRead during active transaction
     // ------------------------------------------------------------------------
     {
         use aydb::engine::LruReadTrackingMode;
@@ -1839,7 +1839,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
 
         let engine = Arc::new(Mutex::new(StorageEngine::open(fs.clone(), cfg.clone()).unwrap()));
 
-        // R-03: 100-byte PK -> row_key.len() == 103.
+        // Exact 4 KB block boundary: 100-byte PK -> row_key.len() == 103.
         // 15 + 103 + 3970 == 4088 (fits inline in 4 KB block) vs 3971 -> 4089 (spills to blob).
         // Even with a high threshold (or default threshold), 3970B fits in an inline 4KB block
         // when threshold allows, while 3971B spills to blob without wedging flush_memtable!
@@ -1869,7 +1869,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             ok
         };
 
-        // R-05: CREATE VIRTUAL TABLE (`register_or_resolve_vtab`) inside a rolled-back
+        // Rolled-back DDL: CREATE VIRTUAL TABLE (`register_or_resolve_vtab`) inside a rolled-back
         // transaction must roll back cleanly without WAL LSN inversion or leaked catalog entries.
         let r05_ok = {
             let mut eng = engine.lock().unwrap();
@@ -1885,7 +1885,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             tid == 55 && lsn_after == lsn_before && eng.get_row(0, b"r05_aborted").unwrap().is_none()
         };
 
-        // R-06: DROP TABLE of a capped table inside a committed transaction must reclaim
+        // Committed DROP: DROP TABLE of a capped table inside a committed transaction must reclaim
         // its LRU blob segments and remove its quota from boot_meta.db!
         let (segs_before_drop, segs_after_drop) = {
             let mut eng = engine.lock().unwrap();
@@ -1906,7 +1906,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             (before, after)
         };
 
-        // R-07: Concurrent read under EagerWriteOnRead during an active transaction must not
+        // Active Tx read: Concurrent read under EagerWriteOnRead during an active transaction must not
         // corrupt the writer transaction's undo log on ROLLBACK!
         let r07_ok = {
             let mut eng = engine.lock().unwrap();
@@ -1936,21 +1936,19 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         assert!(
             r03_ok && r05_ok && r06_ok && r07_ok,
-            "9B (R-03, R-05, R-06 & R-07) failed: r03={r03_ok}, r05={r05_ok}, r06={r06_ok}, r07={r07_ok}"
+            "9B 4KB bound, DDL tx & eager read guard check failed: r03={r03_ok}, r05={r05_ok}, r06={r06_ok}, r07={r07_ok}"
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9B. 4KB Bound, DDL Tx & Eager Read Guard (R-03..07)",
+            "9B. 4KB Bound, DDL Tx & Eager Read Guard",
             "PASS",
             "Isolated & Reclaimed"
         );
     }
 
     // ------------------------------------------------------------------------
-    // 9C: C-01 (sub-ULP negative floats in REAL PK & BLOB PK),
-    //     C-02 (10 and 10.0 conflict on BLOB PRIMARY KEY),
-    //     C-03 & P-01 (SELECT ... WHERE v LIKE '%target%' LIMIT 3 across 600 rows),
-    //     C-04 & C-05 (non-integer PK rowid resolution & Statement clear_bindings / %.15g)
+    // 9C: Sub-ULP negative floats in REAL PK & BLOB PK, 10 and 10.0 conflict on BLOB PK,
+    //     LIKE LIMIT chunk streaming across 600 rows, and non-integer PK rowid resolution
     // ------------------------------------------------------------------------
     {
         let sub = base_dir.join("s9c_c01_to_c05");
@@ -1995,7 +1993,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                 )
             });
 
-        // C-02: 10 and 10.0 conflict on BLOB PRIMARY KEY
+        // 10 and 10.0 conflict on BLOB PRIMARY KEY
         conn.execute_batch(
             "CREATE VIRTUAL TABLE c02_blob USING aydb(table_id = 63, columns = 'pk BLOB PRIMARY KEY, v TEXT');
              INSERT INTO c02_blob VALUES (10, 'ten_int');",
@@ -2014,7 +2012,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                     SqlValue::Text("replaced".into()),
                 ]];
 
-        // C-03 & P-01: SELECT ... WHERE v LIKE '%target%' LIMIT 3 across 600 rows (> 2x 256 chunk)
+        // Unindexed LIKE predicate: SELECT ... WHERE v LIKE '%target%' LIMIT 3 across 600 rows (> 2x 256 chunk)
         conn.execute_batch(
             "CREATE VIRTUAL TABLE c03_scan USING aydb(table_id = 64, columns = 'id INT PRIMARY KEY, v TEXT');
              BEGIN;",
@@ -2046,7 +2044,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                 vec![SqlValue::Integer(592)],
             ];
 
-        // C-04 & C-05: TEXT PK rowid UPDATE/DELETE and statement re-binding + %.15g formatting
+        // TEXT PK rowid UPDATE/DELETE and statement re-binding + %.15g formatting
         conn.execute_batch(
             "CREATE VIRTUAL TABLE c04_c05 USING aydb(table_id = 65, columns = 'k TEXT PRIMARY KEY, v TEXT');",
         )
@@ -2088,20 +2086,20 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         assert!(
             c01_ok && c02_ok && c03_ok && c04_c05_ok,
-            "9C (C-01..C-05) failed: c01={c01_ok}, c02={c02_ok}, c03={c03_ok}, c04_05={c04_c05_ok}"
+            "9C sub-ULP float & LIKE LIMIT check failed: c01={c01_ok}, c02={c02_ok}, c03={c03_ok}, c04_05={c04_c05_ok}"
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9C. Sub-ULP Float, Numeric PK & LIKE LIMIT (C-01..05)",
+            "9C. Sub-ULP Float, Numeric PK & LIKE LIMIT",
             "PASS",
             "Lossless & Complete"
         );
     }
 
     // ------------------------------------------------------------------------
-    // 9D: P-01 (ORDER BY id DESC LIMIT 5 reverse streaming cursor pushdown),
-    //     P-02..P-04 (row-meta skip, buffered blob read in tx, two-level AccessTracker),
-    //     O-02 (deep long directory path > 260 chars creation & StorageEngine I/O)
+    // 9D: Reverse streaming cursor pushdown (ORDER BY id DESC LIMIT 5),
+    //     row-meta skip, buffered blob read in tx, two-level AccessTracker,
+    //     and deep long directory path > 260 chars creation & StorageEngine I/O
     // ------------------------------------------------------------------------
     {
         let sub = base_dir.join("s9d_p01_to_p04");
@@ -2155,7 +2153,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         drop(engine);
         let _ = std::fs::remove_dir_all(&sub);
 
-        // O-02: Deep directory path exceeding 260 characters (Windows MAX_PATH)
+        // Deep directory path exceeding 260 characters (Windows MAX_PATH)
         let mut deep_dir = base_dir.join("s9d_o02_long");
         for i in 0..8 {
             deep_dir = deep_dir.join(format!(
@@ -2182,20 +2180,19 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
 
         assert!(
             p01_ok && o02_ok,
-            "9D (P-01..04 & O-02) failed: p01={p01_ok}, o02={o02_ok}"
+            "9D reverse stream & long-path check failed: p01={p01_ok}, o02={o02_ok}"
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9D. Reverse Stream & >260-Char Path (P-01..04, O-02)",
+            "9D. Reverse Stream & >260-Char Path",
             "PASS",
             "Streamed & Long-Path"
         );
     }
 
     // ------------------------------------------------------------------------
-    // 9E: N-01 (RowidMap undo across ROLLBACK & ROLLBACK TO SAVEPOINT),
-    //     N-02 (capped table quota persisted to boot_meta.db on COMMIT),
-    //     N-03..N-04 (sync_barrier & SyncTransactional catalog registration)
+    // 9E: RowidMap transactional undo across ROLLBACK & SAVEPOINT,
+    //     capped table quota persistence to boot_meta.db, and sync catalog durability
     // ------------------------------------------------------------------------
     {
         let sub = base_dir.join("s9e_n01_to_n04");
@@ -2210,7 +2207,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             let conn = SqliteConnection::open_in_memory().unwrap();
             conn.register_aydb_module(engine.clone()).unwrap();
 
-            // N-02 & N-04: Create a SyncTransactional capped virtual table with auto-assigned
+            // Create a SyncTransactional capped virtual table with auto-assigned
             // `table_id` inside an explicit `BEGIN ... COMMIT` transaction!
             conn.execute_batch(
                 "BEGIN;
@@ -2235,7 +2232,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                 panic!("expected integer rowid");
             };
 
-            // N-01: Delete `row_a` and rename `row_b` inside a transaction and a savepoint, then roll back
+            // Delete `row_a` and rename `row_b` inside a transaction and a savepoint, then roll back
             conn.execute_batch(
                 "BEGIN;
                  DELETE FROM n01_n04_tbl WHERE k = 'row_a';
@@ -2264,7 +2261,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             (ra, rb)
         };
 
-        // Reopen from disk without prior MemTable flush and verify N-02 quota + N-04 catalog + N-01 data
+        // Reopen from disk without prior MemTable flush and verify quota + catalog + data restoration
         let n01_to_n04_ok = {
             let fs = Arc::new(OsFs::open(&sub, false).unwrap());
             let engine = Arc::new(Mutex::new(
@@ -2304,10 +2301,10 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                     ]
         };
         let _ = std::fs::remove_dir_all(&sub);
-        assert!(n01_to_n04_ok, "9E (N-01..N-04) failed");
+        assert!(n01_to_n04_ok, "9E rowid undo, tx quota & sync catalog check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9E. RowidMap Undo, Tx Quota & Sync Catalog (N-01..04)",
+            "9E. RowidMap Undo, Tx Quota & Sync Catalog",
             "PASS",
             "Restored & Durable"
         );

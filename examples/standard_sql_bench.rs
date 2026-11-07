@@ -160,7 +160,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         }
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0A. Mixed Numeric Types & Unified ORDER BY (F05)",
+            "0A. Mixed Numeric Types & Unified ORDER BY",
             "PASS",
             "100% State Match"
         );
@@ -198,7 +198,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         }
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0B. Column Affinity & NOCASE/RTRIM Collations (F04)",
+            "0B. Column Affinity & NOCASE/RTRIM Collations",
             "PASS",
             "100% State Match"
         );
@@ -1036,7 +1036,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
 }
 
 // =========================================================================
-// SUITE 4: On-Disk SSTable Evaluation (`memtable_capacity_bytes = 128 KB`, BENCH-01 / BENCH-02)
+// SUITE 4: On-Disk SSTable Evaluation (`memtable_capacity_bytes = 128 KB`)
 // =========================================================================
 
 fn bench_on_disk_sstable_suite(root: &PathBuf) {
