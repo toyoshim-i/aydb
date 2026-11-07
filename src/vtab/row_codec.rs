@@ -6,10 +6,10 @@ use std::io::{self, ErrorKind};
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::vtab::ffi::{
     SQLITE_BLOB, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
-    sqlite3_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_int64,
-    sqlite3_result_null, sqlite3_result_text, sqlite3_value, sqlite3_value_blob,
-    sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
-    sqlite3_value_type,
+    sqlite3_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error_toobig,
+    sqlite3_result_int64, sqlite3_result_null, sqlite3_result_text, sqlite3_value,
+    sqlite3_value_blob, sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64,
+    sqlite3_value_text, sqlite3_value_type,
 };
 
 /// 1-byte key storage-class type tags ordered according to SQLite's comparison rules:
@@ -146,22 +146,58 @@ pub fn parse_sqlite_numeric_str(s: &str) -> Option<Result<i64, f64>> {
     None
 }
 
-/// Formats an `f64` into SQLite's canonical text representation when coerced by `TEXT` affinity.
+/// Formats an `f64` into SQLite's canonical text representation (`%.15g`) when coerced by
+/// `TEXT` affinity (`C-05`).
 #[inline]
 pub fn format_sqlite_float_text(f: f64) -> String {
     if f == 0.0 {
         return "0.0".to_string();
     }
-    if f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{f:.1}")
+    if !f.is_finite() {
+        return format!("{f}");
+    }
+    let abs = f.abs();
+    if abs >= 1e15 || abs < 1e-4 {
+        let s = format!("{f:.14e}");
+        if let Some((mant, exp_str)) = s.split_once('e') {
+            let trimmed_mant = mant.trim_end_matches('0');
+            let mant_norm = if trimmed_mant.ends_with('.') {
+                format!("{trimmed_mant}0")
+            } else if !trimmed_mant.contains('.') {
+                format!("{trimmed_mant}.0")
+            } else {
+                trimmed_mant.to_string()
+            };
+            let exp: i32 = exp_str.parse().unwrap_or(0);
+            let sign = if exp >= 0 { '+' } else { '-' };
+            let abs_exp = exp.unsigned_abs();
+            if abs_exp < 100 {
+                return format!("{mant_norm}e{sign}{abs_exp:02}");
+            } else {
+                return format!("{mant_norm}e{sign}{abs_exp}");
+            }
+        }
+        return s;
+    }
+    if f.fract() == 0.0 {
+        return format!("{f:.1}");
+    }
+    let log10 = abs.log10().floor() as i32;
+    let frac_digits = (14 - log10).clamp(1, 18) as usize;
+    let formatted = format!("{f:.frac_digits$}");
+    let trimmed = formatted.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{trimmed}0")
     } else {
-        format!("{f}")
+        trimmed.to_string()
     }
 }
 
-/// Encodes an `f64` into the unified exact numeric key domain (`F05`):
+/// Encodes an `f64` into the unified exact numeric key domain (`F05`, `C-01`):
 /// - `f < -2^63`: `[0x0E, encode_f64_memcomparable(f)]` (9 bytes).
-/// - `-2^63 <= f < 2^63`: `[0x10, encode_i64_memcomparable(q), frac_bits.to_be_bytes()]` (17 bytes).
+/// - `-2^63 <= f < 2^63`: `[0x10, encode_i64_memcomparable(q), r_bytes]` (17 bytes),
+///   where `r_bytes` is `[0; 8]` if `f` is an exact integer (`norm == fl`), or
+///   `encode_f64_memcomparable(norm)` if `norm != fl` (lossless IEEE-754 bit preservation).
 /// - `f >= 2^63` or `NaN`: `[0x12, encode_f64_memcomparable(f)]` (9 bytes).
 #[inline]
 pub fn encode_f64_unified_key(v: f64) -> Vec<u8> {
@@ -174,12 +210,15 @@ pub fn encode_f64_unified_key(v: f64) -> Vec<u8> {
     } else if norm < F64_I64_UPPER_EXCL {
         let fl = norm.floor();
         let q = fl as i64;
-        let r = norm - fl;
-        let r_bits = if r <= 0.0 { 0u64 } else { r.to_bits() };
+        let r_bytes = if norm == fl {
+            [0u8; 8]
+        } else {
+            encode_f64_memcomparable(norm)
+        };
         let mut out = Vec::with_capacity(17);
         out.push(KEY_TAG_INTEGER);
         out.extend_from_slice(&encode_i64_memcomparable(q));
-        out.extend_from_slice(&r_bits.to_be_bytes());
+        out.extend_from_slice(&r_bytes);
         out
     } else {
         let mut out = Vec::with_capacity(9);
@@ -288,20 +327,28 @@ impl SqlValue {
                 Self::Integer(v) => sqlite3_result_int64(ctx, *v),
                 Self::Float(v) => sqlite3_result_double(ctx, *v),
                 Self::Text(s) => {
-                    sqlite3_result_text(
-                        ctx,
-                        s.as_ptr() as *const _,
-                        s.len() as i32,
-                        sqlite_transient(),
-                    );
+                    if s.len() > i32::MAX as usize {
+                        sqlite3_result_error_toobig(ctx);
+                    } else {
+                        sqlite3_result_text(
+                            ctx,
+                            s.as_ptr() as *const _,
+                            s.len() as i32,
+                            sqlite_transient(),
+                        );
+                    }
                 }
                 Self::Blob(b) => {
-                    sqlite3_result_blob(
-                        ctx,
-                        b.as_ptr() as *const _,
-                        b.len() as i32,
-                        sqlite_transient(),
-                    );
+                    if b.len() > i32::MAX as usize {
+                        sqlite3_result_error_toobig(ctx);
+                    } else {
+                        sqlite3_result_blob(
+                            ctx,
+                            b.as_ptr() as *const _,
+                            b.len() as i32,
+                            sqlite_transient(),
+                        );
+                    }
                 }
             }
         }
@@ -353,9 +400,13 @@ impl SqlValue {
             KEY_TAG_INTEGER if payload.len() == 16 => {
                 let q_arr: [u8; 8] = payload[0..8].try_into().ok()?;
                 let r_arr: [u8; 8] = payload[8..16].try_into().ok()?;
-                let q = decode_i64_memcomparable(q_arr);
-                let r = f64::from_bits(u64::from_be_bytes(r_arr));
-                Some(Self::Float((q as f64) + r))
+                let r_bits = u64::from_be_bytes(r_arr);
+                if r_bits == 0 {
+                    let q = decode_i64_memcomparable(q_arr);
+                    Some(Self::Float(q as f64))
+                } else {
+                    Some(Self::Float(decode_f64_memcomparable(r_arr)))
+                }
             }
             KEY_TAG_FLOAT_LT_I64_MIN
             | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1
@@ -529,7 +580,13 @@ pub unsafe fn encode_sqlite_values_direct(
                             }
                         }
                         ColumnAffinity::Text => {
-                            CoercedSlot::TextOwned(format_sqlite_float_text(f))
+                            let ptr = sqlite3_value_text(vptr);
+                            let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                            if !ptr.is_null() && len > 0 {
+                                CoercedSlot::TextSlice(core::slice::from_raw_parts(ptr, len))
+                            } else {
+                                CoercedSlot::TextOwned(format_sqlite_float_text(f))
+                            }
                         }
                         _ => CoercedSlot::Float(f),
                     }
@@ -751,11 +808,21 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                         }
                     }
                     ColumnAffinity::Text => {
-                        let s = format_sqlite_float_text(f);
-                        let mut out = Vec::with_capacity(1 + s.len());
-                        out.push(KEY_TAG_TEXT);
-                        collation.push_normalized_text(s.as_bytes(), &mut out);
-                        out
+                        let ptr = sqlite3_value_text(vptr);
+                        let len = sqlite3_value_bytes(vptr).max(0) as usize;
+                        if !ptr.is_null() && len > 0 {
+                            let slice = core::slice::from_raw_parts(ptr, len);
+                            let mut out = Vec::with_capacity(1 + len);
+                            out.push(KEY_TAG_TEXT);
+                            collation.push_normalized_text(slice, &mut out);
+                            out
+                        } else {
+                            let s = format_sqlite_float_text(f);
+                            let mut out = Vec::with_capacity(1 + s.len());
+                            out.push(KEY_TAG_TEXT);
+                            collation.push_normalized_text(s.as_bytes(), &mut out);
+                            out
+                        }
                     }
                     _ => {
                         if canonical_numeric {
@@ -893,6 +960,13 @@ pub unsafe fn project_column_zero_copy(
                 if offset + 4 + len > row_bytes.len() {
                     return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text"));
                 }
+                if len > i32::MAX as usize {
+                    sqlite3_result_error_toobig(ctx);
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "Text column exceeds i32::MAX bytes",
+                    ));
+                }
                 let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
                 sqlite3_result_text(ctx, ptr as *const _, len as i32, sqlite_transient());
             }
@@ -904,6 +978,13 @@ pub unsafe fn project_column_zero_copy(
                     u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
                 if offset + 4 + len > row_bytes.len() {
                     return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob"));
+                }
+                if len > i32::MAX as usize {
+                    sqlite3_result_error_toobig(ctx);
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "Blob column exceeds i32::MAX bytes",
+                    ));
                 }
                 let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
                 sqlite3_result_blob(ctx, ptr as *const _, len as i32, sqlite_transient());
@@ -1193,5 +1274,86 @@ mod tests {
         assert_eq!(parse_sqlite_numeric_str(" 42.0 "), Some(Ok(42)));
         assert_eq!(parse_sqlite_numeric_str(" -1.5 "), Some(Err(-1.5)));
         assert_eq!(parse_sqlite_numeric_str("abc"), None);
+    }
+
+    #[test]
+    fn c01_c05_negative_sub_ulp_float_key_roundtrip_and_sqlite_float_text_format() {
+        // C-01: Negative sub-ULP and small floats in (-1.0, 0.0) must encode to distinct keys
+        // in strict mathematical order and round-trip with 0 bits of difference!
+        let vals = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -9_223_372_036_854_775_808.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            f64::from_bits((-1.0f64).to_bits() - 1), // immediately above -1.0
+            -0.5,
+            -0.001,
+            -1e-5,
+            -1e-16,
+            -1e-17,
+            -1e-20,
+            -1e-300,
+            -f64::MIN_POSITIVE,
+            -f64::from_bits(1), // smallest negative subnormal
+            0.0,
+            f64::from_bits(1), // smallest positive subnormal
+            f64::MIN_POSITIVE,
+            1e-300,
+            1e-20,
+            0.001,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            9_223_372_036_854_775_808.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for &v in &vals {
+            let key = SqlValue::Float(v).to_key_bytes();
+            let decoded = SqlValue::from_key_bytes(&key).expect("decode float key");
+            match decoded {
+                SqlValue::Float(d) => {
+                    assert_eq!(
+                        d.to_bits(),
+                        v.to_bits(),
+                        "C-01: {v:e} failed exact bit-level round-trip (got {d:e})"
+                    );
+                }
+                other => panic!("expected Float, got {other:?}"),
+            }
+        }
+        // Verify -0.0 normalizes to +0.0
+        let neg_zero_key = SqlValue::Float(-0.0).to_key_bytes();
+        assert_eq!(neg_zero_key, SqlValue::Float(0.0).to_key_bytes());
+        assert_eq!(
+            SqlValue::from_key_bytes(&neg_zero_key),
+            Some(SqlValue::Float(0.0))
+        );
+
+        // Verify strict lexicographical key order across all pairs
+        for pair in vals.windows(2) {
+            let ka = SqlValue::Float(pair[0]).to_key_bytes();
+            let kb = SqlValue::Float(pair[1]).to_key_bytes();
+            assert!(
+                ka < kb,
+                "C-01: {:e} (key {:02x?}) must sort strictly before {:e} (key {:02x?})",
+                pair[0],
+                ka,
+                pair[1],
+                kb
+            );
+        }
+
+        // C-05: format_sqlite_float_text matches SQLite's %.15g / %!.15g formatting
+        assert_eq!(format_sqlite_float_text(0.0), "0.0");
+        assert_eq!(format_sqlite_float_text(-0.0), "0.0");
+        assert_eq!(format_sqlite_float_text(42.0), "42.0");
+        assert_eq!(format_sqlite_float_text(-1.5), "-1.5");
+        assert_eq!(format_sqlite_float_text(1e20), "1.0e+20");
+        assert_eq!(format_sqlite_float_text(1.25e20), "1.25e+20");
+        assert_eq!(format_sqlite_float_text(-1e-20), "-1.0e-20");
     }
 }

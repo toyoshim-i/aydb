@@ -333,4 +333,5 @@ unsafe extern "system" {
         nByte: c_int,
         xDel: Option<unsafe extern "system" fn(*mut c_void)>,
     );
+    pub fn sqlite3_result_error_toobig(pCtx: *mut sqlite3_context);
 }

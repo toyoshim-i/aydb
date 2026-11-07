@@ -23,16 +23,17 @@ use crate::vtab::ffi::{
     SQLITE_BLOB, SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_DONE, SQLITE_ERROR,
     SQLITE_FLOAT, SQLITE_FULL, SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ,
     SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE,
-    SQLITE_INDEX_CONSTRAINT_LIMIT, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
-    SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT,
-    sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64,
-    sqlite3_bind_null, sqlite3_bind_text, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
-    sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text,
-    sqlite3_column_type, sqlite3_context, sqlite3_create_module_v2, sqlite3_declare_vtab,
-    sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_index_info, sqlite3_int64,
-    sqlite3_module, sqlite3_open, sqlite3_prepare_v2, sqlite3_reset, sqlite3_result_int64,
-    sqlite3_step, sqlite3_stmt, sqlite3_value, sqlite3_value_double, sqlite3_value_int64,
-    sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
+    SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR,
+    SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, sqlite_transient, sqlite3,
+    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob,
+    sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
+    sqlite3_column_text, sqlite3_column_type, sqlite3_context, sqlite3_create_module_v2,
+    sqlite3_declare_vtab, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_index_info,
+    sqlite3_int64, sqlite3_module, sqlite3_open, sqlite3_prepare_v2, sqlite3_reset,
+    sqlite3_result_int64, sqlite3_step, sqlite3_stmt, sqlite3_value, sqlite3_value_double,
+    sqlite3_value_int64, sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_cursor,
+    sqlite3_vtab_on_conflict,
 };
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_FLOAT, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
@@ -55,11 +56,49 @@ const RANGE_FLAG_LOWER_INCLUSIVE: c_int = 0x01;
 const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
 const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
 const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
-const RANGE_FLAG_HAS_LIMIT: c_int = 0x10;
 const RANGE_FLAG_KEYS_ONLY: c_int = 0x20;
 
-/// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close.
-const ROWID_MAP_COMPACT_THRESHOLD: usize = 16_384;
+/// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close (`C-04`).
+const MAX_ROWID_MAP_ENTRIES: usize = 262_144;
+
+/// Returns the alternate exact-integer numeric key representation (`9`-byte `Integer(q)` vs
+/// `17`-byte `Float(q.0)`) so SQLite's `10 == 10.0` numeric key equality holds across `BLOB`
+/// and `REAL` affinities (`C-02`).
+#[inline]
+fn build_numeric_alt_key(pk: &[u8]) -> Option<Vec<u8>> {
+    if pk.first().copied() != Some(KEY_TAG_INTEGER) {
+        return None;
+    }
+    if pk.len() == 9 {
+        let mut alt = Vec::with_capacity(17);
+        alt.extend_from_slice(pk);
+        alt.extend_from_slice(&0u64.to_be_bytes());
+        Some(alt)
+    } else if pk.len() == 17 && pk[9..17] == [0u8; 8] {
+        Some(pk[0..9].to_vec())
+    } else {
+        None
+    }
+}
+
+/// Checks if `pk` or its exact-integer numeric dual (`build_numeric_alt_key(pk)`) exists in
+/// `table_id`, returning the existing key bytes if found (`C-02`).
+#[inline]
+fn find_existing_pk_or_numeric_alt(
+    eng: &mut StorageEngine<OsFs>,
+    table_id: u16,
+    pk: &[u8],
+) -> io::Result<Option<Vec<u8>>> {
+    if eng.row_exists(table_id, pk)? {
+        return Ok(Some(pk.to_vec()));
+    }
+    if let Some(alt) = build_numeric_alt_key(pk) {
+        if eng.row_exists(table_id, &alt)? {
+            return Ok(Some(alt));
+        }
+    }
+    Ok(None)
+}
 
 /// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code (`AUD-11`, `F01`).
 #[inline]
@@ -103,16 +142,28 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
 struct RowidMap {
     by_rowid: HashMap<i64, Vec<u8>>,
     by_pk: HashMap<Vec<u8>, i64>,
+    fifo_order: Vec<i64>,
 }
 
 impl RowidMap {
-    fn len(&self) -> usize {
-        self.by_rowid.len()
-    }
-
-    fn clear(&mut self) {
-        self.by_rowid.clear();
-        self.by_pk.clear();
+    /// Evicts the oldest half of entries when the map exceeds `MAX_ROWID_MAP_ENTRIES` (`C-04`),
+    /// preserving all recently assigned `rowid` mappings for subsequent `UPDATE`/`DELETE WHERE rowid = ?`.
+    fn evict_oldest_half_if_needed(&mut self) {
+        if self.by_rowid.len() <= MAX_ROWID_MAP_ENTRIES {
+            return;
+        }
+        let target_keep = MAX_ROWID_MAP_ENTRIES / 2;
+        let mut idx = 0usize;
+        while self.by_rowid.len() > target_keep && idx < self.fifo_order.len() {
+            let rid = self.fifo_order[idx];
+            idx += 1;
+            if let Some(pk) = self.by_rowid.remove(&rid) {
+                self.by_pk.remove(&pk);
+            }
+        }
+        self.fifo_order.drain(0..idx);
+        let rmap_ref = &self.by_rowid;
+        self.fifo_order.retain(|rid| rmap_ref.contains_key(rid));
     }
 
     fn get_or_assign_rowid(&mut self, encoded_pk: &[u8]) -> i64 {
@@ -129,6 +180,7 @@ impl RowidMap {
         let pk_vec = encoded_pk.to_vec();
         self.by_rowid.insert(rid, pk_vec.clone());
         self.by_pk.insert(pk_vec, rid);
+        self.fifo_order.push(rid);
         rid
     }
 
@@ -672,16 +724,11 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
-        // 3. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on Primary Key + optional LIMIT
+        // 3. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on Primary Key (`C-03`)
         let mut lower_idx: Option<(usize, c_int)> = None;
         let mut upper_idx: Option<(usize, c_int)> = None;
-        let mut limit_idx: Option<usize> = None;
         for i in 0..n {
             if constraints[i].usable == 0 {
-                continue;
-            }
-            if constraints[i].op == SQLITE_INDEX_CONSTRAINT_LIMIT && limit_idx.is_none() {
-                limit_idx = Some(i);
                 continue;
             }
             if constraints[i].iColumn != vtab.pk_col_idx as i32 {
@@ -723,37 +770,16 @@ unsafe extern "system" fn vtab_best_index(
                 0
             };
             let mut next_arg = 1;
-            let omit_range = if limit_idx.is_some() { 1 } else { 0 };
             if let Some((i, fl)) = lower_idx {
                 usages[i].argvIndex = next_arg;
-                usages[i].omit = omit_range;
+                usages[i].omit = 0;
                 next_arg += 1;
                 flags |= fl;
             }
             if let Some((i, fl)) = upper_idx {
                 usages[i].argvIndex = next_arg;
-                usages[i].omit = omit_range;
-                next_arg += 1;
+                usages[i].omit = 0;
                 flags |= fl;
-            }
-            if let Some(lim_i) = limit_idx {
-                let all_where_omitted = (0..n).all(|idx| {
-                    idx == lim_i || constraints[idx].usable == 0 || usages[idx].omit != 0
-                });
-                if all_where_omitted && (info.nOrderBy == 0 || order_by_pk_asc) {
-                    usages[lim_i].argvIndex = next_arg;
-                    usages[lim_i].omit = 1;
-                    flags |= RANGE_FLAG_HAS_LIMIT;
-                } else {
-                    // Revert `omit` on range bounds if LIMIT cannot be pushed down so SQLite
-                    // re-evaluates all predicates (`USE-05`).
-                    if let Some((i, _)) = lower_idx {
-                        usages[i].omit = 0;
-                    }
-                    if let Some((i, _)) = upper_idx {
-                        usages[i].omit = 0;
-                    }
-                }
             }
             if order_by_pk_asc {
                 info.orderByConsumed = 1;
@@ -764,21 +790,13 @@ unsafe extern "system" fn vtab_best_index(
             return SQLITE_OK;
         }
 
-        // 4. Fallback: Full Table Scan (with optional LIMIT pushdown when no WHERE/ORDER BY blocks it, `PERF-04`)
-        let mut full_scan_flags = if can_use_keys_only {
+        // 4. Fallback: Full Table Scan (`C-03`: let SQLite's VDBE enforce LIMIT/OFFSET after any
+        //    residual WHERE predicates like `LIKE`, `OR`, or expressions not passed in `aConstraint`)
+        let full_scan_flags = if can_use_keys_only {
             RANGE_FLAG_KEYS_ONLY
         } else {
             0
         };
-        if let Some(lim_i) = limit_idx {
-            let no_other_where =
-                (0..n).all(|idx| idx == lim_i || constraints[idx].usable == 0);
-            if no_other_where && (info.nOrderBy == 0 || order_by_pk_asc) {
-                usages[lim_i].argvIndex = 1;
-                usages[lim_i].omit = 1;
-                full_scan_flags |= RANGE_FLAG_HAS_LIMIT;
-            }
-        }
         if order_by_pk_asc {
             info.orderByConsumed = 1;
         }
@@ -825,9 +843,7 @@ unsafe extern "system" fn vtab_close(p_cursor: *mut sqlite3_vtab_cursor) -> c_in
                     let prev = vtab.open_cursors.fetch_sub(1, Ordering::Relaxed);
                     if prev == 1 && vtab.has_non_int_pks.load(Ordering::Relaxed) {
                         if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                            if rmap.len() > ROWID_MAP_COMPACT_THRESHOLD {
-                                rmap.clear();
-                            }
+                            rmap.evict_oldest_half_if_needed();
                         }
                     }
                 }
@@ -921,24 +937,12 @@ unsafe extern "system" fn vtab_filter(
                         // In SQLite (`10 == 10.0` across all affinities including `BLOB`),
                         // if `pk_bytes` is an exact-integer number (`9`-byte `Integer(q)` or
                         // `17`-byte `Float(q.0)`), also probe the dual exact-integer representation
-                        // if not found under the primary representation (`F04`, `F05`).
-                        if !found && pk_bytes.first().copied() == Some(KEY_TAG_INTEGER) {
-                            if pk_bytes.len() == 9 {
-                                let mut alt = Vec::with_capacity(17);
-                                alt.extend_from_slice(&pk_bytes);
-                                alt.extend_from_slice(&0u64.to_be_bytes());
+                        // if not found under the primary representation (`F04`, `F05`, `C-02`).
+                        if !found {
+                            if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
                                 if let Err(e) = eng.get_row_into(
                                     vtab.table_id,
                                     &alt,
-                                    &mut cursor.slab,
-                                    &mut cursor.spans,
-                                ) {
-                                    return io_err_to_sqlite_rc(&e);
-                                }
-                            } else if pk_bytes.len() == 17 && pk_bytes[9..17] == [0u8; 8] {
-                                if let Err(e) = eng.get_row_into(
-                                    vtab.table_id,
-                                    &pk_bytes[0..9],
                                     &mut cursor.slab,
                                     &mut cursor.spans,
                                 ) {
@@ -1022,7 +1026,6 @@ unsafe extern "system" fn vtab_filter(
                     {
                         let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
                         let val_ptr = *argv.offset(arg_pos as isize);
-                        arg_pos += 1;
                         match pk_range_bound_to_key(
                             val_ptr,
                             vtab.pk_affinity,
@@ -1036,13 +1039,6 @@ unsafe extern "system" fn vtab_filter(
                     } else {
                         None
                     };
-                    let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && arg_pos < argc {
-                        let lim_val = sqlite3_value_int64(*argv.offset(arg_pos as isize));
-                        if lim_val > 0 { lim_val as usize } else { 0 }
-                    } else {
-                        usize::MAX
-                    };
-
                     let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
                     cursor.keys_only = keys_only;
                     if let Err(e) = eng.scan_range_into_slab(
@@ -1050,7 +1046,7 @@ unsafe extern "system" fn vtab_filter(
                         lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                         upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                         false,
-                        limit,
+                        usize::MAX,
                         keys_only,
                         &mut cursor.pks,
                         &mut cursor.slab,
@@ -1061,12 +1057,6 @@ unsafe extern "system" fn vtab_filter(
                 }
                 _ => {
                     let flags = idx_num >> 8;
-                    let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && argc >= 1 {
-                        let lim_val = sqlite3_value_int64(*argv.offset(0));
-                        if lim_val > 0 { lim_val as usize } else { 0 }
-                    } else {
-                        usize::MAX
-                    };
                     let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
                     cursor.keys_only = keys_only;
                     if let Err(e) = eng.scan_range_into_slab(
@@ -1074,7 +1064,7 @@ unsafe extern "system" fn vtab_filter(
                         None,
                         None,
                         false,
-                        limit,
+                        usize::MAX,
                         keys_only,
                         &mut cursor.pks,
                         &mut cursor.slab,
@@ -1372,27 +1362,45 @@ unsafe extern "system" fn vtab_update(
             }
         }
 
-        // Enforce primary key uniqueness & SQLite `ON CONFLICT` resolution (`AUD-03`)
-        let pk_changed = match &old_pk_opt {
-            Some((old_pk, _)) => old_pk.as_slice() != new_pk.as_slice(),
-            None => true,
+        // Enforce primary key uniqueness & SQLite `ON CONFLICT` resolution (`AUD-03`, `C-02`)
+        let same_pk = match &old_pk_opt {
+            Some((old_pk, _)) => {
+                old_pk.as_slice() == new_pk.as_slice()
+                    || build_numeric_alt_key(old_pk.as_slice()).as_deref()
+                        == Some(new_pk.as_slice())
+            }
+            None => false,
         };
-        if pk_changed && pk_override.is_none() {
-            let exists = match eng.row_exists(vtab.table_id, &new_pk) {
-                Ok(b) => b,
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            };
-            if exists {
+        if (is_insert || !same_pk) && pk_override.is_none() {
+            let existing_conflict =
+                match find_existing_pk_or_numeric_alt(&mut eng, vtab.table_id, &new_pk) {
+                    Ok(opt) => opt,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
+            if let Some(conflict_pk) = existing_conflict {
                 let conflict_mode = sqlite3_vtab_on_conflict(vtab.db);
                 if conflict_mode == SQLITE_IGNORE {
                     return SQLITE_OK;
-                } else if conflict_mode != SQLITE_REPLACE {
+                } else if conflict_mode == SQLITE_REPLACE {
+                    if conflict_pk.as_slice() != new_pk.as_slice() {
+                        if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                                rmap.remove_by_pk(&conflict_pk);
+                            }
+                        }
+                        if let Err(e) =
+                            eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)
+                        {
+                            return io_err_to_sqlite_rc(&e);
+                        }
+                    }
+                } else {
                     return SQLITE_CONSTRAINT;
                 }
             }
         }
 
-        // If UPDATE changed the PK, delete the old PK row and clean up `RowidMap` (`AUD-11`)
+        // If UPDATE changed the physical PK bytes, delete the old PK row and clean up `RowidMap` (`AUD-11`, `C-02`)
         if let Some((old_pk, mapped_rid)) = old_pk_opt {
             if old_pk.as_slice() != new_pk.as_slice() {
                 if vtab.has_non_int_pks.load(Ordering::Relaxed) {
@@ -1427,10 +1435,8 @@ unsafe extern "system" fn vtab_update(
         } else {
             vtab.has_non_int_pks.store(true, Ordering::Relaxed);
             if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                if vtab.open_cursors.load(Ordering::Relaxed) == 0
-                    && rmap.len() > ROWID_MAP_COMPACT_THRESHOLD
-                {
-                    rmap.clear();
+                if vtab.open_cursors.load(Ordering::Relaxed) == 0 {
+                    rmap.evict_oldest_half_if_needed();
                 }
                 rmap.get_or_assign_rowid(&new_pk)
             } else {
@@ -1633,6 +1639,12 @@ impl SqliteConnection {
 
     /// Prepares a parameterized SQL statement for repeated low-overhead execution.
     pub fn prepare(&self, sql: &str) -> io::Result<SqliteStatement<'_>> {
+        if sql.len() > i32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQL statement exceeds i32::MAX bytes",
+            ));
+        }
         let mut stmt: *mut sqlite3_stmt = core::ptr::null_mut();
         let rc = unsafe {
             sqlite3_prepare_v2(
@@ -1733,6 +1745,10 @@ impl<'a> SqliteStatement<'a> {
     }
 
     fn bind_all(&mut self, params: &[SqlValue]) -> io::Result<()> {
+        unsafe {
+            sqlite3_reset(self.stmt);
+            sqlite3_clear_bindings(self.stmt);
+        }
         for (i, p) in params.iter().enumerate() {
             let idx = (i + 1) as c_int;
             let rc = unsafe {
@@ -1740,20 +1756,36 @@ impl<'a> SqliteStatement<'a> {
                     SqlValue::Null => sqlite3_bind_null(self.stmt, idx),
                     SqlValue::Integer(v) => sqlite3_bind_int64(self.stmt, idx, *v),
                     SqlValue::Float(v) => sqlite3_bind_double(self.stmt, idx, *v),
-                    SqlValue::Text(s) => sqlite3_bind_text(
-                        self.stmt,
-                        idx,
-                        s.as_ptr() as *const c_char,
-                        s.len() as c_int,
-                        sqlite_transient(),
-                    ),
-                    SqlValue::Blob(b) => sqlite3_bind_blob(
-                        self.stmt,
-                        idx,
-                        b.as_ptr() as *const c_void,
-                        b.len() as c_int,
-                        sqlite_transient(),
-                    ),
+                    SqlValue::Text(s) => {
+                        if s.len() > i32::MAX as usize {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Text parameter exceeds i32::MAX bytes",
+                            ));
+                        }
+                        sqlite3_bind_text(
+                            self.stmt,
+                            idx,
+                            s.as_ptr() as *const c_char,
+                            s.len() as c_int,
+                            sqlite_transient(),
+                        )
+                    }
+                    SqlValue::Blob(b) => {
+                        if b.len() > i32::MAX as usize {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Blob parameter exceeds i32::MAX bytes",
+                            ));
+                        }
+                        sqlite3_bind_blob(
+                            self.stmt,
+                            idx,
+                            b.as_ptr() as *const c_void,
+                            b.len() as c_int,
+                            sqlite_transient(),
+                        )
+                    }
                 }
             };
             if rc != SQLITE_OK {
@@ -2340,7 +2372,8 @@ mod tests {
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine).unwrap();
 
-        // 1. Storage-class key tags prevent collisions between INTEGER, REAL, TEXT, and BLOB
+        // 1. Storage-class key tags prevent collisions between INTEGER, REAL, TEXT, and BLOB,
+        // while exact integer/float equality (`42 == 42.0`) enforces uniqueness (`C-02`).
         conn.execute_batch(
             "CREATE VIRTUAL TABLE poly_t USING aydb(
                 table_id = 30,
@@ -2348,7 +2381,7 @@ mod tests {
                 indexes = 'sec'
             );
             INSERT INTO poly_t VALUES (42, 100, 'int_42');
-            INSERT INTO poly_t VALUES (42.0, 100.0, 'real_42');
+            INSERT INTO poly_t VALUES (42.5, 100.5, 'real_42_5');
             INSERT INTO poly_t VALUES ('', '', 'empty_text');
             INSERT INTO poly_t VALUES (X'', X'', 'empty_blob');
             INSERT INTO poly_t VALUES ('abc', 'abc', 'text_abc');
@@ -2357,13 +2390,20 @@ mod tests {
         )
         .unwrap();
 
+        // Inserting 42.0 when 42 is already present must fail with SQLITE_CONSTRAINT (`C-02`)
+        assert!(
+            conn.execute_batch("INSERT INTO poly_t VALUES (42.0, 100.0, 'dup_real_42');")
+                .is_err(),
+            "C-02: 42.0 must conflict with existing integer 42 on BLOB PRIMARY KEY"
+        );
+
         // All 7 distinct values must coexist without overwriting each other, ordered by storage class
         let ordered_tags = conn.query_all("SELECT tag FROM poly_t", &[]).unwrap();
         assert_eq!(
             ordered_tags,
             vec![
                 vec![SqlValue::Text("int_42".into())],
-                vec![SqlValue::Text("real_42".into())],
+                vec![SqlValue::Text("real_42_5".into())],
                 vec![SqlValue::Text("empty_text".into())],
                 vec![SqlValue::Text("text_8byte".into())],
                 vec![SqlValue::Text("text_abc".into())],
@@ -3083,6 +3123,299 @@ mod tests {
         assert_eq!(
             conn.query_all("SELECT COUNT(*) FROM docs", &[]).unwrap(),
             vec![vec![SqlValue::Integer(5)]]
+        );
+    }
+
+    #[test]
+    fn stage2_c01_c02_c03_c04_c05_audit_remediations() {
+        let tmp = TempTestDir::new("stage2_c01_to_c05");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine).unwrap();
+
+        // 1. C-01: Negative sub-ULP floats (-1e-17, -1e-20, -1e-300, -f64::MIN_POSITIVE, -0.001, -0.5, -1.0, -1.5)
+        //    on REAL PRIMARY KEY and BLOB PRIMARY KEY must not collide and must round-trip via
+        //    keys-only projection (`SELECT pk FROM t`) without collapsing to 0.0!
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c01_real USING aydb(
+                table_id = 90,
+                columns = 'pk REAL PRIMARY KEY, label TEXT'
+            );
+            CREATE VIRTUAL TABLE c01_blob USING aydb(
+                table_id = 91,
+                columns = 'pk BLOB PRIMARY KEY, label TEXT'
+            );",
+        )
+        .unwrap();
+
+        let neg_floats = [
+            -1.5_f64,
+            -1.0,
+            -0.5,
+            -0.001,
+            -1e-17,
+            -1e-20,
+            -1e-300,
+            -f64::MIN_POSITIVE,
+            0.0,
+        ];
+        {
+            let mut ins_real = conn
+                .prepare("INSERT INTO c01_real VALUES (?1, ?2)")
+                .unwrap();
+            let mut ins_blob = conn
+                .prepare("INSERT INTO c01_blob VALUES (?1, ?2)")
+                .unwrap();
+            for (idx, &v) in neg_floats.iter().enumerate() {
+                ins_real
+                    .execute(&[SqlValue::Float(v), SqlValue::Text(format!("r_{idx}"))])
+                    .unwrap();
+                ins_blob
+                    .execute(&[SqlValue::Float(v), SqlValue::Text(format!("b_{idx}"))])
+                    .unwrap();
+            }
+        }
+
+        // Keys-only projection (`SELECT pk FROM ...`) uses `SqlValue::from_key_bytes` directly!
+        let real_pks = conn.query_all("SELECT pk FROM c01_real", &[]).unwrap();
+        let blob_pks = conn.query_all("SELECT pk FROM c01_blob", &[]).unwrap();
+        assert_eq!(real_pks.len(), neg_floats.len());
+        assert_eq!(blob_pks.len(), neg_floats.len());
+        for (i, &expected) in neg_floats.iter().enumerate() {
+            match (&real_pks[i][0], &blob_pks[i][0]) {
+                (SqlValue::Float(r), SqlValue::Float(b)) => {
+                    assert_eq!(r.to_bits(), expected.to_bits());
+                    assert_eq!(b.to_bits(), expected.to_bits());
+                }
+                other => panic!("expected Float PKs, got {other:?}"),
+            }
+        }
+
+        // 2. C-02: Inserting 10 and 10.0 into a BLOB PRIMARY KEY or REAL PRIMARY KEY
+        //    must raise SQLITE_CONSTRAINT on plain INSERT, skip on INSERT OR IGNORE,
+        //    and replace the existing row on INSERT OR REPLACE.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c02_blob USING aydb(
+                table_id = 92,
+                columns = 'pk BLOB PRIMARY KEY, v TEXT'
+            );
+            CREATE VIRTUAL TABLE c02_real USING aydb(
+                table_id = 93,
+                columns = 'pk REAL PRIMARY KEY, v TEXT'
+            );
+            INSERT INTO c02_blob VALUES (10, 'int_ten');
+            INSERT INTO c02_real VALUES (10, 'int_ten_as_real');",
+        )
+        .unwrap();
+
+        // Plain INSERT of 10.0 must fail with SQLITE_CONSTRAINT on both tables
+        assert!(
+            conn.execute_batch("INSERT INTO c02_blob VALUES (10.0, 'float_ten');")
+                .is_err(),
+            "C-02: plain INSERT of 10.0 when 10 exists on BLOB PK must fail"
+        );
+        assert!(
+            conn.execute_batch("INSERT INTO c02_real VALUES (10.0, 'float_ten');")
+                .is_err(),
+            "C-02: plain INSERT of 10.0 when 10 exists on REAL PK must fail"
+        );
+
+        // INSERT OR IGNORE of 10.0 must skip without modifying the existing row
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO c02_blob VALUES (10.0, 'ignored');
+             INSERT OR IGNORE INTO c02_real VALUES (10.0, 'ignored');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT pk, v FROM c02_blob", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(10), SqlValue::Text("int_ten".into())]]
+        );
+
+        // INSERT OR REPLACE of 10.0 must replace the existing 10 row so only 1 row remains!
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO c02_blob VALUES (10.0, 'replaced_by_float');
+             INSERT OR REPLACE INTO c02_real VALUES (10.0, 'replaced_by_float');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT pk, v FROM c02_blob", &[]).unwrap(),
+            vec![vec![
+                SqlValue::Float(10.0),
+                SqlValue::Text("replaced_by_float".into())
+            ]]
+        );
+        assert_eq!(
+            conn.query_all("SELECT pk, v FROM c02_real", &[]).unwrap(),
+            vec![vec![
+                SqlValue::Float(10.0),
+                SqlValue::Text("replaced_by_float".into())
+            ]]
+        );
+
+        // Replacing back with integer 10 on BLOB PK must also replace 10.0 cleanly!
+        conn.execute_batch("INSERT OR REPLACE INTO c02_blob VALUES (10, 'back_to_int');")
+            .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT pk, v FROM c02_blob", &[]).unwrap(),
+            vec![vec![
+                SqlValue::Integer(10),
+                SqlValue::Text("back_to_int".into())
+            ]]
+        );
+
+        // 3. C-03: `SELECT * FROM t WHERE v LIKE '%match%' LIMIT 3` must return all 3 matching
+        //    rows even when the first 50 rows in the table do not match '%match%'.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c03_like USING aydb(
+                table_id = 94,
+                columns = 'id INT PRIMARY KEY, v TEXT'
+            );
+            BEGIN;",
+        )
+        .unwrap();
+        {
+            let mut ins = conn
+                .prepare("INSERT INTO c03_like VALUES (?1, ?2)")
+                .unwrap();
+            for i in 1..=60i64 {
+                let text = if i <= 50 {
+                    format!("prefix_skip_{i}")
+                } else {
+                    format!("prefix_match_{i}_suffix")
+                };
+                ins.execute(&[SqlValue::Integer(i), SqlValue::Text(text)])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let like_full_scan = conn
+            .query_all(
+                "SELECT id, v FROM c03_like WHERE v LIKE '%match%' LIMIT 3",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            like_full_scan,
+            vec![
+                vec![
+                    SqlValue::Integer(51),
+                    SqlValue::Text("prefix_match_51_suffix".into())
+                ],
+                vec![
+                    SqlValue::Integer(52),
+                    SqlValue::Text("prefix_match_52_suffix".into())
+                ],
+                vec![
+                    SqlValue::Integer(53),
+                    SqlValue::Text("prefix_match_53_suffix".into())
+                ],
+            ]
+        );
+
+        // Also test PK range scan combined with LIKE and LIMIT
+        let like_range_scan = conn
+            .query_all(
+                "SELECT id FROM c03_like WHERE id >= 10 AND v LIKE '%match%' LIMIT 3",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            like_range_scan,
+            vec![
+                vec![SqlValue::Integer(51)],
+                vec![SqlValue::Integer(52)],
+                vec![SqlValue::Integer(53)],
+            ]
+        );
+
+        // 4. C-04: `SELECT rowid FROM t` followed by `UPDATE` / `DELETE WHERE rowid = ?` on a
+        //    `TEXT PRIMARY KEY` table with > 20,000 rows must succeed!
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c04_text USING aydb(
+                table_id = 95,
+                columns = 'k TEXT PRIMARY KEY, val INT'
+            );
+            BEGIN;",
+        )
+        .unwrap();
+        {
+            let mut ins = conn
+                .prepare("INSERT INTO c04_text VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..21_000i64 {
+                ins.execute(&[SqlValue::Text(format!("row_{i:06}")), SqlValue::Integer(i)])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let all_rids = conn
+            .query_all("SELECT rowid, k FROM c04_text ORDER BY k", &[])
+            .unwrap();
+        assert_eq!(all_rids.len(), 21_000);
+        let rid_first = match all_rids[0][0] {
+            SqlValue::Integer(r) => r,
+            _ => unreachable!(),
+        };
+        let rid_last = match all_rids[20_999][0] {
+            SqlValue::Integer(r) => r,
+            _ => unreachable!(),
+        };
+
+        conn.query_all(
+            "UPDATE c04_text SET val = 777777 WHERE rowid = ?1",
+            &[SqlValue::Integer(rid_first)],
+        )
+        .unwrap();
+        conn.query_all(
+            "DELETE FROM c04_text WHERE rowid = ?1",
+            &[SqlValue::Integer(rid_last)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_all("SELECT val FROM c04_text WHERE k = 'row_000000'", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Integer(777777)]]
+        );
+        assert!(
+            conn.query_all("SELECT val FROM c04_text WHERE k = 'row_020999'", &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        // 5. C-05: SqliteStatement re-binding (`sqlite3_clear_bindings`) and float-to-text formatting
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c05_text USING aydb(
+                table_id = 96,
+                columns = 'k TEXT PRIMARY KEY, v TEXT'
+            );",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO c05_text VALUES (?1, ?2)")
+            .unwrap();
+        stmt.execute(&[SqlValue::Float(1e20), SqlValue::Text("first".into())])
+            .unwrap();
+        // Execute again with only 1 parameter bound; ?2 must be cleared to NULL by sqlite3_clear_bindings!
+        stmt.execute(&[SqlValue::Float(-1e-20)]).unwrap();
+
+        let c05_rows = conn
+            .query_all("SELECT k, v FROM c05_text ORDER BY k", &[])
+            .unwrap();
+        assert_eq!(
+            c05_rows,
+            vec![
+                vec![SqlValue::Text("-1.0e-20".into()), SqlValue::Null],
+                vec![
+                    SqlValue::Text("1.0e+20".into()),
+                    SqlValue::Text("first".into())
+                ],
+            ]
         );
     }
 }
