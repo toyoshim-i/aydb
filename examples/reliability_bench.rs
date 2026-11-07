@@ -1242,6 +1242,410 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
     }
 }
 
+// ============================================================================
+// Suite 8: Follow-Up Audit Regressions (F01..F08, P01, P02, S01)
+// ============================================================================
+
+pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
+    println!("\n==========================================================================================");
+    println!("SUITE 8: Follow-Up Audit Regressions (F01..F08, P01, P02, S01)");
+    println!("==========================================================================================");
+    println!(
+        "{:<54} | {:>14} | {:>20}",
+        "Follow-Up Audit Regression Scenario", "Status", "Observed Result"
+    );
+    println!("{}", "-".repeat(94));
+
+    // 8A (F01 & F07): Cross-connection transaction isolation & two-phase xSync prepare + rollback
+    {
+        let sub = base_dir.join("suite8_f01_f07");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let shared = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+
+        let conn_a = SqliteConnection::open_in_memory().unwrap();
+        conn_a.register_aydb_module(shared.clone()).unwrap();
+        conn_a
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+            )
+            .unwrap();
+
+        let conn_b = SqliteConnection::open_in_memory().unwrap();
+        conn_b.register_aydb_module(shared.clone()).unwrap();
+        conn_b
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');",
+            )
+            .unwrap();
+
+        conn_a
+            .execute_batch("BEGIN; INSERT INTO t VALUES (3, 'uncommitted');")
+            .unwrap();
+        // Connection B must read the committed snapshot `[]` for id=3
+        let b_sees_uncommitted = conn_b
+            .query_all("SELECT * FROM t WHERE id=3", &[])
+            .unwrap();
+        // Connection B's concurrent write must return SQLITE_BUSY (Err) instead of joining Connection A's tx
+        let b_concurrent_write_busy = conn_b
+            .execute_batch("INSERT INTO t VALUES (4, 'other committed');")
+            .is_err();
+        conn_a.execute_batch("ROLLBACK;").unwrap();
+        // After Connection A rolls back, Connection B can write and commit row 4
+        conn_b
+            .execute_batch("INSERT INTO t VALUES (4, 'other committed');")
+            .unwrap();
+        let b_row4_after = conn_b
+            .query_all("SELECT id, v FROM t WHERE id=4", &[])
+            .unwrap();
+
+        // Two-phase `xSync` (`prepare_commit_transaction`) + rollback on a capped table restores quota-evicted rows
+        let two_phase_ok = {
+            let mut eng = shared.lock().unwrap();
+            eng.register_capped_table(9, 300).unwrap();
+            eng.put_row(9, b"r1", &vec![0x11u8; 150], &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.begin_transaction();
+            eng.put_row(9, b"r2", &vec![0x22u8; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.prepare_commit_transaction(WriteDurability::BufferedFast)
+                .unwrap();
+            eng.rollback_transaction().unwrap();
+            eng.get_row(9, b"r1").unwrap() == Some(vec![0x11u8; 150])
+                && eng.get_row(9, b"r2").unwrap().is_none()
+        };
+
+        drop(conn_a);
+        drop(conn_b);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(&sub);
+
+        let ok = b_sees_uncommitted.is_empty()
+            && b_concurrent_write_busy
+            && b_row4_after
+                == vec![vec![
+                    SqlValue::Integer(4),
+                    SqlValue::Text("other committed".to_string()),
+                ]]
+            && two_phase_ok;
+        assert!(ok, "8A (F01 & F07) regression check failed");
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "8A. Cross-Conn Isolation & 2PC Prepare (F01, F07)",
+            "PASS",
+            "Isolated & 2PC Safe"
+        );
+    }
+
+    // 8B (F02 & F03): Deferred mid-tx checkpointing & atomic multi-chunk WAL recovery on invalid blob
+    {
+        let sub_kv = base_dir.join("suite8_f02_kv");
+        let _ = std::fs::remove_dir_all(&sub_kv);
+        std::fs::create_dir_all(&sub_kv).unwrap();
+        let fs_kv = Arc::new(OsFs::open(&sub_kv, true).unwrap());
+        let mut eng = StorageEngine::open(fs_kv.clone(), EngineConfig::default()).unwrap();
+        eng.begin_transaction();
+        eng.put_row(1, b"aborted", b"value", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        eng.flush_memtable().unwrap();
+        eng.compact().unwrap();
+        eng.rollback_transaction().unwrap();
+        let in_mem_after_rollback = eng.get_row(1, b"aborted").unwrap();
+        drop(eng);
+
+        let mut eng_reopen = StorageEngine::open(fs_kv, EngineConfig::default()).unwrap();
+        let after_reopen = eng_reopen.get_row(1, b"aborted").unwrap();
+        drop(eng_reopen);
+        let _ = std::fs::remove_dir_all(&sub_kv);
+
+        // F03: Multi-chunk (`TxBegin`..`TxCommit`) WAL recovery rejects entire transaction if any chunk has invalid blob
+        let recovered_lsns = {
+            use aydb::wal::*;
+            let sub_wal = base_dir.join("suite8_f03_wal");
+            let _ = std::fs::remove_dir_all(&sub_wal);
+            std::fs::create_dir_all(&sub_wal).unwrap();
+            let fs_wal = OsFs::open(&sub_wal, true).unwrap();
+            let sync = WalStreamWriter::open(
+                &fs_wal,
+                WAL_SYNC_FILE_NAME,
+                65536,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            )
+            .unwrap();
+            let mut buf = WalStreamWriter::open(
+                &fs_wal,
+                WAL_BUF_FILE_NAME,
+                65536,
+                1,
+                WalStreamMode::BufferedImmediateOsCache,
+            )
+            .unwrap();
+            buf.append_batch(&WalBatch::new(
+                1,
+                vec![
+                    WalRecord::TxBegin,
+                    WalRecord::PutInline {
+                        key: b"first".to_vec(),
+                        value: b"value".to_vec(),
+                    },
+                ],
+            ))
+            .unwrap();
+            buf.append_batch(&WalBatch::new(
+                2,
+                vec![
+                    WalRecord::PutBlobPtr {
+                        key: b"second".to_vec(),
+                        blob_ptr: BlobPtr {
+                            kind: BlobKind::Standard,
+                            table_id: 1,
+                            seg_id: 42,
+                            offset: 0,
+                            len: 2048,
+                            crc32c: 0,
+                        },
+                    },
+                    WalRecord::TxCommit,
+                ],
+            ))
+            .unwrap();
+            let rec = recover_two_streams(&**sync.file(), 1, &**buf.file(), 1, 0, |_| false).unwrap();
+            let lsns: Vec<u64> = rec.merged_batches.iter().map(|b| b.lsn).collect();
+            drop(buf);
+            drop(sync);
+            let _ = std::fs::remove_dir_all(&sub_wal);
+            lsns
+        };
+
+        let ok = in_mem_after_rollback.is_none()
+            && after_reopen.is_none()
+            && recovered_lsns.is_empty();
+        assert!(ok, "8B (F02 & F03) regression check failed");
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "8B. Deferred Tx Flush & Atomic Multi-Chunk WAL (F02/03)",
+            "PASS",
+            "0 Leaked / 0 Partial"
+        );
+    }
+
+    // 8C (F04, F05 & F08): SQLite affinity, collation (NOCASE & RTRIM), unified numeric ORDER BY, & max auto-rowid
+    {
+        let sub = base_dir.join("suite8_f04_f05_f08");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let shared = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(shared).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');
+             INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+        )
+        .unwrap();
+        let q_float = conn.query_all("SELECT id FROM t WHERE id=1.0", &[]).unwrap();
+        let q_text = conn.query_all("SELECT id FROM t WHERE id='1'", &[]).unwrap();
+        let q_scan = conn
+            .query_all("SELECT id FROM t WHERE +id=1.0", &[])
+            .unwrap();
+        let affinity_ok = q_float == vec![vec![SqlValue::Integer(1)]]
+            && q_text == vec![vec![SqlValue::Integer(1)]]
+            && q_scan == vec![vec![SqlValue::Integer(1)]];
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c USING aydb(table_id=2, columns='k TEXT PRIMARY KEY COLLATE NOCASE, tag TEXT COLLATE RTRIM', indexes='tag');
+             INSERT INTO c VALUES ('Alice', 'admin   ');",
+        )
+        .unwrap();
+        let nocase_lookup = conn
+            .query_all("SELECT k FROM c WHERE k='alice'", &[])
+            .unwrap();
+        let rtrim_lookup = conn
+            .query_all("SELECT k FROM c WHERE tag='admin'", &[])
+            .unwrap();
+        let collation_ok = nocase_lookup == vec![vec![SqlValue::Text("Alice".to_string())]]
+            && rtrim_lookup == vec![vec![SqlValue::Text("Alice".to_string())]];
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE m USING aydb(table_id=3, columns='k BLOB PRIMARY KEY, v TEXT');
+             INSERT INTO m VALUES (10, 'ten'), (1.5, 'fraction');",
+        )
+        .unwrap();
+        let mixed_order = conn.query_all("SELECT k FROM m ORDER BY k", &[]).unwrap();
+        let numeric_order_ok = mixed_order
+            == vec![
+                vec![SqlValue::Float(1.5)],
+                vec![SqlValue::Integer(10)],
+            ];
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE max_r USING aydb(table_id=4, columns='id INTEGER PRIMARY KEY, v TEXT');
+             INSERT INTO max_r VALUES (9223372036854775807, 'max');
+             INSERT INTO max_r VALUES (NULL, 'auto_after_max');",
+        )
+        .unwrap();
+        let max_rows = conn
+            .query_all("SELECT COUNT(*) FROM max_r", &[])
+            .unwrap();
+        let max_rowid_ok = max_rows == vec![vec![SqlValue::Integer(2)]];
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&sub);
+
+        let ok = affinity_ok && collation_ok && numeric_order_ok && max_rowid_ok;
+        assert!(ok, "8C (F04, F05 & F08) regression check failed");
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "8C. Affinity, Collation, Numeric Order & Rowid (F04-08)",
+            "PASS",
+            "100% SQLite-Aligned"
+        );
+    }
+
+    // 8D (P01, P02 & S01): Size-tiered partial auto-compaction, keys-only COUNT(*), & crafted fp_count rejection
+    {
+        let sub = base_dir.join("suite8_p01_p02_s01");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.auto_compact_segment_threshold = 4;
+
+        // P01: Build a large base segment (~48 KB), then flush 3 tiny segments; auto-compaction
+        // must merge only the 3 tiny suffix segments (`start_idx = 1`, leaving 2 segments total)
+        // and preserve tombstones shadowing the base segment!
+        let tiered_ok = {
+            let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+            let mut eng = StorageEngine::open(fs, cfg.clone()).unwrap();
+            let payload = vec![0x42u8; 256];
+            for i in 0..160u32 {
+                let k = format!("base_{i:04}").into_bytes();
+                eng.put_row(1, &k, &payload, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.flush_memtable().unwrap();
+            assert_eq!(eng.active_idx_segment_count(), 1);
+
+            eng.delete_row(1, b"base_0005", WriteDurability::BufferedFast)
+                .unwrap();
+            eng.flush_memtable().unwrap();
+            eng.put_row(1, b"s1", b"v1", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.flush_memtable().unwrap();
+            eng.put_row(1, b"s2", b"v2", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.flush_memtable().unwrap();
+
+            // 4 segments triggered size-tiered suffix compaction (merging the 3 small segments -> 2 total)
+            eng.active_idx_segment_count() == 2 && eng.get_row(1, b"base_0005").unwrap().is_none()
+        };
+
+        // P02: Keys-only projection (`SELECT COUNT(*)` & `SELECT id`) reads zero out-of-line blobs
+        let sub_p02 = base_dir.join("suite8_p02_keys_only");
+        let _ = std::fs::remove_dir_all(&sub_p02);
+        std::fs::create_dir_all(&sub_p02).unwrap();
+        {
+            let fs = Arc::new(OsFs::open(&sub_p02, true).unwrap());
+            let engine = Arc::new(Mutex::new(
+                StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+            ));
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module(engine.clone()).unwrap();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE docs USING aydb(table_id=10, columns='id INTEGER PRIMARY KEY, body BLOB');",
+            )
+            .unwrap();
+            let big_blob = vec![0x5Au8; 4096];
+            for id in 1..=4i64 {
+                conn.query_all(
+                    "INSERT INTO docs VALUES (?1, ?2)",
+                    &[SqlValue::Integer(id), SqlValue::Blob(big_blob.clone())],
+                )
+                .unwrap();
+            }
+            engine.lock().unwrap().flush_memtable().unwrap();
+        }
+        // Overwrite `blob_std_*.db` with 0xFF so any blob read would fail CRC verification
+        for entry in std::fs::read_dir(&sub_p02).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("blob_std_") && name.ends_with(".db") {
+                let p = entry.path();
+                let len = std::fs::metadata(&p).unwrap().len() as usize;
+                std::fs::write(&p, vec![0xFFu8; len]).unwrap();
+            }
+        }
+        let keys_only_ok = {
+            let fs = Arc::new(OsFs::open(&sub_p02, false).unwrap());
+            let engine = Arc::new(Mutex::new(
+                StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+            ));
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module(engine).unwrap();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE docs USING aydb(table_id=10, columns='id INTEGER PRIMARY KEY, body BLOB');",
+            )
+            .unwrap();
+            let cnt = conn.query_all("SELECT COUNT(*) FROM docs", &[]).unwrap();
+            let ids = conn
+                .query_all("SELECT id FROM docs ORDER BY id", &[])
+                .unwrap();
+            cnt == vec![vec![SqlValue::Integer(4)]] && ids.len() == 4
+        };
+        let _ = std::fs::remove_dir_all(&sub_p02);
+
+        // S01: Defensive rejection of crafted/inflated `fp_count` index trailer with valid CRC32C
+        let s01_ok = {
+            use aydb::index::IdxSegmentReader;
+            use aydb::meta::format_idx_file_name;
+            use aydb::util::crc32c::crc32c;
+
+            let idx_name = format_idx_file_name(1);
+            let idx_path = sub.join(&idx_name);
+            let mut bytes = std::fs::read(&idx_path).unwrap();
+            let flen = bytes.len();
+            let meta_offset =
+                u64::from_le_bytes(bytes[flen - 24..flen - 16].try_into().unwrap()) as usize;
+            let meta_len =
+                u32::from_le_bytes(bytes[flen - 16..flen - 12].try_into().unwrap()) as usize;
+            // Bloom filter header is at `meta_offset`: `[num_probes: u8, 0, 0, 0, bit_bytes_len: u32 LE, bits...]`
+            let bloom_byte_len = u32::from_le_bytes(
+                bytes[meta_offset + 4..meta_offset + 8].try_into().unwrap(),
+            ) as usize;
+            let fp_count_pos = meta_offset + 8 + bloom_byte_len;
+            // Inflate `fp_count` to `u32::MAX` and recompute both `meta_crc` and `footer_crc`
+            bytes[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let new_meta_crc = crc32c(&bytes[meta_offset..meta_offset + meta_len]);
+            bytes[flen - 12..flen - 8].copy_from_slice(&new_meta_crc.to_le_bytes());
+            let new_footer_crc = crc32c(&bytes[flen - 48..flen - 4]);
+            bytes[flen - 4..flen].copy_from_slice(&new_footer_crc.to_le_bytes());
+            std::fs::write(&idx_path, &bytes).unwrap();
+
+            let fs = OsFs::open(&sub, false).unwrap();
+            match IdxSegmentReader::open(&fs, 1) {
+                Err(e) => e.kind() == io::ErrorKind::InvalidData,
+                Ok(_) => false,
+            }
+        };
+        let _ = std::fs::remove_dir_all(&sub);
+
+        let ok = tiered_ok && keys_only_ok && s01_ok;
+        assert!(ok, "8D (P01, P02 & S01) regression check failed");
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "8D. Tiered Compaction, Zero-Blob & Bounds (P01/02/S01)",
+            "PASS",
+            "Bounded & Verified"
+        );
+    }
+}
+
 fn main() {
     let base_dir = std::env::temp_dir().join(format!("aydb_rel_suite7_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base_dir);
@@ -1254,6 +1658,7 @@ fn main() {
     bench_suite_5_io_fault_countdown();
     bench_suite_6_vtab_key_and_rowid_integrity();
     suite_7_audit_regressions(&base_dir);
+    suite_8_followup_audit_regressions(&base_dir);
 
     let _ = std::fs::remove_dir_all(&base_dir);
 }

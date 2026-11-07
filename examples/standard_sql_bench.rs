@@ -1,9 +1,19 @@
-//! Industry-Standard SQL Benchmark Suite (`examples/standard_sql_bench.rs`):
+//! Selected Standard SQL Benchmark Workloads (`examples/standard_sql_bench.rs`):
 //!
 //! Evaluates Vanilla SQLite (`PRAGMA journal_mode = WAL`) vs. `aydb` Virtual Table (`USING aydb(...)`)
-//! across three standard database benchmark suites:
+//! after a **Pre-Benchmark Differential SQL Equivalence Verification Pass (`verify_differential_sql_equivalence`)**
+//! across three representative standard database workload styles:
 //!
-//! 1. **SQLite Official "Speedtest1" Standard Suite (Tests 100..320):**
+//! 0. **Pre-Benchmark Differential SQL Equivalence Verification (`verify_differential_sql_equivalence`):**
+//!    - Executes identical SQL sequences against both a native SQLite table and an `aydb` virtual table
+//!      covering mixed numeric types (`INTEGER` & `REAL` Unified Numeric `ORDER BY`), column affinity
+//!      coercions (`WHERE id = 1.0`, `WHERE id = '1'`), `COLLATE NOCASE` / `COLLATE RTRIM` lookups,
+//!      failed `UNIQUE` constraint statements (`INSERT` / `UPDATE`), `SAVEPOINT` / `ROLLBACK TO`,
+//!      cross-connection transaction snapshot isolation (`SQLITE_BUSY`), and mixed native-SQLite +
+//!      `aydb` virtual table atomic multi-store `COMMIT` and `ROLLBACK`, asserting 100% identical
+//!      query results and table states before running throughput measurements.
+//!
+//! 1. **SQLite `Speedtest1`-Style Workload (Selected Tests 100..240):**
 //!    - Test 100: Bulk `INSERT` of 5,000 rows (`BEGIN .. COMMIT`)
 //!    - Test 130: 5,000 Random Primary-Key Point `SELECT`s (`WHERE id = ?`)
 //!    - Test 140: 5,000 Random Secondary-Index Equality `SELECT`s (`WHERE uval = ?`)
@@ -13,7 +23,7 @@
 //!    - Test 240: 2,500 Random `DELETE`s + Re-`INSERT`s (Churn)
 //!    - Evaluated with `WalStreamMode::BufferedImmediateOsCache` on `aydb` vs. `PRAGMA synchronous = NORMAL` on SQLite.
 //!
-//! 2. **YCSB (Yahoo! Cloud Serving Benchmark) Workloads A through F (Zipfian $\theta = 0.99$):**
+//! 2. **YCSB-Style Workloads A through F (Zipfian $\theta = 0.99$):**
 //!    - Workload A (Update Heavy): 50% Read / 50% Update
 //!    - Workload B (Read Mostly): 95% Read / 5% Update
 //!    - Workload C (Read Only): 100% Point Read
@@ -23,7 +33,7 @@
 //!        fundamental B-Tree vs. WiscKey range-scan trade-off!
 //!    - Workload F (Read-Modify-Write): 50% Point Read / 50% Read-Modify-Write
 //!
-//! 3. **TPC-B (`pgbench`-style) Multi-Table OLTP Benchmark:**
+//! 3. **TPC-B-Style (`pgbench`-like) Multi-Table OLTP Workload:**
 //!    - 4 tables (`branches`, `tellers`, `accounts`, `history`), 5 SQL statements per transaction
 //!      (`UPDATE accounts` -> `SELECT abalance` -> `UPDATE tellers` -> `UPDATE branches` -> `INSERT history`),
 //!      measured under both Buffered (`synchronous = NORMAL` / `wal_buf.db`) and Full Durable Sync
@@ -93,7 +103,225 @@ impl ZipfRng {
 }
 
 // =========================================================================
-// SUITE 1: SQLite Official "Speedtest1" Standard Workload Suite
+// SUITE 0: Pre-Benchmark Differential SQL Equivalence Verification
+// =========================================================================
+
+fn verify_differential_sql_equivalence(root: &PathBuf) {
+    println!("==========================================================================================");
+    println!("PRE-BENCHMARK DIFFERENTIAL SQL EQUIVALENCE VERIFICATION (Native SQLite vs. aydb VTab)");
+    println!("==========================================================================================");
+    println!(
+        "{:<54} | {:>14} | {:>20}",
+        "Differential SQL Equivalence Check", "Status", "Verification Detail"
+    );
+    println!("{}", "-".repeat(94));
+
+    let sub = root.join("diff_verify");
+    let _ = std::fs::remove_dir_all(&sub);
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let sq_conn = SqliteConnection::open_file(&sub.join("native.sqlite")).unwrap();
+    sq_conn
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .unwrap();
+
+    let fs = Arc::new(OsFs::open(&sub.join("aydb"), true).unwrap());
+    let shared_engine = Arc::new(Mutex::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let ay_conn = SqliteConnection::open_in_memory().unwrap();
+    ay_conn
+        .register_aydb_module(shared_engine.clone())
+        .unwrap();
+
+    // 1. Mixed numeric types & exact unified numeric ORDER BY on BLOB PRIMARY KEY
+    {
+        sq_conn
+            .execute_batch(
+                "CREATE TABLE m_num (k BLOB PRIMARY KEY, v TEXT);
+                 INSERT INTO m_num VALUES (10, 'ten'), (1.5, 'one_half'), (-1.5, 'neg_half'), (-10, 'neg_ten'), (0, 'zero'), (9007199254740993, 'two53_p1'), (9007199254740992, 'two53');",
+            )
+            .unwrap();
+        ay_conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE m_num USING aydb(table_id=1, columns='k BLOB PRIMARY KEY, v TEXT');
+                 INSERT INTO m_num VALUES (10, 'ten'), (1.5, 'one_half'), (-1.5, 'neg_half'), (-10, 'neg_ten'), (0, 'zero'), (9007199254740993, 'two53_p1'), (9007199254740992, 'two53');",
+            )
+            .unwrap();
+
+        for q in [
+            "SELECT k, v FROM m_num ORDER BY k",
+            "SELECT k, v FROM m_num WHERE k > -2 ORDER BY k LIMIT 3",
+            "SELECT v FROM m_num WHERE k = 10.0",
+        ] {
+            let sq_rows = sq_conn.query_all(q, &[]).unwrap();
+            let ay_rows = ay_conn.query_all(q, &[]).unwrap();
+            assert_eq!(sq_rows, ay_rows, "differential mismatch on query: {q}");
+        }
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "0A. Mixed Numeric Types & Unified ORDER BY (F05)",
+            "PASS",
+            "100% State Match"
+        );
+    }
+
+    // 2. Column Affinity Coercions & Collation Sequences (NOCASE & RTRIM)
+    {
+        sq_conn
+            .execute_batch(
+                "CREATE TABLE t_aff (id INTEGER PRIMARY KEY, score INT, name TEXT COLLATE NOCASE, tag TEXT COLLATE RTRIM);
+                 CREATE INDEX idx_t_aff_score ON t_aff(score);
+                 CREATE INDEX idx_t_aff_tag ON t_aff(tag);
+                 INSERT INTO t_aff VALUES (1, 100, 'Alice', 'admin   '), ('2', '200', 'Bob', 'user ');",
+            )
+            .unwrap();
+        ay_conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t_aff USING aydb(table_id=2, columns='id INTEGER PRIMARY KEY, score INT, name TEXT COLLATE NOCASE, tag TEXT COLLATE RTRIM', indexes='score,tag');
+                 INSERT INTO t_aff VALUES (1, 100, 'Alice', 'admin   '), ('2', '200', 'Bob', 'user ');",
+            )
+            .unwrap();
+
+        for q in [
+            "SELECT id, score, name FROM t_aff WHERE id = 1.0",
+            "SELECT id, score, name FROM t_aff WHERE id = '1'",
+            "SELECT id, score, name FROM t_aff WHERE +id = 1.0",
+            "SELECT id, name FROM t_aff WHERE score = 200.0",
+            "SELECT id, name FROM t_aff WHERE score = '200'",
+            "SELECT id, name FROM t_aff WHERE name = 'alice'",
+            "SELECT id, tag FROM t_aff WHERE tag = 'admin'",
+        ] {
+            let sq_rows = sq_conn.query_all(q, &[]).unwrap();
+            let ay_rows = ay_conn.query_all(q, &[]).unwrap();
+            assert_eq!(sq_rows, ay_rows, "differential mismatch on query: {q}");
+        }
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "0B. Column Affinity & NOCASE/RTRIM Collations (F04)",
+            "PASS",
+            "100% State Match"
+        );
+    }
+
+    // 3. Failed UNIQUE Constraint Statements & Nested SAVEPOINT / ROLLBACK TO
+    {
+        // Both engines must reject duplicate PK INSERT and preserve existing state
+        assert!(sq_conn
+            .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
+            .is_err());
+        assert!(ay_conn
+            .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
+            .is_err());
+
+        let tx_script = "BEGIN;
+                         INSERT INTO t_aff VALUES (3, 300, 'Charlie', 'mod');
+                         SAVEPOINT sp1;
+                         UPDATE t_aff SET score = 888 WHERE id = 1;
+                         INSERT INTO t_aff VALUES (4, 400, 'Discarded', 'temp');
+                         ROLLBACK TO sp1;
+                         RELEASE sp1;
+                         COMMIT;";
+        sq_conn.execute_batch(tx_script).unwrap();
+        ay_conn.execute_batch(tx_script).unwrap();
+
+        let sq_state = sq_conn
+            .query_all("SELECT id, score, name, tag FROM t_aff ORDER BY id", &[])
+            .unwrap();
+        let ay_state = ay_conn
+            .query_all("SELECT id, score, name, tag FROM t_aff ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(sq_state, ay_state);
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "0C. Failed UNIQUE Statements & Nested SAVEPOINTs",
+            "PASS",
+            "100% State Match"
+        );
+    }
+
+    // 4. Cross-Connection Transaction Snapshot Isolation & Mixed Native-SQLite + aydb 2PC Transactions
+    {
+        let ay_conn2 = SqliteConnection::open_in_memory().unwrap();
+        ay_conn2
+            .register_aydb_module(shared_engine.clone())
+            .unwrap();
+        ay_conn2
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t_aff USING aydb(table_id=2, columns='id INTEGER PRIMARY KEY, score INT, name TEXT COLLATE NOCASE, tag TEXT COLLATE RTRIM', indexes='score,tag');",
+            )
+            .unwrap();
+
+        // Mixed native SQLite table + aydb virtual table on `ay_conn`
+        ay_conn
+            .execute_batch("CREATE TABLE native_audit (id INTEGER PRIMARY KEY, note TEXT);")
+            .unwrap();
+
+        // Start a mixed transaction on Connection 1 touching both `native_audit` and `t_aff` (aydb)
+        ay_conn
+            .execute_batch(
+                "BEGIN;
+                 INSERT INTO native_audit VALUES (10, 'uncommitted_native');
+                 INSERT INTO t_aff VALUES (10, 1000, 'UncommittedAy', 'pending');",
+            )
+            .unwrap();
+
+        // Connection 2 must not see uncommitted row 10 and must receive SQLITE_BUSY on write
+        assert!(ay_conn2
+            .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
+            .unwrap()
+            .is_empty());
+        assert!(ay_conn2
+            .execute_batch("INSERT INTO t_aff VALUES (11, 1100, 'Busy', 'busy');")
+            .is_err());
+
+        // Roll back the mixed transaction on Connection 1 -> both native_audit and t_aff roll back
+        ay_conn.execute_batch("ROLLBACK;").unwrap();
+        assert!(ay_conn
+            .query_all("SELECT * FROM native_audit", &[])
+            .unwrap()
+            .is_empty());
+        assert!(ay_conn
+            .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
+            .unwrap()
+            .is_empty());
+
+        // Now commit a mixed native + aydb transaction across both stores
+        ay_conn
+            .execute_batch(
+                "BEGIN;
+                 INSERT INTO native_audit VALUES (20, 'committed_both');
+                 INSERT INTO t_aff VALUES (20, 2000, 'CommittedBoth', 'ok');
+                 COMMIT;",
+            )
+            .unwrap();
+        sq_conn
+            .execute_batch("INSERT INTO t_aff VALUES (20, 2000, 'CommittedBoth', 'ok');")
+            .unwrap();
+
+        let sq_final = sq_conn
+            .query_all("SELECT id, score, name, tag FROM t_aff ORDER BY id", &[])
+            .unwrap();
+        let ay_final = ay_conn2
+            .query_all("SELECT id, score, name, tag FROM t_aff ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(sq_final, ay_final);
+        println!(
+            "{:<54} | {:>14} | {:>20}\n",
+            "0D. Cross-Conn Isolation & Mixed SQLite+aydb 2PC Tx",
+            "PASS",
+            "100% State Match"
+        );
+    }
+
+    drop(ay_conn);
+    drop(sq_conn);
+    drop(shared_engine);
+    let _ = std::fs::remove_dir_all(&sub);
+}
+
+// =========================================================================
+// SUITE 1: SQLite "Speedtest1"-Style Workload (Selected Tests 100..240)
 // =========================================================================
 
 struct SpeedtestTimings {
@@ -249,7 +477,7 @@ fn run_speedtest1_on_connection(conn: &SqliteConnection) -> SpeedtestTimings {
 
 fn bench_speedtest1_suite(root: &PathBuf) {
     println!("==========================================================================================");
-    println!("SUITE 1: SQLite Official \"Speedtest1\" Standard Workload (5,000 Indexed Rows, 120B Payload)");
+    println!("SUITE 1: SQLite \"Speedtest1\"-Style Workload (Selected Tests 100-240, 5,000 Rows, 120B)");
     println!("==========================================================================================");
     println!(
         "{:<40} | {:>16} | {:>16} | {:>12}",
@@ -373,7 +601,7 @@ fn bench_speedtest1_suite(root: &PathBuf) {
 }
 
 // =========================================================================
-// SUITE 2: YCSB (Yahoo! Cloud Serving Benchmark) Workloads A through F
+// SUITE 2: YCSB-Style Workloads A through F
 // =========================================================================
 
 fn run_ycsb_on_connection(
@@ -520,7 +748,7 @@ fn bench_ycsb_suite(root: &PathBuf) {
     for &val_size in &[256usize, 2048] {
         println!("\n==========================================================================================");
         println!(
-            "SUITE 2: YCSB Workloads A-F (Zipfian theta=0.99, Value Size = {} B — {})",
+            "SUITE 2: YCSB-Style Workloads A-F (Zipfian theta=0.99, Value Size = {} B — {})",
             val_size,
             if val_size < 1024 {
                 "Inline Storage"
@@ -595,7 +823,7 @@ fn bench_ycsb_suite(root: &PathBuf) {
 }
 
 // =========================================================================
-// SUITE 3: TPC-B (pgbench-style) 4-Table OLTP Benchmark
+// SUITE 3: TPC-B-Style (pgbench-like) 4-Table OLTP Workload
 // =========================================================================
 
 fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
@@ -687,7 +915,7 @@ fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
 
 fn bench_tpcb_suite(root: &PathBuf) {
     println!("\n==========================================================================================");
-    println!("SUITE 3: TPC-B (pgbench) 4-Table OLTP Benchmark (5 SQL Statements per Transaction)");
+    println!("SUITE 3: TPC-B-Style (pgbench-like) 4-Table OLTP Workload (5 SQL Statements per Tx)");
     println!("==========================================================================================");
     println!(
         "{:<34} | {:>18} | {:>18} | {:>12}",
@@ -1047,6 +1275,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create bench dir");
 
+    verify_differential_sql_equivalence(&dir);
     bench_speedtest1_suite(&dir);
     bench_ycsb_suite(&dir);
     bench_tpcb_suite(&dir);

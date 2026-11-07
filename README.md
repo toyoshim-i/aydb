@@ -53,46 +53,48 @@ flowchart TB
 
 ## Benchmark Highlights vs. Vanilla SQLite (`WAL` Mode)
 
-All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same Windows NTFS host with **equivalent durability guarantees** (`BENCH-03`: `WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`):
+All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same Windows NTFS host with **equivalent durability guarantees** (`BENCH-03`: `WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` 2PC transactions):
 
 <p align="center">
   <img src="docs/assets/bench_speedup_overview.svg" alt="aydb Relative Speedup Overview vs Vanilla SQLite WAL" width="100%"/>
 </p>
 
 <details>
-<summary><b>📊 View Detailed Benchmark Comparison Charts (YCSB A–F, Speedtest1 Breakdown, TPC-B &amp; Hybrid Workloads)</b></summary>
+<summary><b>📊 View Detailed Benchmark Comparison Charts (YCSB-Style A–F, Speedtest1-Style Breakdown, TPC-B-Style &amp; Hybrid Workloads)</b></summary>
 <br/>
 <p align="center">
-  <img src="docs/assets/bench_ycsb_throughput.svg" alt="YCSB Workloads A-F Throughput Comparison" width="100%"/>
+  <img src="docs/assets/bench_ycsb_throughput.svg" alt="YCSB-Style Workloads A-F Throughput Comparison" width="100%"/>
 </p>
 <p align="center">
-  <img src="docs/assets/bench_speedtest1_breakdown.svg" alt="SQLite Official Speedtest1 Execution Time Breakdown" width="100%"/>
+  <img src="docs/assets/bench_speedtest1_breakdown.svg" alt="SQLite Speedtest1-Style Execution Time Breakdown" width="100%"/>
 </p>
 <p align="center">
-  <img src="docs/assets/bench_hybrid_and_tpcb.svg" alt="Hybrid Desktop Workloads and TPC-B Comparison" width="100%"/>
+  <img src="docs/assets/bench_hybrid_and_tpcb.svg" alt="Hybrid Desktop Workloads and TPC-B-Style Comparison" width="100%"/>
 </p>
 </details>
 
-> **Dataset Scale & `MemTable` vs. On-Disk SSTable Transparency (`BENCH-01`, `BENCH-02`):**
-> With the default `memtable_capacity_bytes = 4 MB`, datasets whose index footprint is `< 4 MB` (`Speedtest1` `5,000` rows $\approx 600\text{ KB}$, `YCSB 256 B` `4,000` rows $\approx 1.1\text{ MB}$, `TPC-B` `2,000` accounts $\approx 300\text{ KB}$) serve index lookups from the in-memory `MemTable` (`BTreeMap`) while logging every commit to the OS page cache (`wal_buf.db`) or non-volatile media (`wal_sync.db`). For `YCSB 2 KB` (`~8.2 MB`), `Bounded Blob Cache` (`32.0 MB` written across `blob_lru_*.db`), and the **`128 KB MemTable` On-Disk SSTable (`idx_*.db`)** rows documented below and in [Chapter 2.3 §4](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md), reads and scans execute positional `ReadFile(OVERLAPPED)` calls against on-disk `idx_*.db` and `blob_*.db` segments.
+> **Dataset Scale, Workload Scope, & Failure-Model Transparency (`BENCH-01`, `BENCH-02`):**
+> * **Workload Coverage:** `examples/standard_sql_bench.rs` implements selected **`Speedtest1`-style** (`Tests 100–240`), **`YCSB`-style** (`Workloads A–F`), and **`TPC-B`-style** (`pgbench`-like 4-table OLTP) workloads rather than full certified/official benchmark suites.
+> * **Warm OS Cache vs. Larger-Than-RAM Datasets:** With the default `memtable_capacity_bytes = 4 MB`, datasets whose index footprint is `< 4 MB` (`Speedtest1`-style `5,000` rows $\approx 600\text{ KB}$, `YCSB`-style `256 B` `4,000` rows $\approx 1.1\text{ MB}$, `TPC-B`-style `2,000` accounts $\approx 300\text{ KB}$) serve index lookups from the in-memory `MemTable` (`BTreeMap`) while logging every commit to the OS page cache (`wal_buf.db`) or non-volatile media (`wal_sync.db`). Lowering `memtable_capacity_bytes = 128 KB` forces `idx_*.db` SSTable flushes and size-tiered compactions ([Chapter 2.3 §4](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md)), exercising positional `ReadFile(OVERLAPPED)` calls against warm OS page cache; establishing cold-storage or larger-than-RAM behavior requires multi-gigabyte datasets beyond these quick-running examples.
+> * **Local Host & Simulated Fault Model:** Reported figures are single-host local Windows NTFS measurements. Power-loss and I/O fault tests in `examples/reliability_bench.rs` use deterministic in-memory simulation (`FaultInjectingFs`) and do not substitute for physical power-cut hardware testing or live SMB network-outage/reconnection testing.
 
-| Benchmark Suite | Workload & Durability / Scale Note | `aydb` (`4 MB` Default / `128 KB` SSTable) | Vanilla SQLite (`WAL`) | Speedup (`4 MB` / `SSTable`) |
+| Benchmark Workload | Workload & Durability / Scale Note | `aydb` (`4 MB` Default / `128 KB` SSTable) | Vanilla SQLite (`WAL`) | Speedup (`4 MB` / `SSTable`) |
 | :--- | :--- | ---: | ---: | ---: |
-| **SQLite `Speedtest1`** | Official 5,000-row SQL suite (`Tests 100–240`, `BufferedImmediateOsCache` vs `NORMAL`, ~600 KB) | `79.00 ms` (`256.31 ms` SSTable) | `68.42 ms` (`68.64 ms`) | `0.87×` (`0.27×` SSTable) |
-| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s (`MemTable` `BTreeMap` vs SQLite `PCache`) | **`5.02 ms`** (`996K qps`) | `16.75 ms` (`299K qps`) | **`3.33×` faster** |
-| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE uval = ?`) | **`7.86 ms`** (`636K qps`) | `17.01 ms` (`294K qps`) | **`2.16×` faster** |
-| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`5.42 ms`** (`185K qps`) | `7.38 ms` (`136K qps`) | **`1.36×` faster** |
-| **YCSB Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`272K`** / `79.1K ops/s` | `210K` / `143K ops/s` | **`1.30×`** / `0.55×` |
-| **YCSB Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`305K`**] / `2 KB` WiscKey) | **`863K`** / `150K ops/s` | `271K` / `169K ops/s` | **`3.18×` [`1.15×` SST]** / `0.89×` |
-| **YCSB Workload C** | 100% Point Read (`256 B` inline [SSTable: **`369K`**] / `2 KB` WiscKey) | **`1,192K`** / **`178K ops/s`** | `280K` / `177K ops/s` | **`4.26×` [`1.35×` SST]** / **`1.00×`** |
-| **YCSB Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`778K` / `159K ops/s`** | `177K` / `94.1K ops/s` | **`4.41×` / `1.69×` faster** |
-| **YCSB Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`229K`** / `22.3K ops/s` | `98.9K` / `41.6K ops/s` | **`2.31×`** / `0.54×` |
-| **YCSB Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`250K`** / `67.1K ops/s` | `155K` / `112K ops/s` | **`1.61×`** / `0.60×` |
-| **TPC-B (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` `WRITE_THROUGH` vs `synchronous=FULL`) | **`10,495 TPS`** (**`8,194`** SSTable) | `578 TPS` (`574` SST) | **`18.17×` (`14.28×` SSTable)** |
-| **TPC-B (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`100,276 TPS`** (**`43,163`** SSTable) | `15,277 TPS` (`15,840` SST) | **`6.56×` (`2.72×` SSTable)** |
-| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates (`wal_sync.db` vs `synchronous=FULL`) | **`11,976 tx/s`** (`76.0 µs` P50) | `539 tx/s` (`1,832.0 µs` P50) | **`22.2×` faster** |
-| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`32.0 MB` written, `4.0 MB` Quota Enforcement) | **`89.9 MB/s`** (`3.98 MB` disk) | `68.8 MB/s` (`8.15 MB` disk) | **`1.31×` faster (`0.5×` space)** |
-| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking (`4 KB` blobs in `blob_lru_*.db`) | **`206,093 ops/s`** (`0.00 MB` RAM) | `21,603 ops/s` (`0.03 MB` WAL) | **`9.54×` faster** |
+| **`Speedtest1`-Style Suite** | Selected 5,000-row SQL workload (`Tests 100–240`, `BufferedImmediateOsCache` vs `NORMAL`, ~600 KB) | `74.78 ms` (`234.51 ms` SSTable) | `59.21 ms` (`63.08 ms`) | `0.79×` (`0.27×` SSTable) |
+| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s (`MemTable` `BTreeMap` vs SQLite `PCache`) | **`5.33 ms`** (`938K qps`) | `14.37 ms` (`348K qps`) | **`2.70×` faster** |
+| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE uval = ?`) | **`6.62 ms`** (`755K qps`) | `15.15 ms` (`330K qps`) | **`2.29×` faster** |
+| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`4.17 ms`** (`240K qps`) | `5.47 ms` (`183K qps`) | **`1.31×` faster** |
+| **YCSB-Style Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`294K`** / `81.9K ops/s` | `159K` / `151K ops/s` | **`1.85×`** / `0.54×` |
+| **YCSB-Style Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`347K`**] / `2 KB` WiscKey) | **`895K`** / `160K ops/s` | `267K` / `180K ops/s` | **`3.35×` [`1.17×` SST]** / `0.89×` |
+| **YCSB-Style Workload C** | 100% Point Read (`256 B` inline [SSTable: **`434K`**] / `2 KB` WiscKey) | **`1,248K`** / `187K ops/s` | `285K` / `201K ops/s` | **`4.38×` [`1.42×` SST]** / `0.93×` |
+| **YCSB-Style Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`928K` / `175K ops/s`** | `221K` / `103K ops/s` | **`4.20×` / `1.69×` faster** |
+| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`266K`** / `24.0K ops/s` | `104K` / `42.3K ops/s` | **`2.55×`** / `0.57×` |
+| **YCSB-Style Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`253K`** / `70.5K ops/s` | `166K` / `123K ops/s` | **`1.52×`** / `0.57×` |
+| **TPC-B-Style (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` `WRITE_THROUGH` vs `synchronous=FULL`) | **`12,864 TPS`** (**`10,572`** SSTable) | `494 TPS` (`497` SST) | **`26.04×` (`21.28×` SSTable)** |
+| **TPC-B-Style (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`102,792 TPS`** (**`42,723`** SSTable) | `14,896 TPS` (`15,106` SST) | **`6.90×` (`2.83×` SSTable)** |
+| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates (`wal_sync.db` vs `synchronous=FULL`) | **`13,607 tx/s`** (`54.2 µs` P50) | `500 tx/s` (`1,977.1 µs` P50) | **`27.2×` faster** |
+| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`32.0 MB` written, `4.0 MB` Quota Enforcement) | **`92.8 MB/s`** (`3.98 MB` disk) | `68.2 MB/s` (`8.15 MB` disk) | **`1.36×` faster (`0.5×` space)** |
+| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking (`4 KB` blobs in `blob_lru_*.db`) | **`227,828 ops/s`** (`0.00 MB` RAM) | `22,570 ops/s` (`0.03 MB` WAL) | **`10.09×` faster** |
 
 ---
 
@@ -115,7 +117,7 @@ This repository is structured as a **"Build-to-Learn" Living Textbook**. Every s
 * **[Chapter 2.0: Phase 2 Overview](docs/phase2/00_OVERVIEW.md)** — Bridging SQLite's VDBE bytecode engine to `aydb` via `sqlite3_module` and zero-dependency `winsqlite3.dll` / `libsqlite3` FFI.
 * **[Chapter 2.1: SQLite Virtual Table Adapter, Row Codec, & Constraint Pushdown](docs/phase2/01_SQLITE_VTAB_ADAPTER.md)** — $O(1)$ offset-indexed binary `RowCodec`, zero-copy FFI column projection (`project_column_zero_copy`), `xBestIndex` constraint/`LIMIT`/`ORDER BY` pushdown, reusable contiguous cursor byte slabs (`AydbCursor::slab`), lock-free reversible 8-byte `ROWID` encoding, and `xBegin`/`xCommit`/`xRollback` transaction coalescing.
 * **[Chapter 2.2: Hybrid Workload Benchmarks vs. Vanilla SQLite](docs/phase2/02_SQLITE_VS_AYDB_BENCHMARKS.md)** — Deep-dive evaluation of synchronous configuration updates, `MAX_BYTES`-bounded 16 KB blob caching, and read-heavy LRU access tracking.
-* **[Chapter 2.3: Industry-Standard SQL Benchmark Suite (`Speedtest1`, `YCSB`, `TPC-B`)](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md)** — Methodology, results, and architectural root-cause analysis across SQLite's official `Speedtest1`, Yahoo! Cloud Serving Benchmark (`Workloads A–F`), and `TPC-B`.
+* **[Chapter 2.3: Selected Standard SQL Benchmark Workloads (`Speedtest1`-Style, `YCSB`-Style, `TPC-B`-Style)](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md)** — Pre-benchmark differential SQL equivalence verification, methodology, results, and architectural root-cause analysis across `Speedtest1`-style, `YCSB`-style (`Workloads A–F`), and `TPC-B`-style workloads.
 
 ---
 
@@ -148,7 +150,7 @@ aydb/
     ├── lru_engine_bench.rs                   # Step 1-5: Zero-I/O LRU & Quota Eviction benchmarks
     ├── reliability_bench.rs                  # Crash-Consistency, Fault-Injection, & Audit Regression Suite
     ├── sqlite_vs_aydb_bench.rs               # Step 2-2: Hybrid Workload SQLite vs. aydb benchmarks
-    └── standard_sql_bench.rs                 # Step 2-3: Speedtest1, YCSB (A-F), & TPC-B SQL benchmarks
+    └── standard_sql_bench.rs                 # Step 2-3: Differential SQL check & Speedtest1/YCSB/TPC-B-style benchmarks
 ```
 
 ---
@@ -167,7 +169,7 @@ cargo run --release --example reliability_bench
 Compare `aydb` against Vanilla SQLite (`WAL` mode) on your machine:
 
 ```powershell
-# Industry-Standard SQL Suite: Speedtest1, YCSB (Workloads A-F), and TPC-B
+# Differential SQL Verification + Selected Speedtest1-Style, YCSB-Style (A-F), and TPC-B-Style Workloads
 cargo run --release --example standard_sql_bench
 
 # Hybrid Desktop Workloads: Sync Config Updates, Bounded 16 KB Blob Cache, & LRU Reads
