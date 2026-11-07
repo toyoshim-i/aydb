@@ -1963,3 +1963,159 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
         Some(&b"\x20live_key"[..])
     );
 }
+
+#[test]
+fn test_f1_through_f4_audit_regressions() {
+    let tmp = TempTestDir::new("audit_regressions");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(Mutex::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+
+    // ------------------------------------------------------------------------
+    // F1: Collation overrides in query predicates
+    // ------------------------------------------------------------------------
+    // Case A: Table with NOCASE collation overridden by COLLATE BINARY
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ci USING aydb(table_id=3, columns='id TEXT COLLATE NOCASE PRIMARY KEY, value TEXT');
+         INSERT INTO ci VALUES ('a', 'original');"
+    )
+    .unwrap();
+
+    // SELECT with COLLATE BINARY must not match 'a' when looking for 'A'
+    let res = conn
+        .query_all("SELECT id FROM ci WHERE id = 'A' COLLATE BINARY", &[])
+        .unwrap();
+    assert_eq!(res, Vec::<Vec<SqlValue>>::new());
+
+    // DELETE with COLLATE BINARY must not delete 'a'
+    conn.execute_batch("DELETE FROM ci WHERE id = 'A' COLLATE BINARY")
+        .unwrap();
+    let left = conn.query_all("SELECT * FROM ci", &[]).unwrap();
+    assert_eq!(
+        left,
+        vec![vec![
+            SqlValue::Text("a".into()),
+            SqlValue::Text("original".into())
+        ]]
+    );
+
+    // Case B: Table with BINARY collation overridden by COLLATE NOCASE on PK and secondary index
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id TEXT PRIMARY KEY, value TEXT', indexes='value');
+         INSERT INTO t VALUES ('a', 'Hello'), ('b', 'World'), ('c', 'Other');"
+    )
+    .unwrap();
+
+    let res_nocase_pk = conn
+        .query_all("SELECT id FROM t WHERE id = 'A' COLLATE NOCASE", &[])
+        .unwrap();
+    assert_eq!(res_nocase_pk, vec![vec![SqlValue::Text("a".into())]]);
+
+    let res_nocase_sec = conn
+        .query_all("SELECT id FROM t WHERE value = 'HELLO' COLLATE NOCASE", &[])
+        .unwrap();
+    assert_eq!(res_nocase_sec, vec![vec![SqlValue::Text("a".into())]]);
+
+    // ------------------------------------------------------------------------
+    // F2: ORDER BY rowid on non-integer PK
+    // ------------------------------------------------------------------------
+    conn.execute_batch("INSERT INTO t VALUES ('d', 'D'), ('e', 'E'), ('f', 'F');")
+        .unwrap();
+
+    let order_by_rowid = conn
+        .query_all("SELECT rowid, id FROM t ORDER BY rowid", &[])
+        .unwrap();
+    let order_by_plus_rowid = conn
+        .query_all("SELECT rowid, id FROM t ORDER BY +rowid", &[])
+        .unwrap();
+    assert_eq!(
+        order_by_rowid, order_by_plus_rowid,
+        "ORDER BY rowid must match SQLite VDBE sort order on synthetic rowid"
+    );
+
+    // ------------------------------------------------------------------------
+    // F3: Synthetic rowid cross-connection lookup
+    // ------------------------------------------------------------------------
+    let rid = match conn.query_all("SELECT rowid FROM t WHERE id = 'a'", &[]).unwrap()[0][0] {
+        SqlValue::Integer(v) => v,
+        _ => unreachable!(),
+    };
+
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    conn2.register_aydb_module(engine.clone()).unwrap();
+    conn2
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id TEXT PRIMARY KEY, value TEXT', indexes='value');"
+        )
+        .unwrap();
+
+    // Connection 2's cache is empty; must resolve via fallback scan
+    let res_other_rid = conn2
+        .query_all("SELECT id FROM t WHERE rowid = ?", &[SqlValue::Integer(rid)])
+        .unwrap();
+    assert_eq!(res_other_rid, vec![vec![SqlValue::Text("a".into())]]);
+
+    // Update via rowid from connection 2
+    conn2
+        .execute_batch(&format!("UPDATE t SET value = 'UpdatedHello' WHERE rowid = {rid}"))
+        .unwrap();
+    let res_after_update = conn
+        .query_all("SELECT value FROM t WHERE id = 'a'", &[])
+        .unwrap();
+    assert_eq!(
+        res_after_update,
+        vec![vec![SqlValue::Text("UpdatedHello".into())]]
+    );
+
+    // Delete via rowid from connection 2
+    conn2
+        .execute_batch(&format!("DELETE FROM t WHERE rowid = {rid}"))
+        .unwrap();
+    let res_after_delete = conn
+        .query_all("SELECT id FROM t WHERE id = 'a'", &[])
+        .unwrap();
+    assert_eq!(res_after_delete, Vec::<Vec<SqlValue>>::new());
+
+    // ------------------------------------------------------------------------
+    // F4: Lossless numeric rowid coercion
+    // ------------------------------------------------------------------------
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE n USING aydb(table_id=2, columns='id INTEGER PRIMARY KEY, value TEXT');
+         INSERT INTO n VALUES (1, 'one'), (2, 'two');"
+    )
+    .unwrap();
+
+    // Exact string representation
+    let r1 = conn
+        .query_all("SELECT id FROM n WHERE rowid = '1'", &[])
+        .unwrap();
+    assert_eq!(r1, vec![vec![SqlValue::Integer(1)]]);
+
+    // Exact float representation
+    let r2 = conn
+        .query_all("SELECT id FROM n WHERE rowid = 1.0", &[])
+        .unwrap();
+    assert_eq!(r2, vec![vec![SqlValue::Integer(1)]]);
+
+    // Non-integer float must return 0 rows
+    let r3 = conn
+        .query_all("SELECT id FROM n WHERE rowid = 1.5", &[])
+        .unwrap();
+    assert_eq!(r3, Vec::<Vec<SqlValue>>::new());
+
+    // Non-integer string float must return 0 rows
+    let r4 = conn
+        .query_all("SELECT id FROM n WHERE rowid = '1.5'", &[])
+        .unwrap();
+    assert_eq!(r4, Vec::<Vec<SqlValue>>::new());
+
+    // Arbitrary text string must return 0 rows
+    let r5 = conn
+        .query_all("SELECT id FROM n WHERE rowid = 'abc'", &[])
+        .unwrap();
+    assert_eq!(r5, Vec::<Vec<SqlValue>>::new());
+}

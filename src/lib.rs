@@ -10,6 +10,13 @@
 //!   and Unified Coordinator Engine (`lru`, `engine`)
 //! - Phase 2: SQLite Virtual Table (`sqlite3_module`) Adapter (`vtab`)
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::map_entry
+)]
+
 pub mod blob;
 pub mod engine;
 pub mod index;

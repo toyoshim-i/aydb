@@ -310,6 +310,10 @@ unsafe extern "system" {
     ) -> c_int;
     pub fn sqlite3_declare_vtab(db: *mut sqlite3, zSQL: *const c_char) -> c_int;
     pub fn sqlite3_vtab_on_conflict(db: *mut sqlite3) -> c_int;
+    pub fn sqlite3_vtab_collation(
+        pIdxInfo: *mut sqlite3_index_info,
+        iConstraint: c_int,
+    ) -> *const c_char;
 
     pub fn sqlite3_value_type(pVal: *mut sqlite3_value) -> c_int;
     pub fn sqlite3_value_int64(pVal: *mut sqlite3_value) -> sqlite3_int64;

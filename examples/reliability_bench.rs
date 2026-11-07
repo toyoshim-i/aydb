@@ -10,6 +10,16 @@
 //! 4. Post-Crash Blob GC Accounting (`dead_bytes` preservation across WAL recovery).
 //! 5. Deterministic I/O Fault Injection (`ENOSPC` / `EIO` during `flush_memtable`).
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::useless_vec,
+    clippy::doc_overindented_list_items,
+    clippy::new_without_default
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -2311,6 +2321,206 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
     }
 }
 
+pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
+    println!("\n=== SUITE 10: Collation Overrides, Synthetic rowid Order & Cross-Conn Resolution ===");
+
+    // 10A: Query Collation Override on Primary Key and Secondary Index
+    {
+        let sub = base_dir.join("s10_collation");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(eng).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE ci USING aydb(table_id=1, columns='id TEXT COLLATE NOCASE PRIMARY KEY, value TEXT');
+             INSERT INTO ci VALUES ('a', 'original');
+             CREATE VIRTUAL TABLE bin USING aydb(table_id=2, columns='id TEXT PRIMARY KEY, value TEXT', indexes='value');
+             INSERT INTO bin VALUES ('a', 'Hello');",
+        )
+        .unwrap();
+
+        // Query with overridden collation must not use mismatching index lookup
+        let r1 = conn
+            .query_all("SELECT id FROM ci WHERE id = 'A' COLLATE BINARY", &[])
+            .unwrap();
+        assert_eq!(r1, Vec::<Vec<SqlValue>>::new());
+
+        conn.execute_batch("DELETE FROM ci WHERE id = 'A' COLLATE BINARY")
+            .unwrap();
+        let r2 = conn.query_all("SELECT * FROM ci", &[]).unwrap();
+        assert_eq!(
+            r2,
+            vec![vec![
+                SqlValue::Text("a".into()),
+                SqlValue::Text("original".into())
+            ]]
+        );
+
+        let r3 = conn
+            .query_all("SELECT id FROM bin WHERE id = 'A' COLLATE NOCASE", &[])
+            .unwrap();
+        assert_eq!(r3, vec![vec![SqlValue::Text("a".into())]]);
+
+        let r4 = conn
+            .query_all(
+                "SELECT id FROM bin WHERE value = 'HELLO' COLLATE NOCASE",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r4, vec![vec![SqlValue::Text("a".into())]]);
+
+        let _ = std::fs::remove_dir_all(&sub);
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "10A. Query Collation Overrides (F1)",
+            "PASS",
+            "VDBE Evaluation"
+        );
+    }
+
+    // 10B: ORDER BY rowid on synthetic non-integer PKs
+    {
+        let sub = base_dir.join("s10_rowid_order");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(eng).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id TEXT PRIMARY KEY, value TEXT');
+             INSERT INTO t VALUES ('a','A'),('b','B'),('c','C'),('d','D'),('e','E'),('f','F');",
+        )
+        .unwrap();
+
+        let r_rowid = conn
+            .query_all("SELECT rowid, id FROM t ORDER BY rowid", &[])
+            .unwrap();
+        let r_plus = conn
+            .query_all("SELECT rowid, id FROM t ORDER BY +rowid", &[])
+            .unwrap();
+        assert_eq!(r_rowid, r_plus);
+
+        let _ = std::fs::remove_dir_all(&sub);
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "10B. Synthetic rowid ORDER BY (F2)",
+            "PASS",
+            "VDBE Rowid Sort"
+        );
+    }
+
+    // 10C: Cross-connection synthetic rowid resolution (F3)
+    {
+        let sub = base_dir.join("s10_cross_conn");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        conn1.register_aydb_module(eng.clone()).unwrap();
+        conn1
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id TEXT PRIMARY KEY, value TEXT');
+                 INSERT INTO t VALUES ('alpha', 'first');",
+            )
+            .unwrap();
+
+        let rid = match conn1
+            .query_all("SELECT rowid FROM t WHERE id = 'alpha'", &[])
+            .unwrap()[0][0]
+        {
+            SqlValue::Integer(v) => v,
+            _ => unreachable!(),
+        };
+
+        // Open a completely separate SQLite connection with cold cache
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        conn2.register_aydb_module(eng).unwrap();
+        conn2
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id TEXT PRIMARY KEY, value TEXT');",
+            )
+            .unwrap();
+
+        let hit = conn2
+            .query_all("SELECT value FROM t WHERE rowid = ?", &[SqlValue::Integer(rid)])
+            .unwrap();
+        assert_eq!(hit, vec![vec![SqlValue::Text("first".into())]]);
+
+        // Mutate via cold connection rowid
+        conn2
+            .execute_batch(&format!(
+                "UPDATE t SET value = 'second' WHERE rowid = {rid}"
+            ))
+            .unwrap();
+        let updated = conn1
+            .query_all("SELECT value FROM t WHERE id = 'alpha'", &[])
+            .unwrap();
+        assert_eq!(updated, vec![vec![SqlValue::Text("second".into())]]);
+
+        let _ = std::fs::remove_dir_all(&sub);
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "10C. Cross-Connection rowid Resolution (F3)",
+            "PASS",
+            "Cache-Miss Scanned"
+        );
+    }
+
+    // 10D: Lossless Numeric rowid Coercion (F4)
+    {
+        let sub = base_dir.join("s10_numeric_rowid");
+        let _ = std::fs::remove_dir_all(&sub);
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(eng).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE n USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, value TEXT');
+             INSERT INTO n VALUES (42, 'forty_two');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_all("SELECT id FROM n WHERE rowid = '42'", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Integer(42)]]
+        );
+        assert_eq!(
+            conn.query_all("SELECT id FROM n WHERE rowid = 42.0", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Integer(42)]]
+        );
+        assert_eq!(
+            conn.query_all("SELECT id FROM n WHERE rowid = 42.5", &[])
+                .unwrap(),
+            Vec::<Vec<SqlValue>>::new()
+        );
+        assert_eq!(
+            conn.query_all("SELECT id FROM n WHERE rowid = '42.5'", &[])
+                .unwrap(),
+            Vec::<Vec<SqlValue>>::new()
+        );
+        assert_eq!(
+            conn.query_all("SELECT id FROM n WHERE rowid = 'foo'", &[])
+                .unwrap(),
+            Vec::<Vec<SqlValue>>::new()
+        );
+
+        let _ = std::fs::remove_dir_all(&sub);
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "10D. Lossless Numeric rowid Coercion (F4)",
+            "PASS",
+            "Lossless Converted"
+        );
+    }
+}
+
 fn main() {
     let base_dir = std::env::temp_dir().join(format!("aydb_rel_suite7_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base_dir);
@@ -2325,6 +2535,7 @@ fn main() {
     suite_7_audit_regressions(&base_dir);
     suite_8_followup_audit_regressions(&base_dir);
     suite_9_multi_angle_audit_regressions(&base_dir);
+    suite_10_collation_rowid_cross_conn_audit_regressions(&base_dir);
 
     let _ = std::fs::remove_dir_all(&base_dir);
 }

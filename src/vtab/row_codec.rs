@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind};
 
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::vtab::ffi::{
-    SQLITE_BLOB, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
+    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
     sqlite3_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error_toobig,
     sqlite3_result_int64, sqlite3_result_null, sqlite3_result_text, sqlite3_value,
     sqlite3_value_blob, sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64,
@@ -304,7 +304,7 @@ impl SqlValue {
                         Self::Text(String::from_utf8_lossy(slice).into_owned())
                     }
                 }
-                SQLITE_BLOB | _ => {
+                _ => {
                     let len = sqlite3_value_bytes(val) as usize;
                     let ptr = sqlite3_value_blob(val) as *const u8;
                     if ptr.is_null() || len == 0 {
@@ -517,6 +517,8 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
 /// a compact binary row byte vector without allocating intermediate `SqlValue` structs!
 /// Applies each column's declared [`ColumnAffinity`] and [`ColCollation`], and extracts
 /// the primary key bytes (`pk_col_idx`) and any secondary index `(index_id, col_key_bytes)`.
+pub type DirectEncodedRow = (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>);
+
 /// If `pk_override` is `Some(auto_id)` (for `INTEGER PRIMARY KEY` when `SQLITE_NULL` is inserted),
 /// serializes `auto_id` as an `SQLITE_INTEGER` in the `pk_col_idx` slot.
 ///
@@ -530,7 +532,7 @@ pub unsafe fn encode_sqlite_values_direct(
     col_affinities: &[ColumnAffinity],
     col_collations: &[ColCollation],
     secondary_indexes: &[(usize, u16)],
-) -> (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>) {
+) -> DirectEncodedRow {
     enum CoercedSlot<'a> {
         Null,
         Int(i64),
@@ -627,7 +629,7 @@ pub unsafe fn encode_sqlite_values_direct(
                         _ => CoercedSlot::TextSlice(slice),
                     }
                 }
-                SQLITE_BLOB | _ => {
+                _ => {
                     let len = sqlite3_value_bytes(vptr).max(0) as usize;
                     let ptr = sqlite3_value_blob(vptr) as *const u8;
                     let slice: &[u8] = if !ptr.is_null() && len > 0 {
@@ -888,7 +890,7 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                 collation.push_normalized_text(slice, &mut out);
                 out
             }
-            SQLITE_BLOB | _ => {
+            _ => {
                 let len = sqlite3_value_bytes(vptr).max(0) as usize;
                 let ptr = sqlite3_value_blob(vptr) as *const u8;
                 let mut out = Vec::with_capacity(1 + len);

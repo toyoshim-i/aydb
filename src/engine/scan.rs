@@ -815,8 +815,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem = best_mem_entry.map_or(true, |(m_lsn, _)| raw.lsn > m_lsn);
-                    if beats_mem && best_seg_meta.map_or(true, |(s_lsn, _)| raw.lsn > s_lsn) {
+                    let beats_mem = best_mem_entry.is_none_or(|(m_lsn, _)| raw.lsn > m_lsn);
+                    if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
                         best_val_buf.extend_from_slice(raw.val_bytes);
@@ -966,8 +966,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem = best_mem_entry.map_or(true, |(m_lsn, _)| raw.lsn > m_lsn);
-                    if beats_mem && best_seg_meta.map_or(true, |(s_lsn, _)| raw.lsn > s_lsn) {
+                    let beats_mem = best_mem_entry.is_none_or(|(m_lsn, _)| raw.lsn > m_lsn);
+                    if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
                         best_val_buf.extend_from_slice(raw.val_bytes);

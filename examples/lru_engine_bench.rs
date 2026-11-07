@@ -9,6 +9,16 @@
 //!    (`max_blob_segment_bytes = 512 KB`) and measures steady-state write throughput,
 //!    logical bytes vs. physical `blob_lru` files on disk, and $O(1)$ segment unlinking.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::useless_vec,
+    clippy::doc_overindented_list_items,
+    clippy::new_without_default
+)]
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;

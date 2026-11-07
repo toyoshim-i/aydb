@@ -39,6 +39,16 @@
 //!      measured under both Buffered (`synchronous = NORMAL` / `wal_buf.db`) and Full Durable Sync
 //!      (`synchronous = FULL` / `wal_sync.db`) modes.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::useless_vec,
+    clippy::doc_overindented_list_items,
+    clippy::new_without_default
+)]
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -125,7 +135,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
         .unwrap();
 
-    let fs = Arc::new(OsFs::open(&sub.join("aydb"), true).unwrap());
+    let fs = Arc::new(OsFs::open(sub.join("aydb"), true).unwrap());
     let shared_engine = Arc::new(Mutex::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
@@ -307,8 +317,78 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
             .unwrap();
         assert_eq!(sq_final, ay_final);
         println!(
-            "{:<54} | {:>14} | {:>20}\n",
+            "{:<54} | {:>14} | {:>20}",
             "0D. Cross-Conn Isolation & Mixed SQLite+aydb 2PC Tx",
+            "PASS",
+            "100% State Match"
+        );
+    }
+
+    // 5. Audit 2026-11-08 Regressions: Collation Override, Synthetic rowid Order & Lossless Numeric Coercion
+    {
+        sq_conn
+            .execute_batch(
+                "CREATE TABLE t_audit (id TEXT PRIMARY KEY, value TEXT);
+                 CREATE INDEX idx_t_audit_val ON t_audit(value);
+                 INSERT INTO t_audit VALUES ('a','Hello'),('b','World'),('c','Other'),('d','D'),('e','E'),('f','F');
+                 CREATE TABLE t_ci (id TEXT COLLATE NOCASE PRIMARY KEY, value TEXT);
+                 INSERT INTO t_ci VALUES ('a','original');
+                 CREATE TABLE t_int (id INTEGER PRIMARY KEY, value TEXT);
+                 INSERT INTO t_int VALUES (1, 'one');",
+            )
+            .unwrap();
+        ay_conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t_audit USING aydb(table_id=10, columns='id TEXT PRIMARY KEY, value TEXT', indexes='value');
+                 INSERT INTO t_audit VALUES ('a','Hello'),('b','World'),('c','Other'),('d','D'),('e','E'),('f','F');
+                 CREATE VIRTUAL TABLE t_ci USING aydb(table_id=11, columns='id TEXT COLLATE NOCASE PRIMARY KEY, value TEXT');
+                 INSERT INTO t_ci VALUES ('a','original');
+                 CREATE VIRTUAL TABLE t_int USING aydb(table_id=12, columns='id INTEGER PRIMARY KEY, value TEXT');
+                 INSERT INTO t_int VALUES (1, 'one');",
+            )
+            .unwrap();
+
+        for q in [
+            "SELECT id FROM t_audit WHERE id = 'A' COLLATE NOCASE",
+            "SELECT id FROM t_audit WHERE value = 'HELLO' COLLATE NOCASE",
+            "SELECT id FROM t_int WHERE rowid = '1'",
+            "SELECT id FROM t_int WHERE rowid = 1.0",
+            "SELECT id FROM t_int WHERE rowid = 1.5",
+            "SELECT id FROM t_int WHERE rowid = '1.5'",
+            "SELECT id FROM t_int WHERE rowid = 'abc'",
+            "SELECT id FROM t_ci WHERE id = 'A' COLLATE BINARY",
+        ] {
+            let sq_rows = sq_conn.query_all(q, &[]).unwrap();
+            let ay_rows = ay_conn.query_all(q, &[]).unwrap();
+            assert_eq!(sq_rows, ay_rows, "differential mismatch on query: {q}");
+        }
+
+        // Verify F2: ORDER BY rowid matches ORDER BY +rowid on synthetic non-integer PK
+        let ay_order_rowid = ay_conn
+            .query_all("SELECT rowid, id FROM t_audit ORDER BY rowid", &[])
+            .unwrap();
+        let ay_order_plus = ay_conn
+            .query_all("SELECT rowid, id FROM t_audit ORDER BY +rowid", &[])
+            .unwrap();
+        assert_eq!(
+            ay_order_rowid, ay_order_plus,
+            "aydb ORDER BY rowid must match SQLite VDBE sort order on synthetic rowid"
+        );
+
+        // Verify DELETE with COLLATE BINARY leaves 'a' intact in both
+        sq_conn
+            .execute_batch("DELETE FROM t_ci WHERE id = 'A' COLLATE BINARY;")
+            .unwrap();
+        ay_conn
+            .execute_batch("DELETE FROM t_ci WHERE id = 'A' COLLATE BINARY;")
+            .unwrap();
+        let sq_left = sq_conn.query_all("SELECT * FROM t_ci", &[]).unwrap();
+        let ay_left = ay_conn.query_all("SELECT * FROM t_ci", &[]).unwrap();
+        assert_eq!(sq_left, ay_left, "differential mismatch on DELETE with COLLATE BINARY");
+
+        println!(
+            "{:<54} | {:>14} | {:>20}\n",
+            "0E. Query Collation Overrides & Rowid Equivalence",
             "PASS",
             "100% State Match"
         );

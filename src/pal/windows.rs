@@ -22,8 +22,11 @@ use std::sync::Arc;
 use super::path::{normalize_db_root_path, validate_flat_file_name};
 use super::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 
+#[allow(clippy::upper_case_acronyms)]
 type HANDLE = *mut core::ffi::c_void;
+#[allow(clippy::upper_case_acronyms)]
 type BOOL = i32;
+#[allow(clippy::upper_case_acronyms)]
 type DWORD = u32;
 
 const INVALID_HANDLE_VALUE: HANDLE = (-1isize) as HANDLE;

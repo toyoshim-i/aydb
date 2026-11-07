@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::engine::StorageEngine;
 use crate::pal::OsFs;
 use crate::vtab::ffi::{
-    SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
+    SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
     SQLITE_TEXT, sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double,
     sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_clear_bindings,
     sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count,
@@ -262,7 +262,7 @@ impl<'a> SqliteStatement<'a> {
                         SqlValue::Text(String::from_utf8_lossy(s).into_owned())
                     }
                 }
-                SQLITE_BLOB | _ => {
+                _ => {
                     let len = sqlite3_column_bytes(self.stmt, col) as usize;
                     let ptr = sqlite3_column_blob(self.stmt, col) as *const u8;
                     if ptr.is_null() || len == 0 {

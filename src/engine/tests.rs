@@ -815,8 +815,7 @@ fn crash_consistency_and_failed_write_rollback() {
         }
         fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
             if self.is_wal && self.fail_wal_writes.load(Ordering::SeqCst) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "simulated WAL write I/O failure",
                 ));
             }
@@ -1351,7 +1350,7 @@ fn deferred_tx_checkpoint_blob_prefix_durability_and_prepare_commit() {
         .put_row(
             5,
             b"row1",
-            &vec![0x11u8; 150],
+            &[0x11u8; 150],
             &[],
             WriteDurability::BufferedFast,
         )
@@ -1361,7 +1360,7 @@ fn deferred_tx_checkpoint_blob_prefix_durability_and_prepare_commit() {
         .put_row(
             5,
             b"row2",
-            &vec![0x22u8; 200],
+            &[0x22u8; 200],
             &[],
             WriteDurability::BufferedFast,
         )

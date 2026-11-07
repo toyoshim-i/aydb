@@ -8,6 +8,16 @@
 //! 3. 4 KB Data Block In-Place Lookup: Downward-growing `u16` Offset Directory $O(\log K)$
 //!    Binary Search vs. $O(K)$ Linear Scan.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::useless_vec,
+    clippy::doc_overindented_list_items,
+    clippy::new_without_default
+)]
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;

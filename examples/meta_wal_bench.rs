@@ -4,6 +4,16 @@
 //! - Step 1-3: `wal_sync.db` (Single vs. Batched Sync) vs. `wal_buf.db` (Immediate OS Cache
 //!   vs. User-Space Coalesced), $O(1)$ Epoch Rotation vs. Zero-Fill reset, and 16 MB Recovery Scan.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::field_reassign_with_default,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::useless_vec,
+    clippy::doc_overindented_list_items,
+    clippy::new_without_default
+)]
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;

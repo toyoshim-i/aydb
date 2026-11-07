@@ -337,7 +337,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         mode: WalStreamMode,
     ) -> io::Result<Self> {
         assert!(
-            target_size >= WAL_SECTOR_SIZE as u64 && target_size % (WAL_SECTOR_SIZE as u64) == 0,
+            target_size >= WAL_SECTOR_SIZE as u64 && target_size.is_multiple_of(WAL_SECTOR_SIZE as u64),
             "WAL size must be a positive multiple of 4096 bytes"
         );
         let (hint, prealloc) = match mode {
@@ -417,8 +417,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// Grows the underlying WAL file if `target_size > current_size` to accommodate an oversized
     /// multi-chunk transaction in a single epoch.
     pub fn ensure_min_size(&mut self, target_size: u64) -> io::Result<()> {
-        let aligned = ((target_size + WAL_SECTOR_SIZE as u64 - 1) / WAL_SECTOR_SIZE as u64)
-            * WAL_SECTOR_SIZE as u64;
+        let aligned = target_size.div_ceil(WAL_SECTOR_SIZE as u64) * WAL_SECTOR_SIZE as u64;
         let new_sectors = (aligned / WAL_SECTOR_SIZE as u64) as usize;
         if new_sectors > self.total_sectors {
             let prealloc = match self.mode {
