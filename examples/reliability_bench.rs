@@ -155,6 +155,10 @@ impl PlatformFile for SimFile {
     }
 
     fn sync_barrier(&self) -> io::Result<()> {
+        // On Windows, `MutableSyncLog` (`wal_sync.db`) opens with `FILE_FLAG_WRITE_THROUGH` so
+        // each write bypasses the OS cache; on Linux/macOS (`UnixPlatformFile`), `sync_barrier()`
+        // issues `fdatasync` / `fcntl(F_FULLFSYNC)` (`N-03`) to flush written sectors to stable
+        // media. Thus `sync_barrier()` transitions buffered pages into `durable_bytes`.
         self.sync_durable()
     }
 
@@ -2185,6 +2189,127 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             "9D. Reverse Stream & >260-Char Path (P-01..04, O-02)",
             "PASS",
             "Streamed & Long-Path"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 9E: N-01 (RowidMap undo across ROLLBACK & ROLLBACK TO SAVEPOINT),
+    //     N-02 (capped table quota persisted to boot_meta.db on COMMIT),
+    //     N-03..N-04 (sync_barrier & SyncTransactional catalog registration)
+    // ------------------------------------------------------------------------
+    {
+        let sub = base_dir.join("s9e_n01_to_n04");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let (rid_a, rid_b) = {
+            let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+            let engine = Arc::new(Mutex::new(
+                StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+            ));
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module(engine.clone()).unwrap();
+
+            // N-02 & N-04: Create a SyncTransactional capped virtual table with auto-assigned
+            // `table_id` inside an explicit `BEGIN ... COMMIT` transaction!
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE VIRTUAL TABLE n01_n04_tbl USING aydb(
+                     durability = 'sync',
+                     max_bytes = 250000,
+                     columns = 'k TEXT PRIMARY KEY, v TEXT'
+                 );
+                 INSERT INTO n01_n04_tbl VALUES ('row_a', 'init_a');
+                 INSERT INTO n01_n04_tbl VALUES ('row_b', 'init_b');
+                 COMMIT;",
+            )
+            .unwrap();
+
+            let rids = conn
+                .query_all("SELECT rowid, k FROM n01_n04_tbl ORDER BY k", &[])
+                .unwrap();
+            let SqlValue::Integer(ra) = rids[0][0] else {
+                panic!("expected integer rowid");
+            };
+            let SqlValue::Integer(rb) = rids[1][0] else {
+                panic!("expected integer rowid");
+            };
+
+            // N-01: Delete `row_a` and rename `row_b` inside a transaction and a savepoint, then roll back
+            conn.execute_batch(
+                "BEGIN;
+                 DELETE FROM n01_n04_tbl WHERE k = 'row_a';
+                 UPDATE n01_n04_tbl SET k = 'row_b_new' WHERE k = 'row_b';
+                 ROLLBACK;
+                 BEGIN;
+                 SAVEPOINT sp_n01;
+                 DELETE FROM n01_n04_tbl WHERE k = 'row_b';
+                 ROLLBACK TO sp_n01;
+                 RELEASE sp_n01;
+                 COMMIT;",
+            )
+            .unwrap();
+
+            // Verify both original rowids still resolve in `RowidMap` for UPDATE by rowid
+            conn.query_all(
+                "UPDATE n01_n04_tbl SET v = 'updated_a' WHERE rowid = ?1",
+                &[SqlValue::Integer(ra)],
+            )
+            .unwrap();
+            conn.query_all(
+                "UPDATE n01_n04_tbl SET v = 'updated_b' WHERE rowid = ?1",
+                &[SqlValue::Integer(rb)],
+            )
+            .unwrap();
+            (ra, rb)
+        };
+
+        // Reopen from disk without prior MemTable flush and verify N-02 quota + N-04 catalog + N-01 data
+        let n01_to_n04_ok = {
+            let fs = Arc::new(OsFs::open(&sub, false).unwrap());
+            let engine = Arc::new(Mutex::new(
+                StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+            ));
+            let has_quota = engine
+                .lock()
+                .unwrap()
+                .capped_table_state(1)
+                .map(|s| s.max_bytes == 250_000)
+                .unwrap_or(false);
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module(engine.clone()).unwrap();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE n01_n04_tbl USING aydb(
+                     durability = 'sync',
+                     max_bytes = 250000,
+                     columns = 'k TEXT PRIMARY KEY, v TEXT'
+                 );",
+            )
+            .unwrap();
+            let rows = conn
+                .query_all("SELECT k, v FROM n01_n04_tbl ORDER BY k", &[])
+                .unwrap();
+            has_quota
+                && rid_a != rid_b
+                && rows
+                    == vec![
+                        vec![
+                            SqlValue::Text("row_a".into()),
+                            SqlValue::Text("updated_a".into()),
+                        ],
+                        vec![
+                            SqlValue::Text("row_b".into()),
+                            SqlValue::Text("updated_b".into()),
+                        ],
+                    ]
+        };
+        let _ = std::fs::remove_dir_all(&sub);
+        assert!(n01_to_n04_ok, "9E (N-01..N-04) failed");
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "9E. RowidMap Undo, Tx Quota & Sync Catalog (N-01..04)",
+            "PASS",
+            "Restored & Durable"
         );
     }
 }

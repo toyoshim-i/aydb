@@ -142,12 +142,22 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     parts
 }
 
+/// Undo record for transactional mutations to [`RowidMap`] (`N-01`).
+#[derive(Clone, Debug)]
+enum RowidUndoOp {
+    Removed { rowid: i64, pk: Vec<u8> },
+    Inserted { rowid: i64, pk: Vec<u8> },
+}
+
 /// Collision-free bidirectional map between synthetic 64-bit SQLite `rowid`s and non-integer `encoded_pk` bytes.
 #[derive(Default)]
 struct RowidMap {
     by_rowid: HashMap<i64, Vec<u8>>,
     by_pk: HashMap<Vec<u8>, i64>,
     fifo_order: Vec<i64>,
+    in_tx: bool,
+    tx_undo: Vec<RowidUndoOp>,
+    savepoint_markers: Vec<(c_int, usize)>,
 }
 
 impl RowidMap {
@@ -164,6 +174,9 @@ impl RowidMap {
             idx += 1;
             if let Some(pk) = self.by_rowid.remove(&rid) {
                 self.by_pk.remove(&pk);
+                if self.in_tx {
+                    self.tx_undo.push(RowidUndoOp::Removed { rowid: rid, pk });
+                }
             }
         }
         self.fifo_order.drain(0..idx);
@@ -184,8 +197,14 @@ impl RowidMap {
         }
         let pk_vec = encoded_pk.to_vec();
         self.by_rowid.insert(rid, pk_vec.clone());
-        self.by_pk.insert(pk_vec, rid);
+        self.by_pk.insert(pk_vec.clone(), rid);
         self.fifo_order.push(rid);
+        if self.in_tx {
+            self.tx_undo.push(RowidUndoOp::Inserted {
+                rowid: rid,
+                pk: pk_vec,
+            });
+        }
         rid
     }
 
@@ -196,6 +215,12 @@ impl RowidMap {
     fn remove_by_rowid(&mut self, rid: i64) -> Option<Vec<u8>> {
         if let Some(pk) = self.by_rowid.remove(&rid) {
             self.by_pk.remove(&pk);
+            if self.in_tx {
+                self.tx_undo.push(RowidUndoOp::Removed {
+                    rowid: rid,
+                    pk: pk.clone(),
+                });
+            }
             Some(pk)
         } else {
             None
@@ -204,7 +229,101 @@ impl RowidMap {
 
     fn remove_by_pk(&mut self, encoded_pk: &[u8]) {
         if let Some(rid) = self.by_pk.remove(encoded_pk) {
-            self.by_rowid.remove(&rid);
+            if let Some(pk) = self.by_rowid.remove(&rid) {
+                if self.in_tx {
+                    self.tx_undo.push(RowidUndoOp::Removed { rowid: rid, pk });
+                }
+            }
+        }
+    }
+
+    fn begin_tx(&mut self) {
+        if !self.in_tx {
+            self.in_tx = true;
+            self.tx_undo.clear();
+            self.savepoint_markers.clear();
+        }
+    }
+
+    fn commit_tx(&mut self) {
+        self.in_tx = false;
+        self.tx_undo.clear();
+        self.savepoint_markers.clear();
+    }
+
+    fn savepoint(&mut self, sp_id: c_int) {
+        if !self.in_tx {
+            self.in_tx = true;
+            self.tx_undo.clear();
+            self.savepoint_markers.clear();
+        }
+        if let Some(pos) = self
+            .savepoint_markers
+            .iter()
+            .position(|&(id, _)| id == sp_id)
+        {
+            self.savepoint_markers.truncate(pos);
+        }
+        self.savepoint_markers.push((sp_id, self.tx_undo.len()));
+    }
+
+    fn release_savepoint(&mut self, sp_id: c_int, tx_finished: bool) {
+        if let Some(pos) = self
+            .savepoint_markers
+            .iter()
+            .position(|&(id, _)| id == sp_id)
+        {
+            self.savepoint_markers.truncate(pos);
+        }
+        if tx_finished {
+            self.commit_tx();
+        }
+    }
+
+    fn rollback_to_savepoint(&mut self, sp_id: c_int) {
+        let Some(pos) = self
+            .savepoint_markers
+            .iter()
+            .position(|&(id, _)| id == sp_id)
+        else {
+            return;
+        };
+        let target_len = self.savepoint_markers[pos].1;
+        self.savepoint_markers.truncate(pos + 1);
+        self.undo_to_len(target_len);
+    }
+
+    fn rollback_tx(&mut self) {
+        self.undo_to_len(0);
+        self.in_tx = false;
+        self.savepoint_markers.clear();
+    }
+
+    fn undo_to_len(&mut self, target_len: usize) {
+        while self.tx_undo.len() > target_len {
+            match self.tx_undo.pop().unwrap() {
+                RowidUndoOp::Inserted { rowid, pk } => {
+                    if self.by_rowid.get(&rowid) == Some(&pk) {
+                        self.by_rowid.remove(&rowid);
+                    }
+                    if self.by_pk.get(&pk) == Some(&rowid) {
+                        self.by_pk.remove(&pk);
+                    }
+                }
+                RowidUndoOp::Removed { rowid, pk } => {
+                    if let Some(prev_pk) = self.by_rowid.insert(rowid, pk.clone()) {
+                        if prev_pk != pk {
+                            self.by_pk.remove(&prev_pk);
+                        }
+                    }
+                    if let Some(prev_rid) = self.by_pk.insert(pk, rowid) {
+                        if prev_rid != rowid {
+                            self.by_rowid.remove(&prev_rid);
+                        }
+                    }
+                    self.fifo_order.push(rowid);
+                }
+            }
         }
     }
 }
@@ -574,7 +693,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             }
         }
 
-        // Resolve or auto-assign unique `table_id` and register Capped Table if `max_bytes > 0` (`AUD-03`)
+        // Resolve or auto-assign unique `table_id` and register Capped Table if `max_bytes > 0` (`AUD-03`, `N-04`)
         let table_id = {
             let mut eng = match aux.engine.lock() {
                 Ok(g) => g,
@@ -583,7 +702,11 @@ unsafe extern "system" fn vtab_create_or_connect(
             if let Err(e) = eng.check_write_allowed_for_conn(db as usize) {
                 return io_err_to_sqlite_rc(&e);
             }
-            let resolved_id = match eng.register_or_resolve_vtab(&table_name, explicit_table_id) {
+            let resolved_id = match eng.register_or_resolve_vtab_with_durability(
+                &table_name,
+                explicit_table_id,
+                durability,
+            ) {
                 Ok(id) => id,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
@@ -1599,6 +1722,9 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         if let Err(e) = eng.begin_transaction_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
         }
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.begin_tx();
+        }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -1630,7 +1756,13 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             Err(_) => return SQLITE_ERROR,
         };
         if let Err(e) = eng.commit_transaction_for_conn(vtab.db as usize) {
+            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                rmap.rollback_tx();
+            }
             return io_err_to_sqlite_rc(&e);
+        }
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.commit_tx();
         }
         SQLITE_OK
     }))
@@ -1647,6 +1779,9 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
         }
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.rollback_tx();
+        }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -1662,6 +1797,9 @@ unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint:
         if let Err(e) = eng.savepoint_for_conn(vtab.db as usize, i_savepoint) {
             return io_err_to_sqlite_rc(&e);
         }
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.savepoint(i_savepoint);
+        }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -1675,7 +1813,16 @@ unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c
             Err(_) => return SQLITE_ERROR,
         };
         if let Err(e) = eng.release_savepoint_for_conn(vtab.db as usize, i_savepoint) {
+            if !eng.in_active_transaction() {
+                if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                    rmap.rollback_tx();
+                }
+            }
             return io_err_to_sqlite_rc(&e);
+        }
+        let tx_finished = !eng.in_active_transaction();
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.release_savepoint(i_savepoint, tx_finished);
         }
         SQLITE_OK
     }))
@@ -1691,6 +1838,9 @@ unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoin
         };
         if let Err(e) = eng.rollback_to_savepoint_for_conn(vtab.db as usize, i_savepoint) {
             return io_err_to_sqlite_rc(&e);
+        }
+        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+            rmap.rollback_to_savepoint(i_savepoint);
         }
         SQLITE_OK
     }))
@@ -3663,6 +3813,130 @@ mod tests {
         assert_eq!(
             desc_range[650],
             vec![SqlValue::Integer(100), SqlValue::Integer(2048)]
+        );
+    }
+
+    #[test]
+    fn stage1_n01_n04_rowid_map_rollback_and_sync_catalog_durability() {
+        let dir = TempTestDir::new("stage1_n01_n04");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap(),
+        ));
+
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+
+        // 1. N-04: Virtual table with `durability = 'sync'` and omitted `table_id` must persist
+        //    its system catalog (`Table 0`) mapping via `WriteDurability::SyncTransactional` (`wal_sync.db`)!
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE n01_text USING aydb(
+                durability = 'sync',
+                columns = 'k TEXT PRIMARY KEY, v TEXT'
+            );",
+        )
+        .unwrap();
+        let sync_wal_size = std::fs::metadata(dir.path.join("wal_sync.db"))
+            .unwrap()
+            .len();
+        assert!(
+            sync_wal_size > 0,
+            "N-04: auto-assigned catalog registration for durability='sync' must write to wal_sync.db"
+        );
+
+        // 2. N-01: Populate rows with TEXT primary keys and capture their synthetic rowids
+        conn.execute_batch(
+            "INSERT INTO n01_text VALUES ('alpha', 'v1');
+             INSERT INTO n01_text VALUES ('beta', 'v2');
+             INSERT INTO n01_text VALUES ('gamma', 'v3');",
+        )
+        .unwrap();
+
+        let initial_rows = conn
+            .query_all("SELECT rowid, k, v FROM n01_text ORDER BY k", &[])
+            .unwrap();
+        let SqlValue::Integer(rid_alpha) = initial_rows[0][0] else {
+            panic!("expected integer rowid for alpha");
+        };
+        let SqlValue::Integer(rid_beta) = initial_rows[1][0] else {
+            panic!("expected integer rowid for beta");
+        };
+
+        // 2a. Explicit transaction that deletes `alpha` and updates `beta` -> `'beta_renamed'`, then rolls back:
+        //     `rid_alpha` and `rid_beta` must still resolve in `RowidMap` after `ROLLBACK`!
+        conn.execute_batch(
+            "BEGIN;
+             DELETE FROM n01_text WHERE k = 'alpha';
+             UPDATE n01_text SET k = 'beta_renamed', v = 'v2_mod' WHERE k = 'beta';
+             ROLLBACK;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_all(
+                "SELECT k, v FROM n01_text WHERE rowid = ?1",
+                &[SqlValue::Integer(rid_alpha)],
+            )
+            .unwrap(),
+            vec![vec![
+                SqlValue::Text("alpha".into()),
+                SqlValue::Text("v1".into()),
+            ]],
+            "N-01: rowid lookup for 'alpha' must succeed after ROLLBACK of DELETE"
+        );
+        assert_eq!(
+            conn.query_all(
+                "SELECT k, v FROM n01_text WHERE rowid = ?1",
+                &[SqlValue::Integer(rid_beta)],
+            )
+            .unwrap(),
+            vec![vec![
+                SqlValue::Text("beta".into()),
+                SqlValue::Text("v2".into()),
+            ]],
+            "N-01: rowid lookup for 'beta' must succeed after ROLLBACK of PK UPDATE"
+        );
+
+        // 2b. Savepoint rollback (`ROLLBACK TO sp1`) and statement-level constraint abort:
+        conn.execute_batch(
+            "BEGIN;
+             SAVEPOINT sp1;
+             DELETE FROM n01_text WHERE rowid = (SELECT rowid FROM n01_text WHERE k = 'alpha');
+             ROLLBACK TO sp1;
+             RELEASE sp1;
+             COMMIT;",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_all(
+                "SELECT k, v FROM n01_text WHERE rowid = ?1",
+                &[SqlValue::Integer(rid_alpha)],
+            )
+            .unwrap(),
+            vec![vec![
+                SqlValue::Text("alpha".into()),
+                SqlValue::Text("v1".into()),
+            ]],
+            "N-01: rowid lookup for 'alpha' must succeed after ROLLBACK TO SAVEPOINT"
+        );
+
+        // Multi-row UPDATE that changes 'alpha' PK first and then hits UNIQUE constraint on 'gamma':
+        let err = conn.execute_batch(
+            "UPDATE n01_text SET k = CASE WHEN k = 'alpha' THEN 'alpha_tmp' ELSE 'gamma' END;",
+        );
+        assert!(err.is_err(), "multi-row duplicate PK update must fail with SQLITE_CONSTRAINT");
+
+        // After statement-level rollback, updating 'alpha' by its original `rid_alpha` must work!
+        conn.query_all(
+            "UPDATE n01_text SET v = 'v1_after_stmt_abort' WHERE rowid = ?1",
+            &[SqlValue::Integer(rid_alpha)],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT v FROM n01_text WHERE k = 'alpha'", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Text("v1_after_stmt_abort".into())]],
+            "N-01: UPDATE WHERE rowid = ? must resolve 'alpha' after statement-level rollback"
         );
     }
 }

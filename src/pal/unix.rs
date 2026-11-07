@@ -103,6 +103,12 @@ impl PlatformFile for UnixPlatformFile {
     }
 
     fn sync_barrier(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.hint == OpenHint::MutableSyncLog {
+                return self.sync_durable();
+            }
+        }
         self.file.sync_data()
     }
 

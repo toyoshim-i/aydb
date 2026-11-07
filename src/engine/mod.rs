@@ -128,6 +128,7 @@ struct TxMetaSnapshot {
     active_vtab_ids: HashMap<u16, String>,
     table_has_row_meta: BTreeMap<u16, bool>,
     dropped_tables_len: usize,
+    quotas_modified_in_tx: bool,
 }
 
 #[derive(Clone)]
@@ -186,6 +187,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     savepoints: Vec<SavepointMarker>,
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`, `R-06`).
     dropped_tables_in_tx: Vec<(u16, bool)>,
+    /// True if any capped-table quota was registered or modified inside the active transaction (`N-02`).
+    quotas_modified_in_tx: bool,
     /// True while a non-owning connection is reading the temporary committed snapshot (`R-07`).
     in_committed_read_view: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing (`AUD-03`).
@@ -563,6 +566,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_start_meta: TxMetaSnapshot::default(),
             savepoints: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
+            quotas_modified_in_tx: false,
             in_committed_read_view: false,
             active_vtab_ids: HashMap::new(),
             table_has_row_meta: BTreeMap::new(),
@@ -608,8 +612,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.meta_mgr.commit_update(|st| {
                 st.table_quotas = quota_metas;
             })?;
+        } else {
+            self.quotas_modified_in_tx = true;
         }
         Ok(())
+    }
+
+    /// Returns `true` if an explicit or savepoint-backed transaction is currently active (`N-01`).
+    #[inline]
+    pub fn in_active_transaction(&self) -> bool {
+        self.tx_depth > 0
     }
 
     /// Returns the next LSN that will be assigned to a WAL batch.
@@ -641,12 +653,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(self.check_existing_row(&row_key)? != ExistingRowStatus::NotFound)
     }
 
-    ///Registers or resolves a virtual table `(table_name, explicit_table_id)` in the engine's
-    /// active registry and persistent catalog (`table_id = 0` under `'c'`) (`AUD-03`).
+    /// Registers or resolves a virtual table `(table_name, explicit_table_id)` in the engine's
+    /// active registry and persistent catalog (`table_id = 0` under `'c'`) using
+    /// [`WriteDurability::BufferedFast`] (`AUD-03`).
     pub fn register_or_resolve_vtab(
         &mut self,
         table_name: &str,
         explicit_id: Option<u16>,
+    ) -> io::Result<u16> {
+        self.register_or_resolve_vtab_with_durability(
+            table_name,
+            explicit_id,
+            WriteDurability::BufferedFast,
+        )
+    }
+
+    /// Registers or resolves a virtual table `(table_name, explicit_table_id)` in the engine's
+    /// active registry and persistent catalog (`table_id = 0` under `'c'`) with the specified
+    /// [`WriteDurability`] (`AUD-03`, `N-04`).
+    pub fn register_or_resolve_vtab_with_durability(
+        &mut self,
+        table_name: &str,
+        explicit_id: Option<u16>,
+        durability: WriteDurability,
     ) -> io::Result<u16> {
         let norm_name = table_name.trim().to_ascii_lowercase();
         let catalog_prefix = [0u8, 0u8, b'c'];
@@ -728,7 +757,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     key: cat_key,
                     value: chosen_id.to_be_bytes().to_vec(),
                 }],
-                WriteDurability::BufferedFast,
+                durability,
             )?;
         }
         Ok(chosen_id)
@@ -1604,6 +1633,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             self.tx_memtable_undo.clear();
             self.dropped_tables_in_tx.clear();
+            self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = None;
             self.deferred_flush_on_commit = false;
@@ -1628,6 +1658,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             self.tx_memtable_undo.clear();
             self.dropped_tables_in_tx.clear();
+            self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = Some(conn_id);
             self.deferred_flush_on_commit = false;
@@ -1812,6 +1843,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             let dropped_tables = core::mem::take(&mut self.dropped_tables_in_tx);
+            let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
             let mut dropped_any_capped = false;
             for (tid, was_capped) in dropped_tables {
                 self.reclaim_fully_dead_lru_blob_segments(tid)?;
@@ -1819,15 +1851,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     dropped_any_capped = true;
                 }
             }
-            if dropped_any_capped {
+            let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
+            let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
+            let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
+            if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
                 let quota_metas = self.build_quota_metas();
                 self.meta_mgr.commit_update(|st| {
                     st.table_quotas = quota_metas;
                 })?;
             }
 
-            let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
-            let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
             if do_compact {
                 self.compact()?;
             } else if do_flush || self.memtable.should_flush() {
@@ -1973,6 +2006,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_vtab_ids: self.active_vtab_ids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
+            quotas_modified_in_tx: self.quotas_modified_in_tx,
         }
     }
 
@@ -1997,6 +2031,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.active_vtab_ids = snap.active_vtab_ids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
+        self.quotas_modified_in_tx = snap.quotas_modified_in_tx;
     }
 
     fn flush_pending_tx_records(&mut self) -> io::Result<()> {
@@ -5829,6 +5864,75 @@ mod tests {
                 engine.lookup_by_secondary_index(11, 1, b"idx_b").unwrap(),
                 vec![b"sk1".to_vec()]
             );
+        }
+    }
+
+    #[test]
+    fn n02_n04_tx_capped_quota_persistence_and_sync_catalog_durability() {
+        let dir = TempTestDir::new("stage1_n02_n04_engine");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+
+        let assigned_id = {
+            let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+
+            // 1. N-02: Register a capped table inside an explicit transaction (`tx_depth > 0`),
+            //    verify that rolling back a savepoint undoes a tentative registration, and
+            //    committing persists `table_quotas` to `boot_meta.db` even without a MemTable flush!
+            engine.begin_transaction();
+            engine.register_capped_table(42, 128_000).unwrap();
+            engine.savepoint(1);
+            engine.register_capped_table(99, 64_000).unwrap();
+            engine.rollback_to_savepoint(1).unwrap();
+            engine.release_savepoint(1).unwrap();
+            engine
+                .put_row(42, b"k1", b"val1", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            engine.commit_transaction().unwrap();
+            assert_eq!(
+                engine.active_idx_segment_count(),
+                0,
+                "precondition: no MemTable flush has occurred yet"
+            );
+
+            // 2. N-04: `register_or_resolve_vtab_with_durability(..., SyncTransactional)` must
+            //    commit the catalog record to `sync_wal` (`current_sector_idx() > 0`)!
+            let sync_sectors_before = engine.sync_wal.current_sector_idx();
+            let id = engine
+                .register_or_resolve_vtab_with_durability(
+                    "sync_cat_tbl",
+                    None,
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            assert!(
+                engine.sync_wal.current_sector_idx() > sync_sectors_before,
+                "N-04: SyncTransactional catalog registration must append to sync_wal"
+            );
+            id
+        };
+
+        // Reopen from disk and verify:
+        // - Table 42's `max_bytes = 128_000` quota is present in `boot_meta.db` (`N-02`),
+        // - Rolled-back table 99 is NOT present (`N-02`),
+        // - `"sync_cat_tbl"` resolves to the same `assigned_id` (`N-04`).
+        {
+            let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+            let st42 = engine
+                .capped_table_state(42)
+                .expect("N-02: capped table 42 quota must survive reopen after tx commit");
+            assert_eq!(st42.max_bytes, 128_000);
+            assert!(
+                engine.capped_table_state(99).is_none(),
+                "N-02: rolled-back capped table 99 must not be persisted"
+            );
+            let resolved_again = engine
+                .register_or_resolve_vtab_with_durability(
+                    "sync_cat_tbl",
+                    None,
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            assert_eq!(resolved_again, assigned_id);
         }
     }
 }
