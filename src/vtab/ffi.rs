@@ -31,6 +31,7 @@ pub struct sqlite3_context {
 // SQLite result codes
 pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
+pub const SQLITE_BUSY: c_int = 5;
 pub const SQLITE_NOMEM: c_int = 7;
 pub const SQLITE_READONLY: c_int = 8;
 pub const SQLITE_IOERR: c_int = 10;

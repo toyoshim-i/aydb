@@ -20,8 +20,8 @@ use crate::engine::{StorageEngine, WriteDurability};
 use crate::pal::OsFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::ffi::{
-    SQLITE_BLOB, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_DONE, SQLITE_ERROR, SQLITE_FLOAT,
-    SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
+    SQLITE_BLOB, SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_DONE, SQLITE_ERROR,
+    SQLITE_FLOAT, SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
     SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LIMIT,
     SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR,
     SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, sqlite_transient, sqlite3,
@@ -57,10 +57,11 @@ const RANGE_FLAG_HAS_LIMIT: c_int = 0x10;
 /// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close.
 const ROWID_MAP_COMPACT_THRESHOLD: usize = 16_384;
 
-/// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code (`AUD-11`).
+/// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code (`AUD-11`, `F01`).
 #[inline]
 fn io_err_to_sqlite_rc(err: &io::Error) -> c_int {
     match err.kind() {
+        io::ErrorKind::WouldBlock => SQLITE_BUSY,
         io::ErrorKind::InvalidData => SQLITE_CORRUPT,
         io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists => SQLITE_ERROR,
         _ => SQLITE_IOERR,
@@ -195,7 +196,7 @@ static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xRowid: Some(vtab_rowid),
     xUpdate: Some(vtab_update),
     xBegin: Some(vtab_begin_tx),
-    xSync: Some(vtab_noop_tx),
+    xSync: Some(vtab_sync_tx),
     xCommit: Some(vtab_commit_tx),
     xRollback: Some(vtab_rollback_tx),
     xFindFunction: None,
@@ -482,6 +483,9 @@ unsafe extern "system" fn vtab_create_or_connect(
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
+            if let Err(e) = eng.check_write_allowed_for_conn(db as usize) {
+                return io_err_to_sqlite_rc(&e);
+            }
             let resolved_id = match eng.register_or_resolve_vtab(&table_name, explicit_table_id) {
                 Ok(id) => id,
                 Err(e) => return io_err_to_sqlite_rc(&e),
@@ -556,14 +560,20 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         if !p_vtab.is_null() {
             unsafe {
-                let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
-                let mut eng = match vtab.engine.lock() {
-                    Ok(g) => g,
-                    Err(_) => return SQLITE_ERROR,
-                };
-                if let Err(e) = eng.drop_table(vtab.table_id, Some(&vtab.table_name)) {
-                    return io_err_to_sqlite_rc(&e);
+                let vtab_ref = &*(p_vtab as *const AydbVTab);
+                {
+                    let mut eng = match vtab_ref.engine.lock() {
+                        Ok(g) => g,
+                        Err(_) => return SQLITE_ERROR,
+                    };
+                    if let Err(e) = eng.check_write_allowed_for_conn(vtab_ref.db as usize) {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                    if let Err(e) = eng.drop_table(vtab_ref.table_id, Some(&vtab_ref.table_name)) {
+                        return io_err_to_sqlite_rc(&e);
+                    }
                 }
+                drop(Box::from_raw(p_vtab as *mut AydbVTab));
             }
         }
         SQLITE_OK
@@ -794,53 +804,152 @@ unsafe extern "system" fn vtab_filter(
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
+        let conn_id = vtab.db as usize;
 
-        let base_plan = idx_num & 0xFF;
-        match base_plan {
-            PLAN_PK_POINT => {
-                if argc < 1 {
-                    return SQLITE_ERROR;
-                }
-                let val_ptr = *argv.offset(0);
-                if sqlite3_value_type(val_ptr) == SQLITE_NULL {
-                    return SQLITE_OK;
-                }
-                let pt_flags = (idx_num >> 8) & 0xFF;
-                if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
-                    if sqlite3_value_type(val_ptr) == SQLITE_INTEGER {
-                        let rid = sqlite3_value_int64(val_ptr);
-                        if vtab.has_non_int_pks.load(Ordering::Relaxed) {
-                            if let Ok(rmap) = vtab.rowid_to_pk.lock() {
-                                if let Some(mapped_pk) = rmap.get_pk(rid) {
-                                    if let Err(e) = eng.get_row_into(
-                                        vtab.table_id,
-                                        mapped_pk,
-                                        &mut cursor.slab,
-                                        &mut cursor.spans,
-                                    ) {
-                                        return io_err_to_sqlite_rc(&e);
+        eng.with_committed_read_for_conn(conn_id, |eng| {
+            let base_plan = idx_num & 0xFF;
+            match base_plan {
+                PLAN_PK_POINT => {
+                    if argc < 1 {
+                        return SQLITE_ERROR;
+                    }
+                    let val_ptr = *argv.offset(0);
+                    if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                        return SQLITE_OK;
+                    }
+                    let pt_flags = (idx_num >> 8) & 0xFF;
+                    if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
+                        if sqlite3_value_type(val_ptr) == SQLITE_INTEGER {
+                            let rid = sqlite3_value_int64(val_ptr);
+                            if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                                if let Ok(rmap) = vtab.rowid_to_pk.lock() {
+                                    if let Some(mapped_pk) = rmap.get_pk(rid) {
+                                        if let Err(e) = eng.get_row_into(
+                                            vtab.table_id,
+                                            mapped_pk,
+                                            &mut cursor.slab,
+                                            &mut cursor.spans,
+                                        ) {
+                                            return io_err_to_sqlite_rc(&e);
+                                        }
+                                        return SQLITE_OK;
                                     }
-                                    return SQLITE_OK;
+                                }
+                            }
+                            if vtab.pk_affinity == ColumnAffinity::Integer {
+                                let pk_arr = encode_i64_tagged_key(rid);
+                                if let Err(e) = eng.get_row_into(
+                                    vtab.table_id,
+                                    &pk_arr,
+                                    &mut cursor.slab,
+                                    &mut cursor.spans,
+                                ) {
+                                    return io_err_to_sqlite_rc(&e);
                                 }
                             }
                         }
-                        if vtab.pk_affinity == ColumnAffinity::Integer {
-                            let pk_arr = encode_i64_tagged_key(rid);
-                            if let Err(e) = eng.get_row_into(
-                                vtab.table_id,
-                                &pk_arr,
-                                &mut cursor.slab,
-                                &mut cursor.spans,
-                            ) {
-                                return io_err_to_sqlite_rc(&e);
-                            }
+                    } else {
+                        let pk_bytes = sqlite_value_to_key_bytes(val_ptr);
+                        if let Err(e) = eng.get_row_into(
+                            vtab.table_id,
+                            &pk_bytes,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                        ) {
+                            return io_err_to_sqlite_rc(&e);
                         }
                     }
-                } else {
-                    let pk_bytes = sqlite_value_to_key_bytes(val_ptr);
-                    if let Err(e) = eng.get_row_into(
+                }
+                PLAN_SECONDARY_EQ => {
+                    if argc < 1 {
+                        return SQLITE_ERROR;
+                    }
+                    let val_ptr = *argv.offset(0);
+                    if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                        return SQLITE_OK;
+                    }
+                    let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
+                    let col_val = sqlite_value_to_key_bytes(val_ptr);
+                    let pks =
+                        match eng.lookup_by_secondary_index(vtab.table_id, index_id, &col_val) {
+                            Ok(pks) => pks,
+                            Err(e) => return io_err_to_sqlite_rc(&e),
+                        };
+                    for pk in pks {
+                        if let Err(e) = eng.get_row_into(
+                            vtab.table_id,
+                            &pk,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                        ) {
+                            return io_err_to_sqlite_rc(&e);
+                        }
+                    }
+                }
+                PLAN_PK_RANGE => {
+                    let flags = idx_num >> 8;
+                    let mut arg_pos = 0;
+                    let lower_bound = if (flags
+                        & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
+                        != 0
+                        && arg_pos < argc
+                    {
+                        let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
+                        let val_ptr = *argv.offset(arg_pos as isize);
+                        arg_pos += 1;
+                        match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, true, inc) {
+                            Ok(bound) => bound,
+                            Err(()) => return SQLITE_OK,
+                        }
+                    } else {
+                        None
+                    };
+                    let upper_bound = if (flags
+                        & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
+                        != 0
+                        && arg_pos < argc
+                    {
+                        let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
+                        let val_ptr = *argv.offset(arg_pos as isize);
+                        arg_pos += 1;
+                        match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, false, inc) {
+                            Ok(bound) => bound,
+                            Err(()) => return SQLITE_OK,
+                        }
+                    } else {
+                        None
+                    };
+                    let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && arg_pos < argc {
+                        let lim_val = sqlite3_value_int64(*argv.offset(arg_pos as isize));
+                        if lim_val > 0 { lim_val as usize } else { 0 }
+                    } else {
+                        usize::MAX
+                    };
+
+                    if let Err(e) = eng.scan_table_values_into(
                         vtab.table_id,
-                        &pk_bytes,
+                        lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        limit,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    ) {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                }
+                _ => {
+                    let flags = idx_num >> 8;
+                    let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && argc >= 1 {
+                        let lim_val = sqlite3_value_int64(*argv.offset(0));
+                        if lim_val > 0 { lim_val as usize } else { 0 }
+                    } else {
+                        usize::MAX
+                    };
+                    if let Err(e) = eng.scan_table_values_into(
+                        vtab.table_id,
+                        None,
+                        None,
+                        limit,
                         &mut cursor.slab,
                         &mut cursor.spans,
                     ) {
@@ -848,104 +957,9 @@ unsafe extern "system" fn vtab_filter(
                     }
                 }
             }
-            PLAN_SECONDARY_EQ => {
-                if argc < 1 {
-                    return SQLITE_ERROR;
-                }
-                let val_ptr = *argv.offset(0);
-                if sqlite3_value_type(val_ptr) == SQLITE_NULL {
-                    return SQLITE_OK;
-                }
-                let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
-                let col_val = sqlite_value_to_key_bytes(val_ptr);
-                let pks = match eng.lookup_by_secondary_index(vtab.table_id, index_id, &col_val) {
-                    Ok(pks) => pks,
-                    Err(e) => return io_err_to_sqlite_rc(&e),
-                };
-                for pk in pks {
-                    if let Err(e) = eng.get_row_into(
-                        vtab.table_id,
-                        &pk,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                    ) {
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                }
-            }
-            PLAN_PK_RANGE => {
-                let flags = idx_num >> 8;
-                let mut arg_pos = 0;
-                let lower_bound = if (flags
-                    & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
-                    != 0
-                    && arg_pos < argc
-                {
-                    let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
-                    let val_ptr = *argv.offset(arg_pos as isize);
-                    arg_pos += 1;
-                    match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, true, inc) {
-                        Ok(bound) => bound,
-                        Err(()) => return SQLITE_OK,
-                    }
-                } else {
-                    None
-                };
-                let upper_bound = if (flags
-                    & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
-                    != 0
-                    && arg_pos < argc
-                {
-                    let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
-                    let val_ptr = *argv.offset(arg_pos as isize);
-                    arg_pos += 1;
-                    match pk_range_bound_to_key(val_ptr, vtab.pk_affinity, false, inc) {
-                        Ok(bound) => bound,
-                        Err(()) => return SQLITE_OK,
-                    }
-                } else {
-                    None
-                };
-                let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && arg_pos < argc {
-                    let lim_val = sqlite3_value_int64(*argv.offset(arg_pos as isize));
-                    if lim_val > 0 { lim_val as usize } else { 0 }
-                } else {
-                    usize::MAX
-                };
 
-                if let Err(e) = eng.scan_table_values_into(
-                    vtab.table_id,
-                    lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    limit,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                ) {
-                    return io_err_to_sqlite_rc(&e);
-                }
-            }
-            _ => {
-                let flags = idx_num >> 8;
-                let limit = if (flags & RANGE_FLAG_HAS_LIMIT) != 0 && argc >= 1 {
-                    let lim_val = sqlite3_value_int64(*argv.offset(0));
-                    if lim_val > 0 { lim_val as usize } else { 0 }
-                } else {
-                    usize::MAX
-                };
-                if let Err(e) = eng.scan_table_values_into(
-                    vtab.table_id,
-                    None,
-                    None,
-                    limit,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                ) {
-                    return io_err_to_sqlite_rc(&e);
-                }
-            }
-        }
-
-        SQLITE_OK
+            SQLITE_OK
+        })
     }))
     .unwrap_or(SQLITE_ERROR)
 }
@@ -1027,6 +1041,9 @@ unsafe extern "system" fn vtab_update(
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
+        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
+        }
 
         // Case 1: DELETE (`argc == 1`)
         if argc == 1 {
@@ -1214,8 +1231,30 @@ unsafe extern "system" fn vtab_update(
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            eng.begin_transaction();
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.begin_transaction_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
+        }
+        SQLITE_OK
+    }))
+    .unwrap_or(SQLITE_ERROR)
+}
+
+unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let vtab = &*(p_vtab as *const AydbVTab);
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
+        }
+        if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
@@ -1225,10 +1264,12 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            if let Err(e) = eng.commit_transaction() {
-                return io_err_to_sqlite_rc(&e);
-            }
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.commit_transaction_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
@@ -1238,25 +1279,27 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            if let Err(e) = eng.rollback_transaction() {
-                return io_err_to_sqlite_rc(&e);
-            }
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
 }
 
-unsafe extern "system" fn vtab_noop_tx(_p_vtab: *mut sqlite3_vtab) -> c_int {
-    SQLITE_OK
-}
-
 unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            eng.savepoint(i_savepoint);
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.savepoint_for_conn(vtab.db as usize, i_savepoint) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
@@ -1266,10 +1309,12 @@ unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint:
 unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            if let Err(e) = eng.release_savepoint(i_savepoint) {
-                return io_err_to_sqlite_rc(&e);
-            }
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.release_savepoint_for_conn(vtab.db as usize, i_savepoint) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
@@ -1279,10 +1324,12 @@ unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c
 unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        if let Ok(mut eng) = vtab.engine.lock() {
-            if let Err(e) = eng.rollback_to_savepoint(i_savepoint) {
-                return io_err_to_sqlite_rc(&e);
-            }
+        let mut eng = match vtab.engine.lock() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.rollback_to_savepoint_for_conn(vtab.db as usize, i_savepoint) {
+            return io_err_to_sqlite_rc(&e);
         }
         SQLITE_OK
     }))
@@ -2424,6 +2471,104 @@ mod tests {
         assert!(
             after_drop.is_empty(),
             "recreated table after DROP TABLE must be empty"
+        );
+    }
+
+    #[test]
+    fn f01_f07_cross_connection_transaction_isolation_and_two_phase_sync_rollback() {
+        let tmp = TempTestDir::new("f01_f07_conn_isolation");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let shared = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        conn1.register_aydb_module(shared.clone()).unwrap();
+        conn1
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(
+                    table_id = 1,
+                    columns = 'id INTEGER PRIMARY KEY, v TEXT'
+                );
+                INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+            )
+            .unwrap();
+
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        conn2.register_aydb_module(shared.clone()).unwrap();
+        conn2
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(
+                    table_id = 1,
+                    columns = 'id INTEGER PRIMARY KEY, v TEXT'
+                );",
+            )
+            .unwrap();
+
+        // 1. Connection 1 opens a transaction and inserts id=3 ('uncommitted'), updates id=1, deletes id=2
+        conn1
+            .execute_batch(
+                "BEGIN;
+                 INSERT INTO t VALUES (3, 'uncommitted');
+                 UPDATE t SET v = 'one_modified' WHERE id = 1;
+                 DELETE FROM t WHERE id = 2;",
+            )
+            .unwrap();
+
+        // Connection 1 sees its own uncommitted changes (read-your-own-writes)
+        assert_eq!(
+            conn1
+                .query_all("SELECT id, v FROM t WHERE id = 3", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Integer(3),
+                SqlValue::Text("uncommitted".into())
+            ]]
+        );
+
+        // 2. Connection 2 MUST NOT see Connection 1's uncommitted changes!
+        assert!(
+            conn2
+                .query_all("SELECT * FROM t WHERE id = 3", &[])
+                .unwrap()
+                .is_empty(),
+            "F01: second connection must not see uncommitted row from first connection"
+        );
+        assert_eq!(
+            conn2
+                .query_all("SELECT id, v FROM t ORDER BY id", &[])
+                .unwrap(),
+            vec![
+                vec![SqlValue::Integer(1), SqlValue::Text("one".into())],
+                vec![SqlValue::Integer(2), SqlValue::Text("two".into())],
+            ],
+            "F01: second connection must read the exact pre-transaction committed snapshot"
+        );
+
+        // 3. Connection 2 attempting an autocommit write while Connection 1 holds the transaction
+        //    must fail with SQLITE_BUSY rather than silently joining Connection 1's transaction!
+        assert!(
+            conn2
+                .execute_batch("INSERT INTO t VALUES (4, 'other committed');")
+                .is_err(),
+            "F01: concurrent write on second connection while first connection is in a transaction must fail with busy error"
+        );
+
+        // 4. Connection 1 rolls back
+        conn1.execute_batch("ROLLBACK;").unwrap();
+
+        // 5. Now Connection 2's write succeeds and persists cleanly!
+        conn2
+            .execute_batch("INSERT INTO t VALUES (4, 'other committed');")
+            .unwrap();
+        assert_eq!(
+            conn1
+                .query_all("SELECT id, v FROM t WHERE id = 4", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Integer(4),
+                SqlValue::Text("other committed".into())
+            ]]
         );
     }
 }

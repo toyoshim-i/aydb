@@ -853,51 +853,72 @@ where
     let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
 
     // Filter out uncommitted multi-chunk transactions (`TxBegin` without a matching `TxCommit`)
-    // per stream (`AUD-04`) while recording the highest LSN observed across all recovered batches.
+    // per stream (`AUD-04`) AND validate `PutBlobPtr` records across the entire transaction group
+    // (`F03`) before stripping transaction markers, while recording the highest LSN observed across
+    // all recovered batches.
     let mut max_lsn = checkpoint_lsn;
-    let mut filter_committed_stream = |batches: Vec<WalBatch>| -> Vec<WalBatch> {
-        let mut out = Vec::with_capacity(batches.len());
-        let mut pending_tx: Option<Vec<WalBatch>> = None;
-        for mut b in batches {
-            if b.lsn > max_lsn {
-                max_lsn = b.lsn;
-            }
-            if b.lsn <= checkpoint_lsn {
-                continue;
-            }
-            let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
-            let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
-            b.records
-                .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
+    let mut filter_committed_stream =
+        |batches: Vec<WalBatch>, validate_blob: &mut V| -> Vec<WalBatch> {
+            let mut out = Vec::with_capacity(batches.len());
+            let mut pending_tx: Option<Vec<WalBatch>> = None;
+            let batch_blobs_valid = |b: &WalBatch, validate_blob: &mut V| -> bool {
+                b.records.iter().all(|rec| match rec {
+                    WalRecord::PutBlobPtr { blob_ptr, .. } => validate_blob(blob_ptr),
+                    _ => true,
+                })
+            };
 
-            if has_begin {
-                // Start of a new multi-chunk transaction; discard any prior incomplete one.
-                let mut tx_vec = Vec::new();
-                if !b.records.is_empty() {
-                    tx_vec.push(b);
+            for mut b in batches {
+                if b.lsn > max_lsn {
+                    max_lsn = b.lsn;
                 }
-                if has_commit {
-                    out.extend(tx_vec);
-                    pending_tx = None;
-                } else {
-                    pending_tx = Some(tx_vec);
+                if b.lsn <= checkpoint_lsn {
+                    continue;
                 }
-            } else if let Some(ref mut tx_vec) = pending_tx {
-                if !b.records.is_empty() {
-                    tx_vec.push(b);
-                }
-                if has_commit {
-                    out.extend(pending_tx.take().unwrap());
-                }
-            } else if !b.records.is_empty() {
-                out.push(b);
-            }
-        }
-        out
-    };
+                let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
+                let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
+                b.records
+                    .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
 
-    let sync_iter = filter_committed_stream(sync_rec.batches);
-    let buf_iter = filter_committed_stream(buf_rec.batches);
+                if has_begin {
+                    // Start of a new multi-chunk transaction; discard any prior incomplete one.
+                    let mut tx_vec = Vec::new();
+                    if !b.records.is_empty() {
+                        tx_vec.push(b);
+                    }
+                    if has_commit {
+                        if tx_vec
+                            .iter()
+                            .all(|chunk| batch_blobs_valid(chunk, validate_blob))
+                        {
+                            out.extend(tx_vec);
+                        }
+                        pending_tx = None;
+                    } else {
+                        pending_tx = Some(tx_vec);
+                    }
+                } else if let Some(ref mut tx_vec) = pending_tx {
+                    if !b.records.is_empty() {
+                        tx_vec.push(b);
+                    }
+                    if has_commit {
+                        let completed_tx = pending_tx.take().unwrap();
+                        if completed_tx
+                            .iter()
+                            .all(|chunk| batch_blobs_valid(chunk, validate_blob))
+                        {
+                            out.extend(completed_tx);
+                        }
+                    }
+                } else if !b.records.is_empty() && batch_blobs_valid(&b, validate_blob) {
+                    out.push(b);
+                }
+            }
+            out
+        };
+
+    let sync_iter = filter_committed_stream(sync_rec.batches, &mut validate_blob);
+    let buf_iter = filter_committed_stream(buf_rec.batches, &mut validate_blob);
 
     // Two-way merge sort by ascending `lsn`.
     let mut merged = Vec::with_capacity(sync_iter.len() + buf_iter.len());
@@ -915,27 +936,8 @@ where
     merged.extend_from_slice(&sync_iter[i..]);
     merged.extend_from_slice(&buf_iter[j..]);
 
-    // Reject any `WalBatch` atomically if any `PutBlobPtr` record in the batch references a blob
-    // payload that did not reach disk before power loss.
-    let mut validated_batches = Vec::with_capacity(merged.len());
-    for batch in merged {
-        if batch.lsn > max_lsn {
-            max_lsn = batch.lsn;
-        }
-        let all_blobs_valid = batch.records.iter().all(|rec| match rec {
-            WalRecord::PutBlobPtr { blob_ptr, .. } => validate_blob(blob_ptr),
-            _ => true,
-        });
-        if !all_blobs_valid {
-            continue;
-        }
-        if !batch.records.is_empty() {
-            validated_batches.push(batch);
-        }
-    }
-
     Ok(TwoStreamRecoveryResult {
-        merged_batches: validated_batches,
+        merged_batches: merged,
         max_recovered_lsn: max_lsn,
         next_sync_sector_idx: sync_rec.next_sector_idx,
         next_buf_sector_idx: buf_rec.next_sector_idx,
@@ -1373,5 +1375,114 @@ mod tests {
         // Entire Batch 2 must be discarded so companion Delete("k1") and PutInline("sec_idx_for_k2") are not applied
         assert_eq!(res.merged_batches.len(), 1);
         assert_eq!(res.merged_batches[0].lsn, 1);
+    }
+
+    #[test]
+    fn f03_multi_chunk_transaction_rejected_atomically_when_any_chunk_blob_is_invalid() {
+        let tmp = TempTestDir::new("f03_multi_chunk_atomicity");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let wal_size = 64 * 1024u64;
+        let sync_w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        let mut buf_w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+
+        // Chunk 1 (LSN 1): TxBegin + valid inline write
+        buf_w
+            .append_batch(&WalBatch::new(
+                1,
+                vec![
+                    WalRecord::TxBegin,
+                    WalRecord::PutInline {
+                        key: b"first".to_vec(),
+                        value: b"value".to_vec(),
+                    },
+                ],
+            ))
+            .unwrap();
+
+        // Chunk 2 (LSN 2): PutBlobPtr (invalid/missing blob) + TxCommit
+        buf_w
+            .append_batch(&WalBatch::new(
+                2,
+                vec![
+                    WalRecord::PutBlobPtr {
+                        key: b"second".to_vec(),
+                        blob_ptr: BlobPtr {
+                            kind: BlobKind::Standard,
+                            table_id: 1,
+                            seg_id: 42,
+                            offset: 0,
+                            len: 2048,
+                            crc32c: 0,
+                        },
+                    },
+                    WalRecord::TxCommit,
+                ],
+            ))
+            .unwrap();
+
+        // Also verify a subsequent valid 2-chunk transaction (LSNs 3 and 4) IS recovered
+        buf_w
+            .append_batch(&WalBatch::new(
+                3,
+                vec![
+                    WalRecord::TxBegin,
+                    WalRecord::PutInline {
+                        key: b"valid_tx_part1".to_vec(),
+                        value: b"ok1".to_vec(),
+                    },
+                ],
+            ))
+            .unwrap();
+        buf_w
+            .append_batch(&WalBatch::new(
+                4,
+                vec![
+                    WalRecord::PutBlobPtr {
+                        key: b"valid_tx_part2".to_vec(),
+                        blob_ptr: BlobPtr {
+                            kind: BlobKind::Standard,
+                            table_id: 1,
+                            seg_id: 7,
+                            offset: 0,
+                            len: 2048,
+                            crc32c: 0,
+                        },
+                    },
+                    WalRecord::TxCommit,
+                ],
+            ))
+            .unwrap();
+
+        let recovered = recover_two_streams(
+            &**sync_w.file(),
+            1,
+            &**buf_w.file(),
+            1,
+            0,
+            |ptr| ptr.seg_id == 7,
+        )
+        .unwrap();
+
+        let recovered_lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
+        assert_eq!(
+            recovered_lsns,
+            vec![3, 4],
+            "multi-chunk transaction [1, 2] with invalid blob in chunk 2 must be discarded as a unit"
+        );
     }
 }

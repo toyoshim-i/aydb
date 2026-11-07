@@ -159,6 +159,14 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// `WalRecord` bytes are accumulated directly into `pending_tx_buf` and committed as a
     /// single atomic `WalBatch` on `commit_transaction`!
     tx_depth: usize,
+    /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction (`F01`).
+    tx_owner_conn: Option<usize>,
+    /// True if `flush_memtable()` was requested during an active transaction (`F02`).
+    deferred_flush_on_commit: bool,
+    /// True if `compact()` was requested during an active transaction (`F02`).
+    deferred_compact_on_commit: bool,
+    /// True if `prepare_commit_transaction()` (`xSync`) has already run for the current commit (`F07`).
+    tx_prepared: bool,
     pending_tx_buf: Vec<u8>,
     pending_tx_record_count: u32,
     pending_tx_sync: bool,
@@ -393,6 +401,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             capped_tables,
             access_tracker: AccessTracker::new(1, 65_536),
             tx_depth: 0,
+            tx_owner_conn: None,
+            deferred_flush_on_commit: false,
+            deferred_compact_on_commit: false,
+            tx_prepared: false,
             pending_tx_buf: Vec::new(),
             pending_tx_record_count: 0,
             pending_tx_sync: false,
@@ -546,13 +558,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());
             cat_key.extend_from_slice(&catalog_prefix);
             cat_key.extend_from_slice(norm_name.as_bytes());
-            self.commit_wal_and_memtable(
-                vec![WalRecord::PutInline {
-                    key: cat_key,
-                    value: chosen_id.to_be_bytes().to_vec(),
-                }],
-                WriteDurability::BufferedFast,
-            )?;
+            if self.tx_depth == 0 {
+                self.commit_wal_and_memtable(
+                    vec![WalRecord::PutInline {
+                        key: cat_key,
+                        value: chosen_id.to_be_bytes().to_vec(),
+                    }],
+                    WriteDurability::BufferedFast,
+                )?;
+            } else {
+                let batch = WalBatch::new(
+                    self.next_lsn,
+                    vec![WalRecord::PutInline {
+                        key: cat_key,
+                        value: chosen_id.to_be_bytes().to_vec(),
+                    }],
+                );
+                let encoded = batch.encode();
+                self.append_raw_wal_batch_with_rotation(&encoded, WriteDurability::BufferedFast)?;
+                self.next_lsn += 1;
+                self.memtable.apply_wal_batch_owned(batch);
+            }
         }
         Ok(chosen_id)
     }
@@ -1238,39 +1264,212 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             self.tx_memtable_undo.clear();
             self.tx_start_meta = self.capture_tx_meta_snapshot();
+            self.tx_owner_conn = None;
+            self.deferred_flush_on_commit = false;
+            self.deferred_compact_on_commit = false;
+            self.tx_prepared = false;
         }
         self.tx_depth += 1;
+    }
+
+    /// Begins an explicit transaction owned by SQLite connection `conn_id` (`F01`).
+    /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection already holds
+    /// an active transaction on this `StorageEngine`.
+    pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "database is locked by another connection's active transaction",
+            ));
+        }
+        if self.tx_depth == 0 {
+            self.tx_memtable_undo.clear();
+            self.tx_start_meta = self.capture_tx_meta_snapshot();
+            self.tx_owner_conn = Some(conn_id);
+            self.deferred_flush_on_commit = false;
+            self.deferred_compact_on_commit = false;
+            self.tx_prepared = false;
+        }
+        self.tx_depth += 1;
+        Ok(())
+    }
+
+    /// Checks whether `conn_id` is permitted to mutate this `StorageEngine` (`F01`).
+    /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection holds an active transaction.
+    #[inline]
+    pub fn check_write_allowed_for_conn(&self, conn_id: usize) -> io::Result<()> {
+        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "database is locked by another connection's active transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Executes a read closure `f` for `conn_id` against the committed snapshot (`F01`).
+    /// If `conn_id` owns the active transaction (or no transaction is active), `f` sees the live
+    /// `MemTable` (read-your-own-writes). If another connection owns an active transaction,
+    /// uncommitted `MemTable` mutations are temporarily hidden so `conn_id` sees only committed data.
+    pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        if self.tx_depth == 0
+            || self.tx_owner_conn == Some(conn_id)
+            || self.tx_memtable_undo.is_empty()
+        {
+            return f(self);
+        }
+
+        struct CommittedReadGuard<'a, FS: PlatformFs> {
+            eng: &'a mut StorageEngine<FS>,
+            uncommitted_redo: Vec<(Vec<u8>, Option<crate::memtable::MemEntry>)>,
+            uncommitted_highest_lsn: u64,
+        }
+
+        impl<'a, FS: PlatformFs> Drop for CommittedReadGuard<'a, FS> {
+            fn drop(&mut self) {
+                while let Some((key, entry)) = self.uncommitted_redo.pop() {
+                    self.eng.memtable.restore_entry(key, entry);
+                }
+                self.eng
+                    .memtable
+                    .set_highest_lsn(self.uncommitted_highest_lsn);
+            }
+        }
+
+        let uncommitted_highest_lsn = self.memtable.highest_lsn();
+        let committed_highest_lsn = self.tx_start_meta.memtable_highest_lsn;
+        let mut uncommitted_redo = Vec::with_capacity(self.tx_memtable_undo.len());
+        for i in (0..self.tx_memtable_undo.len()).rev() {
+            let key = self.tx_memtable_undo[i].0.clone();
+            let prev_entry = self.tx_memtable_undo[i].1.clone();
+            let cur_entry = self.memtable.get(&key).cloned();
+            self.memtable.restore_entry(key.clone(), prev_entry);
+            uncommitted_redo.push((key, cur_entry));
+        }
+        self.memtable.set_highest_lsn(committed_highest_lsn);
+
+        let guard = CommittedReadGuard {
+            eng: self,
+            uncommitted_redo,
+            uncommitted_highest_lsn,
+        };
+        f(guard.eng)
+    }
+
+    /// Prepares the active transaction for commit (`xSync` two-phase commit phase 1, `F07`).
+    /// Runs deferred capped-table quota evictions inside the undoable transaction context,
+    /// flushes/syncs out-of-line blob segments, and pre-checks WAL capacity so any fallible I/O
+    /// or space errors surface during `xSync` while `xRollback` can still cleanly undo all state.
+    pub fn prepare_commit_transaction(&mut self, durability: WriteDurability) -> io::Result<()> {
+        if self.tx_depth == 0 {
+            return Ok(());
+        }
+        if durability == WriteDurability::SyncTransactional {
+            self.pending_tx_sync = true;
+        }
+        let effective_durability = if self.pending_tx_sync {
+            WriteDurability::SyncTransactional
+        } else {
+            WriteDurability::BufferedFast
+        };
+
+        // 1. Run capped-table quota evictions while `tx_depth > 0` so eviction mutations are
+        //    recorded in `pending_tx_buf` and `tx_memtable_undo` (fully undoable on `xRollback`!).
+        let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
+        for tid in capped_table_ids {
+            self.evict_until_within_quota(tid, effective_durability)?;
+        }
+
+        // 2. Sync active blob writers (`Write-Blob-Before-WAL` & prefix durability `F06`/`F07`).
+        if effective_durability == WriteDurability::SyncTransactional {
+            self.sync_active_blob_writers()?;
+            if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                self.buf_wal.flush_buffered_to_os()?;
+                self.buf_wal.file().sync_barrier()?;
+                self.last_buf_synced_lsn = self.last_buf_append_lsn;
+            }
+        }
+
+        // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB).
+        const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
+        if self.pending_tx_buf.len() > MAX_WAL_CHUNK_BYTES {
+            let required_sectors = (self.pending_tx_buf.len() / 4070) + 8;
+            match effective_durability {
+                WriteDurability::SyncTransactional => {
+                    let target_sectors = self.sync_wal.current_sector_idx() + required_sectors;
+                    if target_sectors > self.sync_wal.total_sectors() {
+                        self.sync_wal.ensure_min_size(
+                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
+                        )?;
+                    }
+                }
+                WriteDurability::BufferedFast => {
+                    let target_sectors = self.buf_wal.current_sector_idx() + required_sectors;
+                    if target_sectors > self.buf_wal.total_sectors() {
+                        self.buf_wal.ensure_min_size(
+                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        self.tx_prepared = true;
+        Ok(())
     }
 
     /// Commits an explicit batch transaction (`COMMIT`), writing all coalesced [`WalRecord`]
     /// entries in a single [`WalBatch`] syscall (or chunked batches if exceeding 512 KB)!
     pub fn commit_transaction(&mut self) -> io::Result<()> {
-        if self.tx_depth > 0 {
-            self.tx_depth -= 1;
-        }
-        if self.tx_depth == 0 {
+        if self.tx_depth == 1 && !self.tx_prepared {
             let durability = if self.pending_tx_sync {
                 WriteDurability::SyncTransactional
             } else {
                 WriteDurability::BufferedFast
             };
+            if let Err(e) = self.prepare_commit_transaction(durability) {
+                let _ = self.rollback_transaction();
+                return Err(e);
+            }
+        }
+        if self.tx_depth > 0 {
+            self.tx_depth -= 1;
+        }
+        if self.tx_depth == 0 {
             if let Err(e) = self.flush_pending_tx_records() {
                 self.tx_depth = 1;
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
+            self.tx_owner_conn = None;
+            self.tx_prepared = false;
             self.savepoints.clear();
             self.tx_memtable_undo.clear();
             self.tx_start_meta = TxMetaSnapshot::default();
+
             let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
             for tid in capped_table_ids {
-                self.evict_until_within_quota(tid, durability)?;
+                self.reclaim_fully_dead_lru_blob_segments(tid)?;
             }
-            if self.memtable.should_flush() {
+
+            let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
+            let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
+            if do_compact {
+                self.compact()?;
+            } else if do_flush || self.memtable.should_flush() {
                 self.flush_memtable()?;
             }
         }
         Ok(())
+    }
+
+    /// Commits an explicit transaction for SQLite connection `conn_id` (`F01`).
+    pub fn commit_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        self.commit_transaction()
     }
 
     /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_tx_buf`
@@ -1278,6 +1477,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// $O(\text{tx mutations})$ time via the in-memory undo log (`PERF-03`).
     pub fn rollback_transaction(&mut self) -> io::Result<()> {
         self.tx_depth = 0;
+        self.tx_owner_conn = None;
+        self.deferred_flush_on_commit = false;
+        self.deferred_compact_on_commit = false;
+        self.tx_prepared = false;
         self.savepoints.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_buf.clear();
@@ -1287,8 +1490,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Aborts an explicit transaction for SQLite connection `conn_id` (`F01`).
+    pub fn rollback_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        self.rollback_transaction()
+    }
+
     /// Opens or updates a transaction savepoint (`xSavepoint`) (`USE-01`).
     pub fn savepoint(&mut self, sp_id: i32) {
+        self.tx_prepared = false;
         let mut implicit_tx = false;
         if self.tx_depth == 0 {
             self.begin_transaction();
@@ -1315,6 +1525,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         });
     }
 
+    /// Opens or updates a transaction savepoint for SQLite connection `conn_id` (`F01`).
+    pub fn savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        let was_zero = self.tx_depth == 0;
+        self.savepoint(sp_id);
+        if was_zero {
+            self.tx_owner_conn = Some(conn_id);
+        }
+        Ok(())
+    }
+
     /// Releases savepoints `>= sp_id` (`xRelease`) (`USE-01`).
     pub fn release_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
         if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
@@ -1327,9 +1548,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Releases savepoints `>= sp_id` for SQLite connection `conn_id` (`F01`).
+    pub fn release_savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        self.release_savepoint(sp_id)
+    }
+
     /// Rolls back all mutations since savepoint `sp_id` (`xRollbackTo`) in
     /// $O(\text{mutations since savepoint})$ time via the undo log (`USE-01`, `PERF-03`).
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
+        self.tx_prepared = false;
         let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
             return Ok(());
         };
@@ -1344,6 +1572,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.pending_tx_sync = marker.pending_tx_sync;
         self.restore_tx_state(marker.undo_len, &marker.meta_snapshot);
         Ok(())
+    }
+
+    /// Rolls back to savepoint `sp_id` for SQLite connection `conn_id` (`F01`).
+    pub fn rollback_to_savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        self.rollback_to_savepoint(sp_id)
     }
 
     fn capture_tx_meta_snapshot(&self) -> TxMetaSnapshot {
@@ -1400,18 +1634,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.pending_tx_sync = false;
 
         if durability == WriteDurability::SyncTransactional {
-            if let Some(w) = &mut self.active_std_writer {
-                w.sync_durable()?;
-                if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                    b.file_len = w.current_len();
-                }
-            }
-            for w in self.active_lru_writers.values_mut() {
-                w.sync_durable()?;
-                if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
-                    b.file_len = w.current_len();
-                }
-            }
+            self.sync_active_blob_writers()?;
         }
 
         const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
@@ -1549,7 +1772,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
     /// WAL streams to `epoch + 1` in $O(1)$ without zero-filling, atomically commits `boot_meta.db`,
     /// and triggers automatic compaction if `auto_compact_segment_threshold` is reached (`PERF-02`).
+    /// If called while an explicit transaction is active (`tx_depth > 0`), defers checkpointing
+    /// until `commit_transaction` so provisional state is never published to SSTables (`F02`).
     pub fn flush_memtable(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.deferred_flush_on_commit = true;
+            return Ok(());
+        }
         self.flush_memtable_no_auto_compact()?;
         if self.tx_depth == 0
             && self.config.auto_compact_segment_threshold > 1
@@ -1561,6 +1790,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn flush_memtable_no_auto_compact(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.deferred_flush_on_commit = true;
+            return Ok(());
+        }
         self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
@@ -1568,18 +1801,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // Ensure all active blob segments are durably flushed before checkpointing `boot_meta.db`
-        if let Some(w) = &mut self.active_std_writer {
-            w.sync_durable()?;
-            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                b.file_len = w.current_len();
-            }
-        }
-        for w in self.active_lru_writers.values_mut() {
-            w.sync_durable()?;
-            if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
-                b.file_len = w.current_len();
-            }
-        }
+        self.sync_active_blob_writers()?;
 
         let new_seq_id = self.meta_mgr.state_snapshot().next_seq_id;
 
@@ -1685,6 +1907,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
     /// and can be reclaimed in $O(1)$.
     pub fn relocate_fragmented_std_blobs(&mut self, dead_ratio_threshold: f64) -> io::Result<usize> {
+        if self.tx_depth > 0 {
+            return Ok(0);
+        }
         use std::collections::HashSet;
         let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
         let fragmented_seqs: HashSet<u64> = self
@@ -1755,7 +1980,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// dead blob bytes from overwritten keys, relocates fragmented standard blob segments,
     /// commits the compacted segment to `boot_meta.db`, and deletes superseded `idx` and
     /// 100%-dead blob segments via Deferred GC.
+    /// If called while an explicit transaction is active (`tx_depth > 0`), defers compaction
+    /// until `commit_transaction` (`F02`).
     pub fn compact(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.deferred_compact_on_commit = true;
+            return Ok(());
+        }
         if !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         }
@@ -2037,7 +2268,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        self.reclaim_fully_dead_lru_blob_segments(table_id)?;
+        if self.tx_depth == 0 {
+            self.reclaim_fully_dead_lru_blob_segments(table_id)?;
+        }
+        Ok(())
+    }
+
+    fn sync_active_blob_writers(&mut self) -> io::Result<()> {
+        if let Some(w) = &mut self.active_std_writer {
+            w.sync_durable()?;
+            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                b.file_len = w.current_len();
+            }
+        }
+        for w in self.active_lru_writers.values_mut() {
+            w.sync_durable()?;
+            if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
+                b.file_len = w.current_len();
+            }
+        }
         Ok(())
     }
 
@@ -2396,12 +2645,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.next_lsn
         };
 
-        // Enforce prefix durability across `wal_buf.db` and `wal_sync.db` (`AUD-08`):
-        // before appending a `SyncTransactional` batch at LSN `L`, ensure all earlier
-        // `BufferedFast` batches (`last_buf_append_lsn > last_buf_synced_lsn`) are synced!
+        // Enforce prefix durability across `wal_buf.db`, active blob segments, and `wal_sync.db` (`AUD-08`, `F06`):
+        // before appending a `SyncTransactional` batch at LSN `L`, ensure all earlier `BufferedFast`
+        // batches AND their out-of-line blobs (`last_buf_append_lsn > last_buf_synced_lsn`) are synced!
         if durability == WriteDurability::SyncTransactional
             && self.last_buf_append_lsn > self.last_buf_synced_lsn
         {
+            self.sync_active_blob_writers()?;
             self.buf_wal.flush_buffered_to_os()?;
             self.buf_wal.file().sync_barrier()?;
             self.last_buf_synced_lsn = self.last_buf_append_lsn;
@@ -3855,13 +4105,17 @@ mod tests {
             .put_row(2, b"cap_k", b"small", &[], WriteDurability::BufferedFast)
             .unwrap();
 
-        // AUD-08 check: Write `idx_row` with `BufferedFast` (tag_buf), then overwrite with
-        // `SyncTransactional` (tag_sync), then simulate power loss!
+        // AUD-08 + F06 check: Write `idx_row` with a large out-of-line blob (> 128 B) using
+        // `BufferedFast` (`tag_buf`), then overwrite `idx_row` with an inline value using
+        // `SyncTransactional` (`tag_sync`), then simulate power loss!
+        // Because `F06` syncs active blob writers before syncing `wal_buf.db` on the later
+        // `SyncTransactional` inline write, the earlier buffered blob batch is NOT rejected on
+        // recovery, preventing `tag_buf` from remaining as a stale secondary index entry!
         engine
             .put_row(
                 1,
                 b"idx_row",
-                b"v_buf",
+                &vec![0x77u8; 512],
                 &[(1, b"tag_buf".to_vec())],
                 WriteDurability::BufferedFast,
             )
@@ -3870,7 +4124,7 @@ mod tests {
             .put_row(
                 1,
                 b"idx_row",
-                b"v_sync",
+                b"v_sync_inline",
                 &[(1, b"tag_sync".to_vec())],
                 WriteDurability::SyncTransactional,
             )
@@ -4116,5 +4370,103 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(&slab[spans[0].0..spans[0].1], blob_a.as_slice());
         assert_eq!(&slab[spans[1].0..spans[1].1], blob_b.as_slice());
+    }
+
+    #[test]
+    fn f02_f06_f07_deferred_tx_checkpoint_blob_prefix_durability_and_prepare_commit() {
+        let tmp = TempTestDir::new("f02_f06_f07");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+
+        // F02: Calling `flush_memtable()` and `compact()` inside an active transaction must NOT
+        // publish uncommitted rows to SSTables, so `rollback_transaction()` completely removes them
+        // both in memory and across reopen!
+        engine.begin_transaction();
+        engine
+            .put_row(1, b"aborted", b"value", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        engine.compact().unwrap();
+        engine.rollback_transaction().unwrap();
+        assert_eq!(
+            engine.get_row(1, b"aborted").unwrap(),
+            None,
+            "F02: rolled-back row must not remain visible after flush_memtable() during transaction"
+        );
+        drop(engine);
+
+        let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+        assert_eq!(
+            engine.get_row(1, b"aborted").unwrap(),
+            None,
+            "F02: rolled-back row must not survive reopen after flush_memtable() during transaction"
+        );
+
+        // Verify that if the transaction DOES commit after `flush_memtable()` was requested inside
+        // the transaction, the deferred flush executes upon commit and creates an SSTable segment!
+        assert_eq!(engine.active_idx_segment_count(), 0);
+        engine.begin_transaction();
+        engine
+            .put_row(
+                1,
+                b"committed_flushed",
+                b"ok",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        assert_eq!(
+            engine.active_idx_segment_count(),
+            0,
+            "flush must be deferred while tx_depth > 0"
+        );
+        engine.commit_transaction().unwrap();
+        assert_eq!(
+            engine.active_idx_segment_count(),
+            1,
+            "deferred flush must execute upon commit_transaction()"
+        );
+        assert_eq!(
+            engine.get_row(1, b"committed_flushed").unwrap(),
+            Some(b"ok".to_vec())
+        );
+
+        // F07: `prepare_commit_transaction` runs capped-table quota eviction while still inside
+        // the undoable transaction, so `rollback_transaction()` after `prepare_commit_transaction`
+        // restores the evicted row!
+        engine.register_capped_table(5, 300).unwrap();
+        engine
+            .put_row(
+                5,
+                b"row1",
+                &vec![0x11u8; 150],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine.begin_transaction();
+        engine
+            .put_row(
+                5,
+                b"row2",
+                &vec![0x22u8; 200],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        // Prepare phase evicts `row1` to bring table 5 within its 300-byte quota
+        engine
+            .prepare_commit_transaction(WriteDurability::BufferedFast)
+            .unwrap();
+        assert!(engine.get_row(5, b"row1").unwrap().is_none());
+        // If another 2PC participant fails and SQLite triggers rollback after xSync:
+        engine.rollback_transaction().unwrap();
+        assert_eq!(
+            engine.get_row(5, b"row1").unwrap(),
+            Some(vec![0x11u8; 150]),
+            "F07: rolling back after prepare_commit_transaction must restore quota-evicted rows"
+        );
+        assert!(engine.get_row(5, b"row2").unwrap().is_none());
     }
 }
