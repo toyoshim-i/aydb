@@ -153,11 +153,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for bmeta in &state_snapshot.std_blob_segments {
             let fname = format_std_blob_file_name(bmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
+            let file_len = file.file_len()?.max(bmeta.file_len);
             std_blobs.insert(
                 bmeta.seq_id,
                 TrackedStdBlob {
                     reader: BlobSegmentReader::new(file, bmeta.seq_id),
-                    file_len: bmeta.file_len,
+                    file_len,
                     dead_bytes: bmeta.dead_bytes,
                 },
             );
@@ -168,12 +169,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for lmeta in &state_snapshot.lru_blob_segments {
             let fname = format_lru_blob_file_name(lmeta.table_id, lmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
+            let file_len = file.file_len()?.max(lmeta.file_len);
             lru_blobs.insert(
                 (lmeta.table_id, lmeta.seq_id),
                 TrackedLruBlob {
                     table_id: lmeta.table_id,
                     reader: BlobSegmentReader::new(file, lmeta.seq_id),
-                    file_len: lmeta.file_len,
+                    file_len,
                     dead_bytes: lmeta.dead_bytes,
                 },
             );
@@ -416,6 +418,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 BlobKind::Standard
             };
             let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, &value)?;
+            if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
+                match blob_kind {
+                    BlobKind::Standard => {
+                        if let Some(w) = &mut self.active_std_writer {
+                            w.sync_durable()?;
+                            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                                b.file_len = w.current_len();
+                            }
+                        }
+                    }
+                    BlobKind::Lru => {
+                        if let Some(w) = self.active_lru_writers.get_mut(&table_id) {
+                            w.sync_durable()?;
+                            if let Some(b) = self.lru_blobs.get_mut(&(table_id, w.seq_id())) {
+                                b.file_len = w.current_len();
+                            }
+                        }
+                    }
+                }
+            }
             records.push(WalRecord::PutBlobPtr {
                 key: row_key,
                 blob_ptr: ptr,
@@ -937,6 +959,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
         self.pending_tx_sync = false;
 
+        if durability == WriteDurability::SyncTransactional {
+            if let Some(w) = &mut self.active_std_writer {
+                w.sync_durable()?;
+                if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                    b.file_len = w.current_len();
+                }
+            }
+            for w in self.active_lru_writers.values_mut() {
+                w.sync_durable()?;
+                if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
+                    b.file_len = w.current_len();
+                }
+            }
+        }
+
         let lsn = self.next_lsn;
         self.next_lsn += 1;
         WalBatch::finalize_encoded_buf(lsn, record_count, &mut self.pending_tx_buf);
@@ -970,21 +1007,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        let mut new_seq_id = 0u64;
-        self.meta_mgr.commit_update(|st| {
-            new_seq_id = st.allocate_seq_id();
-        })?;
+        let new_seq_id = self.meta_mgr.state_snapshot().next_seq_id;
 
-        let new_reader =
-            self.memtable
-                .flush_to_segment(&*self.fs, new_seq_id, self.config.bloom_bits_per_key)?;
+        let new_reader = match self.memtable.write_to_segment(
+            &*self.fs,
+            new_seq_id,
+            self.config.bloom_bits_per_key,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.fs.remove_file(&format_idx_file_name(new_seq_id));
+                return Err(e);
+            }
+        };
         let idx_meta = IdxSegmentMeta {
             seq_id: new_reader.seq_id(),
             file_len: new_reader.file_len(),
             level: new_reader.level(),
             record_count: new_reader.record_count(),
         };
-        self.idx_segments.push(new_reader);
 
         let new_sync_epoch = self.sync_wal.active_epoch() + 1;
         let new_buf_epoch = self.buf_wal.active_epoch() + 1;
@@ -994,7 +1035,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lru_metas = self.build_lru_blob_metas();
         let quota_metas = self.build_quota_metas();
 
-        self.meta_mgr.commit_update(|st| {
+        if let Err(e) = self.meta_mgr.commit_update(|st| {
+            let allocated = st.allocate_seq_id();
+            debug_assert_eq!(allocated, new_seq_id);
             st.idx_segments.push(idx_meta);
             st.std_blob_segments = std_metas;
             st.lru_blob_segments = lru_metas;
@@ -1002,8 +1045,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             st.checkpoint_lsn = new_checkpoint_lsn;
             st.sync_wal_epoch = new_sync_epoch;
             st.buf_wal_epoch = new_buf_epoch;
-        })?;
+        }) {
+            drop(new_reader);
+            let _ = self.fs.remove_file(&format_idx_file_name(new_seq_id));
+            return Err(e);
+        }
 
+        self.memtable.clear();
+        self.idx_segments.push(new_reader);
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
         Ok(())
@@ -1020,22 +1069,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
-        let mut comp_seq_id = 0u64;
-        self.meta_mgr.commit_update(|st| {
-            comp_seq_id = st.allocate_seq_id();
-        })?;
+        let comp_seq_id = self.meta_mgr.state_snapshot().next_seq_id;
 
         // Pass segments ordered newest-first (`rev()`) to `compact_idx_segments`
         let refs_newest_first: Vec<&IdxSegmentReader<FS::File>> =
             self.idx_segments.iter().rev().collect();
-        let outcome = compact_idx_segments(
+        let outcome = match compact_idx_segments(
             &*self.fs,
             &refs_newest_first,
             comp_seq_id,
             1,
             self.config.bloom_bits_per_key,
             true,
-        )?;
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
+                return Err(e);
+            }
+        };
 
         let old_idx_names: Vec<String> = self
             .idx_segments
@@ -1050,16 +1102,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             record_count: outcome.new_segment.record_count(),
         };
 
-        // Drop old segment readers BEFORE committing `boot_meta.db` so `try_process_pending_deletes`
-        // can immediately unlink the superseded `idx_<SeqID>.db` files!
-        self.idx_segments.clear();
-        self.idx_segments.push(outcome.new_segment);
-
         let std_metas = self.build_std_blob_metas();
         let lru_metas = self.build_lru_blob_metas();
         let quota_metas = self.build_quota_metas();
 
-        self.meta_mgr.commit_update(|st| {
+        if let Err(e) = self.meta_mgr.commit_update(|st| {
+            let allocated = st.allocate_seq_id();
+            debug_assert_eq!(allocated, comp_seq_id);
             st.idx_segments = vec![new_meta];
             st.std_blob_segments = std_metas;
             st.lru_blob_segments = lru_metas;
@@ -1067,7 +1116,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             for name in old_idx_names {
                 st.queue_pending_delete(name);
             }
-        })?;
+        }) {
+            drop(outcome);
+            let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
+            return Err(e);
+        }
+
+        // Drop old segment readers and run pending deletes so superseded `idx_<SeqID>.db`
+        // files are unlinked immediately now that `boot_meta.db` is committed!
+        self.idx_segments.clear();
+        self.idx_segments.push(outcome.new_segment);
+        self.meta_mgr.try_process_pending_deletes();
 
         self.reclaim_fully_dead_blob_segments()?;
         Ok(())
@@ -1251,10 +1310,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             b.file_len = old_w.current_len();
                         }
                     }
-                    let mut seq_id = 0u64;
-                    self.meta_mgr.commit_update(|st| {
-                        seq_id = st.allocate_seq_id();
-                    })?;
+                    let seq_id = self.meta_mgr.state_snapshot().next_seq_id;
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
                     self.std_blobs.insert(
                         seq_id,
@@ -1264,6 +1320,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             dead_bytes: 0,
                         },
                     );
+                    let std_metas = self.build_std_blob_metas();
+                    self.meta_mgr.commit_update(|st| {
+                        let allocated = st.allocate_seq_id();
+                        debug_assert_eq!(allocated, seq_id);
+                        st.std_blob_segments = std_metas;
+                    })?;
                     self.active_std_writer = Some(writer);
                 }
                 let writer = self.active_std_writer.as_mut().unwrap();
@@ -1289,10 +1351,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             b.file_len = old_w.current_len();
                         }
                     }
-                    let mut seq_id = 0u64;
-                    self.meta_mgr.commit_update(|st| {
-                        seq_id = st.allocate_seq_id();
-                    })?;
+                    let seq_id = self.meta_mgr.state_snapshot().next_seq_id;
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
                     self.lru_blobs.insert(
@@ -1304,6 +1363,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             dead_bytes: 0,
                         },
                     );
+                    let lru_metas = self.build_lru_blob_metas();
+                    self.meta_mgr.commit_update(|st| {
+                        let allocated = st.allocate_seq_id();
+                        debug_assert_eq!(allocated, seq_id);
+                        st.lru_blob_segments = lru_metas;
+                    })?;
                     self.active_lru_writers.insert(table_id, writer);
                 }
                 let writer = self.active_lru_writers.get_mut(&table_id).unwrap();
@@ -1990,5 +2055,157 @@ mod tests {
             "eviction must advance past 80 tombstones and bring table within quota (got {})",
             st.current_logical_bytes
         );
+    }
+
+    #[test]
+    fn blob_segments_and_coalesced_wal_survive_reopen_before_flush_memtable() {
+        let tmp = TempTestDir::new("blob_and_coalesced_reopen");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+
+        let mut cfg = EngineConfig::default();
+        cfg.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+        cfg.inline_threshold_bytes = 512;
+
+        let large_blob = vec![0x5Au8; 2048];
+        {
+            let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+            engine
+                .put_row(1, b"blob_k1", &large_blob, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            engine
+                .put_row(
+                    1,
+                    b"inline_k2",
+                    b"small_tail_val",
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            // Drop without calling flush_memtable()!
+        }
+
+        let mut reopened = StorageEngine::open(fs, cfg).unwrap();
+        assert_eq!(reopened.get_row(1, b"blob_k1").unwrap(), Some(large_blob));
+        assert_eq!(
+            reopened.get_row(1, b"inline_k2").unwrap(),
+            Some(b"small_tail_val".to_vec())
+        );
+    }
+
+    #[test]
+    fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
+        use crate::pal::PreallocStrategy;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+
+        struct FaultFile<F> {
+            inner: Arc<F>,
+            name: String,
+            fail_boot_meta_sync: Arc<AtomicBool>,
+        }
+
+        impl<F: PlatformFile> PlatformFile for FaultFile<F> {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                if self.name == "boot_meta.db" && self.fail_boot_meta_sync.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "simulated boot_meta write failure",
+                    ));
+                }
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        struct FaultFs {
+            inner: OsFs,
+            fail_boot_meta_sync: Arc<AtomicBool>,
+        }
+
+        impl PlatformFs for FaultFs {
+            type File = FaultFile<<OsFs as PlatformFs>::File>;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+                Ok(Arc::new(FaultFile {
+                    inner,
+                    name: rel_name.to_string(),
+                    fail_boot_meta_sync: Arc::clone(&self.fail_boot_meta_sync),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("flush_fault_retry");
+        let fail_flag = Arc::new(AtomicBool::new(false));
+        let fs = Arc::new(FaultFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            fail_boot_meta_sync: Arc::clone(&fail_flag),
+        });
+
+        let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+        for i in 0..20u32 {
+            let k = format!("k_{i:02}").into_bytes();
+            let v = format!("v_{i:02}").into_bytes();
+            engine
+                .put_row(1, &k, &v, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+
+        // Inject fault on boot_meta.db write during flush_memtable()
+        fail_flag.store(true, Ordering::SeqCst);
+        assert!(engine.flush_memtable().is_err());
+
+        // MemTable entries must remain intact in memory and survive subsequent retry
+        fail_flag.store(false, Ordering::SeqCst);
+        for i in 0..20u32 {
+            let k = format!("k_{i:02}").into_bytes();
+            let expected = format!("v_{i:02}").into_bytes();
+            assert_eq!(engine.get_row(1, &k).unwrap(), Some(expected));
+        }
+
+        engine.flush_memtable().unwrap();
+        drop(engine);
+
+        let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        for i in 0..20u32 {
+            let k = format!("k_{i:02}").into_bytes();
+            let expected = format!("v_{i:02}").into_bytes();
+            assert_eq!(reopened.get_row(1, &k).unwrap(), Some(expected));
+        }
     }
 }

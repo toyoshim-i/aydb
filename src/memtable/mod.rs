@@ -191,10 +191,10 @@ impl MemTable {
         self.map.range::<[u8], _>((lower, upper))
     }
 
-    /// Flushes the sorted contents of this `MemTable` to a new immutable `idx_<seq_id>.db`
-    /// segment on disk and clears the `MemTable`.
-    pub fn flush_to_segment<F: PlatformFile>(
-        &mut self,
+    /// Writes the sorted contents of this `MemTable` to a new immutable `idx_<seq_id>.db`
+    /// segment on disk **without** clearing `self.map` or `self.approximate_bytes`.
+    pub fn write_to_segment<F: PlatformFile>(
+        &self,
         fs: &impl PlatformFs<File = F>,
         seq_id: u64,
         bloom_bits_per_key: usize,
@@ -207,9 +207,25 @@ impl MemTable {
                 value: entry.value.clone(),
             })?;
         }
-        let reader = builder.finish()?;
+        builder.finish()
+    }
+
+    /// Clears all entries from the `MemTable` after its segment has been durably committed to `boot_meta.db`.
+    pub fn clear(&mut self) {
         self.map.clear();
         self.approximate_bytes = 0;
+    }
+
+    /// Flushes the sorted contents of this `MemTable` to a new immutable `idx_<seq_id>.db`
+    /// segment on disk and clears the `MemTable`.
+    pub fn flush_to_segment<F: PlatformFile>(
+        &mut self,
+        fs: &impl PlatformFs<File = F>,
+        seq_id: u64,
+        bloom_bits_per_key: usize,
+    ) -> io::Result<IdxSegmentReader<F>> {
+        let reader = self.write_to_segment(fs, seq_id, bloom_bits_per_key)?;
+        self.clear();
         Ok(reader)
     }
 

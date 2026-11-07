@@ -41,6 +41,10 @@ struct FileState {
     page_cache_bytes: Vec<u8>,
     /// Unsynced writes since the last `sync_durable()`.
     unsynced_writes: Vec<PendingWrite>,
+    /// Snapshot of `page_cache_bytes` right before the most recent `write_all_at`.
+    pre_last_write_bytes: Vec<u8>,
+    /// Most recent `write_all_at` operation (used for 512 B torn-sector simulation on power cut).
+    last_write: Option<PendingWrite>,
 }
 
 impl FileState {
@@ -50,6 +54,8 @@ impl FileState {
             durable_bytes: Vec::new(),
             page_cache_bytes: Vec::new(),
             unsynced_writes: Vec::new(),
+            pre_last_write_bytes: Vec::new(),
+            last_write: None,
         }
     }
 }
@@ -116,15 +122,18 @@ impl PlatformFile for SimFile {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.fs_ctrl.check_fault(&self.name)?;
         let mut st = self.state.lock().unwrap();
+        st.pre_last_write_bytes = st.page_cache_bytes.clone();
         let end = (offset as usize) + buf.len();
         if end > st.page_cache_bytes.len() {
             st.page_cache_bytes.resize(end, 0);
         }
         st.page_cache_bytes[offset as usize..end].copy_from_slice(buf);
-        st.unsynced_writes.push(PendingWrite {
+        let pw = PendingWrite {
             offset,
             data: buf.to_vec(),
-        });
+        };
+        st.unsynced_writes.push(pw.clone());
+        st.last_write = Some(pw);
         Ok(())
     }
 
@@ -206,20 +215,13 @@ impl FaultInjectingFs {
     ///   on the very last write if `inject_torn_tail` is true.
     pub fn simulate_power_loss(&self, honor_write_through_hint: bool, inject_torn_tail: bool) {
         let files = self.ctrl.files.lock().unwrap();
-        for (_name, file_arc) in files.iter() {
+        for (name, file_arc) in files.iter() {
             let mut st = file_arc.lock().unwrap();
             if honor_write_through_hint && st.hint == OpenHint::MutableSyncLog {
-                if inject_torn_tail {
-                    if let Some(last) = st.unsynced_writes.last().cloned() {
+                if inject_torn_tail && name == "wal_sync.db" {
+                    if let Some(last) = st.last_write.clone() {
                         // Roll back the last 4 KB write to only its first 512 bytes (torn sector)
-                        let mut base = st.durable_bytes.clone();
-                        for w in &st.unsynced_writes[..st.unsynced_writes.len() - 1] {
-                            let end = (w.offset as usize) + w.data.len();
-                            if end > base.len() {
-                                base.resize(end, 0);
-                            }
-                            base[w.offset as usize..end].copy_from_slice(&w.data);
-                        }
+                        let mut base = st.pre_last_write_bytes.clone();
                         let torn_len = last.data.len().min(512);
                         let end = (last.offset as usize) + torn_len;
                         if end > base.len() {

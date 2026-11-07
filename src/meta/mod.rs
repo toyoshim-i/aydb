@@ -533,6 +533,11 @@ impl<F: PlatformFs> BootMetaManager<F> {
         &self.state
     }
 
+    /// Returns a shared reference to the current authoritative [`BootMetaState`].
+    pub fn state_snapshot(&self) -> &BootMetaState {
+        &self.state
+    }
+
     /// Returns which ping-pong slot currently holds the latest committed state.
     pub fn active_slot(&self) -> SlotIndex {
         self.active_slot

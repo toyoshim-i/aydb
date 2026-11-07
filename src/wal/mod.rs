@@ -535,6 +535,10 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             self.multi_sector_buf.clear();
         }
 
+        if self.mode == WalStreamMode::SyncSectorIsolated {
+            self.file.sync_barrier()?;
+        }
+
         Ok(WalAppendOutcome::Appended {
             first_sector_idx,
             sectors_touched,
@@ -609,6 +613,12 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             self.sector_buf.fill(0);
         }
         Ok(())
+    }
+}
+
+impl<F: PlatformFile> Drop for WalStreamWriter<F> {
+    fn drop(&mut self) {
+        let _ = self.flush_buffered_to_os();
     }
 }
 
@@ -825,17 +835,21 @@ where
     merged.extend_from_slice(&sync_iter[i..]);
     merged.extend_from_slice(&buf_iter[j..]);
 
-    // Filter out any `PutBlobPtr` whose target blob payload did not reach disk before power loss.
+    // Reject any `WalBatch` atomically if any `PutBlobPtr` record in the batch references a blob
+    // payload that did not reach disk before power loss.
     let mut max_lsn = checkpoint_lsn;
     let mut validated_batches = Vec::with_capacity(merged.len());
-    for mut batch in merged {
+    for batch in merged {
         if batch.lsn > max_lsn {
             max_lsn = batch.lsn;
         }
-        batch.records.retain(|rec| match rec {
+        let all_blobs_valid = batch.records.iter().all(|rec| match rec {
             WalRecord::PutBlobPtr { blob_ptr, .. } => validate_blob(blob_ptr),
             _ => true,
         });
+        if !all_blobs_valid {
+            continue;
+        }
         if !batch.records.is_empty() {
             validated_batches.push(batch);
         }
@@ -1157,5 +1171,128 @@ mod tests {
         let recovered_lsns: Vec<u64> = res.merged_batches.iter().map(|b| b.lsn).collect();
         assert_eq!(recovered_lsns, vec![11, 12, 14]);
         assert_eq!(res.max_recovered_lsn, 14);
+    }
+
+    #[test]
+    fn buffered_user_space_coalesced_flushes_tail_sector_on_drop() {
+        let tmp = TempTestDir::new("coalesced_drop");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let wal_size = 64 * 1024u64;
+        let mut writer = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::BufferedUserSpaceCoalesced,
+        )
+        .expect("open wal_buf coalesced");
+
+        let batch = WalBatch::new(
+            1,
+            vec![WalRecord::PutInline {
+                key: b"tail_key".to_vec(),
+                value: b"tail_value_under_4kb".to_vec(),
+            }],
+        );
+        writer.append_batch(&batch).unwrap();
+        // Drop without calling flush_buffered_to_os() explicitly
+        drop(writer);
+
+        let f = fs
+            .open_file(
+                WAL_BUF_FILE_NAME,
+                false,
+                false,
+                OpenHint::MutableBufferedLog,
+            )
+            .unwrap();
+        let rec = recover_single_wal_stream(&*f, 1).expect("recover tail sector after drop");
+        assert_eq!(rec.batches.len(), 1);
+        assert_eq!(rec.batches[0], batch);
+    }
+
+    #[test]
+    fn atomic_wal_batch_rejection_when_any_blob_ptr_is_invalid() {
+        let tmp = TempTestDir::new("atomic_batch_reject");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let wal_size = 64 * 1024u64;
+        let sync_w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        let mut buf_w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+
+        // Batch 1 (LSN 1): valid batch
+        buf_w
+            .append_batch(&WalBatch::new(
+                1,
+                vec![WalRecord::PutInline {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
+            ))
+            .unwrap();
+
+        // Batch 2 (LSN 2): multi-record batch where a Delete and PutInline accompany an unverified PutBlobPtr
+        buf_w
+            .append_batch(&WalBatch::new(
+                2,
+                vec![
+                    WalRecord::Delete {
+                        key: b"k1".to_vec(),
+                    },
+                    WalRecord::PutBlobPtr {
+                        key: b"k2_blob".to_vec(),
+                        blob_ptr: BlobPtr {
+                            kind: BlobKind::Standard,
+                            table_id: 1,
+                            seg_id: 42,
+                            offset: 0,
+                            len: 2048,
+                            crc32c: 0xABCD_EF01,
+                        },
+                    },
+                    WalRecord::PutInline {
+                        key: b"sec_idx_for_k2".to_vec(),
+                        value: Vec::new(),
+                    },
+                ],
+            ))
+            .unwrap();
+
+        drop(sync_w);
+        drop(buf_w);
+
+        let sync_f = fs
+            .open_file(WAL_SYNC_FILE_NAME, false, false, OpenHint::MutableSyncLog)
+            .unwrap();
+        let buf_f = fs
+            .open_file(
+                WAL_BUF_FILE_NAME,
+                false,
+                false,
+                OpenHint::MutableBufferedLog,
+            )
+            .unwrap();
+
+        let res = recover_two_streams(&*sync_f, 1, &*buf_f, 1, 0, |_ptr| false)
+            .expect("recover two streams");
+
+        // Entire Batch 2 must be discarded so companion Delete("k1") and PutInline("sec_idx_for_k2") are not applied
+        assert_eq!(res.merged_batches.len(), 1);
+        assert_eq!(res.merged_batches[0].lsn, 1);
     }
 }
