@@ -3,7 +3,7 @@
 
 use std::io::{self, ErrorKind};
 
-use crate::lru::encode_i64_memcomparable;
+use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::vtab::ffi::{
     SQLITE_BLOB, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
     sqlite3_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_int64,
@@ -11,6 +11,14 @@ use crate::vtab::ffi::{
     sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
     sqlite3_value_type,
 };
+
+/// 1-byte key storage-class type tags ordered according to SQLite's comparison rules:
+/// `NULL < INTEGER/REAL < TEXT < BLOB` (`AUD-05`).
+pub const KEY_TAG_NULL: u8 = 0x05;
+pub const KEY_TAG_INTEGER: u8 = 0x10;
+pub const KEY_TAG_FLOAT: u8 = 0x18;
+pub const KEY_TAG_TEXT: u8 = 0x20;
+pub const KEY_TAG_BLOB: u8 = 0x30;
 
 /// Encodes an IEEE-754 `f64` into an 8-byte order-preserving big-endian representation:
 /// - Normalizes `-0.0` to `+0.0`.
@@ -118,21 +126,89 @@ impl SqlValue {
         }
     }
 
-    /// Encodes this value into a standalone memcomparable primary/secondary key component:
-    /// - `Null` -> empty byte vector (`Vec::new()`).
-    /// - `Integer(i)` -> 8-byte sign-flipped big-endian (`encode_i64_memcomparable(i)`).
-    /// - `Float(f)` -> 8-byte IEEE-754 order-preserving big-endian (`encode_f64_memcomparable(f)`).
-    /// - `Text(s)` -> raw UTF-8 bytes (so string primary keys have zero tag overhead and preserve
-    ///   exact lexicographical order).
-    /// - `Blob(b)` -> raw bytes.
+    /// Encodes this value into a standalone type-tagged memcomparable primary/secondary key component
+    /// ordered according to SQLite's storage-class comparison rules (`NULL < INTEGER/REAL < TEXT < BLOB`):
+    /// - `Null` -> `[0x05]` (1 byte).
+    /// - `Integer(i)` -> `[0x10, encode_i64_memcomparable(i)..]` (9 bytes).
+    /// - `Float(f)` -> `[0x18, encode_f64_memcomparable(f)..]` (9 bytes).
+    /// - `Text(s)` -> `[0x20, s.as_bytes()..]`.
+    /// - `Blob(b)` -> `[0x30, b..]`.
     pub fn to_key_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Null => Vec::new(),
-            Self::Integer(v) => encode_i64_memcomparable(*v).to_vec(),
-            Self::Float(v) => encode_f64_memcomparable(*v).to_vec(),
-            Self::Text(s) => s.as_bytes().to_vec(),
-            Self::Blob(b) => b.clone(),
+            Self::Null => vec![KEY_TAG_NULL],
+            Self::Integer(v) => {
+                let mut out = Vec::with_capacity(9);
+                out.push(KEY_TAG_INTEGER);
+                out.extend_from_slice(&encode_i64_memcomparable(*v));
+                out
+            }
+            Self::Float(v) => {
+                let mut out = Vec::with_capacity(9);
+                out.push(KEY_TAG_FLOAT);
+                out.extend_from_slice(&encode_f64_memcomparable(*v));
+                out
+            }
+            Self::Text(s) => {
+                let bytes = s.as_bytes();
+                let mut out = Vec::with_capacity(1 + bytes.len());
+                out.push(KEY_TAG_TEXT);
+                out.extend_from_slice(bytes);
+                out
+            }
+            Self::Blob(b) => {
+                let mut out = Vec::with_capacity(1 + b.len());
+                out.push(KEY_TAG_BLOB);
+                out.extend_from_slice(b);
+                out
+            }
         }
+    }
+
+    /// Decodes a type-tagged key slice back into its exact [`SqlValue`].
+    pub fn from_key_bytes(key: &[u8]) -> Option<Self> {
+        let (&tag, payload) = key.split_first()?;
+        match tag {
+            KEY_TAG_NULL if payload.is_empty() => Some(Self::Null),
+            KEY_TAG_INTEGER if payload.len() == 8 => {
+                let arr: [u8; 8] = payload.try_into().ok()?;
+                Some(Self::Integer(decode_i64_memcomparable(arr)))
+            }
+            KEY_TAG_FLOAT if payload.len() == 8 => {
+                let arr: [u8; 8] = payload.try_into().ok()?;
+                Some(Self::Float(decode_f64_memcomparable(arr)))
+            }
+            KEY_TAG_TEXT => Some(Self::Text(String::from_utf8_lossy(payload).into_owned())),
+            KEY_TAG_BLOB => Some(Self::Blob(payload.to_vec())),
+            _ => None,
+        }
+    }
+}
+
+/// Encodes a signed `i64` into a 9-byte type-tagged memcomparable key (`[KEY_TAG_INTEGER, be_bytes]`).
+#[inline]
+pub fn encode_i64_tagged_key(val: i64) -> [u8; 9] {
+    let be = encode_i64_memcomparable(val);
+    [
+        KEY_TAG_INTEGER,
+        be[0],
+        be[1],
+        be[2],
+        be[3],
+        be[4],
+        be[5],
+        be[6],
+        be[7],
+    ]
+}
+
+/// Decodes a 9-byte type-tagged integer key back into `Some(i64)`.
+#[inline]
+pub fn decode_i64_tagged_key(key: &[u8]) -> Option<i64> {
+    if key.len() == 9 && key[0] == KEY_TAG_INTEGER {
+        let arr: [u8; 8] = key[1..9].try_into().ok()?;
+        Some(decode_i64_memcomparable(arr))
+    } else {
+        None
     }
 }
 
@@ -199,6 +275,8 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
 /// Encodes a slice of raw `sqlite3_value*` pointers (`argv[2 .. 2 + col_count]`) directly into
 /// a compact binary row byte vector without allocating intermediate `SqlValue` structs!
 /// Also extracts the primary key bytes (`pk_col_idx`) and any secondary index `(index_id, col_key_bytes)`.
+/// If `pk_override` is `Some(auto_id)` (for `INTEGER PRIMARY KEY` when `SQLITE_NULL` is inserted),
+/// serializes `auto_id` as an `SQLITE_INTEGER` in the `pk_col_idx` slot (`USE-05`).
 ///
 /// # Safety
 /// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
@@ -206,6 +284,7 @@ pub unsafe fn encode_sqlite_values_direct(
     values: *mut *mut sqlite3_value,
     col_count: usize,
     pk_col_idx: usize,
+    pk_override: Option<i64>,
     secondary_indexes: &[(usize, u16)],
 ) -> (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>) {
     unsafe {
@@ -214,6 +293,10 @@ pub unsafe fn encode_sqlite_values_direct(
 
         let mut total_payload = 0usize;
         for i in 0..col_count {
+            if i == pk_col_idx && pk_override.is_some() {
+                total_payload += 8;
+                continue;
+            }
             let vptr = *values.add(i);
             total_payload += match sqlite3_value_type(vptr) {
                 SQLITE_NULL => 0,
@@ -228,11 +311,20 @@ pub unsafe fn encode_sqlite_values_direct(
 
         let mut write_pos = payload_start;
         for i in 0..col_count {
-            let vptr = *values.add(i);
             let dir_pos = dir_start + i * 5;
             let offset_u32 = write_pos as u32;
             buf[dir_pos + 1..dir_pos + 5].copy_from_slice(&offset_u32.to_le_bytes());
 
+            if i == pk_col_idx {
+                if let Some(auto_id) = pk_override {
+                    buf[dir_pos] = 1;
+                    buf[write_pos..write_pos + 8].copy_from_slice(&auto_id.to_le_bytes());
+                    write_pos += 8;
+                    continue;
+                }
+            }
+
+            let vptr = *values.add(i);
             match sqlite3_value_type(vptr) {
                 SQLITE_NULL => {
                     buf[dir_pos] = 0;
@@ -274,11 +366,24 @@ pub unsafe fn encode_sqlite_values_direct(
             }
         }
 
-        let pk_bytes = sqlite_value_to_key_bytes(*values.add(pk_col_idx));
+        let pk_bytes = if let Some(auto_id) = pk_override {
+            encode_i64_tagged_key(auto_id).to_vec()
+        } else {
+            sqlite_value_to_key_bytes(*values.add(pk_col_idx))
+        };
         let mut sec_keys = Vec::with_capacity(secondary_indexes.len());
         for &(col_idx, index_id) in secondary_indexes {
             if col_idx < col_count {
-                sec_keys.push((index_id, sqlite_value_to_key_bytes(*values.add(col_idx))));
+                let sec_val = if col_idx == pk_col_idx {
+                    if let Some(auto_id) = pk_override {
+                        encode_i64_tagged_key(auto_id).to_vec()
+                    } else {
+                        sqlite_value_to_key_bytes(*values.add(col_idx))
+                    }
+                } else {
+                    sqlite_value_to_key_bytes(*values.add(col_idx))
+                };
+                sec_keys.push((index_id, sec_val));
             }
         }
 
@@ -286,8 +391,8 @@ pub unsafe fn encode_sqlite_values_direct(
     }
 }
 
-/// Converts a raw `*mut sqlite3_value` directly into memcomparable key bytes without intermediate
-/// string/vec allocations.
+/// Converts a raw `*mut sqlite3_value` directly into type-tagged memcomparable key bytes
+/// ordered according to SQLite's storage-class comparison rules (`NULL < INTEGER/REAL < TEXT < BLOB`).
 ///
 /// # Safety
 /// `vptr` must be a valid non-null `*mut sqlite3_value`.
@@ -295,26 +400,33 @@ pub unsafe fn encode_sqlite_values_direct(
 pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
     unsafe {
         match sqlite3_value_type(vptr) {
-            SQLITE_NULL => Vec::new(),
-            SQLITE_INTEGER => encode_i64_memcomparable(sqlite3_value_int64(vptr)).to_vec(),
-            SQLITE_FLOAT => encode_f64_memcomparable(sqlite3_value_double(vptr)).to_vec(),
+            SQLITE_NULL => vec![KEY_TAG_NULL],
+            SQLITE_INTEGER => encode_i64_tagged_key(sqlite3_value_int64(vptr)).to_vec(),
+            SQLITE_FLOAT => {
+                let mut out = Vec::with_capacity(9);
+                out.push(KEY_TAG_FLOAT);
+                out.extend_from_slice(&encode_f64_memcomparable(sqlite3_value_double(vptr)));
+                out
+            }
             SQLITE_TEXT => {
                 let len = sqlite3_value_bytes(vptr).max(0) as usize;
                 let ptr = sqlite3_value_text(vptr);
-                if ptr.is_null() || len == 0 {
-                    Vec::new()
-                } else {
-                    core::slice::from_raw_parts(ptr, len).to_vec()
+                let mut out = Vec::with_capacity(1 + len);
+                out.push(KEY_TAG_TEXT);
+                if !ptr.is_null() && len > 0 {
+                    out.extend_from_slice(core::slice::from_raw_parts(ptr, len));
                 }
+                out
             }
             SQLITE_BLOB | _ => {
                 let len = sqlite3_value_bytes(vptr).max(0) as usize;
                 let ptr = sqlite3_value_blob(vptr) as *const u8;
-                if ptr.is_null() || len == 0 {
-                    Vec::new()
-                } else {
-                    core::slice::from_raw_parts(ptr, len).to_vec()
+                let mut out = Vec::with_capacity(1 + len);
+                out.push(KEY_TAG_BLOB);
+                if !ptr.is_null() && len > 0 {
+                    out.extend_from_slice(core::slice::from_raw_parts(ptr, len));
                 }
+                out
             }
         }
     }
@@ -406,52 +518,72 @@ pub unsafe fn project_column_zero_copy(
     }
 }
 
-/// Extracts the memcomparable key bytes for column `col_idx` directly from `row_bytes`
+/// Extracts the type-tagged memcomparable key bytes for column `col_idx` directly from `row_bytes`
 /// without decoding other columns (used when cleaning up old secondary indexes on overwrite/delete).
 pub fn extract_column_key_bytes(row_bytes: &[u8], col_idx: usize) -> io::Result<Vec<u8>> {
     if row_bytes.len() < 4 {
-        return Ok(Vec::new());
+        return Ok(vec![KEY_TAG_NULL]);
     }
     let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
     if col_idx >= col_count {
-        return Ok(Vec::new());
+        return Ok(vec![KEY_TAG_NULL]);
     }
     let dir_pos = 4 + col_idx * 5;
     if dir_pos + 5 > row_bytes.len() {
-        return Ok(Vec::new());
+        return Ok(vec![KEY_TAG_NULL]);
     }
     let type_tag = row_bytes[dir_pos];
     let offset =
         u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
 
     match type_tag {
-        0 => Ok(Vec::new()),
+        0 => Ok(vec![KEY_TAG_NULL]),
         1 => {
             if offset + 8 > row_bytes.len() {
-                return Ok(Vec::new());
+                return Ok(vec![KEY_TAG_NULL]);
             }
             let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-            Ok(encode_i64_memcomparable(v).to_vec())
+            Ok(encode_i64_tagged_key(v).to_vec())
         }
         2 => {
             if offset + 8 > row_bytes.len() {
-                return Ok(Vec::new());
+                return Ok(vec![KEY_TAG_NULL]);
             }
             let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-            Ok(encode_f64_memcomparable(v).to_vec())
+            let mut out = Vec::with_capacity(9);
+            out.push(KEY_TAG_FLOAT);
+            out.extend_from_slice(&encode_f64_memcomparable(v));
+            Ok(out)
         }
-        3 | 4 => {
+        3 => {
             if offset + 4 > row_bytes.len() {
-                return Ok(Vec::new());
+                return Ok(vec![KEY_TAG_NULL]);
             }
             let len =
                 u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
             if offset + 4 + len > row_bytes.len() {
-                return Ok(Vec::new());
+                return Ok(vec![KEY_TAG_NULL]);
             }
-            Ok(row_bytes[offset + 4..offset + 4 + len].to_vec())
+            let mut out = Vec::with_capacity(1 + len);
+            out.push(KEY_TAG_TEXT);
+            out.extend_from_slice(&row_bytes[offset + 4..offset + 4 + len]);
+            Ok(out)
         }
-        _ => Ok(Vec::new()),
+        4 => {
+            if offset + 4 > row_bytes.len() {
+                return Ok(vec![KEY_TAG_NULL]);
+            }
+            let len =
+                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            if offset + 4 + len > row_bytes.len() {
+                return Ok(vec![KEY_TAG_NULL]);
+            }
+            let mut out = Vec::with_capacity(1 + len);
+            out.push(KEY_TAG_BLOB);
+            out.extend_from_slice(&row_bytes[offset + 4..offset + 4 + len]);
+            Ok(out)
+        }
+        _ => Ok(vec![KEY_TAG_NULL]),
     }
 }
 
@@ -579,11 +711,11 @@ mod tests {
         let row = encode_row(&[SqlValue::Float(-2.5), SqlValue::Float(2.5)]);
         assert_eq!(
             extract_column_key_bytes(&row, 0).unwrap(),
-            encode_f64_memcomparable(-2.5).to_vec()
+            SqlValue::Float(-2.5).to_key_bytes()
         );
         assert_eq!(
             extract_column_key_bytes(&row, 1).unwrap(),
-            encode_f64_memcomparable(2.5).to_vec()
+            SqlValue::Float(2.5).to_key_bytes()
         );
         assert!(
             SqlValue::Float(-2.5).to_key_bytes() < SqlValue::Float(-1.0).to_key_bytes()
@@ -591,5 +723,27 @@ mod tests {
         assert!(
             SqlValue::Float(-1.0).to_key_bytes() < SqlValue::Float(0.0).to_key_bytes()
         );
+
+        // Verify cross-type key ordering: NULL < INTEGER < FLOAT < TEXT < BLOB
+        let ordered_values = [
+            SqlValue::Null,
+            SqlValue::Integer(-100),
+            SqlValue::Integer(0),
+            SqlValue::Integer(100),
+            SqlValue::Float(-100.0),
+            SqlValue::Float(0.0),
+            SqlValue::Float(100.0),
+            SqlValue::Text(String::new()),
+            SqlValue::Text("abc".to_string()),
+            SqlValue::Blob(Vec::new()),
+            SqlValue::Blob(b"abc".to_vec()),
+        ];
+        for pair in ordered_values.windows(2) {
+            let ka = pair[0].to_key_bytes();
+            let kb = pair[1].to_key_bytes();
+            assert!(ka < kb, "{:?} must sort before {:?}", pair[0], pair[1]);
+            assert_eq!(SqlValue::from_key_bytes(&ka).as_ref(), Some(&pair[0]));
+            assert_eq!(SqlValue::from_key_bytes(&kb).as_ref(), Some(&pair[1]));
+        }
     }
 }

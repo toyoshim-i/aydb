@@ -17,10 +17,10 @@ use crate::index::{
     MAX_SINGLE_BLOCK_ENTRY_BYTES, compact_idx_segments,
 };
 use crate::lru::{
-    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, RowMetaRecord,
-    decode_lru_queue_key, decode_primary_row_key, encode_lru_queue_key, encode_namespace_prefix,
-    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_exact_prefix,
-    encode_secondary_index_key,
+    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META,
+    NS_SECONDARY_INDEX, RowMetaRecord, decode_lru_queue_key, decode_primary_row_key,
+    encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key, encode_row_meta_key,
+    encode_secondary_index_exact_prefix, encode_secondary_index_key,
 };
 use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
 use crate::meta::{
@@ -106,6 +106,15 @@ struct TrackedLruBlob<F: PlatformFile> {
     dead_bytes: u64,
 }
 
+#[derive(Clone)]
+struct SavepointMarker {
+    sp_id: i32,
+    buf_offset: usize,
+    record_count: u32,
+    pending_tx_sync: bool,
+    implicit_tx: bool,
+}
+
 /// Unified Phase 1 Storage Engine.
 pub struct StorageEngine<FS: PlatformFs> {
     fs: Arc<FS>,
@@ -136,6 +145,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pending_tx_sync: bool,
     tx_start_std_lengths: BTreeMap<u64, u64>,
     tx_start_lru_lengths: BTreeMap<(u16, u64), u64>,
+    savepoints: Vec<SavepointMarker>,
+    /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing (`AUD-03`).
+    active_vtab_ids: HashMap<u16, String>,
     /// Highest LSN appended to `buf_wal` (`AUD-08`).
     last_buf_append_lsn: u64,
     /// Highest LSN in `buf_wal` synced to durable storage (`AUD-08`).
@@ -367,6 +379,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_tx_sync: false,
             tx_start_std_lengths: BTreeMap::new(),
             tx_start_lru_lengths: BTreeMap::new(),
+            savepoints: Vec::new(),
+            active_vtab_ids: HashMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
         };
@@ -429,6 +443,171 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .keys()
             .filter(|&&(tid, _)| tid == table_id)
             .count()
+    }
+
+    /// Checks whether a row with primary key `pk` currently exists in `table_id`.
+    pub fn row_exists(&self, table_id: u16, pk: &[u8]) -> io::Result<bool> {
+        let row_key = encode_primary_row_key(table_id, pk);
+        Ok(self.check_existing_row(&row_key)? != ExistingRowStatus::NotFound)
+    }
+
+    ///Registers or resolves a virtual table `(table_name, explicit_table_id)` in the engine's
+    /// active registry and persistent catalog (`table_id = 0` under `'c'`) (`AUD-03`).
+    pub fn register_or_resolve_vtab(
+        &mut self,
+        table_name: &str,
+        explicit_id: Option<u16>,
+    ) -> io::Result<u16> {
+        let norm_name = table_name.trim().to_ascii_lowercase();
+        let catalog_prefix = [0u8, 0u8, b'c'];
+        let entries = self.scan_merged_prefix(&catalog_prefix)?;
+        let mut persisted_name_to_id: HashMap<String, u16> = HashMap::new();
+        let mut persisted_id_to_name: HashMap<u16, String> = HashMap::new();
+        for entry in entries {
+            if entry.key.len() > 3 {
+                if let IndexValue::Inline(val) = entry.value {
+                    if val.len() == 2 {
+                        let name = String::from_utf8_lossy(&entry.key[3..]).into_owned();
+                        let id = u16::from_be_bytes([val[0], val[1]]);
+                        persisted_name_to_id.insert(name.clone(), id);
+                        persisted_id_to_name.insert(id, name);
+                    }
+                }
+            }
+        }
+
+        let chosen_id = match explicit_id {
+            Some(id) => {
+                if id == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "table_id 0 is reserved for engine system catalog",
+                    ));
+                }
+                if let Some(existing_name) = self.active_vtab_ids.get(&id) {
+                    if existing_name != &norm_name {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "table_id {id} is already registered to live virtual table '{existing_name}'"
+                            ),
+                        ));
+                    }
+                }
+                id
+            }
+            None => {
+                if let Some(&id) = persisted_name_to_id.get(&norm_name) {
+                    if let Some(existing_name) = self.active_vtab_ids.get(&id) {
+                        if existing_name != &norm_name {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "table_id {id} is already registered to live virtual table '{existing_name}'"
+                                ),
+                            ));
+                        }
+                    }
+                    id
+                } else {
+                    let mut candidate = 1u16;
+                    while candidate < u16::MAX
+                        && (self.active_vtab_ids.contains_key(&candidate)
+                            || persisted_id_to_name.contains_key(&candidate))
+                    {
+                        candidate += 1;
+                    }
+                    candidate
+                }
+            }
+        };
+
+        self.active_vtab_ids.insert(chosen_id, norm_name.clone());
+        if persisted_name_to_id.get(&norm_name).copied() != Some(chosen_id) {
+            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
+            cat_key.extend_from_slice(&catalog_prefix);
+            cat_key.extend_from_slice(norm_name.as_bytes());
+            self.commit_wal_and_memtable(
+                vec![WalRecord::PutInline {
+                    key: cat_key,
+                    value: chosen_id.to_be_bytes().to_vec(),
+                }],
+                WriteDurability::BufferedFast,
+            )?;
+        }
+        Ok(chosen_id)
+    }
+
+    /// Unregisters a disconnected virtual table `(table_id, table_name)` from the live registry.
+    pub fn unregister_vtab(&mut self, table_id: u16, table_name: &str) {
+        let norm_name = table_name.trim().to_ascii_lowercase();
+        if self.active_vtab_ids.get(&table_id).map(|s| s.as_str()) == Some(norm_name.as_str()) {
+            self.active_vtab_ids.remove(&table_id);
+        }
+    }
+
+    /// Drops a table (`xDestroy` / `DROP TABLE`), deleting all primary rows (`'r'`), secondary
+    /// index entries (`'i'`), row metadata (`'t'`), LRU queue entries (`'l'`), capped table
+    /// quota registrations, and system catalog entries (`USE-02`).
+    pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
+        let mut records = Vec::new();
+        let mut dead_ptrs = Vec::new();
+
+        for ns in [NS_PRIMARY_ROW, NS_SECONDARY_INDEX, NS_ROW_META, NS_LRU_QUEUE] {
+            let prefix = encode_namespace_prefix(table_id, ns);
+            let entries = self.scan_merged_prefix(&prefix)?;
+            for entry in entries {
+                if let IndexValue::Blob(ptr) = entry.value {
+                    dead_ptrs.push(ptr);
+                }
+                records.push(WalRecord::Delete { key: entry.key });
+            }
+        }
+
+        let removed_name = self.active_vtab_ids.remove(&table_id);
+        let name_to_clean = table_name
+            .map(|s| s.trim().to_ascii_lowercase())
+            .or(removed_name);
+        if let Some(norm_name) = name_to_clean {
+            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
+            cat_key.extend_from_slice(&[0u8, 0u8, b'c']);
+            cat_key.extend_from_slice(norm_name.as_bytes());
+            if self.check_existing_row(&cat_key)? != ExistingRowStatus::NotFound {
+                records.push(WalRecord::Delete { key: cat_key });
+            }
+        }
+
+        if !records.is_empty() {
+            self.commit_wal_and_memtable(records, WriteDurability::BufferedFast)?;
+        }
+        for ptr in dead_ptrs {
+            self.record_dead_blob_bytes(&ptr);
+        }
+
+        let was_capped = self.capped_tables.remove(&table_id).is_some();
+        if let Some(old_w) = self.active_lru_writers.remove(&table_id) {
+            let _ = old_w.sync_durable();
+            if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
+                b.file_len = old_w.current_len();
+                b.dead_bytes = b.file_len;
+            }
+        }
+        for (&(tid, _), b) in &mut self.lru_blobs {
+            if tid == table_id {
+                b.dead_bytes = b.file_len;
+            }
+        }
+
+        if self.tx_depth == 0 {
+            self.reclaim_fully_dead_lru_blob_segments(table_id)?;
+            if was_capped {
+                let quota_metas = self.build_quota_metas();
+                self.meta_mgr.commit_update(|st| {
+                    st.table_quotas = quota_metas;
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Inserts or overwrites a row (`pk` -> `value`) in `table_id`, along with any secondary index
@@ -735,7 +914,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         pk: &[u8],
         slab: &mut Vec<u8>,
-        spans: &mut Vec<(u32, u32)>,
+        spans: &mut Vec<(usize, usize)>,
     ) -> io::Result<bool> {
         let mut stack_buf = [0u8; 64];
         let heap_buf;
@@ -755,17 +934,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(mem_entry) = self.memtable.get(row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
-                    let start = slab.len() as u32;
+                    let start = slab.len();
                     slab.extend_from_slice(bytes);
-                    spans.push((start, slab.len() as u32));
+                    spans.push((start, slab.len()));
                     hit = true;
                 }
                 IndexValue::Blob(ptr) => {
                     let ptr_copy = *ptr;
                     if let Some(bytes) = self.dereference_blob(&ptr_copy, row_key)? {
-                        let start = slab.len() as u32;
+                        let start = slab.len();
                         slab.extend_from_slice(&bytes);
-                        spans.push((start, slab.len() as u32));
+                        spans.push((start, slab.len()));
                         hit = true;
                     }
                 }
@@ -776,16 +955,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if let Some((_lsn, val)) = seg.get(row_key)? {
                     match val {
                         IndexValue::Inline(bytes) => {
-                            let start = slab.len() as u32;
+                            let start = slab.len();
                             slab.extend_from_slice(&bytes);
-                            spans.push((start, slab.len() as u32));
+                            spans.push((start, slab.len()));
                             hit = true;
                         }
                         IndexValue::Blob(ptr) => {
                             if let Some(bytes) = self.dereference_blob(&ptr, row_key)? {
-                                let start = slab.len() as u32;
+                                let start = slab.len();
                                 slab.extend_from_slice(&bytes);
-                                spans.push((start, slab.len() as u32));
+                                spans.push((start, slab.len()));
                                 hit = true;
                             }
                         }
@@ -819,7 +998,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_bound: Option<(&[u8], bool)>,
         limit: usize,
         slab: &mut Vec<u8>,
-        spans: &mut Vec<(u32, u32)>,
+        spans: &mut Vec<(usize, usize)>,
     ) -> io::Result<()> {
         use std::ops::Bound;
         if limit == 0 {
@@ -879,18 +1058,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 match &entry.value {
                     IndexValue::Inline(v) => {
-                        let start = slab.len() as u32;
+                        let start = slab.len();
                         slab.extend_from_slice(v);
-                        spans.push((start, slab.len() as u32));
+                        spans.push((start, slab.len()));
                         if spans.len() >= limit {
                             break;
                         }
                     }
                     IndexValue::Blob(ptr) => {
                         if let Some(v) = self.dereference_blob(ptr, k)? {
-                            let start = slab.len() as u32;
+                            let start = slab.len();
                             slab.extend_from_slice(&v);
-                            spans.push((start, slab.len() as u32));
+                            spans.push((start, slab.len()));
                             if spans.len() >= limit {
                                 break;
                             }
@@ -904,9 +1083,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let pairs = self.scan_table_range(table_id, lower_bound, upper_bound, limit)?;
         for (_, v) in pairs {
-            let start = slab.len() as u32;
+            let start = slab.len();
             slab.extend_from_slice(&v);
-            spans.push((start, slab.len() as u32));
+            spans.push((start, slab.len()));
         }
         Ok(())
     }
@@ -1062,6 +1241,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_depth -= 1;
         }
         if self.tx_depth == 0 {
+            self.savepoints.clear();
             let durability = if self.pending_tx_sync {
                 WriteDurability::SyncTransactional
             } else {
@@ -1090,15 +1270,76 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// since `checkpoint_lsn`.
     pub fn rollback_transaction(&mut self) -> io::Result<()> {
         self.tx_depth = 0;
+        self.savepoints.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_buf.clear();
         self.pending_tx_sync = false;
+        self.rebuild_memtable_from_wal_and_pending()?;
+        self.tx_start_std_lengths.clear();
+        self.tx_start_lru_lengths.clear();
+        Ok(())
+    }
 
+    /// Opens or updates a transaction savepoint (`xSavepoint`) (`USE-01`).
+    pub fn savepoint(&mut self, sp_id: i32) {
+        let mut implicit_tx = false;
+        if self.tx_depth == 0 {
+            self.begin_transaction();
+            implicit_tx = true;
+        }
+        if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
+            implicit_tx = self.savepoints[pos].implicit_tx;
+            self.savepoints.truncate(pos);
+        }
+        let buf_offset = if self.pending_tx_record_count == 0 {
+            0
+        } else {
+            self.pending_tx_buf.len()
+        };
+        self.savepoints.push(SavepointMarker {
+            sp_id,
+            buf_offset,
+            record_count: self.pending_tx_record_count,
+            pending_tx_sync: self.pending_tx_sync,
+            implicit_tx,
+        });
+    }
+
+    /// Releases savepoints `>= sp_id` (`xRelease`) (`USE-01`).
+    pub fn release_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
+        if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
+            let implicit_tx = self.savepoints[pos].implicit_tx;
+            self.savepoints.truncate(pos);
+            if implicit_tx && self.tx_depth == 1 {
+                self.commit_transaction()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rolls back all mutations since savepoint `sp_id` (`xRollbackTo`) (`USE-01`).
+    pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
+        let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
+            return Ok(());
+        };
+        let marker = self.savepoints[pos].clone();
+        self.savepoints.truncate(pos + 1);
+        if marker.record_count == 0 {
+            self.pending_tx_buf.clear();
+        } else {
+            self.pending_tx_buf.truncate(marker.buf_offset);
+        }
+        self.pending_tx_record_count = marker.record_count;
+        self.pending_tx_sync = marker.pending_tx_sync;
+        self.rebuild_memtable_from_wal_and_pending()
+    }
+
+    fn rebuild_memtable_from_wal_and_pending(&mut self) -> io::Result<()> {
         self.buf_wal.flush_buffered_to_os()?;
         let st = self.meta_mgr.state().clone();
 
         // Reset `dead_bytes` to the checkpoint state in `boot_meta.db`, plus any aborted bytes
-        // appended to blob segments during this rolled-back transaction!
+        // appended to blob segments during this transaction!
         let mut checkpoint_std_dead: HashMap<u64, u64> = HashMap::new();
         for bmeta in &st.std_blob_segments {
             checkpoint_std_dead.insert(bmeta.seq_id, bmeta.dead_bytes);
@@ -1132,8 +1373,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 aborted_lru_map.insert((tid, seq), aborted_bytes);
             }
         }
-        self.tx_start_std_lengths.clear();
-        self.tx_start_lru_lengths.clear();
 
         let std_blobs = &self.std_blobs;
         let lru_blobs = &self.lru_blobs;
@@ -1186,6 +1425,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
             new_mem.apply_wal_batch(batch);
+        }
+
+        if self.pending_tx_record_count > 0 && self.pending_tx_buf.len() > 16 {
+            let pending_lsn = rec.max_recovered_lsn + 1;
+            WalBatch::finalize_encoded_buf(
+                pending_lsn,
+                self.pending_tx_record_count,
+                &mut self.pending_tx_buf,
+            );
+            let pending_batch = WalBatch::decode(&self.pending_tx_buf)?;
+            new_mem.apply_wal_batch(&pending_batch);
         }
 
         for (seq, aborted) in aborted_std_map {

@@ -33,11 +33,20 @@ pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
 pub const SQLITE_NOMEM: c_int = 7;
 pub const SQLITE_READONLY: c_int = 8;
+pub const SQLITE_IOERR: c_int = 10;
+pub const SQLITE_CORRUPT: c_int = 11;
 pub const SQLITE_CONSTRAINT: c_int = 19;
 pub const SQLITE_MISMATCH: c_int = 20;
 pub const SQLITE_MISUSE: c_int = 21;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
+
+// SQLite conflict resolution modes returned by `sqlite3_vtab_on_conflict`
+pub const SQLITE_ROLLBACK: c_int = 1;
+pub const SQLITE_IGNORE: c_int = 2;
+pub const SQLITE_FAIL: c_int = 3;
+pub const SQLITE_ABORT: c_int = 4;
+pub const SQLITE_REPLACE: c_int = 5;
 
 // SQLite fundamental datatypes
 pub const SQLITE_INTEGER: c_int = 1;
@@ -298,6 +307,7 @@ unsafe extern "system" {
         xDestroy: Option<unsafe extern "system" fn(*mut c_void)>,
     ) -> c_int;
     pub fn sqlite3_declare_vtab(db: *mut sqlite3, zSQL: *const c_char) -> c_int;
+    pub fn sqlite3_vtab_on_conflict(db: *mut sqlite3) -> c_int;
 
     pub fn sqlite3_value_type(pVal: *mut sqlite3_value) -> c_int;
     pub fn sqlite3_value_int64(pVal: *mut sqlite3_value) -> sqlite3_int64;
