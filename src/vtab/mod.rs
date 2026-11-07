@@ -56,6 +56,7 @@ const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
 const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
 const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
 const RANGE_FLAG_HAS_LIMIT: c_int = 0x10;
+const RANGE_FLAG_KEYS_ONLY: c_int = 0x20;
 
 /// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close.
 const ROWID_MAP_COMPACT_THRESHOLD: usize = 16_384;
@@ -219,6 +220,11 @@ struct AydbCursor {
     slab: Vec<u8>,
     /// `(start_offset, end_offset)` into `slab` for each row (`PERF-04`).
     spans: Vec<(usize, usize)>,
+    /// Primary key bytes per row when `keys_only` is `true` (`P02`).
+    pks: Vec<Vec<u8>>,
+    /// True when the active scan only needs primary keys (`RANGE_FLAG_KEYS_ONLY`, `P02`),
+    /// avoiding any out-of-line blob reads or `slab` allocations.
+    keys_only: bool,
     pos: usize,
 }
 
@@ -264,6 +270,22 @@ fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
         rmap.get_or_assign_rowid(&pk)
     } else {
         hash_pk_to_rowid(&pk)
+    }
+}
+
+/// Extracts the `rowid` (`i64`) directly from `pk_bytes` for keys-only cursor scans (`P02`).
+#[inline]
+fn extract_rowid_from_pk_bytes(pk_bytes: &[u8], vtab: &AydbVTab) -> i64 {
+    if vtab.pk_affinity == ColumnAffinity::Integer {
+        if let Some(id) = decode_i64_tagged_key(pk_bytes) {
+            return id;
+        }
+    }
+    vtab.has_non_int_pks.store(true, Ordering::Relaxed);
+    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+        rmap.get_or_assign_rowid(pk_bytes)
+    } else {
+        hash_pk_to_rowid(pk_bytes)
     }
 }
 
@@ -688,8 +710,18 @@ unsafe extern "system" fn vtab_best_index(
             (ob.iColumn == vtab.pk_col_idx as i32 || ob.iColumn == -1) && ob.desc == 0
         };
 
+        // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected (`P02`)
+        let can_use_keys_only = info.colUsed == 0
+            || (vtab.pk_collation == ColCollation::Binary
+                && vtab.pk_col_idx < 63
+                && info.colUsed == (1u64 << vtab.pk_col_idx));
+
         if lower_idx.is_some() || upper_idx.is_some() {
-            let mut flags = 0;
+            let mut flags = if can_use_keys_only {
+                RANGE_FLAG_KEYS_ONLY
+            } else {
+                0
+            };
             let mut next_arg = 1;
             let omit_range = if limit_idx.is_some() { 1 } else { 0 };
             if let Some((i, fl)) = lower_idx {
@@ -733,7 +765,11 @@ unsafe extern "system" fn vtab_best_index(
         }
 
         // 4. Fallback: Full Table Scan (with optional LIMIT pushdown when no WHERE/ORDER BY blocks it, `PERF-04`)
-        let mut full_scan_flags = 0;
+        let mut full_scan_flags = if can_use_keys_only {
+            RANGE_FLAG_KEYS_ONLY
+        } else {
+            0
+        };
         if let Some(lim_i) = limit_idx {
             let no_other_where =
                 (0..n).all(|idx| idx == lim_i || constraints[idx].usable == 0);
@@ -767,6 +803,8 @@ unsafe extern "system" fn vtab_open(
             base: sqlite3_vtab_cursor { pVtab: p_vtab },
             slab: Vec::with_capacity(512),
             spans: Vec::with_capacity(16),
+            pks: Vec::new(),
+            keys_only: false,
             pos: 0,
         });
         *pp_cursor = Box::into_raw(cursor) as *mut sqlite3_vtab_cursor;
@@ -812,6 +850,8 @@ unsafe extern "system" fn vtab_filter(
         let vtab = &*(cursor.base.pVtab as *const AydbVTab);
         cursor.slab.clear();
         cursor.spans.clear();
+        cursor.pks.clear();
+        cursor.keys_only = false;
         cursor.pos = 0;
 
         let mut eng = match vtab.engine.lock() {
@@ -1003,11 +1043,16 @@ unsafe extern "system" fn vtab_filter(
                         usize::MAX
                     };
 
-                    if let Err(e) = eng.scan_table_values_into(
+                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    cursor.keys_only = keys_only;
+                    if let Err(e) = eng.scan_range_into_slab(
                         vtab.table_id,
                         lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                         upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        false,
                         limit,
+                        keys_only,
+                        &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
                     ) {
@@ -1022,11 +1067,16 @@ unsafe extern "system" fn vtab_filter(
                     } else {
                         usize::MAX
                     };
-                    if let Err(e) = eng.scan_table_values_into(
+                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    cursor.keys_only = keys_only;
+                    if let Err(e) = eng.scan_range_into_slab(
                         vtab.table_id,
                         None,
                         None,
+                        false,
                         limit,
+                        keys_only,
+                        &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
                     ) {
@@ -1053,7 +1103,12 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
 unsafe extern "system" fn vtab_eof(p_cursor: *mut sqlite3_vtab_cursor) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
-        if cursor.pos >= cursor.spans.len() {
+        let len = if cursor.keys_only {
+            cursor.pks.len()
+        } else {
+            cursor.spans.len()
+        };
+        if cursor.pos >= len {
             1
         } else {
             0
@@ -1069,13 +1124,31 @@ unsafe extern "system" fn vtab_column(
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
+        let vtab = &*(cursor.base.pVtab as *const AydbVTab);
+        if cursor.keys_only {
+            if cursor.pos >= cursor.pks.len() {
+                return SQLITE_ERROR;
+            }
+            let pk_bytes = &cursor.pks[cursor.pos];
+            if i_col < 0 {
+                let rid = extract_rowid_from_pk_bytes(pk_bytes, vtab);
+                sqlite3_result_int64(p_ctx, rid);
+                return SQLITE_OK;
+            }
+            if i_col as usize == vtab.pk_col_idx {
+                if let Some(val) = SqlValue::from_key_bytes(pk_bytes) {
+                    val.set_sqlite_result(p_ctx);
+                    return SQLITE_OK;
+                }
+            }
+            return SQLITE_ERROR;
+        }
         if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
         let (start, end) = cursor.spans[cursor.pos];
         let row_bytes = &cursor.slab[start..end];
         if i_col < 0 {
-            let vtab = &*(cursor.base.pVtab as *const AydbVTab);
             let rid = extract_rowid_from_row(row_bytes, vtab);
             sqlite3_result_int64(p_ctx, rid);
             return SQLITE_OK;
@@ -1094,12 +1167,19 @@ unsafe extern "system" fn vtab_rowid(
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let cursor = &*(p_cursor as *const AydbCursor);
+        let vtab = &*(cursor.base.pVtab as *const AydbVTab);
+        if cursor.keys_only {
+            if cursor.pos >= cursor.pks.len() {
+                return SQLITE_ERROR;
+            }
+            *p_rowid = extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab);
+            return SQLITE_OK;
+        }
         if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
         let (start, end) = cursor.spans[cursor.pos];
         let row_bytes = &cursor.slab[start..end];
-        let vtab = &*(cursor.base.pVtab as *const AydbVTab);
         *p_rowid = extract_rowid_from_row(row_bytes, vtab);
         SQLITE_OK
     }))
@@ -2890,5 +2970,119 @@ mod tests {
             _ => panic!("expected integer PK"),
         };
         assert!(id1 > 0 && id1 < id2 && id2 < i64::MAX);
+    }
+
+    #[test]
+    fn p02_vtab_keys_only_projection_and_tx_budget() {
+        let tmp = TempTestDir::new("p02_vtab_keys_only");
+        let mut cfg = EngineConfig::default();
+        cfg.max_transaction_bytes = 32 * 1024; // 32 KB transaction budget
+
+        {
+            let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+            let engine = Arc::new(Mutex::new(
+                StorageEngine::open(fs.clone(), cfg.clone()).unwrap(),
+            ));
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module(engine.clone()).unwrap();
+
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE docs USING aydb(
+                    table_id = 80,
+                    columns = 'id INTEGER PRIMARY KEY, body BLOB'
+                );",
+            )
+            .unwrap();
+
+            let big_blob = vec![0x5Au8; 4096];
+            for id in 1..=5i64 {
+                conn.query_all(
+                    "INSERT INTO docs VALUES (?1, ?2)",
+                    &[SqlValue::Integer(id), SqlValue::Blob(big_blob.clone())],
+                )
+                .unwrap();
+            }
+            engine.lock().unwrap().flush_memtable().unwrap();
+        }
+
+        // Corrupt the out-of-line `blob_std_*.db` payload bytes on disk while handles are closed
+        // to prove that `SELECT COUNT(*)`, `SELECT id`, and `SELECT rowid, id` do NOT read any blob files!
+        let mut found_blob = false;
+        for entry in std::fs::read_dir(&tmp.path).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("blob_std_") && name.ends_with(".db") {
+                found_blob = true;
+                let p = entry.path();
+                let blen = std::fs::metadata(&p).unwrap().len() as usize;
+                std::fs::write(&p, vec![0xFFu8; blen]).unwrap();
+            }
+        }
+        assert!(found_blob);
+
+        let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING aydb(
+                table_id = 80,
+                columns = 'id INTEGER PRIMARY KEY, body BLOB'
+            );",
+        )
+        .unwrap();
+
+        // `SELECT COUNT(*) FROM docs` (`colUsed == 0`) must succeed without touching `blob_std_*.db`!
+        assert_eq!(
+            conn.query_all("SELECT COUNT(*) FROM docs", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(5)]]
+        );
+
+        // `SELECT id FROM docs WHERE id >= 2 AND id <= 4` (`colUsed == (1 << pk_col_idx)`)
+        // must also succeed via `RANGE_FLAG_KEYS_ONLY` without touching `blob_std_*.db`!
+        assert_eq!(
+            conn.query_all("SELECT id FROM docs WHERE id >= 2 AND id <= 4 ORDER BY id", &[])
+                .unwrap(),
+            vec![
+                vec![SqlValue::Integer(2)],
+                vec![SqlValue::Integer(3)],
+                vec![SqlValue::Integer(4)],
+            ]
+        );
+
+        // `SELECT rowid, id FROM docs` must also succeed via `RANGE_FLAG_KEYS_ONLY`!
+        assert_eq!(
+            conn.query_all("SELECT rowid, id FROM docs WHERE id <= 2 ORDER BY id", &[])
+                .unwrap(),
+            vec![
+                vec![SqlValue::Integer(1), SqlValue::Integer(1)],
+                vec![SqlValue::Integer(2), SqlValue::Integer(2)],
+            ]
+        );
+
+        // Whereas projecting `body` (`SELECT body FROM docs`) DOES attempt to dereference the
+        // corrupted blob and skips all 5 rows (`Ok(false)` safe blob miss), proving that the
+        // keys-only queries above never touched `blob_std_*.db`!
+        assert_eq!(
+            conn.query_all("SELECT body FROM docs", &[]).unwrap(),
+            Vec::<Vec<SqlValue>>::new(),
+            "reading projected BLOB column must dereference blob_std and skip corrupted blobs"
+        );
+
+        // Verify `max_transaction_bytes` rejects an oversized SQL transaction cleanly
+        conn.execute_batch("BEGIN;").unwrap();
+        let huge_blob = vec![0x77u8; 40 * 1024]; // 40 KB > 32 KB max_transaction_bytes
+        let res = conn.query_all(
+            "INSERT INTO docs VALUES (?1, ?2)",
+            &[SqlValue::Integer(99), SqlValue::Blob(huge_blob)],
+        );
+        assert!(
+            res.is_err(),
+            "P02: SQL INSERT exceeding max_transaction_bytes must fail"
+        );
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(
+            conn.query_all("SELECT COUNT(*) FROM docs", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(5)]]
+        );
     }
 }

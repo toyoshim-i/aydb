@@ -468,5 +468,43 @@ mod tests {
             comp.newly_dead_blob_bytes,
             vec![(BlobKind::Standard, 0, 10, 16384)]
         );
+
+        // S01: Verify that a crafted index segment with an inflated `fp_count` (even with a
+        // valid recomputed footer_crc32c) is rejected before allocating `fence_pointers`.
+        drop(comp);
+        let seg_fname = crate::meta::format_idx_file_name(3);
+        let seg_file = fs
+            .open_file(&seg_fname, false, true, crate::pal::OpenHint::ImmutableRandom)
+            .unwrap();
+        let flen = seg_file.file_len().unwrap() as usize;
+        let mut raw_seg = vec![0u8; flen];
+        seg_file.read_exact_at(&mut raw_seg, 0).unwrap();
+
+        let footer_start = flen - 48;
+        let meta_offset =
+            u64::from_le_bytes(raw_seg[footer_start + 24..footer_start + 32].try_into().unwrap())
+                as usize;
+        // `meta_buf` starts with `[num_probes: u8 | reserved: [u8; 3] | bit_bytes_len: u32 LE | bits...]`,
+        // followed by `fp_count: u32`.
+        let bloom_byte_len =
+            u32::from_le_bytes(raw_seg[meta_offset + 4..meta_offset + 8].try_into().unwrap())
+                as usize;
+        let fp_count_pos = meta_offset + 8 + bloom_byte_len;
+        // Overwrite `fp_count` with `u32::MAX` and recompute both `meta_crc` and `footer_crc32c`
+        raw_seg[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let new_meta_crc = crate::util::crc32c::crc32c(&raw_seg[meta_offset..footer_start]);
+        raw_seg[footer_start + 36..footer_start + 40].copy_from_slice(&new_meta_crc.to_le_bytes());
+        let new_footer_crc =
+            crate::util::crc32c::crc32c(&raw_seg[footer_start..footer_start + 44]);
+        raw_seg[footer_start + 44..footer_start + 48]
+            .copy_from_slice(&new_footer_crc.to_le_bytes());
+        seg_file.write_all_at(&raw_seg, 0).unwrap();
+        drop(seg_file);
+
+        let err = match IdxSegmentReader::open(&fs, 3) {
+            Ok(_) => panic!("S01: crafted huge fp_count with valid CRC must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

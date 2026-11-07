@@ -39,6 +39,9 @@ const FLAG_EXTERNAL_MANIFEST: u16 = 0x0001;
 const EXTERNAL_POINTER_LEN: usize = 20;
 const MANIFEST_HEADER_LEN: usize = 16;
 
+/// Defensive upper bound on external manifest file size (16 MB).
+pub const MAX_EXTERNAL_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Formats an immutable index segment filename (`idx_<16-hex-digit SeqID>.db`).
 pub fn format_idx_file_name(seq_id: u64) -> String {
     format!("idx_{seq_id:016x}.db")
@@ -297,13 +300,16 @@ impl BootMetaState {
 
         // 1. Index segments
         let num_idx = read_u32(&mut payload)? as usize;
-        if num_idx.saturating_mul(24) > payload.len() {
+        if num_idx.checked_mul(24).is_none_or(|b| b > payload.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted idx_segments count",
             ));
         }
-        let mut idx_segments = Vec::with_capacity(num_idx);
+        let mut idx_segments = Vec::new();
+        idx_segments
+            .try_reserve_exact(num_idx)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "idx_segments allocation overflow"))?;
         for _ in 0..num_idx {
             let seq_id = read_u64(&mut payload)?;
             let file_len = read_u64(&mut payload)?;
@@ -320,13 +326,16 @@ impl BootMetaState {
 
         // 2. Standard blob segments
         let num_std_blob = read_u32(&mut payload)? as usize;
-        if num_std_blob.saturating_mul(24) > payload.len() {
+        if num_std_blob.checked_mul(24).is_none_or(|b| b > payload.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted std_blob_segments count",
             ));
         }
-        let mut std_blob_segments = Vec::with_capacity(num_std_blob);
+        let mut std_blob_segments = Vec::new();
+        std_blob_segments
+            .try_reserve_exact(num_std_blob)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "std_blob_segments allocation overflow"))?;
         for _ in 0..num_std_blob {
             let seq_id = read_u64(&mut payload)?;
             let file_len = read_u64(&mut payload)?;
@@ -340,13 +349,16 @@ impl BootMetaState {
 
         // 3. LRU blob segments
         let num_lru_blob = read_u32(&mut payload)? as usize;
-        if num_lru_blob.saturating_mul(32) > payload.len() {
+        if num_lru_blob.checked_mul(32).is_none_or(|b| b > payload.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted lru_blob_segments count",
             ));
         }
-        let mut lru_blob_segments = Vec::with_capacity(num_lru_blob);
+        let mut lru_blob_segments = Vec::new();
+        lru_blob_segments
+            .try_reserve_exact(num_lru_blob)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lru_blob_segments allocation overflow"))?;
         for _ in 0..num_lru_blob {
             let seq_id = read_u64(&mut payload)?;
             let file_len = read_u64(&mut payload)?;
@@ -363,13 +375,16 @@ impl BootMetaState {
 
         // 4. Table quotas
         let num_quotas = read_u32(&mut payload)? as usize;
-        if num_quotas.saturating_mul(24) > payload.len() {
+        if num_quotas.checked_mul(24).is_none_or(|b| b > payload.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted table_quotas count",
             ));
         }
-        let mut table_quotas = Vec::with_capacity(num_quotas);
+        let mut table_quotas = Vec::new();
+        table_quotas
+            .try_reserve_exact(num_quotas)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "table_quotas allocation overflow"))?;
         for _ in 0..num_quotas {
             let table_id = read_u16(&mut payload)?;
             let policy_byte = read_bytes(&mut payload, 1)?[0];
@@ -387,7 +402,16 @@ impl BootMetaState {
 
         // 5. Pending deletes
         let num_deletes = read_u32(&mut payload)? as usize;
-        let mut pending_delete_files = Vec::with_capacity(num_deletes.min(1024));
+        if num_deletes.checked_mul(2).is_none_or(|b| b > payload.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted pending_delete_files count",
+            ));
+        }
+        let mut pending_delete_files = Vec::new();
+        pending_delete_files
+            .try_reserve_exact(num_deletes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pending_delete_files allocation overflow"))?;
         for _ in 0..num_deletes {
             let name_len = read_u16(&mut payload)? as usize;
             let name_bytes = read_bytes(&mut payload, name_len)?;
@@ -804,14 +828,23 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
             let mf_name = format_manifest_file_name(mf_seq_id);
             let mf_file = fs.open_file(&mf_name, false, false, OpenHint::ImmutableSequential)?;
-            if mf_file.file_len()? != mf_file_len || mf_file_len < MANIFEST_HEADER_LEN as u64 {
+            if mf_file.file_len()? != mf_file_len
+                || mf_file_len < MANIFEST_HEADER_LEN as u64
+                || mf_file_len > MAX_EXTERNAL_MANIFEST_BYTES
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "external manifest file length mismatch",
+                    "external manifest file length mismatch or exceeds budget",
                 ));
             }
-
-            let mut mf_buf = vec![0u8; mf_file_len as usize];
+            let mf_len_usize = usize::try_from(mf_file_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "external manifest length overflow")
+            })?;
+            let mut mf_buf = Vec::new();
+            mf_buf
+                .try_reserve_exact(mf_len_usize)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "external manifest allocation overflow"))?;
+            mf_buf.resize(mf_len_usize, 0u8);
             mf_file.read_exact_at(&mut mf_buf, 0)?;
 
             if &mf_buf[0..4] != MANIFEST_MAGIC {
@@ -827,7 +860,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 u32::from_le_bytes([mf_buf[12], mf_buf[13], mf_buf[14], mf_buf[15]]);
 
             if mf_ver != FORMAT_VERSION
-                || MANIFEST_HEADER_LEN + mf_payload_len != mf_buf.len()
+                || MANIFEST_HEADER_LEN.checked_add(mf_payload_len) != Some(mf_buf.len())
                 || mf_header_crc_field != mf_expected_crc
             {
                 return Err(io::Error::new(
@@ -1175,5 +1208,43 @@ mod tests {
             fs.list_files().unwrap().contains(&idx_name),
             "existing segment file must NOT be deleted when boot_meta.db is missing or zeroed"
         );
+    }
+
+    #[test]
+    fn s01_corrupted_catalog_counts_with_valid_crc_rejected() {
+        let tmp = TempTestDir::new("s01_corrupted_catalog_counts");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        {
+            let _mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
+        }
+
+        // Craft a slot payload claiming `num_deletes = u32::MAX` while recomputing a valid slot CRC32C
+        let file = fs
+            .open_file(BOOT_META_FILE_NAME, false, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        let mut buf = vec![0u8; BOOT_META_FILE_SIZE as usize];
+        file.read_exact_at(&mut buf, 0).unwrap();
+
+        // Slot A starts at 0; payload starts at 64 (`num_idx=0`, `num_std=0`, `num_lru=0`, `num_quotas=0`, `num_deletes=u32::MAX`)
+        buf[64..68].copy_from_slice(&0u32.to_le_bytes());
+        buf[68..72].copy_from_slice(&0u32.to_le_bytes());
+        buf[72..76].copy_from_slice(&0u32.to_le_bytes());
+        buf[76..80].copy_from_slice(&0u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Bump Slot A generation to 99 so it wins over Slot B, and recompute Slot A CRC32C
+        buf[8..16].copy_from_slice(&99u64.to_le_bytes());
+        let crc_a = crc32c(&buf[0..4092]);
+        buf[4092..4096].copy_from_slice(&crc_a.to_le_bytes());
+        // Corrupt Slot B so Slot A is the sole valid-CRC candidate
+        buf[4096..4100].copy_from_slice(b"XXXX");
+        file.write_all_at(&buf, 0).unwrap();
+        file.sync_durable().unwrap();
+        drop(file);
+
+        let err = match BootMetaManager::open_or_recover(Arc::clone(&fs)) {
+            Ok(_) => panic!("S01: crafted huge num_deletes with valid CRC must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

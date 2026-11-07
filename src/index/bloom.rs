@@ -113,10 +113,25 @@ impl BloomFilter {
                 "truncated BloomFilter bitset",
             ));
         }
-        let bits = input[..byte_len].to_vec();
+        let num_bits = byte_len
+            .checked_mul(8)
+            .and_then(|b| u32::try_from(b).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BloomFilter bitset length overflows u32 bits",
+                )
+            })?;
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(byte_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to allocate BloomFilter bitset",
+            )
+        })?;
+        bits.extend_from_slice(&input[..byte_len]);
         *input = &input[byte_len..];
 
-        let num_bits = (byte_len * 8) as u32;
         Ok(Self {
             bits,
             num_bits,

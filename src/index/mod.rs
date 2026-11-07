@@ -31,6 +31,9 @@ pub const MAX_SINGLE_BLOCK_ENTRY_BYTES: usize = IDX_BLOCK_USABLE_SIZE - 2;
 /// Default Bloom filter bits per key (`10` bits/key -> ~0.9% false-positive rate).
 pub const DEFAULT_BLOOM_BITS_PER_KEY: usize = 10;
 
+/// Maximum defensive size for an index segment's filter/fence metadata trailer (64 MB, `S01`).
+pub const MAX_INDEX_META_BYTES: usize = 64 * 1024 * 1024;
+
 /// Fixed 48-byte footer at the end of every `idx_<SeqID>.db` file.
 const IDX_FOOTER_SIZE: usize = 48;
 const IDX_FOOTER_MAGIC: &[u8; 4] = b"AYIX";
@@ -90,7 +93,6 @@ pub struct IdxBlockBuilder {
     buf: [u8; IDX_BLOCK_SIZE],
     write_pos: usize,
     offsets: Vec<u16>,
-    first_key: Option<Vec<u8>>,
 }
 
 impl Default for IdxBlockBuilder {
@@ -105,7 +107,6 @@ impl IdxBlockBuilder {
             buf: [0u8; IDX_BLOCK_SIZE],
             write_pos: 0,
             offsets: Vec::with_capacity(64),
-            first_key: None,
         }
     }
 
@@ -118,7 +119,11 @@ impl IdxBlockBuilder {
     }
 
     pub fn first_key(&self) -> Option<&[u8]> {
-        self.first_key.as_deref()
+        if self.offsets.is_empty() {
+            return None;
+        }
+        let klen = u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
+        Some(&self.buf[11..11 + klen])
     }
 
     /// Returns `true` if `entry` fits in the remaining space of this 4 KB block.
@@ -139,10 +144,6 @@ impl IdxBlockBuilder {
         let klen = u16::try_from(entry.key.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
         })?;
-
-        if self.first_key.is_none() {
-            self.first_key = Some(entry.key.clone());
-        }
 
         let start = self.write_pos;
         self.offsets.push(start as u16);
@@ -207,7 +208,6 @@ impl IdxBlockBuilder {
         self.buf.fill(0);
         self.write_pos = 0;
         self.offsets.clear();
-        self.first_key = None;
         finished
     }
 }
@@ -418,6 +418,13 @@ impl BloomFilter {
         (h1, h2)
     }
 
+    /// Computes a packed 64-bit hash `((h1 as u64) << 32) | (h2 as u64)` for `key` (`P02`).
+    #[inline]
+    pub fn hash64(key: &[u8]) -> u64 {
+        let (h1, h2) = Self::hash_pair(key);
+        ((h1 as u64) << 32) | (h2 as u64)
+    }
+
     /// Builds a [`BloomFilter`] from precomputed `(h1, h2)` hash pairs without retaining raw keys.
     pub fn from_hash_pairs(hashes: &[(u32, u32)], bits_per_key: usize) -> Self {
         if bits_per_key == 0 || hashes.is_empty() {
@@ -443,6 +450,34 @@ impl BloomFilter {
         let mut slice: &[u8] = &buf;
         Self::decode(&mut slice).expect("valid encoded BloomFilter")
     }
+
+    /// Builds a [`BloomFilter`] from packed 64-bit hashes without retaining raw keys (`P02`).
+    pub fn from_hashes64(hashes: &[u64], bits_per_key: usize) -> Self {
+        if bits_per_key == 0 || hashes.is_empty() {
+            return Self::new(0, 0);
+        }
+        let num_probes = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
+        let raw_bits = (hashes.len().saturating_mul(bits_per_key)).max(64);
+        let num_bytes = raw_bits.div_ceil(8);
+        let num_bits = (num_bytes * 8) as u32;
+
+        let mut buf = vec![0u8; 8 + num_bytes];
+        buf[0] = num_probes;
+        buf[4..8].copy_from_slice(&(num_bytes as u32).to_le_bytes());
+        let bits = &mut buf[8..];
+        for &packed in hashes {
+            let h1 = (packed >> 32) as u32;
+            let h2 = packed as u32;
+            let mut h = h1;
+            for _ in 0..num_probes {
+                let bit_idx = (h % num_bits) as usize;
+                bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
+                h = h.wrapping_add(h2);
+            }
+        }
+        let mut slice: &[u8] = &buf;
+        Self::decode(&mut slice).expect("valid encoded BloomFilter")
+    }
 }
 
 /// Writes a sorted stream of [`IndexEntry`] items into a new immutable `idx_<SeqID>.db` file.
@@ -453,7 +488,7 @@ pub struct IdxSegmentBuilder<F: PlatformFile> {
     bloom_bits_per_key: usize,
     block_builder: IdxBlockBuilder,
     fence_pointers: Vec<FencePointer>,
-    bloom_hashes: Vec<(u32, u32)>,
+    bloom_hashes: Vec<u64>,
     last_key: Vec<u8>,
     num_blocks: u32,
     record_count: u32,
@@ -491,7 +526,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         }
         self.block_builder.add_entry(entry)?;
         if self.bloom_bits_per_key > 0 {
-            self.bloom_hashes.push(BloomFilter::hash_pair(&entry.key));
+            self.bloom_hashes.push(BloomFilter::hash64(&entry.key));
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(&entry.key);
@@ -527,8 +562,10 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
     pub fn finish(mut self) -> io::Result<IdxSegmentReader<F>> {
         self.flush_current_data_block()?;
 
-        // Build BloomFilter from precomputed (h1, h2) hash pairs
-        let bloom = BloomFilter::from_hash_pairs(&self.bloom_hashes, self.bloom_bits_per_key);
+        // Build BloomFilter from precomputed 64-bit hashes and drop the hash vector immediately (`P02`)
+        let bloom_hashes = core::mem::take(&mut self.bloom_hashes);
+        let bloom = BloomFilter::from_hashes64(&bloom_hashes, self.bloom_bits_per_key);
+        drop(bloom_hashes);
 
         // Encode Filter + Sparse Fence Pointers + max_key metadata section
         let meta_offset = self.write_offset;
@@ -650,9 +687,14 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         let meta_len = u32::from_le_bytes(footer[32..36].try_into().unwrap()) as usize;
         let expected_meta_crc = u32::from_le_bytes(footer[36..40].try_into().unwrap());
 
+        let expected_meta_offset = (num_blocks as u64).checked_mul(IDX_BLOCK_SIZE as u64);
+        let expected_file_len = meta_offset
+            .checked_add(meta_len as u64)
+            .and_then(|v| v.checked_add(IDX_FOOTER_SIZE as u64));
+
         if stored_seq_id != seq_id
-            || meta_offset != (num_blocks as u64) * (IDX_BLOCK_SIZE as u64)
-            || meta_offset + (meta_len as u64) + (IDX_FOOTER_SIZE as u64) != file_len
+            || expected_meta_offset != Some(meta_offset)
+            || expected_file_len != Some(file_len)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -660,7 +702,21 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             ));
         }
 
-        let mut meta_buf = vec![0u8; meta_len];
+        if meta_len > MAX_INDEX_META_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idx segment metadata exceeds maximum allowed size",
+            ));
+        }
+
+        let mut meta_buf = Vec::new();
+        meta_buf.try_reserve_exact(meta_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to allocate idx segment metadata buffer",
+            )
+        })?;
+        meta_buf.resize(meta_len, 0u8);
         file.read_exact_at(&mut meta_buf, meta_offset)?;
         if crc32c(&meta_buf) != expected_meta_crc {
             return Err(io::Error::new(
@@ -680,7 +736,29 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         let fp_count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
         slice = &slice[4..];
 
-        let mut fence_pointers = Vec::with_capacity(fp_count);
+        // Validate `fp_count` against the number of 4 KB data blocks (`<= 1` fence pointer per block)
+        // and the remaining bytes in `slice` (`>= 6` bytes per fence pointer) BEFORE allocating (`S01`).
+        let max_possible_blocks = (meta_offset / (IDX_BLOCK_SIZE as u64)) as usize;
+        let min_fp_bytes = fp_count.checked_mul(6).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fence pointer count byte size overflow",
+            )
+        })?;
+        if fp_count > max_possible_blocks || min_fp_bytes > slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted or out-of-bounds fence pointer count in idx segment",
+            ));
+        }
+
+        let mut fence_pointers = Vec::new();
+        fence_pointers.try_reserve_exact(fp_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to reserve fence pointers",
+            )
+        })?;
         for _ in 0..fp_count {
             if slice.len() < 6 {
                 return Err(io::Error::new(
@@ -690,6 +768,12 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             }
             let klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
             let block_idx = u32::from_le_bytes([slice[2], slice[3], slice[4], slice[5]]);
+            if block_idx >= num_blocks {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fence pointer block_idx out of bounds",
+                ));
+            }
             slice = &slice[6..];
             if slice.len() < klen {
                 return Err(io::Error::new(
@@ -845,7 +929,15 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
 
     /// Reads all entries in this segment in sorted order.
     pub fn scan_all(&self) -> io::Result<Vec<IndexEntry>> {
-        let mut out = Vec::with_capacity(self.record_count as usize);
+        let max_entries_cap = (self.num_blocks as usize).saturating_mul(IDX_BLOCK_USABLE_SIZE / 13);
+        let cap = (self.record_count as usize).min(max_entries_cap);
+        let mut out = Vec::new();
+        out.try_reserve(cap).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to reserve scan_all entry buffer",
+            )
+        })?;
         let mut block_buf = [0u8; IDX_BLOCK_SIZE];
         for b in 0..self.num_blocks {
             self.file

@@ -217,7 +217,17 @@ impl WalBatch {
             ));
         }
 
-        let mut records = Vec::with_capacity(record_count.min(4096));
+        // Minimum serialized WalRecord is 5 bytes (1B op + 4B key_len for Delete with 0-byte key).
+        if record_count.checked_mul(5).is_none_or(|b| b > data.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WalBatch record_count exceeds remaining payload bytes",
+            ));
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(record_count)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WalBatch records allocation overflow"))?;
         for _ in 0..record_count {
             let op = read_bytes(&mut data, 1)?[0];
             match op {
@@ -917,24 +927,22 @@ where
             out
         };
 
-    let sync_iter = filter_committed_stream(sync_rec.batches, &mut validate_blob);
-    let buf_iter = filter_committed_stream(buf_rec.batches, &mut validate_blob);
+    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob);
+    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob);
 
-    // Two-way merge sort by ascending `lsn`.
-    let mut merged = Vec::with_capacity(sync_iter.len() + buf_iter.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < sync_iter.len() && j < buf_iter.len() {
-        if sync_iter[i].lsn <= buf_iter[j].lsn {
-            merged.push(sync_iter[i].clone());
-            i += 1;
+    // Two-way merge sort by ascending `lsn` by value (zero-clone).
+    let mut merged = Vec::with_capacity(sync_batches.len() + buf_batches.len());
+    let mut sync_iter = sync_batches.into_iter().peekable();
+    let mut buf_iter = buf_batches.into_iter().peekable();
+    while let (Some(s_peek), Some(b_peek)) = (sync_iter.peek(), buf_iter.peek()) {
+        if s_peek.lsn <= b_peek.lsn {
+            merged.push(sync_iter.next().unwrap());
         } else {
-            merged.push(buf_iter[j].clone());
-            j += 1;
+            merged.push(buf_iter.next().unwrap());
         }
     }
-    merged.extend_from_slice(&sync_iter[i..]);
-    merged.extend_from_slice(&buf_iter[j..]);
+    merged.extend(sync_iter);
+    merged.extend(buf_iter);
 
     Ok(TwoStreamRecoveryResult {
         merged_batches: merged,

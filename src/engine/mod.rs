@@ -66,6 +66,9 @@ pub enum LruReadTrackingMode {
 /// Default number of immutable `idx_<SeqID>.db` segments that triggers automatic compaction (`PERF-02`).
 pub const DEFAULT_AUTO_COMPACT_SEGMENT_THRESHOLD: usize = 8;
 
+/// Default maximum in-memory transaction footprint (`64 MB`) (`P02`). `0` disables the limit.
+pub const DEFAULT_MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
+
 /// Configuration parameters for [`StorageEngine`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -78,9 +81,11 @@ pub struct EngineConfig {
     pub bloom_bits_per_key: usize,
     pub lru_read_tracking: LruReadTrackingMode,
     pub max_in_memory_access_ticks: usize,
-    /// Automatically triggers `compact()` after `flush_memtable()` when the active segment count
-    /// reaches this threshold (`0` disables automatic compaction) (`PERF-02`).
+    /// Automatically triggers `compact_auto_tiered()` after `flush_memtable()` when the active
+    /// segment count reaches this threshold (`0` disables automatic compaction) (`PERF-02`, `P01`).
     pub auto_compact_segment_threshold: usize,
+    /// Maximum uncommitted transaction payload + WAL record budget in bytes (`0` = unlimited) (`P02`).
+    pub max_transaction_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -96,6 +101,7 @@ impl Default for EngineConfig {
             lru_read_tracking: LruReadTrackingMode::CoalescedLazyPromotion,
             max_in_memory_access_ticks: 65_536,
             auto_compact_segment_threshold: DEFAULT_AUTO_COMPACT_SEGMENT_THRESHOLD,
+            max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
         }
     }
 }
@@ -128,6 +134,7 @@ struct SavepointMarker {
     sp_id: i32,
     buf_offset: usize,
     record_count: u32,
+    pending_tx_bytes: usize,
     pending_tx_sync: bool,
     implicit_tx: bool,
     undo_len: usize,
@@ -167,8 +174,11 @@ pub struct StorageEngine<FS: PlatformFs> {
     deferred_compact_on_commit: bool,
     /// True if `prepare_commit_transaction()` (`xSync`) has already run for the current commit (`F07`).
     tx_prepared: bool,
+    /// True while `prepare_commit_transaction()` is running internal quota eviction (`P02`).
+    tx_preparing: bool,
     pending_tx_buf: Vec<u8>,
     pending_tx_record_count: u32,
+    pending_tx_bytes: usize,
     pending_tx_sync: bool,
     tx_memtable_undo: Vec<(Vec<u8>, Option<crate::memtable::MemEntry>)>,
     tx_start_meta: TxMetaSnapshot,
@@ -318,8 +328,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);
         buf_wal.set_cursor_after_recovery(rec.next_buf_sector_idx);
 
+        let had_recovered_batches = !rec.merged_batches.is_empty();
         let mut memtable = MemTable::new(config.memtable_capacity_bytes);
-        for batch in &rec.merged_batches {
+        for batch in rec.merged_batches {
             for record in &batch.records {
                 let key = match record {
                     WalRecord::PutInline { key, .. }
@@ -359,7 +370,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                 }
             }
-            memtable.apply_wal_batch(batch);
+            memtable.apply_wal_batch_owned(batch);
         }
 
         // Bump `next_seq_id` past any recovered blob segment SeqIDs if necessary
@@ -405,8 +416,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
             tx_prepared: false,
+            tx_preparing: false,
             pending_tx_buf: Vec::new(),
             pending_tx_record_count: 0,
+            pending_tx_bytes: 0,
             pending_tx_sync: false,
             tx_memtable_undo: Vec::new(),
             tx_start_meta: TxMetaSnapshot::default(),
@@ -418,7 +431,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
 
-        if !rec.merged_batches.is_empty()
+        if had_recovered_batches
             || rec.next_sync_sector_idx > 0
             || rec.next_buf_sector_idx > 0
         {
@@ -751,6 +764,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 2. Write out-of-line blob FIRST if `value.len() >= inline_threshold_bytes` or if inline entry exceeds 4 KB block (`AUD-02`)
         let store_as_blob = value.len() >= self.config.inline_threshold_bytes
             || 13 + row_key.len() + value.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES;
+        if self.tx_depth > 0
+            && !self.tx_preparing
+            && self.config.max_transaction_bytes > 0
+        {
+            let est_row_bytes = (if store_as_blob { 28 } else { 9 })
+                + row_key.len()
+                + value.len();
+            if self.pending_tx_bytes.saturating_add(est_row_bytes)
+                > self.config.max_transaction_bytes
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transaction exceeds max_transaction_bytes budget",
+                ));
+            }
+        }
         if store_as_blob {
             let blob_kind = if is_capped {
                 BlobKind::Lru
@@ -1032,16 +1061,47 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(hit)
     }
 
-    /// Scans up to `limit` live row payloads in `table_id` within `lower_bound` and `upper_bound`
-    /// directly into `slab` and `spans`, avoiding per-row `Vec<u8>` heap allocations!
-    pub fn scan_table_values_into(
+    /// Scans up to `limit` live primary keys (`pk`) in `table_id` within inclusive `[lower, upper]`
+    /// without reading or dereferencing any out-of-line blob files (`P02`).
+    pub fn scan_keys_range(
         &mut self,
         table_id: u16,
-        lower_bound: Option<(&[u8], bool)>,
-        upper_bound: Option<(&[u8], bool)>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
         limit: usize,
-        slab: &mut Vec<u8>,
-        spans: &mut Vec<(usize, usize)>,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let mut pks = Vec::new();
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        self.scan_range_into_slab(
+            table_id,
+            lower.map(|b| (b, true)),
+            upper.map(|b| (b, true)),
+            false,
+            limit,
+            true,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+        )?;
+        Ok(pks)
+    }
+
+    /// Streams live rows in `table_id` within `lower` and `upper` directly into `slab_out` and
+    /// `spans_out` (or into `pks_out` when `keys_only` is `true` without dereferencing blobs)
+    /// without intermediate per-row `Vec<u8>` allocations (`P02`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_range_into_slab(
+        &mut self,
+        table_id: u16,
+        lower: Option<(&[u8], bool)>,
+        upper: Option<(&[u8], bool)>,
+        reverse: bool,
+        limit: usize,
+        keys_only: bool,
+        pks_out: &mut Vec<Vec<u8>>,
+        slab_out: &mut Vec<u8>,
+        spans_out: &mut Vec<(usize, usize)>,
     ) -> io::Result<()> {
         use std::ops::Bound;
         if limit == 0 {
@@ -1050,7 +1110,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
         let mut lb_stack = [0u8; 64];
         let lb_heap;
-        let seek_key: &[u8] = match lower_bound {
+        let seek_key: &[u8] = match lower {
             Some((lb_pk, _)) if 3 + lb_pk.len() <= lb_stack.len() => {
                 lb_stack[0..3].copy_from_slice(&prefix);
                 lb_stack[3..3 + lb_pk.len()].copy_from_slice(lb_pk);
@@ -1065,7 +1125,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let mut ub_stack = [0u8; 64];
         let ub_heap;
-        let upper_key_slice: Option<(&[u8], bool)> = match upper_bound {
+        let upper_key_slice: Option<(&[u8], bool)> = match upper {
             Some((ub_pk, inc)) if 3 + ub_pk.len() <= ub_stack.len() => {
                 ub_stack[0..3].copy_from_slice(&prefix);
                 ub_stack[3..3 + ub_pk.len()].copy_from_slice(ub_pk);
@@ -1078,15 +1138,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             None => None,
         };
 
-        let lo_inc = lower_bound.map(|(_, inc)| inc).unwrap_or(true);
+        let lo_inc = lower.map(|(_, inc)| inc).unwrap_or(true);
         if let Some((ub, ub_inc)) = upper_key_slice {
             if seek_key > ub || (seek_key == ub && (!lo_inc || !ub_inc)) {
                 return Ok(());
             }
         }
 
-        if self.idx_segments.is_empty() {
-            let lo = match lower_bound {
+        if self.idx_segments.is_empty() && !reverse {
+            let lo = match lower {
                 Some((_, false)) => Bound::Excluded(seek_key),
                 _ => Bound::Included(seek_key),
             };
@@ -1099,20 +1159,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if !k.starts_with(&prefix) {
                     break;
                 }
+                if keys_only {
+                    if !matches!(entry.value, IndexValue::Tombstone) {
+                        pks_out.push(k[3..].to_vec());
+                        if pks_out.len() >= limit {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 match &entry.value {
                     IndexValue::Inline(v) => {
-                        let start = slab.len();
-                        slab.extend_from_slice(v);
-                        spans.push((start, slab.len()));
-                        if spans.len() >= limit {
+                        let start = slab_out.len();
+                        slab_out.extend_from_slice(v);
+                        spans_out.push((start, slab_out.len()));
+                        if spans_out.len() >= limit {
                             break;
                         }
                     }
                     IndexValue::Blob(ptr) => {
-                        let start = slab.len();
-                        if self.dereference_blob_append_into(ptr, k, slab)? {
-                            spans.push((start, slab.len()));
-                            if spans.len() >= limit {
+                        let start = slab_out.len();
+                        if self.dereference_blob_append_into(ptr, k, slab_out)? {
+                            spans_out.push((start, slab_out.len()));
+                            if spans_out.len() >= limit {
                                 break;
                             }
                         }
@@ -1123,13 +1192,112 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
-        let pairs = self.scan_table_range(table_id, lower_bound, upper_bound, limit)?;
-        for (_, v) in pairs {
-            let start = slab.len();
-            slab.extend_from_slice(&v);
-            spans.push((start, slab.len()));
+        let merge_limit = if reverse { usize::MAX } else { limit };
+        let merged = self.scan_merged_prefix_range(
+            &prefix,
+            seek_key,
+            lo_inc,
+            upper_key_slice,
+            merge_limit,
+        )?;
+
+        if reverse {
+            for entry in merged.into_iter().rev() {
+                if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
+                    continue;
+                }
+                if keys_only {
+                    if !matches!(entry.value, IndexValue::Tombstone) {
+                        pks_out.push(entry.key[3..].to_vec());
+                        if pks_out.len() >= limit {
+                            break;
+                        }
+                    }
+                } else {
+                    match entry.value {
+                        IndexValue::Inline(v) => {
+                            let start = slab_out.len();
+                            slab_out.extend_from_slice(&v);
+                            spans_out.push((start, slab_out.len()));
+                            if spans_out.len() >= limit {
+                                break;
+                            }
+                        }
+                        IndexValue::Blob(ptr) => {
+                            let start = slab_out.len();
+                            if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
+                                spans_out.push((start, slab_out.len()));
+                                if spans_out.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                        IndexValue::Tombstone => {}
+                    }
+                }
+            }
+        } else {
+            for entry in merged {
+                if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
+                    continue;
+                }
+                if keys_only {
+                    if !matches!(entry.value, IndexValue::Tombstone) {
+                        pks_out.push(entry.key[3..].to_vec());
+                        if pks_out.len() >= limit {
+                            break;
+                        }
+                    }
+                } else {
+                    match entry.value {
+                        IndexValue::Inline(v) => {
+                            let start = slab_out.len();
+                            slab_out.extend_from_slice(&v);
+                            spans_out.push((start, slab_out.len()));
+                            if spans_out.len() >= limit {
+                                break;
+                            }
+                        }
+                        IndexValue::Blob(ptr) => {
+                            let start = slab_out.len();
+                            if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
+                                spans_out.push((start, slab_out.len()));
+                                if spans_out.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                        IndexValue::Tombstone => {}
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Scans up to `limit` live row payloads in `table_id` within `lower_bound` and `upper_bound`
+    /// directly into `slab` and `spans`, avoiding per-row `Vec<u8>` heap allocations!
+    pub fn scan_table_values_into(
+        &mut self,
+        table_id: u16,
+        lower_bound: Option<(&[u8], bool)>,
+        upper_bound: Option<(&[u8], bool)>,
+        limit: usize,
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(usize, usize)>,
+    ) -> io::Result<()> {
+        let mut unused_pks = Vec::new();
+        self.scan_range_into_slab(
+            table_id,
+            lower_bound,
+            upper_bound,
+            false,
+            limit,
+            false,
+            &mut unused_pks,
+            slab,
+            spans,
+        )
     }
 
     /// Scans up to `limit` live rows `(pk, value)` in `table_id` within `lower_bound` and `upper_bound`
@@ -1268,6 +1436,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_flush_on_commit = false;
             self.deferred_compact_on_commit = false;
             self.tx_prepared = false;
+            self.tx_preparing = false;
+            self.pending_tx_bytes = 0;
         }
         self.tx_depth += 1;
     }
@@ -1289,6 +1459,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_flush_on_commit = false;
             self.deferred_compact_on_commit = false;
             self.tx_prepared = false;
+            self.tx_preparing = false;
+            self.pending_tx_bytes = 0;
         }
         self.tx_depth += 1;
         Ok(())
@@ -1378,10 +1550,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 1. Run capped-table quota evictions while `tx_depth > 0` so eviction mutations are
         //    recorded in `pending_tx_buf` and `tx_memtable_undo` (fully undoable on `xRollback`!).
+        self.tx_preparing = true;
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in capped_table_ids {
-            self.evict_until_within_quota(tid, effective_durability)?;
+            if let Err(e) = self.evict_until_within_quota(tid, effective_durability) {
+                self.tx_preparing = false;
+                return Err(e);
+            }
         }
+        self.tx_preparing = false;
 
         // 2. Sync active blob writers (`Write-Blob-Before-WAL` & prefix durability `F06`/`F07`).
         if effective_durability == WriteDurability::SyncTransactional {
@@ -1446,6 +1623,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             self.tx_owner_conn = None;
             self.tx_prepared = false;
+            self.tx_preparing = false;
+            self.pending_tx_bytes = 0;
             self.savepoints.clear();
             self.tx_memtable_undo.clear();
             self.tx_start_meta = TxMetaSnapshot::default();
@@ -1481,8 +1660,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.deferred_flush_on_commit = false;
         self.deferred_compact_on_commit = false;
         self.tx_prepared = false;
+        self.tx_preparing = false;
         self.savepoints.clear();
         self.pending_tx_record_count = 0;
+        self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
         self.pending_tx_sync = false;
         let snap = core::mem::take(&mut self.tx_start_meta);
@@ -1518,6 +1699,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             sp_id,
             buf_offset,
             record_count: self.pending_tx_record_count,
+            pending_tx_bytes: self.pending_tx_bytes,
             pending_tx_sync: self.pending_tx_sync,
             implicit_tx,
             undo_len: self.tx_memtable_undo.len(),
@@ -1569,6 +1751,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.pending_tx_buf.truncate(marker.buf_offset);
         }
         self.pending_tx_record_count = marker.record_count;
+        self.pending_tx_bytes = marker.pending_tx_bytes;
         self.pending_tx_sync = marker.pending_tx_sync;
         self.restore_tx_state(marker.undo_len, &marker.meta_snapshot);
         Ok(())
@@ -1784,7 +1967,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && self.config.auto_compact_segment_threshold > 1
             && self.idx_segments.len() >= self.config.auto_compact_segment_threshold
         {
-            self.compact()?;
+            self.compact_auto_tiered()?;
         }
         Ok(())
     }
@@ -2085,6 +2268,150 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Drop old segment readers and run pending deletes so superseded `idx_<SeqID>.db`
         // and 100%-dead blob files are unlinked immediately now that `boot_meta.db` is committed!
         self.idx_segments.clear();
+        self.idx_segments.push(outcome.new_segment);
+        self.meta_mgr.try_process_pending_deletes();
+        Ok(())
+    }
+
+    /// Runs size-tiered suffix automatic compaction (`P01`).
+    ///
+    /// Selects a contiguous suffix `self.idx_segments[start_idx..]` of newer/smaller segments
+    /// such that no older segment is merged when its size exceeds `2x` the combined size of all
+    /// newer segments after it:
+    /// - When `start_idx == 0` (all segments are comparable in size), delegates to full
+    ///   [`compact()`] (`drop_tombstones = true` + blob relocation).
+    /// - When `start_idx > 0` (partial suffix compaction), merges only `idx_segments[start_idx..]`
+    ///   with `drop_tombstones = false` (preserving tombstones that may shadow keys in older
+    ///   segments `0..start_idx`) and skips whole-database blob relocation.
+    pub fn compact_auto_tiered(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.deferred_compact_on_commit = true;
+            return Ok(());
+        }
+        if !self.memtable.is_empty() {
+            self.flush_memtable_no_auto_compact()?;
+        }
+        if self.idx_segments.len() <= 1 {
+            self.reclaim_fully_dead_blob_segments()?;
+            return Ok(());
+        }
+
+        let n = self.idx_segments.len();
+        let mut start_idx = (n / 2).min(n - 2);
+        for i in 0..(n - 1) {
+            let curr_bytes = self.idx_segments[i].file_len();
+            let newer_bytes: u64 = self.idx_segments[i + 1..].iter().map(|s| s.file_len()).sum();
+            if curr_bytes <= newer_bytes.saturating_mul(2) {
+                start_idx = i;
+                break;
+            }
+        }
+
+        if start_idx == 0 {
+            return self.compact();
+        }
+
+        let comp_seq_id = self.meta_mgr.state_snapshot().next_seq_id;
+        let new_level = self.idx_segments[start_idx..]
+            .iter()
+            .map(|s| s.level())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        // Pass suffix segments ordered newest-first (`rev()`) with `drop_tombstones = false`
+        let refs_newest_first: Vec<&IdxSegmentReader<FS::File>> =
+            self.idx_segments[start_idx..].iter().rev().collect();
+        let outcome = match compact_idx_segments(
+            &*self.fs,
+            &refs_newest_first,
+            comp_seq_id,
+            new_level,
+            self.config.bloom_bits_per_key,
+            false,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
+                return Err(e);
+            }
+        };
+
+        let old_idx_names: Vec<String> = self.idx_segments[start_idx..]
+            .iter()
+            .map(|r| format_idx_file_name(r.seq_id()))
+            .collect();
+
+        let new_meta = IdxSegmentMeta {
+            seq_id: outcome.new_segment.seq_id(),
+            file_len: outcome.new_segment.file_len(),
+            level: outcome.new_segment.level(),
+            record_count: outcome.new_segment.record_count(),
+        };
+
+        let mut new_idx_metas: Vec<IdxSegmentMeta> = Vec::with_capacity(start_idx + 1);
+        for seg in &self.idx_segments[..start_idx] {
+            new_idx_metas.push(IdxSegmentMeta {
+                seq_id: seg.seq_id(),
+                file_len: seg.file_len(),
+                level: seg.level(),
+                record_count: seg.record_count(),
+            });
+        }
+        new_idx_metas.push(new_meta);
+
+        let (dead_std_seqs, dead_lru_keys, dead_blob_files) =
+            self.collect_fully_dead_blob_segments();
+        let std_metas: Vec<StdBlobSegmentMeta> = self
+            .std_blobs
+            .iter()
+            .filter(|(seq, _)| !dead_std_seqs.contains(seq))
+            .map(|(&seq_id, b)| StdBlobSegmentMeta {
+                seq_id,
+                file_len: b.file_len,
+                dead_bytes: b.dead_bytes,
+            })
+            .collect();
+        let lru_metas: Vec<LruBlobSegmentMeta> = self
+            .lru_blobs
+            .iter()
+            .filter(|(k, _)| !dead_lru_keys.contains(k))
+            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
+                seq_id,
+                file_len: b.file_len,
+                dead_bytes: b.dead_bytes,
+                table_id: b.table_id,
+            })
+            .collect();
+        let quota_metas = self.build_quota_metas();
+
+        if let Err(e) = self.meta_mgr.commit_update(|st| {
+            let allocated = st.allocate_seq_id();
+            debug_assert_eq!(allocated, comp_seq_id);
+            st.idx_segments = new_idx_metas;
+            st.std_blob_segments = std_metas;
+            st.lru_blob_segments = lru_metas;
+            st.table_quotas = quota_metas;
+            for name in old_idx_names {
+                st.queue_pending_delete(name);
+            }
+            for fname in &dead_blob_files {
+                st.queue_pending_delete(fname.clone());
+            }
+        }) {
+            drop(outcome);
+            let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
+            return Err(e);
+        }
+
+        for seq in dead_std_seqs {
+            self.std_blobs.remove(&seq);
+        }
+        for key in dead_lru_keys {
+            self.lru_blobs.remove(&key);
+        }
+
+        self.idx_segments.truncate(start_idx);
         self.idx_segments.push(outcome.new_segment);
         self.meta_mgr.try_process_pending_deletes();
         Ok(())
@@ -2598,6 +2925,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lsn = self.next_lsn;
 
         if self.tx_depth > 0 {
+            let batch_bytes: usize = records
+                .iter()
+                .map(|r| match r {
+                    WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
+                    WalRecord::PutBlobPtr { key, blob_ptr } => {
+                        28 + key.len() + (blob_ptr.len as usize)
+                    }
+                    WalRecord::Delete { key } => 5 + key.len(),
+                    WalRecord::TxBegin | WalRecord::TxCommit => 1,
+                })
+                .sum();
+            let next_tx_bytes = self.pending_tx_bytes.saturating_add(batch_bytes);
+            if !self.tx_preparing
+                && self.config.max_transaction_bytes > 0
+                && next_tx_bytes > self.config.max_transaction_bytes
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transaction exceeds max_transaction_bytes budget",
+                ));
+            }
+            self.pending_tx_bytes = next_tx_bytes;
             self.next_lsn += 1;
             if durability == WriteDurability::SyncTransactional {
                 self.pending_tx_sync = true;
@@ -4468,5 +4817,141 @@ mod tests {
             "F07: rolling back after prepare_commit_transaction must restore quota-evicted rows"
         );
         assert!(engine.get_row(5, b"row2").unwrap().is_none());
+    }
+
+    #[test]
+    fn p01_p02_size_tiered_auto_compaction_scan_keys_and_tx_budget() {
+        let tmp = TempTestDir::new("p01_p02_tiered_scan_budget");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.auto_compact_segment_threshold = 4;
+        cfg.max_transaction_bytes = 8 * 1024; // 8 KB transaction budget for testing P02
+        let mut engine = StorageEngine::open(fs.clone(), cfg).unwrap();
+
+        // 1. P01: Build a large base segment (`idx_segments[0]`, ~64 KB across multiple 4 KB blocks)
+        let base_payload = vec![0x42u8; 256];
+        for i in 0..180u32 {
+            let pk = format!("base_key_{i:04}");
+            engine
+                .put_row(1, pk.as_bytes(), &base_payload, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable_no_auto_compact().unwrap();
+        assert_eq!(engine.active_idx_segment_count(), 1);
+        let base_seq_id = engine.idx_segments[0].seq_id();
+        assert!(
+            engine.idx_segments[0].file_len() >= 16 * 1024,
+            "base segment should span multiple 4 KB blocks"
+        );
+
+        // Now perform 3 small flushes (including a tombstone for `base_key_0010` in the base segment).
+        // When the 4th segment is flushed (`len() == 4 == auto_compact_segment_threshold`),
+        // `compact_auto_tiered()` must merge ONLY the 3 small suffix segments (`1..4`) with
+        // `drop_tombstones = false`, leaving the large `base_seq_id` segment at index 0 untouched!
+        engine
+            .delete_row(1, b"base_key_0010", WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        engine
+            .put_row(1, b"new_key_1", b"v1", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        assert_eq!(engine.active_idx_segment_count(), 3);
+
+        engine
+            .put_row(1, b"new_key_2", b"v2", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+
+        // The 3 small segments should have been merged into 1 suffix segment, leaving 2 segments total,
+        // with `idx_segments[0]` still having `base_seq_id`!
+        assert_eq!(
+            engine.active_idx_segment_count(),
+            2,
+            "P01: size-tiered auto-compaction must merge the 3 small suffix segments into 1"
+        );
+        assert_eq!(
+            engine.idx_segments[0].seq_id(),
+            base_seq_id,
+            "P01: large base segment must NOT be rewritten during small suffix auto-compaction"
+        );
+        // And the tombstone for `base_key_0010` in the merged suffix segment MUST have been preserved!
+        assert_eq!(
+            engine.get_row(1, b"base_key_0010").unwrap(),
+            None,
+            "P01: suffix compaction with start_idx > 0 must preserve tombstones shadowing base segment"
+        );
+        assert_eq!(
+            engine.get_row(1, b"new_key_1").unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            engine.get_row(1, b"new_key_2").unwrap(),
+            Some(b"v2".to_vec())
+        );
+
+        // Explicit full `compact()` merges down to `start_idx == 0` (`1` segment) and drops tombstones
+        engine.compact().unwrap();
+        assert_eq!(engine.active_idx_segment_count(), 1);
+        assert_eq!(engine.get_row(1, b"base_key_0010").unwrap(), None);
+
+        // 2. P02: `scan_keys_range` & `scan_range_into_slab`
+        let pks = engine
+            .scan_keys_range(1, Some(b"base_key_0008"), Some(b"base_key_0012"), 10)
+            .unwrap();
+        assert_eq!(
+            pks,
+            vec![
+                b"base_key_0008".to_vec(),
+                b"base_key_0009".to_vec(),
+                // `base_key_0010` was deleted!
+                b"base_key_0011".to_vec(),
+                b"base_key_0012".to_vec(),
+            ]
+        );
+
+        let mut rev_pks = Vec::new();
+        let mut rev_slab = Vec::new();
+        let mut rev_spans = Vec::new();
+        engine
+            .scan_range_into_slab(
+                1,
+                Some((b"base_key_0008", true)),
+                Some((b"base_key_0012", true)),
+                true,
+                2,
+                false,
+                &mut rev_pks,
+                &mut rev_slab,
+                &mut rev_spans,
+            )
+            .unwrap();
+        assert_eq!(rev_spans.len(), 2);
+        assert_eq!(&rev_slab[rev_spans[0].0..rev_spans[0].1], base_payload.as_slice());
+
+        // 3. P02: `max_transaction_bytes` budget enforcement
+        engine.begin_transaction();
+        engine
+            .put_row(
+                1,
+                b"tx_ok",
+                &vec![0x11u8; 2048],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        let err = engine
+            .put_row(
+                1,
+                b"tx_too_big",
+                &vec![0x22u8; 8192],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .expect_err("P02: exceeding max_transaction_bytes must return Err(InvalidInput)");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        engine.rollback_transaction().unwrap();
+        assert_eq!(engine.get_row(1, b"tx_ok").unwrap(), None);
+        assert_eq!(engine.get_row(1, b"tx_too_big").unwrap(), None);
     }
 }
