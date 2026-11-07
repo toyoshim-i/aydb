@@ -59,6 +59,7 @@ fn bench_lru_read_tracking(root: &PathBuf) {
         }
 
         // Measure 50,000 hot cache reads on the oldest 100 keys (`pk_00000` .. `pk_00099`)
+        let lsn_before_reads = engine.next_lsn();
         let t_read = Instant::now();
         for i in 0..READ_OPS {
             let pk = format!("pk_{:05}", i % 100);
@@ -66,6 +67,7 @@ fn bench_lru_read_tracking(root: &PathBuf) {
             black_box(res);
         }
         let read_elapsed = t_read.elapsed().as_secs_f64();
+        let read_wal_batches = (engine.next_lsn() - lsn_before_reads) as usize;
         let ops_sec = (READ_OPS as f64) / read_elapsed;
         let lat_us = (read_elapsed * 1e6) / (READ_OPS as f64);
 
@@ -79,8 +81,10 @@ fn bench_lru_read_tracking(root: &PathBuf) {
 
         let st = engine.capped_table_state(1).unwrap();
         let wal_batches = match mode {
-            LruReadTrackingMode::EagerWriteOnRead => READ_OPS,
-            LruReadTrackingMode::CoalescedLazyPromotion => st.total_lazy_promotions as usize,
+            LruReadTrackingMode::EagerWriteOnRead => read_wal_batches,
+            LruReadTrackingMode::CoalescedLazyPromotion => {
+                read_wal_batches + st.total_lazy_promotions as usize
+            }
         };
 
         println!(

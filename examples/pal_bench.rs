@@ -257,6 +257,8 @@ fn bench_concurrent_reads(root: &PathBuf) {
             while !stop_staller.load(Ordering::Relaxed) {
                 #[cfg(windows)]
                 let _ = f_staller.seek_write(&page, off);
+                #[cfg(unix)]
+                let _ = f_staller.write_all_at(&page, off);
                 let _ = f_staller.sync_data();
                 off = (off + 65536) % FILE_SIZE;
             }
@@ -281,6 +283,8 @@ fn bench_concurrent_reads(root: &PathBuf) {
                     let t0 = Instant::now();
                     #[cfg(windows)]
                     f.seek_read(&mut buf, blk * 4096).expect("seek_read");
+                    #[cfg(unix)]
+                    f.read_exact_at(&mut buf, blk * 4096).expect("read_exact_at");
                     lats.push(t0.elapsed().as_nanos() as u64);
                 }
                 lats

@@ -389,6 +389,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Returns the next LSN that will be assigned to a WAL batch.
+    pub fn next_lsn(&self) -> u64 {
+        self.next_lsn
+    }
+
     /// Returns a snapshot of the [`CappedTableState`] for `table_id`, if registered.
     pub fn capped_table_state(&self, table_id: u16) -> Option<&CappedTableState> {
         self.capped_tables.get(&table_id)

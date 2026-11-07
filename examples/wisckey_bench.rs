@@ -38,6 +38,7 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
 
     const NUM_SEGS: usize = 4;
     const KEYS_PER_SEG: usize = 1_500;
+    const TOTAL_KEYS: usize = NUM_SEGS * KEYS_PER_SEG;
     const READ_SAMPLES: usize = 2_000;
 
     for &val_size in &[128usize, 512, 1024, 2048] {
@@ -51,20 +52,26 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
             let mut segs = Vec::with_capacity(NUM_SEGS);
             for s in 0..NUM_SEGS {
                 let mut mt = MemTable::new(64 * 1024 * 1024);
-                for k in 0..KEYS_PER_SEG {
+                let key_start = s * KEYS_PER_SEG;
+                let key_end = (s + 1) * KEYS_PER_SEG;
+                for k in key_start..key_end {
                     let key = format!("key_{k:06}").into_bytes();
-                    let lsn = (s * KEYS_PER_SEG + k + 1) as u64;
+                    let lsn = (k + 1) as u64;
                     mt.put_inline(key, payload.clone(), lsn);
                 }
                 segs.push(mt.flush_to_segment(&fs, (s + 1) as u64, 10).unwrap());
             }
 
-            // Measure point read latency from newest segment
+            // Measure point read latency across all 4 segments (newest-first search)
             let t_read = Instant::now();
             for i in 0..READ_SAMPLES {
-                let key = format!("key_{:06}", i % KEYS_PER_SEG);
-                let res = segs.last().unwrap().get(key.as_bytes()).unwrap();
-                black_box(res);
+                let key = format!("key_{:06}", (i * 37) % TOTAL_KEYS);
+                for seg in segs.iter().rev() {
+                    if let Some(res) = seg.get(key.as_bytes()).unwrap() {
+                        black_box(res);
+                        break;
+                    }
+                }
             }
             let read_us = t_read.elapsed().as_secs_f64() * 1e6 / (READ_SAMPLES as f64);
 
@@ -102,9 +109,11 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
 
             for s in 0..NUM_SEGS {
                 let mut mt = MemTable::new(64 * 1024 * 1024);
-                for k in 0..KEYS_PER_SEG {
+                let key_start = s * KEYS_PER_SEG;
+                let key_end = (s + 1) * KEYS_PER_SEG;
+                for k in key_start..key_end {
                     let key = format!("key_{k:06}").into_bytes();
-                    let lsn = (s * KEYS_PER_SEG + k + 1) as u64;
+                    let lsn = (k + 1) as u64;
                     let ptr = blob_writer.append_blob(&key, &payload).unwrap();
                     mt.put_blob_ptr(key, ptr, lsn);
                 }
@@ -114,18 +123,21 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
             let blob_reader =
                 BlobSegmentReader::new(blob_writer.file().clone(), blob_writer.seq_id());
 
-            // Measure point read latency (idx lookup + blob dereference)
+            // Measure point read latency across all 4 segments (idx lookup + blob dereference)
             let t_read = Instant::now();
             for i in 0..READ_SAMPLES {
-                let key = format!("key_{:06}", i % KEYS_PER_SEG);
-                if let Some((_lsn, IndexValue::Blob(ptr))) =
-                    segs.last().unwrap().get(key.as_bytes()).unwrap()
-                {
-                    let val = blob_reader
-                        .read_blob(&ptr, Some(key.as_bytes()))
-                        .unwrap()
-                        .unwrap();
-                    black_box(val);
+                let key = format!("key_{:06}", (i * 37) % TOTAL_KEYS);
+                for seg in segs.iter().rev() {
+                    if let Some((_lsn, IndexValue::Blob(ptr))) =
+                        seg.get(key.as_bytes()).unwrap()
+                    {
+                        let val = blob_reader
+                            .read_blob(&ptr, Some(key.as_bytes()))
+                            .unwrap()
+                            .unwrap();
+                        black_box(val);
+                        break;
+                    }
                 }
             }
             let read_us = t_read.elapsed().as_secs_f64() * 1e6 / (READ_SAMPLES as f64);

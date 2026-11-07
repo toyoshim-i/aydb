@@ -4,13 +4,14 @@
 //! across three standard database benchmark suites:
 //!
 //! 1. **SQLite Official "Speedtest1" Standard Suite (Tests 100..320):**
-//!    - Test 100: Bulk `INSERT` of 10,000 rows (`BEGIN .. COMMIT`)
-//!    - Test 130: 10,000 Random Primary-Key Point `SELECT`s (`WHERE id = ?`)
-//!    - Test 140: 10,000 Random Secondary-Index Equality `SELECT`s (`WHERE uval = ?`)
-//!    - Test 160: 2,000 Primary-Key Range `SELECT`s (`WHERE id >= ? AND id < ?`)
+//!    - Test 100: Bulk `INSERT` of 5,000 rows (`BEGIN .. COMMIT`)
+//!    - Test 130: 5,000 Random Primary-Key Point `SELECT`s (`WHERE id = ?`)
+//!    - Test 140: 5,000 Random Secondary-Index Equality `SELECT`s (`WHERE uval = ?`)
+//!    - Test 160: 1,000 Primary-Key Range `SELECT`s (`WHERE id >= ? AND id < ?`)
 //!    - Test 210: Full-Table Aggregation & `GROUP BY` (`SELECT category, COUNT(*), SUM(uval) ...`)
-//!    - Test 230: 5,000 Random `UPDATE`s on Indexed Table
-//!    - Test 240: 5,000 Random `DELETE`s + Re-`INSERT`s (Churn)
+//!    - Test 230: 2,500 Random `UPDATE`s on Indexed Table
+//!    - Test 240: 2,500 Random `DELETE`s + Re-`INSERT`s (Churn)
+//!    - Evaluated with `WalStreamMode::BufferedUserSpaceCoalesced` on `aydb` vs. `PRAGMA synchronous = NORMAL` on SQLite.
 //!
 //! 2. **YCSB (Yahoo! Cloud Serving Benchmark) Workloads A through F (Zipfian $\theta = 0.99$):**
 //!    - Workload A (Update Heavy): 50% Read / 50% Update
@@ -221,7 +222,7 @@ fn run_speedtest1_on_connection(conn: &SqliteConnection) -> SpeedtestTimings {
             .prepare("INSERT OR REPLACE INTO t1 VALUES (?1, ?2, ?3, ?4)")
             .unwrap();
         for i in 1..=N_MUT {
-            let id = i as i64;
+            let id = (rng.next_usize(N_ROWS) + 1) as i64;
             del.execute(&[SqlValue::Integer(id)]).unwrap();
             ins.execute(&[
                 SqlValue::Integer(id),
@@ -405,6 +406,9 @@ fn run_ycsb_on_connection(
         .prepare("SELECT field0 FROM usertable WHERE ycsb_key = ?1")
         .unwrap();
     let mut upd_stmt = conn
+        .prepare("UPDATE usertable SET field0 = ?1 WHERE ycsb_key = ?2")
+        .unwrap();
+    let mut ins_stmt = conn
         .prepare("INSERT OR REPLACE INTO usertable VALUES (?1, ?2)")
         .unwrap();
     let mut scan_stmt = conn
@@ -422,7 +426,7 @@ fn run_ycsb_on_connection(
             black_box(sel_stmt.query(&[key]).unwrap());
         } else {
             upd_stmt
-                .execute(&[key, SqlValue::Blob(payload.clone())])
+                .execute(&[SqlValue::Blob(payload.clone()), key])
                 .unwrap();
         }
     }
@@ -435,7 +439,7 @@ fn run_ycsb_on_connection(
         let key = SqlValue::Text(format!("user{k_idx:08}"));
         if i % 20 == 0 {
             upd_stmt
-                .execute(&[key, SqlValue::Blob(payload.clone())])
+                .execute(&[SqlValue::Blob(payload.clone()), key])
                 .unwrap();
         } else {
             black_box(sel_stmt.query(&[key]).unwrap());
@@ -459,7 +463,7 @@ fn run_ycsb_on_connection(
         if i % 20 == 0 {
             latest_count += 1;
             let key = SqlValue::Text(format!("user{latest_count:08}"));
-            upd_stmt
+            ins_stmt
                 .execute(&[key, SqlValue::Blob(payload.clone())])
                 .unwrap();
         } else {
@@ -477,7 +481,7 @@ fn run_ycsb_on_connection(
         if i % 20 == 0 {
             latest_count += 1;
             let key = SqlValue::Text(format!("user{latest_count:08}"));
-            upd_stmt
+            ins_stmt
                 .execute(&[key, SqlValue::Blob(payload.clone())])
                 .unwrap();
         } else {
@@ -496,7 +500,7 @@ fn run_ycsb_on_connection(
         black_box(sel_stmt.query(std::slice::from_ref(&key)).unwrap());
         if i % 2 == 0 {
             upd_stmt
-                .execute(&[key, SqlValue::Blob(payload.clone())])
+                .execute(&[SqlValue::Blob(payload.clone()), key])
                 .unwrap();
         }
     }
@@ -630,26 +634,20 @@ fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
     }
     conn.execute_batch("COMMIT").unwrap();
 
-    let mut sel_acc = conn
-        .prepare("SELECT bid, abalance FROM accounts WHERE aid = ?1")
-        .unwrap();
     let mut upd_acc = conn
-        .prepare("INSERT OR REPLACE INTO accounts VALUES (?1, ?2, ?3)")
+        .prepare("UPDATE accounts SET abalance = abalance + ?1 WHERE aid = ?2")
         .unwrap();
-    let mut sel_tel = conn
-        .prepare("SELECT bid, tbalance FROM tellers WHERE tid = ?1")
+    let mut sel_acc = conn
+        .prepare("SELECT abalance FROM accounts WHERE aid = ?1")
         .unwrap();
     let mut upd_tel = conn
-        .prepare("INSERT OR REPLACE INTO tellers VALUES (?1, ?2, ?3)")
-        .unwrap();
-    let mut sel_br = conn
-        .prepare("SELECT bbalance FROM branches WHERE bid = ?1")
+        .prepare("UPDATE tellers SET tbalance = tbalance + ?1 WHERE tid = ?2")
         .unwrap();
     let mut upd_br = conn
-        .prepare("INSERT OR REPLACE INTO branches VALUES (?1, ?2)")
+        .prepare("UPDATE branches SET bbalance = bbalance + ?1 WHERE bid = ?2")
         .unwrap();
     let mut ins_hist = conn
-        .prepare("INSERT OR REPLACE INTO history VALUES (?1, ?2, ?3, ?4, ?5)")
+        .prepare("INSERT INTO history VALUES (?1, ?2, ?3, ?4, ?5)")
         .unwrap();
 
     let mut rng = ZipfRng::new(0x55AA_1234, N_ACCOUNTS as usize, 0.99);
@@ -657,45 +655,21 @@ fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
     for tx_id in 1..=n_tx {
         let aid = (rng.next_usize(N_ACCOUNTS as usize) + 1) as i64;
         let tid = (rng.next_usize(N_TELLERS as usize) + 1) as i64;
-        let bid = (rng.next_usize(N_BRANCHES as usize) + 1) as i64;
+        let bid = (aid % N_BRANCHES) + 1;
         let delta = ((tx_id as i64) % 200) - 100;
 
         conn.execute_batch("BEGIN").unwrap();
-        let acc_rows = sel_acc.query(&[SqlValue::Integer(aid)]).unwrap();
-        let cur_abal = match acc_rows.first().and_then(|r| r.get(1)) {
-            Some(SqlValue::Integer(v)) => *v,
-            _ => 0,
-        };
         upd_acc
-            .execute(&[
-                SqlValue::Integer(aid),
-                SqlValue::Integer(bid),
-                SqlValue::Integer(cur_abal + delta),
-            ])
+            .execute(&[SqlValue::Integer(delta), SqlValue::Integer(aid)])
             .unwrap();
-
-        let tel_rows = sel_tel.query(&[SqlValue::Integer(tid)]).unwrap();
-        let cur_tbal = match tel_rows.first().and_then(|r| r.get(1)) {
-            Some(SqlValue::Integer(v)) => *v,
-            _ => 0,
-        };
+        let acc_rows = sel_acc.query(&[SqlValue::Integer(aid)]).unwrap();
+        black_box(acc_rows);
         upd_tel
-            .execute(&[
-                SqlValue::Integer(tid),
-                SqlValue::Integer(bid),
-                SqlValue::Integer(cur_tbal + delta),
-            ])
+            .execute(&[SqlValue::Integer(delta), SqlValue::Integer(tid)])
             .unwrap();
-
-        let br_rows = sel_br.query(&[SqlValue::Integer(bid)]).unwrap();
-        let cur_bbal = match br_rows.first().and_then(|r| r.first()) {
-            Some(SqlValue::Integer(v)) => *v,
-            _ => 0,
-        };
         upd_br
-            .execute(&[SqlValue::Integer(bid), SqlValue::Integer(cur_bbal + delta)])
+            .execute(&[SqlValue::Integer(delta), SqlValue::Integer(bid)])
             .unwrap();
-
         ins_hist
             .execute(&[
                 SqlValue::Integer(tx_id as i64),

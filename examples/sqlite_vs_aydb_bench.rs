@@ -211,8 +211,7 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
                  url TEXT PRIMARY KEY,
                  access_tick INTEGER NOT NULL,
                  body BLOB NOT NULL
-             );
-             CREATE INDEX idx_http_cache_tick ON http_cache(access_tick);",
+             );",
         )
         .unwrap();
 
@@ -220,11 +219,7 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
             .prepare("INSERT OR REPLACE INTO http_cache VALUES (?1, ?2, ?3)")
             .unwrap();
         let mut evict_stmt = conn
-            .prepare(
-                "DELETE FROM http_cache WHERE url IN (
-                     SELECT url FROM http_cache ORDER BY access_tick ASC LIMIT 1
-                 )",
-            )
+            .prepare("DELETE FROM http_cache WHERE access_tick <= ?1")
             .unwrap();
 
         let mut lats = Vec::with_capacity(TOTAL_INSERTS);
@@ -235,10 +230,14 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
             let body = SqlValue::Blob(blob_payload.clone());
 
             let t0 = Instant::now();
+            conn.execute_batch("BEGIN").unwrap();
             ins_stmt.execute(&[url, tick, body]).unwrap();
             if (i as i64) > MAX_LIVE_ROWS {
-                evict_stmt.execute(&[]).unwrap();
+                evict_stmt
+                    .execute(&[SqlValue::Integer((i as i64) - MAX_LIVE_ROWS)])
+                    .unwrap();
             }
+            conn.execute_batch("COMMIT").unwrap();
             lats.push(t0.elapsed().as_nanos() as u64);
         }
         let elapsed = t_start.elapsed().as_secs_f64();
@@ -418,18 +417,19 @@ fn bench_read_heavy_cache_lru_tracking(root: &PathBuf) {
                 table_id = 1,
                 max_bytes = 2097152,
                 durability = 'buffered',
-                columns = 'url TEXT PRIMARY KEY, body BLOB'
+                columns = 'url TEXT PRIMARY KEY, access_tick INTEGER, body BLOB'
             );",
         )
         .unwrap();
 
         let mut ins_stmt = conn
-            .prepare("INSERT INTO http_cache VALUES (?1, ?2)")
+            .prepare("INSERT INTO http_cache VALUES (?1, ?2, ?3)")
             .unwrap();
         for i in 0..NUM_ITEMS {
             ins_stmt
                 .execute(&[
                     SqlValue::Text(format!("https://cache.local/item_{i:04}")),
+                    SqlValue::Integer(i as i64),
                     SqlValue::Blob(payload.clone()),
                 ])
                 .unwrap();
