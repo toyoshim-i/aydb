@@ -19,6 +19,10 @@ use crate::wal::{BlobKind, BlobPtr};
 /// Size of an index data block (4096 bytes).
 pub const IDX_BLOCK_SIZE: usize = 4096;
 
+/// Write coalescing buffer capacity (`256 KB` = 64 data blocks, matching the Windows Cache
+/// Manager Virtual Address Control Block size) used by [`IdxSegmentBuilder`] (`P3`).
+const IDX_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
+
 /// Size of the fixed trailer at the end of every 4 KB index data block (`4088..4096`).
 const IDX_BLOCK_TRAILER_SIZE: usize = 8;
 
@@ -169,6 +173,78 @@ impl IdxBlockBuilder {
         used + needed <= IDX_BLOCK_USABLE_SIZE
     }
 
+    /// Returns `true` if a raw entry with `(key_len, val_type, val_len)` fits in this 4 KB block (`P2`).
+    #[inline]
+    pub fn can_fit_raw(&self, key_len: usize, val_type: u8, val_len: usize) -> bool {
+        let payload_len = match val_type {
+            1 => 2 + val_len,
+            2 => BLOB_PTR_ENCODED_LEN,
+            _ => 0,
+        };
+        let needed = 11 + key_len + payload_len + 2;
+        let used = self.write_pos + (self.offsets.len() * 2);
+        used + needed <= IDX_BLOCK_USABLE_SIZE
+    }
+
+    /// Appends a raw borrowed entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to this block (`P2`).
+    pub fn add_raw_entry(
+        &mut self,
+        key: &[u8],
+        lsn: u64,
+        val_type: u8,
+        val_bytes: &[u8],
+    ) -> io::Result<()> {
+        if !self.can_fit_raw(key.len(), val_type, val_bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RawIdxEntry exceeds remaining 4 KB block capacity",
+            ));
+        }
+        let klen = u16::try_from(key.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
+        })?;
+
+        let start = self.write_pos;
+        self.offsets.push(start as u16);
+
+        self.buf[start..start + 2].copy_from_slice(&klen.to_le_bytes());
+        self.buf[start + 2] = val_type;
+        self.buf[start + 3..start + 11].copy_from_slice(&lsn.to_le_bytes());
+        let mut pos = start + 11;
+
+        self.buf[pos..pos + key.len()].copy_from_slice(key);
+        pos += key.len();
+
+        match val_type {
+            1 => {
+                let vlen = u16::try_from(val_bytes.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inline value length exceeds u16::MAX",
+                    )
+                })?;
+                self.buf[pos..pos + 2].copy_from_slice(&vlen.to_le_bytes());
+                pos += 2;
+                self.buf[pos..pos + val_bytes.len()].copy_from_slice(val_bytes);
+                pos += val_bytes.len();
+            }
+            2 => {
+                self.buf[pos..pos + BLOB_PTR_ENCODED_LEN].copy_from_slice(val_bytes);
+                pos += BLOB_PTR_ENCODED_LEN;
+            }
+            3 => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown IndexValue type_tag: {other}"),
+                ));
+            }
+        }
+
+        self.write_pos = pos;
+        Ok(())
+    }
+
     /// Appends `entry` (which must be in strictly ascending key order) to this block.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
         if !self.can_fit(entry) {
@@ -248,6 +324,73 @@ impl IdxBlockBuilder {
     }
 }
 
+/// Zero-copy borrowed view of an entry inside a verified 4 KB index data block (`P2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawIdxEntry<'a> {
+    pub key: &'a [u8],
+    pub lsn: u64,
+    pub val_type: u8,
+    pub val_bytes: &'a [u8],
+}
+
+impl<'a> RawIdxEntry<'a> {
+    /// Decodes a 23-byte encoded [`BlobPtr`] slice without heap allocation (`P2`).
+    #[inline]
+    pub fn decode_blob_ptr(val_bytes: &[u8]) -> io::Result<BlobPtr> {
+        if val_bytes.len() != BLOB_PTR_ENCODED_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted BlobPtr slice length in RawIdxEntry",
+            ));
+        }
+        let kind = BlobKind::from_u8(val_bytes[0])?;
+        let table_id = u16::from_le_bytes([val_bytes[1], val_bytes[2]]);
+        let seg_id = u64::from_le_bytes(val_bytes[3..11].try_into().unwrap());
+        let offset = u32::from_le_bytes(val_bytes[11..15].try_into().unwrap());
+        let len = u32::from_le_bytes(val_bytes[15..19].try_into().unwrap());
+        let crc = u32::from_le_bytes(val_bytes[19..23].try_into().unwrap());
+        Ok(BlobPtr {
+            kind,
+            table_id,
+            seg_id,
+            offset,
+            len,
+            crc32c: crc,
+        })
+    }
+
+    /// Decodes the value payload of this entry into an owned [`IndexValue`].
+    pub fn decode_value(&self) -> io::Result<IndexValue> {
+        match self.val_type {
+            1 => Ok(IndexValue::Inline(self.val_bytes.to_vec())),
+            2 => Ok(IndexValue::Blob(Self::decode_blob_ptr(self.val_bytes)?)),
+            3 => Ok(IndexValue::Tombstone),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown IndexValue type_tag: {other}"),
+            )),
+        }
+    }
+
+    /// Materializes a full [`IndexEntry`] from this borrowed view.
+    #[inline]
+    pub fn to_owned_entry(&self) -> io::Result<IndexEntry> {
+        Ok(IndexEntry {
+            key: self.key.to_vec(),
+            lsn: self.lsn,
+            value: self.decode_value()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CursorEntrySpan {
+    key_range: core::ops::Range<usize>,
+    lsn: u64,
+    val_type: u8,
+    val_range: core::ops::Range<usize>,
+}
+
 /// Zero-copy reader for a single 4096-byte index data block.
 pub struct IdxBlockReader<'a> {
     buf: &'a [u8; IDX_BLOCK_SIZE],
@@ -324,8 +467,9 @@ impl<'a> IdxBlockReader<'a> {
         Ok(&self.buf[kstart..kstart + klen])
     }
 
-    /// Decodes the full [`IndexEntry`] at `index`.
-    pub fn decode_entry_at(&self, index: usize) -> io::Result<IndexEntry> {
+    /// Parses the byte ranges of the entry at `index` inside `self.buf` with zero heap allocations (`P2`).
+    #[inline]
+    fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
         let off = self.entry_offset(index);
         if off + 11 > self.dir_start {
             return Err(io::Error::new(
@@ -334,60 +478,47 @@ impl<'a> IdxBlockReader<'a> {
             ));
         }
         let klen = u16::from_le_bytes([self.buf[off], self.buf[off + 1]]) as usize;
-        let type_tag = self.buf[off + 2];
+        let val_type = self.buf[off + 2];
         let lsn = u64::from_le_bytes(self.buf[off + 3..off + 11].try_into().unwrap());
-        let mut pos = off + 11;
-
-        if pos + klen > self.dir_start {
+        let kstart = off + 11;
+        let kend = kstart + klen;
+        if kend > self.dir_start {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted key slice in 4 KB index block",
             ));
         }
-        let key = self.buf[pos..pos + klen].to_vec();
-        pos += klen;
-
-        let value = match type_tag {
+        let val_range = match val_type {
             1 => {
-                if pos + 2 > self.dir_start {
+                if kend + 2 > self.dir_start {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "truncated inline value length",
                     ));
                 }
-                let vlen = u16::from_le_bytes([self.buf[pos], self.buf[pos + 1]]) as usize;
-                pos += 2;
-                if pos + vlen > self.dir_start {
+                let vlen = u16::from_le_bytes([self.buf[kend], self.buf[kend + 1]]) as usize;
+                let vstart = kend + 2;
+                let vend = vstart + vlen;
+                if vend > self.dir_start {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "truncated inline value payload",
                     ));
                 }
-                IndexValue::Inline(self.buf[pos..pos + vlen].to_vec())
+                vstart..vend
             }
             2 => {
-                if pos + 23 > self.dir_start {
+                let vend = kend + BLOB_PTR_ENCODED_LEN;
+                if vend > self.dir_start {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "truncated BlobPtr in 4 KB index block",
                     ));
                 }
-                let kind = BlobKind::from_u8(self.buf[pos])?;
-                let table_id = u16::from_le_bytes([self.buf[pos + 1], self.buf[pos + 2]]);
-                let seg_id = u64::from_le_bytes(self.buf[pos + 3..pos + 11].try_into().unwrap());
-                let offset = u32::from_le_bytes(self.buf[pos + 11..pos + 15].try_into().unwrap());
-                let len = u32::from_le_bytes(self.buf[pos + 15..pos + 19].try_into().unwrap());
-                let crc = u32::from_le_bytes(self.buf[pos + 19..pos + 23].try_into().unwrap());
-                IndexValue::Blob(BlobPtr {
-                    kind,
-                    table_id,
-                    seg_id,
-                    offset,
-                    len,
-                    crc32c: crc,
-                })
+                BlobKind::from_u8(self.buf[kend])?;
+                kend..vend
             }
-            3 => IndexValue::Tombstone,
+            3 => kend..kend,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -395,8 +526,29 @@ impl<'a> IdxBlockReader<'a> {
                 ));
             }
         };
+        Ok(CursorEntrySpan {
+            key_range: kstart..kend,
+            lsn,
+            val_type,
+            val_range,
+        })
+    }
 
-        Ok(IndexEntry { key, lsn, value })
+    /// Returns a zero-copy [`RawIdxEntry`] at `index` borrowed directly from `self.buf` (`P2`).
+    #[inline]
+    pub fn raw_entry_at(&self, index: usize) -> io::Result<RawIdxEntry<'a>> {
+        let span = self.parse_entry_span_at(index)?;
+        Ok(RawIdxEntry {
+            key: &self.buf[span.key_range],
+            lsn: span.lsn,
+            val_type: span.val_type,
+            val_bytes: &self.buf[span.val_range],
+        })
+    }
+
+    /// Decodes the full [`IndexEntry`] at `index`.
+    pub fn decode_entry_at(&self, index: usize) -> io::Result<IndexEntry> {
+        self.raw_entry_at(index)?.to_owned_entry()
     }
 
     /// Searches for `target_key` in $O(\log K)$ time using the downward-growing `u16` offset directory.
@@ -529,6 +681,8 @@ pub struct IdxSegmentBuilder<F: PlatformFile> {
     num_blocks: u32,
     record_count: u32,
     write_offset: u64,
+    buf_start_offset: u64,
+    write_buf: Vec<u8>,
 }
 
 impl<F: PlatformFile> IdxSegmentBuilder<F> {
@@ -552,6 +706,8 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             num_blocks: 0,
             record_count: 0,
             write_offset: 0,
+            buf_start_offset: 0,
+            write_buf: Vec::with_capacity(IDX_WRITE_BUFFER_CAPACITY),
         })
     }
 
@@ -570,6 +726,44 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         Ok(())
     }
 
+    /// Adds a sorted raw entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to the segment
+    /// without constructing an intermediate [`IndexEntry`] (`P2`).
+    pub fn add_raw_entry(
+        &mut self,
+        key: &[u8],
+        lsn: u64,
+        val_type: u8,
+        val_bytes: &[u8],
+    ) -> io::Result<()> {
+        if !self.block_builder.is_empty()
+            && !self
+                .block_builder
+                .can_fit_raw(key.len(), val_type, val_bytes.len())
+        {
+            self.flush_current_data_block()?;
+        }
+        self.block_builder
+            .add_raw_entry(key, lsn, val_type, val_bytes)?;
+        if self.bloom_bits_per_key > 0 {
+            self.bloom_hashes.push(BloomFilter::hash64(key));
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.record_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn flush_write_buf(&mut self) -> io::Result<()> {
+        if !self.write_buf.is_empty() {
+            self.file
+                .write_all_at(&self.write_buf, self.buf_start_offset)?;
+            self.buf_start_offset += self.write_buf.len() as u64;
+            self.write_buf.clear();
+        }
+        Ok(())
+    }
+
     fn flush_current_data_block(&mut self) -> io::Result<()> {
         if self.block_builder.is_empty() {
             return Ok(());
@@ -583,13 +777,19 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         let block_idx = self.num_blocks;
         let block_bytes = self.block_builder.finish_and_reset();
 
-        self.file.write_all_at(&block_bytes, self.write_offset)?;
+        if self.write_buf.is_empty() {
+            self.buf_start_offset = self.write_offset;
+        }
+        self.write_buf.extend_from_slice(&block_bytes);
         self.write_offset += IDX_BLOCK_SIZE as u64;
         self.num_blocks += 1;
         self.fence_pointers.push(FencePointer {
             first_key,
             block_idx,
         });
+        if self.write_buf.len() >= IDX_WRITE_BUFFER_CAPACITY {
+            self.flush_write_buf()?;
+        }
         Ok(())
     }
 
@@ -597,6 +797,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
     /// and Sparse Fence Pointer section, writing the 48-byte footer, and syncing to disk.
     pub fn finish(mut self) -> io::Result<IdxSegmentReader<F>> {
         self.flush_current_data_block()?;
+        self.flush_write_buf()?;
 
         // Build BloomFilter from precomputed 64-bit hashes and drop the hash vector immediately (`P02`)
         let bloom_hashes = core::mem::take(&mut self.bloom_hashes);
@@ -1092,14 +1293,14 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 }
 
-/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`] (`P-01`).
+/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`] (`P-01`, `P2`).
 pub struct IdxSegmentRevCursor<'a, F: PlatformFile> {
     seg: &'a IdxSegmentReader<F>,
     next_block_idx: Option<u32>,
     block_buf: [u8; IDX_BLOCK_SIZE],
     entry_idx: usize,
     num_entries_in_block: usize,
-    current: Option<IndexEntry>,
+    current_span: Option<CursorEntrySpan>,
 }
 
 impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
@@ -1113,7 +1314,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
             block_buf: [0u8; IDX_BLOCK_SIZE],
             entry_idx: 0,
             num_entries_in_block: 0,
-            current: None,
+            current_span: None,
         };
         if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
             return Ok(cursor);
@@ -1163,10 +1364,10 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
 
             if low > 0 {
                 let target_idx = low - 1;
-                let entry = reader.decode_entry_at(target_idx)?;
+                let span = reader.parse_entry_span_at(target_idx)?;
                 cursor.entry_idx = target_idx;
                 cursor.next_block_idx = b.checked_sub(1);
-                cursor.current = Some(entry);
+                cursor.current_span = Some(span);
                 break;
             }
 
@@ -1178,23 +1379,48 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
         Ok(cursor)
     }
 
+    /// Returns the raw key slice of the current entry without heap allocation (`P2`).
     #[inline]
-    pub fn peek(&self) -> Option<&IndexEntry> {
-        self.current.as_ref()
+    pub fn current_key(&self) -> Option<&[u8]> {
+        self.current_span
+            .as_ref()
+            .map(|s| &self.block_buf[s.key_range.clone()])
     }
 
-    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
-        let prev = self.current.take();
-        if prev.is_some() {
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf` (`P2`).
+    #[inline]
+    pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        self.current_span.as_ref().map(|s| RawIdxEntry {
+            key: &self.block_buf[s.key_range.clone()],
+            lsn: s.lsn,
+            val_type: s.val_type,
+            val_bytes: &self.block_buf[s.val_range.clone()],
+        })
+    }
+
+    /// Advances the cursor to the previous entry in the segment without allocating (`P2`).
+    #[inline]
+    pub fn advance(&mut self) -> io::Result<()> {
+        if self.current_span.is_some() {
             self.advance_to_prev()?;
         }
-        Ok(prev)
+        Ok(())
+    }
+
+    /// Consumes and returns the current [`IndexEntry`], advancing the cursor to the previous entry.
+    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
+        let Some(raw) = self.peek_raw() else {
+            return Ok(None);
+        };
+        let owned = raw.to_owned_entry()?;
+        self.advance_to_prev()?;
+        Ok(Some(owned))
     }
 
     fn advance_to_prev(&mut self) -> io::Result<()> {
         while self.entry_idx == 0 {
             let Some(b) = self.next_block_idx else {
-                self.current = None;
+                self.current_span = None;
                 return Ok(());
             };
             self.next_block_idx = b.checked_sub(1);
@@ -1208,23 +1434,23 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
 
         self.entry_idx -= 1;
         let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
-        let entry = reader.decode_entry_at(self.entry_idx)?;
-        self.current = Some(entry);
+        let span = reader.parse_entry_span_at(self.entry_idx)?;
+        self.current_span = Some(span);
         Ok(())
     }
 }
 
-/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].
+/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`] (`P2`).
 ///
 /// Holds only a single 4 KB data block buffer (`[u8; IDX_BLOCK_SIZE]`) in stack/struct memory,
-/// enabling $O(K \times 4\text{ KB})$ streaming K-way merges for range scans and compaction.
+/// enabling zero-allocation key/LSN inspection and $O(K \times 4\text{ KB})$ streaming K-way merges.
 pub struct IdxSegmentCursor<'a, F: PlatformFile> {
     seg: &'a IdxSegmentReader<F>,
     next_block_idx: u32,
     block_buf: [u8; IDX_BLOCK_SIZE],
     entry_idx: usize,
     num_entries_in_block: usize,
-    current: Option<IndexEntry>,
+    current_span: Option<CursorEntrySpan>,
 }
 
 impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
@@ -1235,7 +1461,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             block_buf: [0u8; IDX_BLOCK_SIZE],
             entry_idx: 0,
             num_entries_in_block: 0,
-            current: None,
+            current_span: None,
         };
         cursor.advance_to_next()?;
         Ok(cursor)
@@ -1252,7 +1478,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             block_buf: [0u8; IDX_BLOCK_SIZE],
             entry_idx: 0,
             num_entries_in_block: 0,
-            current: None,
+            current_span: None,
         };
         if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
             return Ok(cursor);
@@ -1290,9 +1516,9 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             }
 
             if low < cursor.num_entries_in_block {
-                let first_entry = reader.decode_entry_at(low)?;
+                let first_span = reader.parse_entry_span_at(low)?;
                 cursor.entry_idx = low + 1;
-                cursor.current = Some(first_entry);
+                cursor.current_span = Some(first_span);
                 break;
             } else {
                 cursor.entry_idx = cursor.num_entries_in_block;
@@ -1301,25 +1527,48 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         Ok(cursor)
     }
 
-    /// Returns a reference to the current [`IndexEntry`] without advancing the cursor.
+    /// Returns the raw key slice of the current entry without heap allocation (`P2`).
     #[inline]
-    pub fn peek(&self) -> Option<&IndexEntry> {
-        self.current.as_ref()
+    pub fn current_key(&self) -> Option<&[u8]> {
+        self.current_span
+            .as_ref()
+            .map(|s| &self.block_buf[s.key_range.clone()])
+    }
+
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf` (`P2`).
+    #[inline]
+    pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        self.current_span.as_ref().map(|s| RawIdxEntry {
+            key: &self.block_buf[s.key_range.clone()],
+            lsn: s.lsn,
+            val_type: s.val_type,
+            val_bytes: &self.block_buf[s.val_range.clone()],
+        })
+    }
+
+    /// Advances the cursor to the next entry in the segment without allocating (`P2`).
+    #[inline]
+    pub fn advance(&mut self) -> io::Result<()> {
+        if self.current_span.is_some() {
+            self.advance_to_next()?;
+        }
+        Ok(())
     }
 
     /// Consumes and returns the current [`IndexEntry`], advancing the cursor to the next entry.
     pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
-        let prev = self.current.take();
-        if prev.is_some() {
-            self.advance_to_next()?;
-        }
-        Ok(prev)
+        let Some(raw) = self.peek_raw() else {
+            return Ok(None);
+        };
+        let owned = raw.to_owned_entry()?;
+        self.advance_to_next()?;
+        Ok(Some(owned))
     }
 
     fn advance_to_next(&mut self) -> io::Result<()> {
         while self.entry_idx >= self.num_entries_in_block {
             if self.next_block_idx >= self.seg.num_blocks {
-                self.current = None;
+                self.current_span = None;
                 return Ok(());
             }
             let b = self.next_block_idx;
@@ -1333,9 +1582,9 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         }
 
         let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
-        let entry = reader.decode_entry_at(self.entry_idx)?;
+        let span = reader.parse_entry_span_at(self.entry_idx)?;
         self.entry_idx += 1;
-        self.current = Some(entry);
+        self.current_span = Some(span);
         Ok(())
     }
 }
@@ -1368,15 +1617,17 @@ pub fn compact_idx_segments<F: PlatformFile>(
 
     let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
     let mut dead_blob_map: BTreeMap<(u8, u16, u64), u64> = BTreeMap::new();
+    let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
+    let mut winning_val_buf: Vec<u8> = Vec::with_capacity(256);
 
     loop {
         let mut min_key: Option<&[u8]> = None;
         for cur in &cursors {
-            if let Some(entry) = cur.peek() {
+            if let Some(k) = cur.current_key() {
                 match min_key {
-                    None => min_key = Some(entry.key.as_slice()),
-                    Some(mk) if entry.key.as_slice() < mk => {
-                        min_key = Some(entry.key.as_slice());
+                    None => min_key = Some(k),
+                    Some(mk) if k < mk => {
+                        min_key = Some(k);
                     }
                     _ => {}
                 }
@@ -1386,43 +1637,57 @@ pub fn compact_idx_segments<F: PlatformFile>(
         let Some(target_key_slice) = min_key else {
             break;
         };
-        let target_key = target_key_slice.to_vec();
+        target_key_buf.clear();
+        target_key_buf.extend_from_slice(target_key_slice);
 
-        let mut winning_entry: Option<IndexEntry> = None;
+        let mut winning_meta: Option<(u64, u8)> = None;
         for cur in &mut cursors {
-            while cur
-                .peek()
-                .map(|e| e.key.as_slice() == target_key.as_slice())
-                .unwrap_or(false)
-            {
-                let entry = cur.next_entry()?.unwrap();
-                match &mut winning_entry {
+            while cur.current_key() == Some(target_key_buf.as_slice()) {
+                let raw = cur.peek_raw().unwrap();
+                match &mut winning_meta {
                     None => {
-                        winning_entry = Some(entry);
+                        winning_meta = Some((raw.lsn, raw.val_type));
+                        winning_val_buf.clear();
+                        winning_val_buf.extend_from_slice(raw.val_bytes);
                     }
-                    Some(existing) => {
-                        if entry.lsn > existing.lsn {
-                            if let IndexValue::Blob(old_ptr) = &existing.value {
-                                *dead_blob_map
-                                    .entry((old_ptr.kind as u8, old_ptr.table_id, old_ptr.seg_id))
-                                    .or_insert(0) += old_ptr.len as u64;
+                    Some((win_lsn, win_vtype)) => {
+                        if raw.lsn > *win_lsn {
+                            if *win_vtype == 2 && winning_val_buf.len() == BLOB_PTR_ENCODED_LEN {
+                                let k = winning_val_buf[0];
+                                let tid =
+                                    u16::from_le_bytes([winning_val_buf[1], winning_val_buf[2]]);
+                                let sid = u64::from_le_bytes(
+                                    winning_val_buf[3..11].try_into().unwrap(),
+                                );
+                                let blen = u32::from_le_bytes(
+                                    winning_val_buf[15..19].try_into().unwrap(),
+                                );
+                                *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
                             }
-                            *existing = entry;
-                        } else if let IndexValue::Blob(old_ptr) = &entry.value {
-                            *dead_blob_map
-                                .entry((old_ptr.kind as u8, old_ptr.table_id, old_ptr.seg_id))
-                                .or_insert(0) += old_ptr.len as u64;
+                            *win_lsn = raw.lsn;
+                            *win_vtype = raw.val_type;
+                            winning_val_buf.clear();
+                            winning_val_buf.extend_from_slice(raw.val_bytes);
+                        } else if raw.val_type == 2 && raw.val_bytes.len() == BLOB_PTR_ENCODED_LEN {
+                            let k = raw.val_bytes[0];
+                            let tid = u16::from_le_bytes([raw.val_bytes[1], raw.val_bytes[2]]);
+                            let sid =
+                                u64::from_le_bytes(raw.val_bytes[3..11].try_into().unwrap());
+                            let blen =
+                                u32::from_le_bytes(raw.val_bytes[15..19].try_into().unwrap());
+                            *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
                         }
                     }
                 }
+                cur.advance()?;
             }
         }
 
-        if let Some(entry) = winning_entry {
-            if drop_tombstones && entry.value == IndexValue::Tombstone {
+        if let Some((lsn, val_type)) = winning_meta {
+            if drop_tombstones && val_type == 3 {
                 continue;
             }
-            builder.add_entry(&entry)?;
+            builder.add_raw_entry(&target_key_buf, lsn, val_type, &winning_val_buf)?;
         }
     }
 

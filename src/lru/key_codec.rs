@@ -152,6 +152,15 @@ pub fn encode_secondary_index_key(
     out
 }
 
+/// Encodes the 5-byte prefix `[TableID: u16 BE | 'i' | IndexID: u16 BE]` for scanning all
+/// entries belonging to secondary index `(table_id, index_id)` (`P1`).
+#[inline]
+pub fn encode_secondary_index_prefix(table_id: u16, index_id: u16) -> [u8; 5] {
+    let tb = table_id.to_be_bytes();
+    let ib = index_id.to_be_bytes();
+    [tb[0], tb[1], NS_SECONDARY_INDEX, ib[0], ib[1]]
+}
+
 /// Encodes the prefix for scanning all Secondary Index entries matching `(table_id, index_id, col_val)`.
 pub fn encode_secondary_index_exact_prefix(
     table_id: u16,
@@ -159,8 +168,7 @@ pub fn encode_secondary_index_exact_prefix(
     col_val: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + col_val.len() + 2);
-    out.extend_from_slice(&encode_namespace_prefix(table_id, NS_SECONDARY_INDEX));
-    out.extend_from_slice(&index_id.to_be_bytes());
+    out.extend_from_slice(&encode_secondary_index_prefix(table_id, index_id));
     encode_bytes_escaped(col_val, &mut out);
     out
 }
@@ -179,6 +187,39 @@ pub fn decode_secondary_index_key(
     }
     let (col_val, rem) = decode_bytes_escaped(&full_key[5..])?;
     Ok(Some((col_val, rem.to_vec())))
+}
+
+/// Extracts the borrowed `pk` suffix directly from a Secondary Index Key belonging to
+/// `(table_id, index_id)` with zero heap allocations (`P1`).
+#[inline]
+pub fn decode_secondary_index_pk_slice(
+    table_id: u16,
+    index_id: u16,
+    full_key: &[u8],
+) -> Option<&[u8]> {
+    let mut prefix = [0u8; 5];
+    prefix[0..3].copy_from_slice(&encode_namespace_prefix(table_id, NS_SECONDARY_INDEX));
+    prefix[3..5].copy_from_slice(&index_id.to_be_bytes());
+    if !full_key.starts_with(&prefix) {
+        return None;
+    }
+    let body = &full_key[5..];
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == 0x00 {
+            if i + 1 >= body.len() {
+                return None;
+            }
+            match body[i + 1] {
+                0x01 => return Some(&body[i + 2..]),
+                0xFF => i += 2,
+                _ => return None,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Per-row metadata stored under `[TableID | 't' | pk]` for Capped Tables.

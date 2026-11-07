@@ -100,19 +100,19 @@ impl MemTable {
         }
     }
 
-    /// Inserts or updates a key with an inline value (`< INLINE_THRESHOLD`).
-    pub fn put_inline(&mut self, key: Vec<u8>, value: Vec<u8>, lsn: u64) {
-        self.upsert(key, IndexValue::Inline(value), lsn);
+    /// Inserts or updates a key with an inline value (`< INLINE_THRESHOLD`), returning the displaced [`MemEntry`].
+    pub fn put_inline(&mut self, key: Vec<u8>, value: Vec<u8>, lsn: u64) -> Option<MemEntry> {
+        self.upsert(key, IndexValue::Inline(value), lsn)
     }
 
-    /// Inserts or updates a key with a 23-byte out-of-line [`BlobPtr`].
-    pub fn put_blob_ptr(&mut self, key: Vec<u8>, blob_ptr: BlobPtr, lsn: u64) {
-        self.upsert(key, IndexValue::Blob(blob_ptr), lsn);
+    /// Inserts or updates a key with a 23-byte out-of-line [`BlobPtr`], returning the displaced [`MemEntry`].
+    pub fn put_blob_ptr(&mut self, key: Vec<u8>, blob_ptr: BlobPtr, lsn: u64) -> Option<MemEntry> {
+        self.upsert(key, IndexValue::Blob(blob_ptr), lsn)
     }
 
-    /// Marks `key` as deleted with a tombstone at `lsn`.
-    pub fn delete(&mut self, key: Vec<u8>, lsn: u64) {
-        self.upsert(key, IndexValue::Tombstone, lsn);
+    /// Marks `key` as deleted with a tombstone at `lsn`, returning the displaced [`MemEntry`].
+    pub fn delete(&mut self, key: Vec<u8>, lsn: u64) -> Option<MemEntry> {
+        self.upsert(key, IndexValue::Tombstone, lsn)
     }
 
     /// Applies all records in a [`WalBatch`] into this `MemTable`.
@@ -138,24 +138,19 @@ impl MemTable {
     pub fn apply_wal_batch_owned(&mut self, batch: WalBatch) {
         let lsn = batch.lsn;
         for rec in batch.records {
-            self.apply_single_wal_record(lsn, rec);
+            let _ = self.apply_single_wal_record(lsn, rec);
         }
     }
 
-    /// Applies a single [`WalRecord`] at `lsn` into this `MemTable` without cloning (`R-02`).
+    /// Applies a single [`WalRecord`] at `lsn` into this `MemTable` without cloning (`R-02`, `P5`),
+    /// returning the displaced previous [`MemEntry`] if any.
     #[inline]
-    pub fn apply_single_wal_record(&mut self, lsn: u64, rec: WalRecord) {
+    pub fn apply_single_wal_record(&mut self, lsn: u64, rec: WalRecord) -> Option<MemEntry> {
         match rec {
-            WalRecord::PutInline { key, value } => {
-                self.put_inline(key, value, lsn);
-            }
-            WalRecord::PutBlobPtr { key, blob_ptr } => {
-                self.put_blob_ptr(key, blob_ptr, lsn);
-            }
-            WalRecord::Delete { key } => {
-                self.delete(key, lsn);
-            }
-            WalRecord::TxBegin | WalRecord::TxCommit => {}
+            WalRecord::PutInline { key, value } => self.put_inline(key, value, lsn),
+            WalRecord::PutBlobPtr { key, blob_ptr } => self.put_blob_ptr(key, blob_ptr, lsn),
+            WalRecord::Delete { key } => self.delete(key, lsn),
+            WalRecord::TxBegin | WalRecord::TxCommit => None,
         }
     }
 
@@ -267,7 +262,7 @@ impl MemTable {
         Ok(reader)
     }
 
-    fn upsert(&mut self, key: Vec<u8>, value: IndexValue, lsn: u64) {
+    fn upsert(&mut self, key: Vec<u8>, value: IndexValue, lsn: u64) -> Option<MemEntry> {
         if lsn > self.highest_lsn {
             self.highest_lsn = lsn;
         }
@@ -275,7 +270,8 @@ impl MemTable {
         let new_entry = MemEntry { lsn, value };
         let new_cost = new_entry.approx_heap_bytes(klen);
 
-        if let Some(old_entry) = self.map.insert(key, new_entry) {
+        let prev = self.map.insert(key, new_entry);
+        if let Some(ref old_entry) = prev {
             let old_cost = old_entry.approx_heap_bytes(klen);
             self.approximate_bytes = self
                 .approximate_bytes
@@ -284,6 +280,7 @@ impl MemTable {
         } else {
             self.approximate_bytes = self.approximate_bytes.saturating_add(new_cost);
         }
+        prev
     }
 }
 
@@ -512,5 +509,99 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn p2_p3_p5_single_pass_upsert_zero_copy_cursors_and_256kb_coalesced_segment_builder() {
+        let tmp = TempTestDir::new("p2_p3_p5_idx");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        // P5 Part A: Verify single-pass `put_inline`, `delete`, and `apply_single_wal_record`
+        // return the displaced `Option<MemEntry>` directly without a separate lookup.
+        let mut mt = MemTable::new(16 * 1024 * 1024);
+        assert_eq!(mt.put_inline(b"k1".to_vec(), b"v1".to_vec(), 10), None);
+        assert_eq!(
+            mt.put_inline(b"k1".to_vec(), b"v2".to_vec(), 11),
+            Some(MemEntry {
+                lsn: 10,
+                value: IndexValue::Inline(b"v1".to_vec()),
+            })
+        );
+        assert_eq!(
+            mt.delete(b"k1".to_vec(), 12),
+            Some(MemEntry {
+                lsn: 11,
+                value: IndexValue::Inline(b"v2".to_vec()),
+            })
+        );
+        assert_eq!(
+            mt.apply_single_wal_record(
+                13,
+                WalRecord::PutInline {
+                    key: b"k1".to_vec(),
+                    value: b"v3".to_vec(),
+                },
+            ),
+            Some(MemEntry {
+                lsn: 12,
+                value: IndexValue::Tombstone,
+            })
+        );
+
+        // P3: Populate > 80 blocks (> 320 KB, crossing the 256 KB VACB write coalescing boundary)
+        // and flush to an `idx_<SeqID>.db` segment.
+        let mut big_mt = MemTable::new(16 * 1024 * 1024);
+        let payload = vec![0x5Au8; 256];
+        let total_keys = 1200u32; // 1200 * ~280 B > 336 KB (> 82 blocks of 4 KB)
+        for i in 0..total_keys {
+            let key = format!("coalesce_key_{i:06}").into_bytes();
+            big_mt.put_inline(key, payload.clone(), (i + 1) as u64);
+        }
+        let seg = big_mt
+            .flush_to_segment(&fs, 10, 10)
+            .expect("flush > 256 KB segment");
+        let num_blocks = seg.num_blocks();
+        assert!(
+            num_blocks > 64,
+            "segment must exceed 64 blocks (256 KB) to exercise multi-chunk write coalescing"
+        );
+        assert_eq!(seg.record_count(), total_keys);
+        drop(seg);
+
+        // Reopen from disk to verify all coalesced 256 KB + tail blocks and metadata trailer
+        let reopened = IdxSegmentReader::open(&fs, 10).expect("reopen coalesced segment");
+        assert_eq!(reopened.num_blocks(), num_blocks);
+        assert_eq!(reopened.record_count(), total_keys);
+
+        // P2: Verify zero-copy forward and reverse cursors (`current_key()` and `peek_raw()`)
+        let mut fwd = reopened.cursor_all().expect("forward cursor");
+        let mut count_fwd = 0u32;
+        while let Some(raw) = fwd.peek_raw() {
+            let expected_key = format!("coalesce_key_{count_fwd:06}");
+            assert_eq!(raw.key, expected_key.as_bytes());
+            assert_eq!(fwd.current_key(), Some(expected_key.as_bytes()));
+            assert_eq!(raw.lsn, (count_fwd + 1) as u64);
+            assert_eq!(raw.val_type, 1);
+            assert_eq!(raw.val_bytes, payload.as_slice());
+            count_fwd += 1;
+            fwd.advance().unwrap();
+        }
+        assert_eq!(count_fwd, total_keys);
+
+        let mut rev = reopened
+            .cursor_reverse_from(None)
+            .expect("reverse cursor");
+        let mut count_rev = total_keys;
+        while let Some(raw) = rev.peek_raw() {
+            count_rev -= 1;
+            let expected_key = format!("coalesce_key_{count_rev:06}");
+            assert_eq!(raw.key, expected_key.as_bytes());
+            assert_eq!(rev.current_key(), Some(expected_key.as_bytes()));
+            assert_eq!(raw.lsn, (count_rev + 1) as u64);
+            assert_eq!(raw.val_type, 1);
+            assert_eq!(raw.val_bytes, payload.as_slice());
+            rev.advance().unwrap();
+        }
+        assert_eq!(count_rev, 0);
     }
 }

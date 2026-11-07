@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use key_codec::{
     NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX, RowMetaRecord,
     decode_bytes_escaped, decode_i64_memcomparable, decode_lru_queue_key, decode_primary_row_key,
-    decode_secondary_index_key, encode_bytes_escaped, encode_i64_memcomparable,
-    encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key, encode_row_meta_key,
-    encode_secondary_index_exact_prefix, encode_secondary_index_key,
+    decode_secondary_index_key, decode_secondary_index_pk_slice, encode_bytes_escaped,
+    encode_i64_memcomparable, encode_lru_queue_key, encode_namespace_prefix,
+    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_exact_prefix,
+    encode_secondary_index_key, encode_secondary_index_prefix,
 };
 
 /// Quota and live-byte state for a single Capped Table (`MAX_BYTES`).

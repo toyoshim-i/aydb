@@ -18,8 +18,9 @@ use crate::index::{
 use crate::lru::{
     AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META,
     NS_SECONDARY_INDEX, RowMetaRecord, decode_lru_queue_key, decode_primary_row_key,
-    encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key, encode_row_meta_key,
-    encode_secondary_index_exact_prefix, encode_secondary_index_key,
+    decode_secondary_index_pk_slice, encode_lru_queue_key, encode_namespace_prefix,
+    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_exact_prefix,
+    encode_secondary_index_key,
 };
 use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
 use crate::meta::{
@@ -37,6 +38,12 @@ use crate::wal::{
 enum ExistingRowStatus {
     NotFound,
     Inline,
+    Blob(BlobPtr),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MergedValueRef<'a> {
+    Inline(&'a [u8]),
     Blob(BlobPtr),
 }
 
@@ -125,7 +132,7 @@ struct TxMetaSnapshot {
     std_blobs: BTreeMap<u64, (u64, u64)>,
     lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
     capped_tables: HashMap<u16, CappedTableState>,
-    active_vtab_ids: HashMap<u16, String>,
+    active_vtab_ids: HashMap<u16, Arc<str>>,
     table_has_row_meta: BTreeMap<u16, bool>,
     dropped_tables_len: usize,
     quotas_modified_in_tx: bool,
@@ -191,8 +198,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     quotas_modified_in_tx: bool,
     /// True while a non-owning connection is reading the temporary committed snapshot (`R-07`).
     in_committed_read_view: bool,
-    /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing (`AUD-03`).
-    active_vtab_ids: HashMap<u16, String>,
+    /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing (`AUD-03`, `P5`).
+    active_vtab_ids: HashMap<u16, Arc<str>>,
     /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys (`P-02`).
     /// Standard uncapped tables without secondary indexes resolve to `false` once and skip
     /// all `'t'` negative point lookups on `UPDATE` and `DELETE`!
@@ -704,7 +711,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     ));
                 }
                 if let Some(existing_name) = self.active_vtab_ids.get(&id) {
-                    if existing_name != &norm_name {
+                    if existing_name.as_ref() != norm_name.as_str() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!(
@@ -718,7 +725,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             None => {
                 if let Some(&id) = persisted_name_to_id.get(&norm_name) {
                     if let Some(existing_name) = self.active_vtab_ids.get(&id) {
-                        if existing_name != &norm_name {
+                        if existing_name.as_ref() != norm_name.as_str() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 format!(
@@ -741,7 +748,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
 
-        self.active_vtab_ids.insert(chosen_id, norm_name.clone());
+        self.active_vtab_ids
+            .insert(chosen_id, Arc::from(norm_name.as_str()));
         if persisted_name_to_id.get(&norm_name).copied() != Some(chosen_id) {
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());
             cat_key.extend_from_slice(&catalog_prefix);
@@ -766,7 +774,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Unregisters a disconnected virtual table `(table_id, table_name)` from the live registry.
     pub fn unregister_vtab(&mut self, table_id: u16, table_name: &str) {
         let norm_name = table_name.trim().to_ascii_lowercase();
-        if self.active_vtab_ids.get(&table_id).map(|s| s.as_str()) == Some(norm_name.as_str()) {
+        if self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) == Some(norm_name.as_str()) {
             self.active_vtab_ids.remove(&table_id);
         }
     }
@@ -789,7 +797,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        let removed_name = self.active_vtab_ids.remove(&table_id);
+        let removed_name = self.active_vtab_ids.remove(&table_id).map(|s| s.to_string());
         let name_to_clean = table_name
             .map(|s| s.trim().to_ascii_lowercase())
             .or(removed_name);
@@ -862,6 +870,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         secondary_keys: &[(u16, Vec<u8>)],
         durability: WriteDurability,
     ) -> io::Result<()> {
+        self.put_row_owned_with_hint(table_id, pk, value, secondary_keys, durability, false)
+    }
+
+    /// Inserts or overwrites a row (`pk` -> `value`) in `table_id` with an optional `known_absent`
+    /// hint (`P4`). When `known_absent` is `true`, the caller has just verified under the same
+    /// engine lock that `pk` does not exist in `table_id`, so redundant `check_existing_row` and
+    /// `get_row_meta_with_ptr` lookups are skipped completely.
+    pub fn put_row_owned_with_hint(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        value: Vec<u8>,
+        secondary_keys: &[(u16, Vec<u8>)],
+        durability: WriteDurability,
+        known_absent: bool,
+    ) -> io::Result<()> {
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -908,7 +932,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut had_old_meta = false;
         let meta_key = encode_row_meta_key(table_id, pk);
 
-        let existing = self.check_existing_row(&row_key)?;
+        let existing = if known_absent {
+            ExistingRowStatus::NotFound
+        } else {
+            self.check_existing_row(&row_key)?
+        };
         if let ExistingRowStatus::Blob(old_ptr) = existing {
             old_blob_ptr = Some(old_ptr);
         }
@@ -1326,6 +1354,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        if !keys_only {
+            self.flush_active_blob_buffers()?;
+        }
+
         if self.idx_segments.is_empty() && !reverse {
             let lo = match lower {
                 Some((_, false)) => Bound::Excluded(seek_key),
@@ -1336,8 +1368,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Some((ub, false)) => Bound::Excluded(ub),
                 None => Bound::Unbounded,
             };
-            let mut pending_blobs = Vec::new();
-            let mut last_pk: Option<Vec<u8>> = None;
+            let mut last_pk_buf: Vec<u8> = Vec::new();
             for (k, entry) in self.memtable.iter_range(lo, hi) {
                 if !k.starts_with(&prefix) {
                     break;
@@ -1356,118 +1387,87 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         let start = slab_out.len();
                         slab_out.extend_from_slice(v);
                         spans_out.push((start, slab_out.len()));
-                        last_pk = Some(k[3..].to_vec());
+                        last_pk_buf.clear();
+                        last_pk_buf.extend_from_slice(&k[3..]);
                         if spans_out.len() >= limit {
                             break;
                         }
                     }
                     IndexValue::Blob(ptr) => {
-                        pending_blobs.push((k.clone(), *ptr));
-                        if spans_out.len() + pending_blobs.len() >= limit {
-                            break;
+                        let start = slab_out.len();
+                        if self.read_flushed_blob_append_into(ptr, k, slab_out)? {
+                            spans_out.push((start, slab_out.len()));
+                            last_pk_buf.clear();
+                            last_pk_buf.extend_from_slice(&k[3..]);
+                            if spans_out.len() >= limit {
+                                break;
+                            }
                         }
                     }
                     IndexValue::Tombstone => {}
                 }
             }
-            if !pending_blobs.is_empty() {
-                // Re-scan if any blobs were mixed with inline entries to preserve exact key order
-                slab_out.clear();
-                spans_out.clear();
-                last_pk = None;
-                let entries: Vec<(Vec<u8>, IndexValue)> = self
-                    .memtable
-                    .iter_range(lo, hi)
-                    .take_while(|(k, _)| k.starts_with(&prefix))
-                    .filter(|(_, e)| !matches!(e.value, IndexValue::Tombstone))
-                    .map(|(k, e)| (k.clone(), e.value.clone()))
-                    .collect();
-                for (k, val) in entries {
-                    match val {
-                        IndexValue::Inline(v) => {
-                            let start = slab_out.len();
-                            slab_out.extend_from_slice(&v);
-                            spans_out.push((start, slab_out.len()));
-                            last_pk = Some(k[3..].to_vec());
-                            if spans_out.len() >= limit {
-                                break;
-                            }
-                        }
-                        IndexValue::Blob(ptr) => {
-                            let start = slab_out.len();
-                            if self.dereference_blob_append_into(&ptr, &k, slab_out)? {
-                                spans_out.push((start, slab_out.len()));
-                                last_pk = Some(k[3..].to_vec());
-                                if spans_out.len() >= limit {
-                                    break;
-                                }
-                            }
-                        }
-                        IndexValue::Tombstone => {}
-                    }
-                }
-            }
-            if !keys_only {
-                if let Some(lpk) = last_pk {
-                    pks_out.push(lpk);
-                }
+            if !keys_only && !last_pk_buf.is_empty() {
+                pks_out.push(last_pk_buf);
             }
             return Ok(());
         }
 
-        let merged = if reverse {
-            self.scan_merged_prefix_range_reverse(
+        let mut last_pk_buf: Vec<u8> = Vec::new();
+        let mut emit_entry =
+            |key: &[u8], _lsn: u64, val: MergedValueRef<'_>| -> io::Result<bool> {
+                if key.len() < 3 || !key.starts_with(&prefix) {
+                    return Ok(false);
+                }
+                if keys_only {
+                    pks_out.push(key[3..].to_vec());
+                    return Ok(true);
+                }
+                match val {
+                    MergedValueRef::Inline(v) => {
+                        let start = slab_out.len();
+                        slab_out.extend_from_slice(v);
+                        spans_out.push((start, slab_out.len()));
+                        last_pk_buf.clear();
+                        last_pk_buf.extend_from_slice(&key[3..]);
+                        Ok(true)
+                    }
+                    MergedValueRef::Blob(ptr) => {
+                        let start = slab_out.len();
+                        if self.read_flushed_blob_append_into(&ptr, key, slab_out)? {
+                            spans_out.push((start, slab_out.len()));
+                            last_pk_buf.clear();
+                            last_pk_buf.extend_from_slice(&key[3..]);
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                }
+            };
+
+        if reverse {
+            self.visit_merged_prefix_range_reverse(
                 &prefix,
                 seek_key,
                 lo_inc,
                 upper_key_slice,
                 limit,
-            )?
+                &mut emit_entry,
+            )?;
         } else {
-            self.scan_merged_prefix_range(&prefix, seek_key, lo_inc, upper_key_slice, limit)?
-        };
-
-        let mut last_pk: Option<Vec<u8>> = None;
-        for entry in merged {
-            if entry.key.len() < 3 || !entry.key.starts_with(&prefix) {
-                continue;
-            }
-            if keys_only {
-                if !matches!(entry.value, IndexValue::Tombstone) {
-                    pks_out.push(entry.key[3..].to_vec());
-                    if pks_out.len() >= limit {
-                        break;
-                    }
-                }
-            } else {
-                match entry.value {
-                    IndexValue::Inline(v) => {
-                        let start = slab_out.len();
-                        slab_out.extend_from_slice(&v);
-                        spans_out.push((start, slab_out.len()));
-                        last_pk = Some(entry.key[3..].to_vec());
-                        if spans_out.len() >= limit {
-                            break;
-                        }
-                    }
-                    IndexValue::Blob(ptr) => {
-                        let start = slab_out.len();
-                        if self.dereference_blob_append_into(&ptr, &entry.key, slab_out)? {
-                            spans_out.push((start, slab_out.len()));
-                            last_pk = Some(entry.key[3..].to_vec());
-                            if spans_out.len() >= limit {
-                                break;
-                            }
-                        }
-                    }
-                    IndexValue::Tombstone => {}
-                }
-            }
+            self.visit_merged_prefix_range(
+                &prefix,
+                seek_key,
+                lo_inc,
+                upper_key_slice,
+                limit,
+                &mut emit_entry,
+            )?;
         }
-        if !keys_only {
-            if let Some(lpk) = last_pk {
-                pks_out.push(lpk);
-            }
+
+        if !keys_only && !last_pk_buf.is_empty() {
+            pks_out.push(last_pk_buf);
         }
         Ok(())
     }
@@ -1613,17 +1613,186 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(pks);
         }
 
-        let merged = self.scan_merged_prefix(&prefix)?;
-        let mut pks = Vec::with_capacity(merged.len());
-        for entry in merged {
-            if matches!(entry.value, IndexValue::Tombstone) {
-                continue;
-            }
-            if entry.key.starts_with(&prefix) {
-                pks.push(entry.key[prefix.len()..].to_vec());
+        let mut pks = Vec::new();
+        self.visit_merged_prefix_range(
+            &prefix,
+            &prefix,
+            true,
+            None,
+            usize::MAX,
+            |key, _lsn, _val| {
+                if key.starts_with(&prefix) {
+                    pks.push(key[prefix.len()..].to_vec());
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            },
+        )?;
+        Ok(pks)
+    }
+
+    /// Streams up to `limit` live rows matching a secondary index range `[lower_sec_key, upper_sec_key]`
+    /// under `prefix` into `slab_out` and `spans_out` (or into `pks_out` when `keys_only` is `true`),
+    /// returning `Ok(Some(last_sec_key))` when `limit` rows were emitted so the caller can resume
+    /// the next chunk in `vtab_next` (`P1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_secondary_index_into_slab(
+        &mut self,
+        table_id: u16,
+        index_id: u16,
+        prefix: &[u8],
+        lower_sec_key: (&[u8], bool),
+        upper_sec_key: Option<(&[u8], bool)>,
+        limit: usize,
+        keys_only: bool,
+        pks_out: &mut Vec<Vec<u8>>,
+        slab_out: &mut Vec<u8>,
+        spans_out: &mut Vec<(usize, usize)>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        use std::ops::Bound;
+        if limit == 0 {
+            return Ok(None);
+        }
+        let (seek_slice, mut cur_inc) = lower_sec_key;
+        if let Some((ub, ub_inc)) = upper_sec_key {
+            if seek_slice > ub || (seek_slice == ub && (!cur_inc || !ub_inc)) {
+                return Ok(None);
             }
         }
-        Ok(pks)
+
+        let mut last_sec_key_buf: Vec<u8> = Vec::new();
+
+        if keys_only {
+            if self.idx_segments.is_empty() {
+                let lo = if cur_inc {
+                    Bound::Included(seek_slice)
+                } else {
+                    Bound::Excluded(seek_slice)
+                };
+                let hi = match upper_sec_key {
+                    Some((ub, true)) => Bound::Included(ub),
+                    Some((ub, false)) => Bound::Excluded(ub),
+                    None => Bound::Unbounded,
+                };
+                for (k, entry) in self.memtable.iter_range(lo, hi) {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if matches!(entry.value, IndexValue::Tombstone) {
+                        continue;
+                    }
+                    if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                        pks_out.push(pk.to_vec());
+                        last_sec_key_buf.clear();
+                        last_sec_key_buf.extend_from_slice(k);
+                        if pks_out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                self.visit_merged_prefix_range(
+                    prefix,
+                    seek_slice,
+                    cur_inc,
+                    upper_sec_key,
+                    limit,
+                    |k, _lsn, _val| {
+                        if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                            pks_out.push(pk.to_vec());
+                            last_sec_key_buf.clear();
+                            last_sec_key_buf.extend_from_slice(k);
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                )?;
+            }
+            if pks_out.len() >= limit && !last_sec_key_buf.is_empty() {
+                return Ok(Some(last_sec_key_buf));
+            }
+            return Ok(None);
+        }
+
+        let mut cur_seek_owned: Option<Vec<u8>> = None;
+        let mut batch_pks: Vec<Vec<u8>> = Vec::with_capacity(limit.min(256));
+
+        while spans_out.len() < limit {
+            let batch_need = limit - spans_out.len();
+            batch_pks.clear();
+            let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
+
+            if self.idx_segments.is_empty() {
+                let lo = if cur_inc {
+                    Bound::Included(active_seek)
+                } else {
+                    Bound::Excluded(active_seek)
+                };
+                let hi = match upper_sec_key {
+                    Some((ub, true)) => Bound::Included(ub),
+                    Some((ub, false)) => Bound::Excluded(ub),
+                    None => Bound::Unbounded,
+                };
+                for (k, entry) in self.memtable.iter_range(lo, hi) {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    if matches!(entry.value, IndexValue::Tombstone) {
+                        continue;
+                    }
+                    if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                        batch_pks.push(pk.to_vec());
+                        last_sec_key_buf.clear();
+                        last_sec_key_buf.extend_from_slice(k);
+                        if batch_pks.len() >= batch_need {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                self.visit_merged_prefix_range(
+                    prefix,
+                    active_seek,
+                    cur_inc,
+                    upper_sec_key,
+                    batch_need,
+                    |k, _lsn, _val| {
+                        if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                            batch_pks.push(pk.to_vec());
+                            last_sec_key_buf.clear();
+                            last_sec_key_buf.extend_from_slice(k);
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                )?;
+            }
+
+            if batch_pks.is_empty() {
+                return Ok(None);
+            }
+            let scanned_count = batch_pks.len();
+            for pk in &batch_pks {
+                self.get_row_into(table_id, pk, slab_out, spans_out)?;
+            }
+            if scanned_count < batch_need {
+                return Ok(None);
+            }
+            if spans_out.len() >= limit {
+                return Ok(Some(last_sec_key_buf));
+            }
+            cur_seek_owned = Some(last_sec_key_buf.clone());
+            cur_inc = false;
+        }
+
+        if !last_sec_key_buf.is_empty() {
+            Ok(Some(last_sec_key_buf))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Begins an explicit batch transaction (`BEGIN`). Subsequent mutations apply immediately to
@@ -2363,6 +2532,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             seek_key = entries.last().unwrap().key.clone();
             lower_inclusive = false;
 
+            let mut batch_wal_records = Vec::new();
+            let mut batch_dead_ptrs = Vec::new();
             for entry in entries {
                 if let IndexValue::Blob(old_ptr) = entry.value {
                     if old_ptr.kind == BlobKind::Standard
@@ -2375,17 +2546,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 &entry.key,
                                 &payload,
                             )?;
-                            self.record_dead_blob_bytes(&old_ptr);
-                            self.commit_wal_and_memtable(
-                                vec![WalRecord::PutBlobPtr {
-                                    key: entry.key,
-                                    blob_ptr: new_ptr,
-                                }],
-                                WriteDurability::BufferedFast,
-                            )?;
+                            batch_dead_ptrs.push(old_ptr);
+                            batch_wal_records.push(WalRecord::PutBlobPtr {
+                                key: entry.key,
+                                blob_ptr: new_ptr,
+                            });
                             relocated += 1;
                         }
                     }
+                }
+            }
+            if !batch_wal_records.is_empty() {
+                self.commit_wal_and_memtable(batch_wal_records, WriteDurability::BufferedFast)?;
+                for old_ptr in batch_dead_ptrs {
+                    self.record_dead_blob_bytes(&old_ptr);
                 }
             }
         }
@@ -3181,6 +3355,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
         self.ensure_blob_flushed(ptr)?;
+        self.read_flushed_blob_append_into(ptr, expected_key, out)
+    }
+
+    fn read_flushed_blob_append_into(
+        &self,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<bool> {
         let reader = match ptr.kind {
             BlobKind::Standard => {
                 let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
@@ -3242,18 +3425,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
             self.pending_tx_record_count += records.len() as u32;
-            for rec in &records {
-                let key = match rec {
+            for rec in records {
+                let undo_key = match &rec {
                     WalRecord::PutInline { key, .. }
                     | WalRecord::PutBlobPtr { key, .. }
-                    | WalRecord::Delete { key } => key.as_slice(),
-                    WalRecord::TxBegin | WalRecord::TxCommit => continue,
+                    | WalRecord::Delete { key } => Some(key.clone()),
+                    WalRecord::TxBegin | WalRecord::TxCommit => None,
                 };
-                let prev = self.memtable.get(key).cloned();
-                self.tx_memtable_undo.push((key.to_vec(), prev));
+                let prev = self.memtable.apply_single_wal_record(lsn, rec);
+                if let Some(k) = undo_key {
+                    self.tx_memtable_undo.push((k, prev));
+                }
             }
-            self.memtable
-                .apply_wal_batch_owned(WalBatch::new(lsn, records));
             return Ok(lsn);
         }
 
@@ -3422,9 +3605,47 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
+        let mut out = Vec::new();
+        self.visit_merged_prefix_range(
+            prefix,
+            seek_key,
+            lower_inclusive,
+            upper_key_bound,
+            limit,
+            |key, lsn, val| {
+                let value = match val {
+                    MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
+                    MergedValueRef::Blob(ptr) => IndexValue::Blob(ptr),
+                };
+                out.push(IndexEntry {
+                    key: key.to_vec(),
+                    lsn,
+                    value,
+                });
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// Streams up to `limit` live entries from the ascending K-way merge across `self.memtable`
+    /// and `self.idx_segments` into `on_live` without allocating intermediate `IndexEntry`
+    /// structs or per-entry `Vec<u8>` buffers (`P2`).
+    fn visit_merged_prefix_range<F>(
+        &self,
+        prefix: &[u8],
+        seek_key: &[u8],
+        lower_inclusive: bool,
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
+        mut on_live: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
+    {
         use std::ops::Bound;
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let (eff_lo_key, eff_lo_inc) = if seek_key >= prefix {
@@ -3435,7 +3656,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if let Some((ub, ub_inc)) = upper_key_bound {
             if eff_lo_key > ub || (eff_lo_key == ub && (!eff_lo_inc || !ub_inc)) {
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
 
@@ -3503,8 +3724,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             seg_cursors.push(seg.cursor_from(eff_lo_key, eff_lo_inc)?);
         }
 
-        let mut out = Vec::new();
-        while out.len() < limit {
+        let mut emitted = 0usize;
+        let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
+        let mut best_val_buf: Vec<u8> = Vec::with_capacity(256);
+
+        while emitted < limit {
             let mut min_key: Option<&[u8]> = None;
 
             if !mem_exhausted {
@@ -3520,12 +3744,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             for cur in &seg_cursors {
-                if let Some(entry) = cur.peek() {
-                    if in_upper_and_prefix(entry.key.as_slice()) {
+                if let Some(k) = cur.current_key() {
+                    if in_upper_and_prefix(k) {
                         match min_key {
-                            None => min_key = Some(entry.key.as_slice()),
-                            Some(mk) if entry.key.as_slice() < mk => {
-                                min_key = Some(entry.key.as_slice());
+                            None => min_key = Some(k),
+                            Some(mk) if k < mk => {
+                                min_key = Some(k);
                             }
                             _ => {}
                         }
@@ -3536,65 +3760,92 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let Some(target_key_slice) = min_key else {
                 break;
             };
-            let target_key = target_key_slice.to_vec();
+            target_key_buf.clear();
+            target_key_buf.extend_from_slice(target_key_slice);
 
-            let mut best_entry: Option<IndexEntry> = None;
-
+            let mut best_mem_entry: Option<(u64, &IndexValue)> = None;
             if !mem_exhausted {
                 if let Some(&(k, _)) = mem_iter.peek() {
-                    if k.as_slice() == target_key.as_slice() {
-                        let (k, mem_entry) = mem_iter.next().unwrap();
-                        best_entry = Some(IndexEntry {
-                            key: k.clone(),
-                            lsn: mem_entry.lsn,
-                            value: mem_entry.value.clone(),
-                        });
+                    if k.as_slice() == target_key_buf.as_slice() {
+                        let (_, mem_entry) = mem_iter.next().unwrap();
+                        best_mem_entry = Some((mem_entry.lsn, &mem_entry.value));
                     }
                 }
             }
 
+            let mut best_seg_meta: Option<(u64, u8)> = None;
             for cur in &mut seg_cursors {
-                while cur
-                    .peek()
-                    .map(|e| e.key.as_slice() == target_key.as_slice())
-                    .unwrap_or(false)
-                {
-                    let seg_entry = cur.next_entry()?.unwrap();
-                    match &mut best_entry {
-                        None => best_entry = Some(seg_entry),
-                        Some(existing) => {
-                            if seg_entry.lsn > existing.lsn {
-                                *existing = seg_entry;
-                            }
+                while cur.current_key() == Some(target_key_buf.as_slice()) {
+                    let raw = cur.peek_raw().unwrap();
+                    let beats_mem = best_mem_entry.map_or(true, |(m_lsn, _)| raw.lsn > m_lsn);
+                    if beats_mem && best_seg_meta.map_or(true, |(s_lsn, _)| raw.lsn > s_lsn) {
+                        best_seg_meta = Some((raw.lsn, raw.val_type));
+                        best_val_buf.clear();
+                        best_val_buf.extend_from_slice(raw.val_bytes);
+                    }
+                    cur.advance()?;
+                }
+            }
+
+            if let Some((seg_lsn, val_type)) = best_seg_meta {
+                match val_type {
+                    1 => {
+                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Inline(&best_val_buf))? {
+                            emitted += 1;
                         }
                     }
+                    2 => {
+                        let ptr = crate::index::RawIdxEntry::decode_blob_ptr(&best_val_buf)?;
+                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Blob(ptr))? {
+                            emitted += 1;
+                        }
+                    }
+                    3 => {}
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unknown idx entry val_type {other}"),
+                        ));
+                    }
                 }
-            }
-
-            if let Some(winner) = best_entry {
-                if !matches!(winner.value, IndexValue::Tombstone) {
-                    out.push(winner);
+            } else if let Some((mem_lsn, mem_val)) = best_mem_entry {
+                match mem_val {
+                    IndexValue::Inline(v) => {
+                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
+                            emitted += 1;
+                        }
+                    }
+                    IndexValue::Blob(ptr) => {
+                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Blob(*ptr))? {
+                            emitted += 1;
+                        }
+                    }
+                    IndexValue::Tombstone => {}
                 }
             }
         }
 
-        Ok(out)
+        Ok(())
     }
 
-    /// Performs a bounded-memory reverse streaming K-way merge across `self.memtable` and all
-    /// `self.idx_segments` within `[seek_key, upper_key_bound]` under `prefix`, returning up to
-    /// `limit` live entries in descending key order (`P-01`).
-    fn scan_merged_prefix_range_reverse(
+    /// Streams up to `limit` live entries from the descending K-way merge across `self.memtable`
+    /// and `self.idx_segments` into `on_live` without allocating intermediate `IndexEntry`
+    /// structs or per-entry `Vec<u8>` buffers (`P2`).
+    fn visit_merged_prefix_range_reverse<F>(
         &self,
         prefix: &[u8],
         seek_key: &[u8],
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
-    ) -> io::Result<Vec<IndexEntry>> {
+        mut on_live: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
+    {
         use std::ops::Bound;
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let (eff_lo_key, eff_lo_inc) = if seek_key >= prefix {
@@ -3605,7 +3856,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if let Some((ub, ub_inc)) = upper_key_bound {
             if eff_lo_key > ub || (eff_lo_key == ub && (!eff_lo_inc || !ub_inc)) {
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
 
@@ -3670,8 +3921,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             seg_cursors.push(seg.cursor_reverse_from(seg_upper_arg)?);
         }
 
-        let mut out = Vec::new();
-        while out.len() < limit {
+        let mut emitted = 0usize;
+        let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
+        let mut best_val_buf: Vec<u8> = Vec::with_capacity(256);
+
+        while emitted < limit {
             let mut max_key: Option<&[u8]> = None;
 
             if !mem_exhausted {
@@ -3687,12 +3941,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             for cur in &seg_cursors {
-                if let Some(entry) = cur.peek() {
-                    if in_lower_and_prefix(entry.key.as_slice()) {
+                if let Some(k) = cur.current_key() {
+                    if in_lower_and_prefix(k) {
                         match max_key {
-                            None => max_key = Some(entry.key.as_slice()),
-                            Some(mk) if entry.key.as_slice() > mk => {
-                                max_key = Some(entry.key.as_slice());
+                            None => max_key = Some(k),
+                            Some(mk) if k > mk => {
+                                max_key = Some(k);
                             }
                             _ => {}
                         }
@@ -3703,49 +3957,72 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let Some(target_key_slice) = max_key else {
                 break;
             };
-            let target_key = target_key_slice.to_vec();
+            target_key_buf.clear();
+            target_key_buf.extend_from_slice(target_key_slice);
 
-            let mut best_entry: Option<IndexEntry> = None;
-
+            let mut best_mem_entry: Option<(u64, &IndexValue)> = None;
             if !mem_exhausted {
                 if let Some(&(k, _)) = mem_iter.peek() {
-                    if k.as_slice() == target_key.as_slice() {
-                        let (k, mem_entry) = mem_iter.next().unwrap();
-                        best_entry = Some(IndexEntry {
-                            key: k.clone(),
-                            lsn: mem_entry.lsn,
-                            value: mem_entry.value.clone(),
-                        });
+                    if k.as_slice() == target_key_buf.as_slice() {
+                        let (_, mem_entry) = mem_iter.next().unwrap();
+                        best_mem_entry = Some((mem_entry.lsn, &mem_entry.value));
                     }
                 }
             }
 
+            let mut best_seg_meta: Option<(u64, u8)> = None;
             for cur in &mut seg_cursors {
-                while cur
-                    .peek()
-                    .map(|e| e.key.as_slice() == target_key.as_slice())
-                    .unwrap_or(false)
-                {
-                    let seg_entry = cur.next_entry()?.unwrap();
-                    match &mut best_entry {
-                        None => best_entry = Some(seg_entry),
-                        Some(existing) => {
-                            if seg_entry.lsn > existing.lsn {
-                                *existing = seg_entry;
-                            }
+                while cur.current_key() == Some(target_key_buf.as_slice()) {
+                    let raw = cur.peek_raw().unwrap();
+                    let beats_mem = best_mem_entry.map_or(true, |(m_lsn, _)| raw.lsn > m_lsn);
+                    if beats_mem && best_seg_meta.map_or(true, |(s_lsn, _)| raw.lsn > s_lsn) {
+                        best_seg_meta = Some((raw.lsn, raw.val_type));
+                        best_val_buf.clear();
+                        best_val_buf.extend_from_slice(raw.val_bytes);
+                    }
+                    cur.advance()?;
+                }
+            }
+
+            if let Some((seg_lsn, val_type)) = best_seg_meta {
+                match val_type {
+                    1 => {
+                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Inline(&best_val_buf))? {
+                            emitted += 1;
                         }
                     }
+                    2 => {
+                        let ptr = crate::index::RawIdxEntry::decode_blob_ptr(&best_val_buf)?;
+                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Blob(ptr))? {
+                            emitted += 1;
+                        }
+                    }
+                    3 => {}
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unknown idx entry val_type {other}"),
+                        ));
+                    }
                 }
-            }
-
-            if let Some(winner) = best_entry {
-                if !matches!(winner.value, IndexValue::Tombstone) {
-                    out.push(winner);
+            } else if let Some((mem_lsn, mem_val)) = best_mem_entry {
+                match mem_val {
+                    IndexValue::Inline(v) => {
+                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
+                            emitted += 1;
+                        }
+                    }
+                    IndexValue::Blob(ptr) => {
+                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Blob(*ptr))? {
+                            emitted += 1;
+                        }
+                    }
+                    IndexValue::Tombstone => {}
                 }
             }
         }
 
-        Ok(out)
+        Ok(())
     }
 
     fn reconcile_single_capped_table(&mut self, tid: u16) -> io::Result<()> {
@@ -5934,5 +6211,176 @@ mod tests {
                 .unwrap();
             assert_eq!(resolved_again, assigned_id);
         }
+    }
+
+    #[test]
+    fn p1_p2_p4_p5_p6_engine_optimizations_secondary_streaming_zero_copy_and_batched_blob_gc() {
+        let dir = TempTestDir::new("stage2_p1_p6_engine");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 128;
+        cfg.max_blob_segment_bytes = 2048;
+
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+
+        // 1. P4: `put_row_owned_with_hint(..., known_absent: true)` skips redundant SSTable/MemTable
+        //    probing on fresh inserts while maintaining secondary indexes properly.
+        for i in 0..40u32 {
+            let pk = format!("pk_{i:03}").into_bytes();
+            let val = if i % 4 == 0 {
+                vec![b'B'; 300] // Out-of-line blob (> 128 B)
+            } else {
+                format!("inline_val_{i:03}").into_bytes()
+            };
+            let sec_bucket = format!("bucket_{}", i % 3).into_bytes();
+            engine
+                .put_row_owned_with_hint(
+                    1,
+                    &pk,
+                    val,
+                    &[(1, sec_bucket)],
+                    WriteDurability::BufferedFast,
+                    true,
+                )
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        // Add more rows in MemTable so queries span both SSTable segment and MemTable
+        for i in 40..60u32 {
+            let pk = format!("pk_{i:03}").into_bytes();
+            let val = format!("inline_val_{i:03}").into_bytes();
+            let sec_bucket = format!("bucket_{}", i % 3).into_bytes();
+            engine
+                .put_row_owned_with_hint(
+                    1,
+                    &pk,
+                    val,
+                    &[(1, sec_bucket)],
+                    WriteDurability::BufferedFast,
+                    true,
+                )
+                .unwrap();
+        }
+
+        // 2. P1 & P2: Chunked `scan_secondary_index_into_slab` (both `keys_only = true` and `keys_only = false`)
+        let prefix = encode_secondary_index_exact_prefix(1, 1, b"bucket_0");
+        let mut all_pks_keys_only = Vec::new();
+        let mut cur_lo: Vec<u8> = prefix.clone();
+        let mut cur_inc = true;
+        loop {
+            let mut chunk_pks = Vec::new();
+            let mut slab = Vec::new();
+            let mut spans = Vec::new();
+            let next_opt = engine
+                .scan_secondary_index_into_slab(
+                    1,
+                    1,
+                    &prefix,
+                    (&cur_lo, cur_inc),
+                    None,
+                    7,
+                    true,
+                    &mut chunk_pks,
+                    &mut slab,
+                    &mut spans,
+                )
+                .unwrap();
+            assert!(slab.is_empty() && spans.is_empty());
+            all_pks_keys_only.extend(chunk_pks);
+            match next_opt {
+                Some(last_sec) => {
+                    cur_lo = last_sec;
+                    cur_inc = false;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(all_pks_keys_only.len(), 20); // 60 / 3 = 20 rows in bucket_0
+
+        let mut all_rows_slab = Vec::new();
+        let mut cur_lo2: Vec<u8> = prefix.clone();
+        let mut cur_inc2 = true;
+        loop {
+            let mut pks = Vec::new();
+            let mut slab = Vec::new();
+            let mut spans = Vec::new();
+            let next_opt = engine
+                .scan_secondary_index_into_slab(
+                    1,
+                    1,
+                    &prefix,
+                    (&cur_lo2, cur_inc2),
+                    None,
+                    6,
+                    false,
+                    &mut pks,
+                    &mut slab,
+                    &mut spans,
+                )
+                .unwrap();
+            for (s, e) in spans {
+                all_rows_slab.push(slab[s..e].to_vec());
+            }
+            match next_opt {
+                Some(last_sec) => {
+                    cur_lo2 = last_sec;
+                    cur_inc2 = false;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(all_rows_slab.len(), 20);
+
+        // 3. P6 Part B: Verify batched WAL commit in `relocate_fragmented_std_blobs`.
+        //    Create a sealed `blob_std` segment with 6 blobs, delete 4 of them (> 50% dead bytes),
+        //    and run `compact()`. All 2 surviving blobs in that segment must be relocated in a
+        //    SINGLE batched WAL commit (`lsn` advances by 1 for the batch of relocated pointers!).
+        for i in 0..6u32 {
+            let pk = format!("frag_blob_{i}").into_bytes();
+            engine
+                .put_row(2, &pk, &vec![0xABu8; 300], &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        // Roll the active std writer by inserting one more blob into a new segment
+        engine
+            .put_row(
+                2,
+                b"frag_blob_roll",
+                &vec![0xCDu8; 2000],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Delete 4 of the 6 blobs in the sealed segment so dead_bytes * 2 >= file_len
+        for i in 0..4u32 {
+            let pk = format!("frag_blob_{i}").into_bytes();
+            engine.delete_row(2, &pk, WriteDurability::BufferedFast).unwrap();
+        }
+        engine.flush_memtable().unwrap();
+
+        let lsn_before_reloc = engine.next_lsn();
+        let relocated = engine
+            .relocate_fragmented_std_blobs(0.5)
+            .expect("relocate fragmented blobs");
+        assert!(relocated >= 2);
+        let lsn_after_reloc = engine.next_lsn();
+        // Even though >= 2 live blobs were relocated across segments, P6 Part B batches their
+        // `WalRecord::PutBlobPtr` updates into a single WAL batch per 512-key window!
+        assert!(
+            lsn_after_reloc - lsn_before_reloc <= 1,
+            "P6 Part B: relocating multiple blobs in a 512-key window must use at most 1 WAL batch commit"
+        );
+        assert_eq!(
+            engine.get_row(2, b"frag_blob_4").unwrap().unwrap(),
+            vec![0xABu8; 300]
+        );
+        assert_eq!(
+            engine.get_row(2, b"frag_blob_5").unwrap().unwrap(),
+            vec![0xABu8; 300]
+        );
     }
 }

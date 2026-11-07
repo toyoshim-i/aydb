@@ -49,6 +49,7 @@ const PLAN_FULL_SCAN: c_int = 0;
 const PLAN_PK_POINT: c_int = 1;
 const PLAN_SECONDARY_EQ: c_int = 2;
 const PLAN_PK_RANGE: c_int = 3;
+const PLAN_SECONDARY_RANGE: c_int = 4;
 
 const POINT_FLAG_BY_ROWID: c_int = 0x01;
 
@@ -87,19 +88,26 @@ fn build_numeric_alt_key(pk: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Checks if `pk` or its exact-integer numeric dual (`build_numeric_alt_key(pk)`) exists in
-/// `table_id`, returning the existing key bytes if found (`C-02`).
+/// `table_id`, returning the existing key bytes if found (`C-02`, `P4`).
+///
+/// When `pk_affinity` is `ColumnAffinity::Integer` or `ColumnAffinity::Numeric`, all exact-integer
+/// floats (`10.0`) are coerced to 9-byte `Integer(q)` before storage, so a 17-byte `Float(q.0)`
+/// key can never exist in the table and the second probe is skipped (`P4`).
 #[inline]
 fn find_existing_pk_or_numeric_alt(
     eng: &mut StorageEngine<OsFs>,
     table_id: u16,
     pk: &[u8],
+    pk_affinity: ColumnAffinity,
 ) -> io::Result<Option<Vec<u8>>> {
     if eng.row_exists(table_id, pk)? {
         return Ok(Some(pk.to_vec()));
     }
-    if let Some(alt) = build_numeric_alt_key(pk) {
-        if eng.row_exists(table_id, &alt)? {
-            return Ok(Some(alt));
+    if !matches!(pk_affinity, ColumnAffinity::Integer | ColumnAffinity::Numeric) {
+        if let Some(alt) = build_numeric_alt_key(pk) {
+            if eng.row_exists(table_id, &alt)? {
+                return Ok(Some(alt));
+            }
         }
     }
     Ok(None)
@@ -163,8 +171,14 @@ struct RowidMap {
 impl RowidMap {
     /// Evicts the oldest half of entries when the map exceeds `MAX_ROWID_MAP_ENTRIES` (`C-04`),
     /// preserving all recently assigned `rowid` mappings for subsequent `UPDATE`/`DELETE WHERE rowid = ?`.
+    /// Also compacts stale deleted `rowid`s out of `fifo_order` if it reaches `MAX_ROWID_MAP_ENTRIES`
+    /// under high insert/delete churn while live entries remain below the threshold (`P6`).
     fn evict_oldest_half_if_needed(&mut self) {
         if self.by_rowid.len() <= MAX_ROWID_MAP_ENTRIES {
+            if self.fifo_order.len() >= MAX_ROWID_MAP_ENTRIES {
+                let rmap_ref = &self.by_rowid;
+                self.fifo_order.retain(|rid| rmap_ref.contains_key(rid));
+            }
             return;
         }
         let target_keep = MAX_ROWID_MAP_ENTRIES / 2;
@@ -403,12 +417,16 @@ struct AydbCursor {
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
     pos: usize,
-    /// True when more chunks may remain in the current range/full scan (`P-01`).
+    /// True when more chunks may remain in the current range/full/secondary-index scan (`P-01`, `P1`).
     streaming_active: bool,
     stream_lower: Option<(Vec<u8>, bool)>,
     stream_upper: Option<(Vec<u8>, bool)>,
     stream_reverse: bool,
     stream_last_pk: Option<Vec<u8>>,
+    /// Active secondary index ID when streaming `PLAN_SECONDARY_EQ` or `PLAN_SECONDARY_RANGE` (`P1`).
+    stream_sec_index_id: Option<u16>,
+    /// Prefix key for the active secondary index scan (`P1`).
+    stream_sec_prefix: Vec<u8>,
 }
 
 /// Computes a 64-bit synthetic `rowid` from `encoded_pk` with full 64-bit entropy using two
@@ -528,6 +546,46 @@ unsafe fn pk_range_bound_to_key(
     }
 
     Ok(Some((key, is_inclusive)))
+}
+
+/// Converts a SQLite range bound value into a full secondary-index key bound for
+/// `PLAN_SECONDARY_RANGE` (`P1`).
+///
+/// Because secondary index keys have layout `[TableID | 'i' | IndexID | Escaped(col_val) | pk]`
+/// where `Escaped(col_val)` terminates with `[0x00, 0x01]` and `pk` begins with a type tag
+/// (`<= 0x30 < 0xFF`), appending `0xFF` to the exact prefix of `col_val` yields a key strictly
+/// greater than every `(col_val, pk)` entry and strictly less than every `(col_val', pk')` with
+/// `col_val' > col_val`.
+unsafe fn sec_range_bound_to_key(
+    val_ptr: *mut sqlite3_value,
+    table_id: u16,
+    index_id: u16,
+    sec_affinity: ColumnAffinity,
+    sec_collation: ColCollation,
+    is_lower: bool,
+    is_inclusive: bool,
+) -> Result<Option<(Vec<u8>, bool)>, ()> {
+    let val_type = unsafe { sqlite3_value_type(val_ptr) };
+    if val_type == SQLITE_NULL {
+        return Err(());
+    }
+    if val_type == SQLITE_FLOAT {
+        let f = unsafe { sqlite3_value_double(val_ptr) };
+        if f.is_nan() {
+            return Err(());
+        }
+    }
+
+    let col_val = unsafe {
+        sqlite_value_to_key_bytes_with_schema(val_ptr, sec_affinity, sec_collation, true)
+    };
+    let mut exact_prefix =
+        crate::lru::encode_secondary_index_exact_prefix(table_id, index_id, &col_val);
+
+    if (is_lower && !is_inclusive) || (!is_lower && is_inclusive) {
+        exact_prefix.push(0xFF);
+    }
+    Ok(Some((exact_prefix, is_inclusive)))
 }
 
 unsafe extern "system" fn destroy_aux_context(ptr: *mut c_void) {
@@ -835,6 +893,12 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
+        // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected (`P02`)
+        let can_use_keys_only = info.colUsed == 0
+            || (vtab.pk_collation == ColCollation::Binary
+                && vtab.pk_col_idx < 63
+                && info.colUsed == (1u64 << vtab.pk_col_idx));
+
         // 2. Check for usable equality constraint (`=`) on a Secondary Index column
         for i in 0..n {
             if constraints[i].usable == 0 || constraints[i].op != SQLITE_INDEX_CONSTRAINT_EQ {
@@ -851,7 +915,14 @@ unsafe extern "system" fn vtab_best_index(
                     // Do not set `omit = 1` on secondary index lookups so SQLite verifies the
                     // exact column type and value (`NULL` vs `""` vs `X''`).
                     usages[i].omit = 0;
-                    info.idxNum = PLAN_SECONDARY_EQ | ((index_id as c_int) << 8);
+                    let eq_flags = if can_use_keys_only {
+                        RANGE_FLAG_KEYS_ONLY
+                    } else {
+                        0
+                    };
+                    info.idxNum = PLAN_SECONDARY_EQ
+                        | (((index_id as c_int) & 0xFFFF) << 8)
+                        | ((eq_flags & 0x7F) << 24);
                     info.estimatedCost = 5.0;
                     info.estimatedRows = 4;
                     return SQLITE_OK;
@@ -897,12 +968,6 @@ unsafe extern "system" fn vtab_best_index(
             }
         }
 
-        // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected (`P02`)
-        let can_use_keys_only = info.colUsed == 0
-            || (vtab.pk_collation == ColCollation::Binary
-                && vtab.pk_col_idx < 63
-                && info.colUsed == (1u64 << vtab.pk_col_idx));
-
         if lower_idx.is_some() || upper_idx.is_some() {
             let mut flags = if can_use_keys_only {
                 RANGE_FLAG_KEYS_ONLY
@@ -933,7 +998,58 @@ unsafe extern "system" fn vtab_best_index(
             return SQLITE_OK;
         }
 
-        // 4. Fallback: Full Table Scan (`C-03`: let SQLite's VDBE enforce LIMIT/OFFSET after any
+        // 4. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on a Secondary Index column (`P1`)
+        for &(sec_col_idx, index_id) in &vtab.secondary_indexes {
+            let mut sec_lower: Option<(usize, c_int)> = None;
+            let mut sec_upper: Option<(usize, c_int)> = None;
+            for i in 0..n {
+                if constraints[i].usable == 0 || constraints[i].iColumn != sec_col_idx as i32 {
+                    continue;
+                }
+                match constraints[i].op {
+                    SQLITE_INDEX_CONSTRAINT_GE if sec_lower.is_none() => {
+                        sec_lower = Some((i, RANGE_FLAG_LOWER_INCLUSIVE));
+                    }
+                    SQLITE_INDEX_CONSTRAINT_GT if sec_lower.is_none() => {
+                        sec_lower = Some((i, RANGE_FLAG_LOWER_EXCLUSIVE));
+                    }
+                    SQLITE_INDEX_CONSTRAINT_LE if sec_upper.is_none() => {
+                        sec_upper = Some((i, RANGE_FLAG_UPPER_INCLUSIVE));
+                    }
+                    SQLITE_INDEX_CONSTRAINT_LT if sec_upper.is_none() => {
+                        sec_upper = Some((i, RANGE_FLAG_UPPER_EXCLUSIVE));
+                    }
+                    _ => {}
+                }
+            }
+            if sec_lower.is_some() || sec_upper.is_some() {
+                let mut flags = if can_use_keys_only {
+                    RANGE_FLAG_KEYS_ONLY
+                } else {
+                    0
+                };
+                let mut next_arg = 1;
+                if let Some((i, fl)) = sec_lower {
+                    usages[i].argvIndex = next_arg;
+                    usages[i].omit = 0;
+                    next_arg += 1;
+                    flags |= fl;
+                }
+                if let Some((i, fl)) = sec_upper {
+                    usages[i].argvIndex = next_arg;
+                    usages[i].omit = 0;
+                    flags |= fl;
+                }
+                info.idxNum = PLAN_SECONDARY_RANGE
+                    | (((index_id as c_int) & 0xFFFF) << 8)
+                    | ((flags & 0x7F) << 24);
+                info.estimatedCost = 40.0;
+                info.estimatedRows = 32;
+                return SQLITE_OK;
+            }
+        }
+
+        // 5. Fallback: Full Table Scan (`C-03`: let SQLite's VDBE enforce LIMIT/OFFSET after any
         //    residual WHERE predicates like `LIKE`, `OR`, or expressions not passed in `aConstraint`)
         let mut full_scan_flags = if can_use_keys_only {
             RANGE_FLAG_KEYS_ONLY
@@ -975,6 +1091,8 @@ unsafe extern "system" fn vtab_open(
             stream_upper: None,
             stream_reverse: false,
             stream_last_pk: None,
+            stream_sec_index_id: None,
+            stream_sec_prefix: Vec::new(),
         });
         *pp_cursor = Box::into_raw(cursor) as *mut sqlite3_vtab_cursor;
         SQLITE_OK
@@ -1025,6 +1143,8 @@ unsafe extern "system" fn vtab_filter(
         cursor.stream_upper = None;
         cursor.stream_reverse = false;
         cursor.stream_last_pk = None;
+        cursor.stream_sec_index_id = None;
+        cursor.stream_sec_prefix.clear();
 
         let mut eng = match vtab.engine.lock() {
             Ok(g) => g,
@@ -1093,8 +1213,13 @@ unsafe extern "system" fn vtab_filter(
                         // In SQLite (`10 == 10.0` across all affinities including `BLOB`),
                         // if `pk_bytes` is an exact-integer number (`9`-byte `Integer(q)` or
                         // `17`-byte `Float(q.0)`), also probe the dual exact-integer representation
-                        // if not found under the primary representation (`F04`, `F05`, `C-02`).
-                        if !found {
+                        // if not found under the primary representation (`F04`, `F05`, `C-02`, `P4`).
+                        if !found
+                            && !matches!(
+                                vtab.pk_affinity,
+                                ColumnAffinity::Integer | ColumnAffinity::Numeric
+                            )
+                        {
                             if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
                                 if let Err(e) = eng.get_row_into(
                                     vtab.table_id,
@@ -1117,6 +1242,9 @@ unsafe extern "system" fn vtab_filter(
                         return SQLITE_OK;
                     }
                     let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
+                    let flags = (idx_num >> 24) & 0x7F;
+                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    cursor.keys_only = keys_only;
                     let sec_col_idx = vtab
                         .secondary_indexes
                         .iter()
@@ -1135,20 +1263,136 @@ unsafe extern "system" fn vtab_filter(
                         .unwrap_or(ColCollation::Binary);
                     let col_val =
                         sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
-                    let pks =
-                        match eng.lookup_by_secondary_index(vtab.table_id, index_id, &col_val) {
-                            Ok(pks) => pks,
-                            Err(e) => return io_err_to_sqlite_rc(&e),
-                        };
-                    for pk in pks {
-                        if let Err(e) = eng.get_row_into(
+                    let prefix = crate::lru::encode_secondary_index_exact_prefix(
+                        vtab.table_id,
+                        index_id,
+                        &col_val,
+                    );
+                    let next_last_sec = match eng.scan_secondary_index_into_slab(
+                        vtab.table_id,
+                        index_id,
+                        &prefix,
+                        (&prefix, true),
+                        None,
+                        CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                        &mut cursor.pks,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    ) {
+                        Ok(last_opt) => last_opt,
+                        Err(e) => return io_err_to_sqlite_rc(&e),
+                    };
+                    if let Some(last_sec_key) = next_last_sec {
+                        cursor.streaming_active = true;
+                        cursor.stream_sec_index_id = Some(index_id);
+                        cursor.stream_sec_prefix = prefix;
+                        cursor.stream_upper = None;
+                        cursor.stream_last_pk = Some(last_sec_key);
+                    }
+                }
+                PLAN_SECONDARY_RANGE => {
+                    let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
+                    let flags = (idx_num >> 24) & 0x7F;
+                    let sec_col_idx = vtab
+                        .secondary_indexes
+                        .iter()
+                        .find(|&&(_, id)| id == index_id)
+                        .map(|&(c, _)| c)
+                        .unwrap_or(0);
+                    let sec_aff = vtab
+                        .col_affinities
+                        .get(sec_col_idx)
+                        .copied()
+                        .unwrap_or(ColumnAffinity::Blob);
+                    let sec_coll = vtab
+                        .col_collations
+                        .get(sec_col_idx)
+                        .copied()
+                        .unwrap_or(ColCollation::Binary);
+
+                    let mut arg_pos = 0;
+                    let lower_bound = if (flags
+                        & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
+                        != 0
+                        && arg_pos < argc
+                    {
+                        let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
+                        let val_ptr = *argv.offset(arg_pos as isize);
+                        arg_pos += 1;
+                        match sec_range_bound_to_key(
+                            val_ptr,
                             vtab.table_id,
-                            &pk,
-                            &mut cursor.slab,
-                            &mut cursor.spans,
+                            index_id,
+                            sec_aff,
+                            sec_coll,
+                            true,
+                            inc,
                         ) {
-                            return io_err_to_sqlite_rc(&e);
+                            Ok(bound) => bound,
+                            Err(()) => return SQLITE_OK,
                         }
+                    } else {
+                        let mut min_non_null = Vec::with_capacity(6);
+                        min_non_null.extend_from_slice(&crate::lru::encode_secondary_index_prefix(
+                            vtab.table_id,
+                            index_id,
+                        ));
+                        min_non_null.push(KEY_TAG_NULL + 1);
+                        Some((min_non_null, true))
+                    };
+                    let upper_bound = if (flags
+                        & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
+                        != 0
+                        && arg_pos < argc
+                    {
+                        let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
+                        let val_ptr = *argv.offset(arg_pos as isize);
+                        match sec_range_bound_to_key(
+                            val_ptr,
+                            vtab.table_id,
+                            index_id,
+                            sec_aff,
+                            sec_coll,
+                            false,
+                            inc,
+                        ) {
+                            Ok(bound) => bound,
+                            Err(()) => return SQLITE_OK,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                    cursor.keys_only = keys_only;
+                    let idx_prefix =
+                        crate::lru::encode_secondary_index_prefix(vtab.table_id, index_id);
+                    let (lo_slice, lo_inc) = lower_bound
+                        .as_ref()
+                        .map(|(b, inc)| (b.as_slice(), *inc))
+                        .unwrap_or((&idx_prefix, true));
+                    let next_last_sec = match eng.scan_secondary_index_into_slab(
+                        vtab.table_id,
+                        index_id,
+                        &idx_prefix,
+                        (lo_slice, lo_inc),
+                        upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                        &mut cursor.pks,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    ) {
+                        Ok(last_opt) => last_opt,
+                        Err(e) => return io_err_to_sqlite_rc(&e),
+                    };
+                    if let Some(last_sec_key) = next_last_sec {
+                        cursor.streaming_active = true;
+                        cursor.stream_sec_index_id = Some(index_id);
+                        cursor.stream_sec_prefix.extend_from_slice(&idx_prefix);
+                        cursor.stream_upper = upper_bound;
+                        cursor.stream_last_pk = Some(last_sec_key);
                     }
                 }
                 PLAN_PK_RANGE => {
@@ -1293,6 +1537,45 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
             };
             let conn_id = vtab.db as usize;
             let keys_only = cursor.keys_only;
+
+            if let Some(sec_index_id) = cursor.stream_sec_index_id {
+                let upper_ref = cursor
+                    .stream_upper
+                    .as_ref()
+                    .map(|(b, inc)| (b.as_slice(), *inc));
+                let mut next_last_sec: Option<Vec<u8>> = None;
+                let rc = eng.with_committed_read_for_conn(conn_id, |eng| {
+                    match eng.scan_secondary_index_into_slab(
+                        vtab.table_id,
+                        sec_index_id,
+                        &cursor.stream_sec_prefix,
+                        (last_pk.as_slice(), false),
+                        upper_ref,
+                        CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                        &mut cursor.pks,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                    ) {
+                        Ok(last_opt) => {
+                            next_last_sec = last_opt;
+                            SQLITE_OK
+                        }
+                        Err(e) => io_err_to_sqlite_rc(&e),
+                    }
+                });
+                if rc != SQLITE_OK {
+                    cursor.streaming_active = false;
+                    return rc;
+                }
+                if let Some(next_key) = next_last_sec {
+                    cursor.stream_last_pk = Some(next_key);
+                } else {
+                    cursor.streaming_active = false;
+                }
+                return SQLITE_OK;
+            }
+
             let reverse = cursor.stream_reverse;
             let lower_ref = if reverse {
                 cursor
@@ -1632,12 +1915,17 @@ unsafe extern "system" fn vtab_update(
             }
             None => false,
         };
+        let mut known_absent = pk_override.is_some();
         if (is_insert || !same_pk) && pk_override.is_none() {
-            let existing_conflict =
-                match find_existing_pk_or_numeric_alt(&mut eng, vtab.table_id, &new_pk) {
-                    Ok(opt) => opt,
-                    Err(e) => return io_err_to_sqlite_rc(&e),
-                };
+            let existing_conflict = match find_existing_pk_or_numeric_alt(
+                &mut eng,
+                vtab.table_id,
+                &new_pk,
+                vtab.pk_affinity,
+            ) {
+                Ok(opt) => opt,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            };
             if let Some(conflict_pk) = existing_conflict {
                 let conflict_mode = sqlite3_vtab_on_conflict(vtab.db);
                 if conflict_mode == SQLITE_IGNORE {
@@ -1654,10 +1942,13 @@ unsafe extern "system" fn vtab_update(
                         {
                             return io_err_to_sqlite_rc(&e);
                         }
+                        known_absent = true;
                     }
                 } else {
                     return SQLITE_CONSTRAINT;
                 }
+            } else {
+                known_absent = true;
             }
         }
 
@@ -1676,15 +1967,19 @@ unsafe extern "system" fn vtab_update(
                 if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
                     return io_err_to_sqlite_rc(&e);
                 }
+                if same_pk {
+                    known_absent = true;
+                }
             }
         }
 
-        if let Err(e) = eng.put_row_owned(
+        if let Err(e) = eng.put_row_owned_with_hint(
             vtab.table_id,
             &new_pk,
             row_bytes,
             &sec_keys,
             vtab.durability,
+            known_absent,
         ) {
             return io_err_to_sqlite_rc(&e);
         }
@@ -3938,5 +4233,173 @@ mod tests {
             vec![vec![SqlValue::Text("v1_after_stmt_abort".into())]],
             "N-01: UPDATE WHERE rowid = ? must resolve 'alpha' after statement-level rollback"
         );
+    }
+
+    #[test]
+    fn stage2_p1_p4_p6_secondary_index_streaming_range_scan_and_rowid_compaction() {
+        let dir = TempTestDir::new("stage2_p1_p4_p6_vtab");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE sec_items USING aydb(
+                 columns = 'id INTEGER PRIMARY KEY, category TEXT, score REAL, tag TEXT COLLATE NOCASE',
+                 indexes = 'category, score, tag'
+             );",
+        )
+        .unwrap();
+
+        // 1. P1 Part A: Insert 650 rows (> 2 * CURSOR_STREAM_CHUNK_ROWS = 512) sharing `category = 'hot'`,
+        //    flushing halfway so entries span both SSTable segments and MemTable.
+        conn.execute_batch("BEGIN;").unwrap();
+        for i in 1..=350i64 {
+            conn.query_all(
+                "INSERT INTO sec_items VALUES (?1, 'hot', ?2, ?3)",
+                &[
+                    SqlValue::Integer(i),
+                    SqlValue::Float(i as f64 * 0.5),
+                    SqlValue::Text(format!("Tag_{i:04}")),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        engine.lock().unwrap().flush_memtable().unwrap();
+
+        conn.execute_batch("BEGIN;").unwrap();
+        for i in 351..=650i64 {
+            conn.query_all(
+                "INSERT INTO sec_items VALUES (?1, 'hot', ?2, ?3)",
+                &[
+                    SqlValue::Integer(i),
+                    SqlValue::Float(i as f64 * 0.5),
+                    SqlValue::Text(format!("Tag_{i:04}")),
+                ],
+            )
+            .unwrap();
+        }
+        // Also insert rows with NULL score/category and negative scores to test boundary semantics
+        conn.execute_batch(
+            "INSERT INTO sec_items VALUES (1001, NULL, NULL, NULL);
+             INSERT INTO sec_items VALUES (1002, 'cold', -20.5, 'alpha');
+             INSERT INTO sec_items VALUES (1003, 'cold', -10.0, 'beta');
+             INSERT INTO sec_items VALUES (1004, 'cold', -9.5, 'gamma');
+             COMMIT;",
+        )
+        .unwrap();
+
+        // Verify chunked streaming on `PLAN_SECONDARY_EQ` (`WHERE category = 'hot'`) with `LIMIT 10`
+        let top10 = conn
+            .query_all(
+                "SELECT id FROM sec_items WHERE category = 'hot' LIMIT 10",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(top10.len(), 10);
+
+        // Verify full multi-chunk `PLAN_SECONDARY_EQ` scan across all 650 rows (3 chunks of 256)
+        let all_hot = conn
+            .query_all("SELECT count(*), sum(id) FROM sec_items WHERE category = 'hot'", &[])
+            .unwrap();
+        assert_eq!(
+            all_hot,
+            vec![vec![
+                SqlValue::Integer(650),
+                SqlValue::Integer(650 * 651 / 2)
+            ]]
+        );
+
+        // 2. P1 Part B: Verify `PLAN_SECONDARY_RANGE` (`>`, `>=`, `<`, `<=`, `BETWEEN`) on `score` and `tag`
+        //    - Negative float & integer range: `score > -20.5 AND score <= -9.5` -> ids 1003 (-10.0) and 1004 (-9.5)
+        let neg_range = conn
+            .query_all(
+                "SELECT id FROM sec_items WHERE score > -20.5 AND score <= -9.5 ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            neg_range,
+            vec![
+                vec![SqlValue::Integer(1003)],
+                vec![SqlValue::Integer(1004)],
+            ]
+        );
+
+        //    - Upper-only bound `< 2.0` must exclude `NULL` (id 1001) and include -20.5, -10.0, -9.5, 0.5, 1.0, 1.5
+        let lt_two = conn
+            .query_all(
+                "SELECT id FROM sec_items WHERE score < 2.0 ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            lt_two,
+            vec![
+                vec![SqlValue::Integer(1)],
+                vec![SqlValue::Integer(2)],
+                vec![SqlValue::Integer(3)],
+                vec![SqlValue::Integer(1002)],
+                vec![SqlValue::Integer(1003)],
+                vec![SqlValue::Integer(1004)],
+            ]
+        );
+
+        //    - Multi-chunk `PLAN_SECONDARY_RANGE` returning > 600 rows (`score >= 10.0` -> ids 20..=650 = 631 rows)
+        let ge_ten = conn
+            .query_all("SELECT count(*) FROM sec_items WHERE score >= 10.0", &[])
+            .unwrap();
+        assert_eq!(ge_ten, vec![vec![SqlValue::Integer(631)]]);
+
+        //    - NOCASE secondary index range (`WHERE tag >= 'tag_0648' AND tag <= 'TAG_0650'`)
+        let nocase_range = conn
+            .query_all(
+                "SELECT id FROM sec_items WHERE tag >= 'tag_0648' AND tag <= 'TAG_0650' ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            nocase_range,
+            vec![
+                vec![SqlValue::Integer(648)],
+                vec![SqlValue::Integer(649)],
+                vec![SqlValue::Integer(650)],
+            ]
+        );
+
+        // 3. P4: Verify `ON CONFLICT REPLACE` and numeric dual PK resolution across `BLOB` and `INTEGER` PKs
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE p4_blob_pk USING aydb(columns = 'k BLOB PRIMARY KEY, v TEXT');
+             INSERT INTO p4_blob_pk VALUES (10, 'int_ten');
+             INSERT OR REPLACE INTO p4_blob_pk VALUES (10.0, 'float_ten');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT v FROM p4_blob_pk WHERE k = 10", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Text("float_ten".into())]]
+        );
+
+        // 4. P6 Part A: Verify `RowidMap::evict_oldest_half_if_needed` compacts `fifo_order`
+        //    when `fifo_order.len() >= MAX_ROWID_MAP_ENTRIES` while `by_rowid.len() <= MAX_ROWID_MAP_ENTRIES`.
+        let mut rmap = RowidMap::default();
+        let rid_live = rmap.get_or_assign_rowid(b"\x20live_key");
+        for i in 0..MAX_ROWID_MAP_ENTRIES {
+            let key = format!("\x20temp_{i}").into_bytes();
+            let rid = rmap.get_or_assign_rowid(&key);
+            rmap.remove_by_rowid(rid);
+        }
+        assert_eq!(rmap.by_rowid.len(), 1);
+        assert!(rmap.fifo_order.len() >= MAX_ROWID_MAP_ENTRIES);
+        rmap.evict_oldest_half_if_needed();
+        assert_eq!(
+            rmap.fifo_order.len(),
+            1,
+            "P6 Part A: stale deleted rowids in fifo_order must be compacted even when by_rowid.len() <= MAX_ROWID_MAP_ENTRIES"
+        );
+        assert_eq!(rmap.get_pk(rid_live).map(|v| v.as_slice()), Some(&b"\x20live_key"[..]));
     }
 }
