@@ -98,6 +98,7 @@ impl MemTable {
                 WalRecord::Delete { key } => {
                     self.delete(key.clone(), batch.lsn);
                 }
+                WalRecord::TxBegin | WalRecord::TxCommit => {}
             }
         }
     }
@@ -117,6 +118,7 @@ impl MemTable {
                 WalRecord::Delete { key } => {
                     self.delete(key, lsn);
                 }
+                WalRecord::TxBegin | WalRecord::TxCommit => {}
             }
         }
     }

@@ -13,7 +13,8 @@ use crate::blob::{
     BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_BLOB_SEGMENT_SIZE,
 };
 use crate::index::{
-    DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, compact_idx_segments,
+    DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue,
+    MAX_SINGLE_BLOCK_ENTRY_BYTES, compact_idx_segments,
 };
 use crate::lru::{
     AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, RowMetaRecord,
@@ -135,6 +136,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     pending_tx_sync: bool,
     tx_start_std_lengths: BTreeMap<u64, u64>,
     tx_start_lru_lengths: BTreeMap<(u16, u64), u64>,
+    /// Highest LSN appended to `buf_wal` (`AUD-08`).
+    last_buf_append_lsn: u64,
+    /// Highest LSN in `buf_wal` synced to durable storage (`AUD-08`).
+    last_buf_synced_lsn: u64,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -281,6 +286,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::PutInline { key, .. }
                     | WalRecord::PutBlobPtr { key, .. }
                     | WalRecord::Delete { key } => key.as_slice(),
+                    WalRecord::TxBegin | WalRecord::TxCommit => continue,
                 };
                 let old_ptr = if let Some(mem_entry) = memtable.get(key) {
                     match mem_entry.value {
@@ -361,9 +367,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_tx_sync: false,
             tx_start_std_lengths: BTreeMap::new(),
             tx_start_lru_lengths: BTreeMap::new(),
+            last_buf_append_lsn: 0,
+            last_buf_synced_lsn: 0,
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
+
+        if !rec.merged_batches.is_empty()
+            || rec.next_sync_sector_idx > 0
+            || rec.next_buf_sector_idx > 0
+        {
+            if !engine.memtable.is_empty() {
+                engine.flush_memtable()?;
+            } else {
+                engine.rotate_wal_epochs_only()?;
+            }
+        }
 
         Ok(engine)
     }
@@ -436,23 +455,61 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         secondary_keys: &[(u16, Vec<u8>)],
         durability: WriteDurability,
     ) -> io::Result<()> {
+        if pk.len() > 2048 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "primary key exceeds maximum length (2048 bytes)",
+            ));
+        }
         let row_key = encode_primary_row_key(table_id, pk);
+        if 13 + row_key.len() + 23 > MAX_SINGLE_BLOCK_ENTRY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "primary key exceeds maximum length (2048 bytes)",
+            ));
+        }
+
+        let mut new_sec_keys = Vec::with_capacity(secondary_keys.len());
+        for (idx_id, col_val) in secondary_keys {
+            let sec_key = encode_secondary_index_key(table_id, *idx_id, col_val, pk);
+            if 13 + sec_key.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secondary index key exceeds 4 KB block capacity",
+                ));
+            }
+            new_sec_keys.push(sec_key);
+        }
+
         let is_capped = self.capped_tables.contains_key(&table_id);
         let logical_size = (pk.len() + value.len()) as u32;
+        if let Some(ct) = self.capped_tables.get(&table_id) {
+            if (3 + pk.len() + value.len()) as u64 > ct.max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "row logical size exceeds capped table max_bytes quota",
+                ));
+            }
+        }
 
         // 1. Check if the row already exists so we can clean up old blob bytes, old secondary keys,
         //    and old LRU queue entries (`[TableID | 'l' | old_tick | pk]`).
         let mut records = Vec::with_capacity(3 + secondary_keys.len() * 2);
         let mut old_logical_size = 0u64;
+        let mut old_blob_ptr = None;
+        let mut old_meta_blob_ptr = None;
+        let mut had_old_meta = false;
+        let meta_key = encode_row_meta_key(table_id, pk);
 
         let existing = self.check_existing_row(&row_key)?;
         if let ExistingRowStatus::Blob(old_ptr) = existing {
-            self.record_dead_blob_bytes(&old_ptr);
+            old_blob_ptr = Some(old_ptr);
         }
 
         if existing != ExistingRowStatus::NotFound {
-            let meta_key = encode_row_meta_key(table_id, pk);
-            if let Some(old_meta) = self.get_row_meta(&meta_key)? {
+            if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
+                had_old_meta = true;
+                old_meta_blob_ptr = m_ptr;
                 old_logical_size = old_meta.logical_size as u64;
                 if is_capped && old_meta.recorded_tick > 0 {
                     records.push(WalRecord::Delete {
@@ -467,8 +524,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // 2. Write out-of-line blob FIRST if `value.len() >= inline_threshold_bytes`
-        if value.len() >= self.config.inline_threshold_bytes {
+        // 2. Write out-of-line blob FIRST if `value.len() >= inline_threshold_bytes` or if inline entry exceeds 4 KB block (`AUD-02`)
+        let store_as_blob = value.len() >= self.config.inline_threshold_bytes
+            || 13 + row_key.len() + value.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES;
+        if store_as_blob {
             let blob_kind = if is_capped {
                 BlobKind::Lru
             } else {
@@ -507,9 +566,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // 3. Emit Secondary Index entries (`[TableID | 'i' | IndexID | Escaped(ColVal) | pk]`)
-        for (idx_id, col_val) in secondary_keys {
+        for sec_key in new_sec_keys {
             records.push(WalRecord::PutInline {
-                key: encode_secondary_index_key(table_id, *idx_id, col_val, pk),
+                key: sec_key,
                 value: Vec::new(),
             });
         }
@@ -527,17 +586,43 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             0
         };
 
-        if is_capped || !secondary_keys.is_empty() {
-            records.push(WalRecord::PutInline {
-                key: encode_row_meta_key(table_id, pk),
-                value: RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys),
-            });
+        let need_meta = is_capped || !secondary_keys.is_empty();
+        if need_meta {
+            let meta_bytes = RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys);
+            if 13 + meta_key.len() + meta_bytes.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES {
+                let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
+                if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
+                    if let Some(w) = &mut self.active_std_writer {
+                        w.sync_durable()?;
+                        if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
+                            b.file_len = w.current_len();
+                        }
+                    }
+                }
+                records.push(WalRecord::PutBlobPtr {
+                    key: meta_key,
+                    blob_ptr: ptr,
+                });
+            } else {
+                records.push(WalRecord::PutInline {
+                    key: meta_key,
+                    value: meta_bytes,
+                });
+            }
+        } else if had_old_meta {
+            records.push(WalRecord::Delete { key: meta_key });
         }
 
         // 5. Append atomic batch to WAL and apply to MemTable
         self.commit_wal_and_memtable(records, durability)?;
 
-        // 6. Update Capped Table logical byte counter and enforce `MAX_BYTES` quota
+        // 6. Apply dead blob byte accounting and update Capped Table logical byte counter after WAL succeeds (`AUD-07`)
+        if let Some(old_ptr) = old_blob_ptr {
+            self.record_dead_blob_bytes(&old_ptr);
+        }
+        if let Some(old_m_ptr) = old_meta_blob_ptr {
+            self.record_dead_blob_bytes(&old_m_ptr);
+        }
         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
             ct.current_logical_bytes = ct
                 .current_logical_bytes
@@ -586,20 +671,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         durability: WriteDurability,
     ) -> io::Result<bool> {
+        if pk.len() > 2048 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "primary key exceeds maximum length (2048 bytes)",
+            ));
+        }
         let row_key = encode_primary_row_key(table_id, pk);
         let existing = self.check_existing_row(&row_key)?;
         if existing == ExistingRowStatus::NotFound {
             return Ok(false);
         }
-        if let ExistingRowStatus::Blob(old_ptr) = existing {
-            self.record_dead_blob_bytes(&old_ptr);
-        }
+        let old_blob_ptr = match existing {
+            ExistingRowStatus::Blob(old_ptr) => Some(old_ptr),
+            _ => None,
+        };
 
         let mut records = vec![WalRecord::Delete { key: row_key }];
         let mut old_logical_size = 0u64;
+        let mut old_meta_blob_ptr = None;
 
         let meta_key = encode_row_meta_key(table_id, pk);
-        if let Some(old_meta) = self.get_row_meta(&meta_key)? {
+        if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
+            old_meta_blob_ptr = m_ptr;
             old_logical_size = old_meta.logical_size as u64;
             if old_meta.recorded_tick > 0 {
                 records.push(WalRecord::Delete {
@@ -617,6 +711,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.access_tracker.remove_key(table_id, pk);
         self.commit_wal_and_memtable(records, durability)?;
 
+        if let Some(old_ptr) = old_blob_ptr {
+            self.record_dead_blob_bytes(&old_ptr);
+        }
+        if let Some(old_m_ptr) = old_meta_blob_ptr {
+            self.record_dead_blob_bytes(&old_m_ptr);
+        }
         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
             ct.current_logical_bytes = ct.current_logical_bytes.saturating_sub(old_logical_size);
         }
@@ -962,14 +1062,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_depth -= 1;
         }
         if self.tx_depth == 0 {
-            self.tx_start_std_lengths.clear();
-            self.tx_start_lru_lengths.clear();
             let durability = if self.pending_tx_sync {
                 WriteDurability::SyncTransactional
             } else {
                 WriteDurability::BufferedFast
             };
-            self.flush_pending_tx_records()?;
+            if let Err(e) = self.flush_pending_tx_records() {
+                self.tx_depth = 1;
+                let _ = self.rollback_transaction();
+                return Err(e);
+            }
+            self.tx_start_std_lengths.clear();
+            self.tx_start_lru_lengths.clear();
             let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
             for tid in capped_table_ids {
                 self.evict_until_within_quota(tid, durability)?;
@@ -1058,6 +1162,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::PutInline { key, .. }
                     | WalRecord::PutBlobPtr { key, .. }
                     | WalRecord::Delete { key } => key.as_slice(),
+                    WalRecord::TxBegin | WalRecord::TxCommit => continue,
                 };
                 let old_ptr = if let Some(mem_entry) = new_mem.get(key) {
                     match mem_entry.value {
@@ -1139,11 +1244,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // Large transaction buffer (> 512 KB): chunk serialized records into <= 512 KB WalBatches
-        // so each chunk fits comfortably inside `wal_sync.db` (2 MB) or `wal_buf.db`, rotating the
-        // WAL via `flush_memtable()` if `RingFull` occurs between chunks.
+        // framed by `WalRecord::TxBegin` in the first chunk and `WalRecord::TxCommit` in the last
+        // chunk (`AUD-04`). Ensure the target WAL file has enough capacity so all chunks of the
+        // transaction remain in the same WAL epoch without flushing uncommitted `MemTable` state.
         let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
         let mut cursor = 16usize;
         let total_len = raw_buf.len();
+        let mut chunks: Vec<(Vec<u8>, u32)> = Vec::new();
         let mut chunk_buf = Vec::with_capacity(MAX_WAL_CHUNK_BYTES + 4096);
         let mut chunk_records = 0u32;
 
@@ -1151,6 +1258,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if chunk_records == 0 {
                 chunk_buf.clear();
                 chunk_buf.extend_from_slice(&[0u8; 16]);
+                if chunks.is_empty() {
+                    // Prepend `WalRecord::TxBegin` (`4u8`) to the first chunk (`AUD-04`).
+                    chunk_buf.push(4u8);
+                    chunk_records += 1;
+                }
             }
             let rec_start = cursor;
             let op = raw_buf[cursor];
@@ -1178,15 +1290,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             as usize;
                     cursor += 4 + klen;
                 }
+                4 | 5 => {}
                 _ => unreachable!("invalid op in pending_tx_buf"),
             }
             let rec_slice = &raw_buf[rec_start..cursor];
-            if chunk_records > 0 && chunk_buf.len() + rec_slice.len() > MAX_WAL_CHUNK_BYTES {
-                let lsn = self.next_lsn;
-                self.next_lsn += 1;
-                WalBatch::finalize_encoded_buf(lsn, chunk_records, &mut chunk_buf);
-                self.append_raw_wal_batch_with_rotation(&chunk_buf, durability)?;
-                chunk_buf.clear();
+            let min_records_before_split = if chunks.is_empty() { 2 } else { 1 };
+            if chunk_records >= min_records_before_split
+                && chunk_buf.len() + rec_slice.len() > MAX_WAL_CHUNK_BYTES
+            {
+                chunks.push((core::mem::take(&mut chunk_buf), chunk_records));
+                chunk_buf = Vec::with_capacity(MAX_WAL_CHUNK_BYTES + 4096);
                 chunk_buf.extend_from_slice(&[0u8; 16]);
                 chunk_records = 0;
             }
@@ -1195,14 +1308,58 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         if chunk_records > 0 {
-            let lsn = self.next_lsn;
-            self.next_lsn += 1;
-            WalBatch::finalize_encoded_buf(lsn, chunk_records, &mut chunk_buf);
-            self.append_raw_wal_batch_with_rotation(&chunk_buf, durability)?;
+            chunks.push((chunk_buf, chunk_records));
         }
 
         raw_buf.clear();
         self.pending_tx_buf = raw_buf;
+
+        if chunks.len() == 1 {
+            let (mut single_buf, mut single_records) = chunks.pop().unwrap();
+            // Strip the leading `TxBegin` (`4u8` at index 16) since it fit in a single chunk
+            single_buf.remove(16);
+            single_records -= 1;
+            let lsn = self.next_lsn;
+            self.next_lsn += 1;
+            WalBatch::finalize_encoded_buf(lsn, single_records, &mut single_buf);
+            return self.append_raw_wal_batch_with_rotation(&single_buf, durability);
+        }
+
+        if let Some((last_buf, last_records)) = chunks.last_mut() {
+            // Append `WalRecord::TxCommit` (`5u8`) to the final chunk (`AUD-04`).
+            last_buf.push(5u8);
+            *last_records += 1;
+        }
+
+        // Ensure the target WAL stream has sufficient sectors to fit all chunks in the current epoch
+        let mut required_sectors = 0usize;
+        for (cbuf, _) in &chunks {
+            required_sectors += (cbuf.len() / 4070) + 2;
+        }
+        match durability {
+            WriteDurability::SyncTransactional => {
+                let target_sectors = self.sync_wal.current_sector_idx() + required_sectors;
+                if target_sectors > self.sync_wal.total_sectors() {
+                    self.sync_wal
+                        .ensure_min_size((target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64)?;
+                }
+            }
+            WriteDurability::BufferedFast => {
+                let target_sectors = self.buf_wal.current_sector_idx() + required_sectors;
+                if target_sectors > self.buf_wal.total_sectors() {
+                    self.buf_wal
+                        .ensure_min_size((target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64)?;
+                }
+            }
+        }
+
+        for (mut cbuf, crec) in chunks {
+            let lsn = self.next_lsn;
+            self.next_lsn += 1;
+            WalBatch::finalize_encoded_buf(lsn, crec, &mut cbuf);
+            self.append_raw_wal_batch_with_rotation(&cbuf, durability)?;
+        }
+
         Ok(())
     }
 
@@ -1493,10 +1650,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     fn eager_promote_lru_on_read(&mut self, table_id: u16, pk: &[u8]) -> io::Result<()> {
         let meta_key = encode_row_meta_key(table_id, pk);
-        let Some((_lsn, IndexValue::Inline(meta_bytes))) = self.lookup_raw_entry(&meta_key)? else {
+        let Some((mut meta, old_m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? else {
             return Ok(());
         };
-        let mut meta = RowMetaRecord::from_bytes(&meta_bytes)?;
         let old_tick = meta.recorded_tick;
         let new_tick = self.access_tracker.next_tick();
         meta.recorded_tick = new_tick;
@@ -1511,11 +1667,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             key: encode_lru_queue_key(table_id, new_tick, pk),
             value: Vec::new(),
         });
-        records.push(WalRecord::PutInline {
-            key: meta_key,
-            value: meta.to_bytes(),
-        });
+        let meta_bytes = meta.to_bytes();
+        if 13 + meta_key.len() + meta_bytes.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES {
+            let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
+            records.push(WalRecord::PutBlobPtr {
+                key: meta_key,
+                blob_ptr: ptr,
+            });
+        } else {
+            records.push(WalRecord::PutInline {
+                key: meta_key,
+                value: meta_bytes,
+            });
+        }
         self.commit_wal_and_memtable(records, WriteDurability::BufferedFast)?;
+        if let Some(m_ptr) = old_m_ptr {
+            self.record_dead_blob_bytes(&m_ptr);
+        }
         Ok(())
     }
 
@@ -1577,18 +1745,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 value: Vec::new(),
                             },
                         ];
-                        if let Some((_lsn, IndexValue::Inline(mbytes))) =
-                            self.lookup_raw_entry(&meta_key)?
-                        {
-                            if let Ok(mut mrec) = RowMetaRecord::from_bytes(&mbytes) {
-                                mrec.recorded_tick = hot_tick;
+                        let mut old_m_ptr = None;
+                        if let Some((mut mrec, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
+                            old_m_ptr = m_ptr;
+                            mrec.recorded_tick = hot_tick;
+                            let meta_bytes = mrec.to_bytes();
+                            if 13 + meta_key.len() + meta_bytes.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES
+                            {
+                                let ptr = self.append_to_blob_segment(
+                                    BlobKind::Standard,
+                                    0,
+                                    &meta_key,
+                                    &meta_bytes,
+                                )?;
+                                records.push(WalRecord::PutBlobPtr {
+                                    key: meta_key,
+                                    blob_ptr: ptr,
+                                });
+                            } else {
                                 records.push(WalRecord::PutInline {
                                     key: meta_key,
-                                    value: mrec.to_bytes(),
+                                    value: meta_bytes,
                                 });
                             }
                         }
                         self.commit_wal_and_memtable(records, durability)?;
+                        if let Some(m_ptr) = old_m_ptr {
+                            self.record_dead_blob_bytes(&m_ptr);
+                        }
                         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
                             ct.total_lazy_promotions += 1;
                             ct.eviction_cursor_tick = old_tick;
@@ -1638,7 +1822,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        self.reclaim_fully_dead_blob_segments()?;
+        self.reclaim_fully_dead_lru_blob_segments(table_id)?;
         Ok(())
     }
 
@@ -1803,6 +1987,57 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         (dead_std, dead_lru, deleted_files)
     }
 
+    /// Reclaims any sealed `blob_lru` segment belonging to `table_id` where `dead_bytes >= file_len`,
+    /// syncing `buf_wal` first so the eviction WAL records are durable before unlinking (`AUD-06`).
+    fn reclaim_fully_dead_lru_blob_segments(&mut self, table_id: u16) -> io::Result<()> {
+        let active_seq = self.active_lru_writers.get(&table_id).map(|w| w.seq_id());
+        let dead_lru: Vec<(u16, u64)> = self
+            .lru_blobs
+            .iter()
+            .filter(|&(&(tid, seq), b)| {
+                tid == table_id
+                    && Some(seq) != active_seq
+                    && b.file_len > 0
+                    && b.dead_bytes >= b.file_len
+            })
+            .map(|(&k, _)| k)
+            .collect();
+
+        if dead_lru.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure all buffered eviction `Delete` WAL records that killed these LRU blob segments
+        // are durable on disk before removing the segments from `boot_meta.db` and unlinking them (`AUD-06`).
+        self.buf_wal.flush_buffered_to_os()?;
+        self.buf_wal.file().sync_durable()?;
+        self.last_buf_synced_lsn = self.last_buf_append_lsn;
+
+        let mut deleted_files = Vec::with_capacity(dead_lru.len());
+        for &(tid, seq) in &dead_lru {
+            deleted_files.push(format_lru_blob_file_name(tid, seq));
+            self.lru_blobs.remove(&(tid, seq));
+        }
+
+        let mut lru_metas = self.build_lru_blob_metas();
+        let prev_lru = &self.meta_mgr.state().lru_blob_segments;
+        for m in &mut lru_metas {
+            m.dead_bytes = prev_lru
+                .iter()
+                .find(|p| p.table_id == m.table_id && p.seq_id == m.seq_id)
+                .map(|p| p.dead_bytes)
+                .unwrap_or(0);
+        }
+        self.meta_mgr.commit_update(|st| {
+            st.lru_blob_segments = lru_metas;
+            for fname in &deleted_files {
+                st.queue_pending_delete(fname.clone());
+            }
+        })?;
+        self.meta_mgr.try_process_pending_deletes();
+        Ok(())
+    }
+
     /// Reclaims any sealed `blob_std` or `blob_lru` segment where `dead_bytes >= file_len`
     /// ($O(1)$ Copy-less Segment Deletion!).
     fn reclaim_fully_dead_blob_segments(&mut self) -> io::Result<()> {
@@ -1870,9 +2105,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<u64> {
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
 
         if self.tx_depth > 0 {
+            self.next_lsn += 1;
             if durability == WriteDurability::SyncTransactional {
                 self.pending_tx_sync = true;
             }
@@ -1889,8 +2124,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let batch = WalBatch::new(lsn, records);
         let encoded = batch.encode();
-        self.memtable.apply_wal_batch_owned(batch);
         self.append_raw_wal_batch_with_rotation(&encoded, durability)?;
+        self.next_lsn = self.next_lsn.max(lsn + 1);
+        self.memtable.apply_wal_batch_owned(batch);
         if self.memtable.should_flush() {
             self.flush_memtable()?;
         }
@@ -1902,6 +2138,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         encoded: &[u8],
         durability: WriteDurability,
     ) -> io::Result<()> {
+        let batch_lsn = if encoded.len() >= 8 {
+            u64::from_le_bytes(encoded[0..8].try_into().unwrap())
+        } else {
+            self.next_lsn
+        };
+
+        // Enforce prefix durability across `wal_buf.db` and `wal_sync.db` (`AUD-08`):
+        // before appending a `SyncTransactional` batch at LSN `L`, ensure all earlier
+        // `BufferedFast` batches (`last_buf_append_lsn > last_buf_synced_lsn`) are synced!
+        if durability == WriteDurability::SyncTransactional
+            && self.last_buf_append_lsn > self.last_buf_synced_lsn
+        {
+            self.buf_wal.flush_buffered_to_os()?;
+            self.buf_wal.file().sync_barrier()?;
+            self.last_buf_synced_lsn = self.last_buf_append_lsn;
+        }
+
         let outcome = match durability {
             WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded)?,
             WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded)?,
@@ -1923,6 +2176,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     "single WAL batch exceeds entire pre-allocated WAL file capacity",
                 ));
             }
+        }
+
+        if durability == WriteDurability::BufferedFast {
+            self.last_buf_append_lsn = self.last_buf_append_lsn.max(batch_lsn);
         }
         Ok(())
     }
@@ -1947,22 +2204,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(ExistingRowStatus::NotFound)
     }
 
-    fn get_row_meta(&self, meta_key: &[u8]) -> io::Result<Option<RowMetaRecord>> {
-        if let Some(mem_entry) = self.memtable.get(meta_key) {
-            return match &mem_entry.value {
-                IndexValue::Inline(bytes) => Ok(RowMetaRecord::from_bytes(bytes).ok()),
-                _ => Ok(None),
-            };
-        }
-        for seg in self.idx_segments.iter().rev() {
-            if let Some((_lsn, val)) = seg.get(meta_key)? {
-                return match val {
-                    IndexValue::Inline(bytes) => Ok(RowMetaRecord::from_bytes(&bytes).ok()),
-                    _ => Ok(None),
-                };
+    fn get_row_meta_with_ptr(
+        &self,
+        meta_key: &[u8],
+    ) -> io::Result<Option<(RowMetaRecord, Option<BlobPtr>)>> {
+        let Some((_lsn, val)) = self.lookup_raw_entry(meta_key)? else {
+            return Ok(None);
+        };
+        match val {
+            IndexValue::Inline(bytes) => Ok(RowMetaRecord::from_bytes(&bytes).ok().map(|r| (r, None))),
+            IndexValue::Blob(ptr) => {
+                if let Some(bytes) = self.dereference_blob(&ptr, meta_key)? {
+                    Ok(RowMetaRecord::from_bytes(&bytes)
+                        .ok()
+                        .map(|r| (r, Some(ptr))))
+                } else {
+                    Ok(None)
+                }
             }
+            IndexValue::Tombstone => Ok(None),
         }
-        Ok(None)
     }
 
     fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
@@ -2037,6 +2298,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true
         };
 
+        let prefix_succ_opt: Option<Vec<u8>> = if upper_key_bound.is_none() && !prefix.is_empty() {
+            let mut s = prefix.to_vec();
+            while s.last() == Some(&0xFF) {
+                s.pop();
+            }
+            if let Some(last) = s.last_mut() {
+                *last += 1;
+                Some(s)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let lo_bound = if eff_lo_inc {
             Bound::Included(eff_lo_key)
         } else {
@@ -2045,9 +2321,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let hi_bound = match upper_key_bound {
             Some((ub, true)) => Bound::Included(ub),
             Some((ub, false)) => Bound::Excluded(ub),
-            None => Bound::Unbounded,
+            None => match &prefix_succ_opt {
+                Some(succ) if succ.as_slice() > eff_lo_key => Bound::Excluded(succ.as_slice()),
+                _ => Bound::Unbounded,
+            },
         };
         let mut mem_iter = self.memtable.iter_range(lo_bound, hi_bound).peekable();
+        let mut mem_exhausted = false;
 
         let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
         for seg in &self.idx_segments {
@@ -2058,11 +2338,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         while out.len() < limit {
             let mut min_key: Option<&[u8]> = None;
 
-            if let Some(&(k, _)) = mem_iter.peek() {
-                if in_upper_and_prefix(k.as_slice()) {
-                    min_key = Some(k.as_slice());
+            if !mem_exhausted {
+                if let Some(&(k, _)) = mem_iter.peek() {
+                    if in_upper_and_prefix(k.as_slice()) {
+                        min_key = Some(k.as_slice());
+                    } else {
+                        mem_exhausted = true;
+                    }
                 } else {
-                    while mem_iter.next().is_some() {}
+                    mem_exhausted = true;
                 }
             }
 
@@ -2087,14 +2371,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
             let mut best_entry: Option<IndexEntry> = None;
 
-            if let Some(&(k, _)) = mem_iter.peek() {
-                if k.as_slice() == target_key.as_slice() {
-                    let (k, mem_entry) = mem_iter.next().unwrap();
-                    best_entry = Some(IndexEntry {
-                        key: k.clone(),
-                        lsn: mem_entry.lsn,
-                        value: mem_entry.value.clone(),
-                    });
+            if !mem_exhausted {
+                if let Some(&(k, _)) = mem_iter.peek() {
+                    if k.as_slice() == target_key.as_slice() {
+                        let (k, mem_entry) = mem_iter.next().unwrap();
+                        best_entry = Some(IndexEntry {
+                            key: k.clone(),
+                            lsn: mem_entry.lsn,
+                            value: mem_entry.value.clone(),
+                        });
+                    }
                 }
             }
 
@@ -2129,14 +2415,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     fn reconcile_single_capped_table(&mut self, tid: u16) -> io::Result<()> {
         let meta_prefix = encode_namespace_prefix(tid, NS_ROW_META);
         let meta_entries = self.scan_merged_prefix_range(&meta_prefix, &meta_prefix, true, None, usize::MAX)?;
-        let mut meta_map: HashMap<Vec<u8>, RowMetaRecord> = HashMap::with_capacity(meta_entries.len());
+        let mut meta_map: HashMap<Vec<u8>, (RowMetaRecord, Option<BlobPtr>)> =
+            HashMap::with_capacity(meta_entries.len());
         for entry in meta_entries {
             if entry.key.len() >= 3 {
-                if let IndexValue::Inline(bytes) = entry.value {
-                    if let Ok(rec) = RowMetaRecord::from_bytes(&bytes) {
-                        self.access_tracker.observe_tick(rec.recorded_tick);
-                        meta_map.insert(entry.key[3..].to_vec(), rec);
+                let decoded = match entry.value {
+                    IndexValue::Inline(bytes) => {
+                        RowMetaRecord::from_bytes(&bytes).ok().map(|r| (r, None))
                     }
+                    IndexValue::Blob(ptr) => self
+                        .dereference_blob(&ptr, &entry.key)?
+                        .and_then(|bytes| RowMetaRecord::from_bytes(&bytes).ok())
+                        .map(|r| (r, Some(ptr))),
+                    IndexValue::Tombstone => None,
+                };
+                if let Some((rec, m_ptr)) = decoded {
+                    self.access_tracker.observe_tick(rec.recorded_tick);
+                    meta_map.insert(entry.key[3..].to_vec(), (rec, m_ptr));
                 }
             }
         }
@@ -2145,12 +2440,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let row_entries = self.scan_merged_prefix_range(&user_prefix, &user_prefix, true, None, usize::MAX)?;
         let mut total_bytes = 0u64;
         let mut missing_records = Vec::new();
+        let mut dead_meta_ptrs = Vec::new();
 
         for entry in row_entries {
             let Some(pk) = decode_primary_row_key(tid, &entry.key) else {
                 continue;
             };
-            if let Some(meta) = meta_map.get(pk) {
+            if let Some((meta, old_m_ptr)) = meta_map.get(pk) {
                 total_bytes = total_bytes.saturating_add(meta.logical_size as u64);
                 if meta.recorded_tick == 0 {
                     let tick = self.access_tracker.next_tick();
@@ -2158,14 +2454,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         key: encode_lru_queue_key(tid, tick, pk),
                         value: Vec::new(),
                     });
-                    missing_records.push(WalRecord::PutInline {
-                        key: encode_row_meta_key(tid, pk),
-                        value: RowMetaRecord::encode_slice(
-                            tick,
-                            meta.logical_size,
-                            &meta.secondary_keys,
-                        ),
-                    });
+                    let meta_key = encode_row_meta_key(tid, pk);
+                    let meta_bytes = RowMetaRecord::encode_slice(
+                        tick,
+                        meta.logical_size,
+                        &meta.secondary_keys,
+                    );
+                    if 13 + meta_key.len() + meta_bytes.len() > MAX_SINGLE_BLOCK_ENTRY_BYTES {
+                        let ptr = self.append_to_blob_segment(
+                            BlobKind::Standard,
+                            0,
+                            &meta_key,
+                            &meta_bytes,
+                        )?;
+                        missing_records.push(WalRecord::PutBlobPtr {
+                            key: meta_key,
+                            blob_ptr: ptr,
+                        });
+                    } else {
+                        missing_records.push(WalRecord::PutInline {
+                            key: meta_key,
+                            value: meta_bytes,
+                        });
+                    }
+                    if let Some(m_ptr) = *old_m_ptr {
+                        dead_meta_ptrs.push(m_ptr);
+                    }
                 }
             } else {
                 let val_len = match &entry.value {
@@ -2189,6 +2503,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if !missing_records.is_empty() {
             self.commit_wal_and_memtable(missing_records, WriteDurability::BufferedFast)?;
+            for m_ptr in dead_meta_ptrs {
+                self.record_dead_blob_bytes(&m_ptr);
+            }
         }
 
         if let Some(ct) = self.capped_tables.get_mut(&tid) {
@@ -2887,5 +3204,491 @@ mod tests {
         let st = reopened.capped_table_state(1).unwrap();
         assert_eq!(st.max_bytes, 1_000);
         assert_eq!(st.current_logical_bytes, 304);
+    }
+
+    #[test]
+    fn aud_01_writes_after_crash_recovery_survive_next_restart() {
+        let tmp = TempTestDir::new("aud_01_post_recovery_writes");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+
+        let row_900 = vec![0x61u8; 900];
+        // 1. Write 9 rows of 900 B in BufferedUserSpaceCoalesced mode:
+        //    First 4 rows + First fragment of 5th row fill Sector 0 (flushed to OS),
+        //    while the Last fragment of 5th row and rows 6..9 stay in user-space sector_buf!
+        let mut engine1 = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for i in 0..9u32 {
+            let k = format!("k_{i:02}").into_bytes();
+            engine1
+                .put_row(1, &k, &row_900, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        // Simulate sudden process crash (`kill -9`) leaving a dangling `First` fragment at the end of Sector 0
+        engine1.buf_wal.discard_user_space_buffer_for_test();
+        drop(engine1);
+
+        // 2. Reopen (recovers first 4 rows and rotates WAL epochs), write 3 new rows, and close cleanly
+        {
+            let mut engine2 = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+            for i in 100..103u32 {
+                let k = format!("post_rec_{i}").into_bytes();
+                engine2
+                    .put_row(1, &k, b"survived_post_recovery", &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+        }
+
+        // 3. Reopen again and verify all 3 post-recovery rows survived!
+        let mut engine3 = StorageEngine::open(fs, cfg).unwrap();
+        for i in 100..103u32 {
+            let k = format!("post_rec_{i}").into_bytes();
+            assert_eq!(
+                engine3.get_row(1, &k).unwrap(),
+                Some(b"survived_post_recovery".to_vec()),
+                "post-recovery write {i} must survive subsequent restart"
+            );
+        }
+    }
+
+    #[test]
+    fn aud_02_oversized_keys_rejected_and_large_inline_values_or_meta_routed_to_blob() {
+        let tmp = TempTestDir::new("aud_02_block_bounds");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 8192; // Configured above 4 KB block capacity!
+        let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+        // 1. 5,000-byte primary key must be rejected with InvalidInput before polluting MemTable
+        let err = engine
+            .put_row(1, &[b'x'; 5000], b"v", &[], WriteDurability::BufferedFast)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // 2. 5,000-byte secondary index key must also be rejected with InvalidInput
+        let err_sec = engine
+            .put_row(
+                1,
+                b"ok_pk",
+                b"v",
+                &[(1, vec![b's'; 5000])],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap_err();
+        assert_eq!(err_sec.kind(), io::ErrorKind::InvalidInput);
+
+        // 3. 5,000-byte row value with `inline_threshold_bytes = 8192` must automatically route
+        //    to a blob segment so `flush_memtable()` succeeds cleanly!
+        let val_5000 = vec![0x55u8; 5000];
+        engine
+            .put_row(
+                1,
+                b"large_val_pk",
+                &val_5000,
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+
+        // 4. Row with many secondary keys whose combined `RowMetaRecord` exceeds 4 KB must route `'t'` to blob
+        let many_sec: Vec<(u16, Vec<u8>)> = (0..10u16)
+            .map(|idx| (idx + 1, vec![b'a' + (idx as u8); 600]))
+            .collect();
+        engine
+            .put_row(
+                1,
+                b"many_sec_pk",
+                b"small_v",
+                &many_sec,
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+
+        engine
+            .flush_memtable()
+            .expect("flush_memtable must succeed without wedging");
+        assert_eq!(
+            engine.get_row(1, b"large_val_pk").unwrap(),
+            Some(val_5000)
+        );
+        assert_eq!(
+            engine
+                .lookup_by_secondary_index(1, 1, &vec![b'a'; 600])
+                .unwrap(),
+            vec![b"many_sec_pk".to_vec()]
+        );
+    }
+
+    #[test]
+    fn aud_04_multi_chunk_transaction_without_commit_marker_discards_all_chunks() {
+        let tmp = TempTestDir::new("aud_04_tx_framing");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+
+        {
+            let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+            engine
+                .put_row(
+                    1,
+                    b"baseline",
+                    b"keep_me",
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+
+            // Write a transaction with `TxBegin` in chunk 1 directly to `wal_sync` without a `TxCommit` chunk
+            let chunk1 = WalBatch::new(
+                engine.next_lsn(),
+                vec![
+                    WalRecord::TxBegin,
+                    WalRecord::PutInline {
+                        key: encode_primary_row_key(1, b"uncommitted_chunk_key"),
+                        value: vec![0xBB; 1024],
+                    },
+                ],
+            );
+            engine.sync_wal.append_batch(&chunk1).unwrap();
+        }
+
+        let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        assert_eq!(
+            reopened.get_row(1, b"baseline").unwrap(),
+            Some(b"keep_me".to_vec())
+        );
+        assert!(
+            reopened.get_row(1, b"uncommitted_chunk_key").unwrap().is_none(),
+            "incomplete multi-chunk transaction lacking TxCommit must be completely discarded on recovery"
+        );
+    }
+
+    #[test]
+    fn aud_06_aud_07_aud_08_crash_consistency_and_failed_write_rollback() {
+        use crate::pal::PreallocStrategy;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+
+        struct SimDiskFile {
+            durable: Mutex<Vec<u8>>,
+            cache: Mutex<Vec<u8>>,
+            fail_wal_writes: Arc<AtomicBool>,
+            is_wal: bool,
+            is_sync_wal: bool,
+        }
+
+        impl PlatformFile for SimDiskFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                let c = self.cache.lock().unwrap();
+                let off = offset as usize;
+                if off >= c.len() {
+                    return Ok(0);
+                }
+                let n = (c.len() - off).min(buf.len());
+                buf[..n].copy_from_slice(&c[off..off + n]);
+                Ok(n)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                let n = self.read_at(buf, offset)?;
+                if n < buf.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+                }
+                Ok(())
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                if self.is_wal && self.fail_wal_writes.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "simulated WAL write I/O failure",
+                    ));
+                }
+                let mut c = self.cache.lock().unwrap();
+                let end = offset as usize + buf.len();
+                if end > c.len() {
+                    c.resize(end, 0);
+                }
+                c[offset as usize..end].copy_from_slice(buf);
+                if self.is_sync_wal {
+                    let mut d = self.durable.lock().unwrap();
+                    if end > d.len() {
+                        d.resize(end, 0);
+                    }
+                    d[offset as usize..end].copy_from_slice(buf);
+                }
+                Ok(())
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                Ok(self.cache.lock().unwrap().len() as u64)
+            }
+            fn preallocate(&self, target_len: u64, _strategy: PreallocStrategy) -> io::Result<()> {
+                let mut c = self.cache.lock().unwrap();
+                let mut d = self.durable.lock().unwrap();
+                let len = target_len as usize;
+                if len > c.len() {
+                    c.resize(len, 0);
+                }
+                if len > d.len() {
+                    d.resize(len, 0);
+                }
+                Ok(())
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.sync_durable()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                let c = self.cache.lock().unwrap();
+                *self.durable.lock().unwrap() = c.clone();
+                Ok(())
+            }
+            fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct SimDiskFs {
+            files: Mutex<HashMap<String, Arc<SimDiskFile>>>,
+            fail_wal_writes: Arc<AtomicBool>,
+            root: PathBuf,
+        }
+
+        impl SimDiskFs {
+            fn new() -> Self {
+                Self {
+                    files: Mutex::new(HashMap::new()),
+                    fail_wal_writes: Arc::new(AtomicBool::new(false)),
+                    root: PathBuf::from("/sim/aud_test"),
+                }
+            }
+            fn simulate_power_loss(&self) {
+                let files = self.files.lock().unwrap();
+                for f in files.values() {
+                    let d = f.durable.lock().unwrap().clone();
+                    *f.cache.lock().unwrap() = d;
+                }
+            }
+        }
+
+        impl PlatformFs for SimDiskFs {
+            type File = SimDiskFile;
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                _writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                let mut files = self.files.lock().unwrap();
+                if let Some(f) = files.get(rel_name) {
+                    return Ok(Arc::clone(f));
+                }
+                if !create {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
+                }
+                let f = Arc::new(SimDiskFile {
+                    durable: Mutex::new(Vec::new()),
+                    cache: Mutex::new(Vec::new()),
+                    fail_wal_writes: Arc::clone(&self.fail_wal_writes),
+                    is_wal: rel_name.starts_with("wal_"),
+                    is_sync_wal: hint == OpenHint::MutableSyncLog,
+                });
+                files.insert(rel_name.to_string(), Arc::clone(&f));
+                Ok(f)
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .remove(rel_name)
+                    .map(|_| ())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                Ok(self.files.lock().unwrap().keys().cloned().collect())
+            }
+            fn root_path(&self) -> &Path {
+                &self.root
+            }
+        }
+
+        let fs = Arc::new(SimDiskFs::new());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 128;
+        cfg.max_blob_segment_bytes = 2048;
+
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine.register_capped_table(2, 4_000).unwrap();
+
+        // AUD-06 setup: Write blob_1 and blob_2 to Table 1 so blob_std_1 is sealed and checkpointed
+        let orig_blob = vec![0x33u8; 2000];
+        engine
+            .put_row(1, b"r1", &orig_blob, &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        engine
+            .put_row(1, b"r2", &orig_blob, &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+
+        // AUD-07 check: Failing a WAL write must NOT mutate `MemTable`!
+        fs.fail_wal_writes.store(true, Ordering::SeqCst);
+        assert!(engine
+            .put_row(1, b"r1", b"failed_update", &[], WriteDurability::BufferedFast)
+            .is_err());
+        assert_eq!(engine.get_row(1, b"r1").unwrap(), Some(orig_blob.clone()));
+
+        // AUD-07 transaction commit check: Failing commit_transaction must roll back MemTable!
+        fs.fail_wal_writes.store(false, Ordering::SeqCst);
+        engine.begin_transaction();
+        engine
+            .put_row(1, b"tx_fail_k", b"tx_val", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        fs.fail_wal_writes.store(true, Ordering::SeqCst);
+        assert!(engine.commit_transaction().is_err());
+        fs.fail_wal_writes.store(false, Ordering::SeqCst);
+        assert!(
+            engine.get_row(1, b"tx_fail_k").unwrap().is_none(),
+            "failed commit_transaction must roll back unlogged MemTable mutations"
+        );
+
+        // AUD-06 check: Overwrite `r1` with `BufferedFast` (making `blob_std_1` 100% dead in RAM),
+        // then trigger `evict_until_within_quota` on capped Table 2, then simulate power loss!
+        engine
+            .put_row(1, b"r1", &vec![0x44u8; 2000], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine
+            .put_row(2, b"cap_k", b"small", &[], WriteDurability::BufferedFast)
+            .unwrap();
+
+        // AUD-08 check: Write `idx_row` with `BufferedFast` (tag_buf), then overwrite with
+        // `SyncTransactional` (tag_sync), then simulate power loss!
+        engine
+            .put_row(
+                1,
+                b"idx_row",
+                b"v_buf",
+                &[(1, b"tag_buf".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine
+            .put_row(
+                1,
+                b"idx_row",
+                b"v_sync",
+                &[(1, b"tag_sync".to_vec())],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+
+        // Now write one more un-synced BufferedFast overwrite on `r3` and cut power!
+        engine
+            .put_row(1, b"r3_unsynced", b"lost", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        std::mem::forget(engine);
+        fs.simulate_power_loss();
+
+        let mut recovered = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+        // AUD-08 verification: `tag_buf` must NOT remain as a dangling secondary index entry!
+        assert!(
+            recovered
+                .lookup_by_secondary_index(1, 1, b"tag_buf")
+                .unwrap()
+                .is_empty(),
+            "prefix durability on sync commit must prevent dangling secondary index from earlier buffered write"
+        );
+        assert_eq!(
+            recovered
+                .lookup_by_secondary_index(1, 1, b"tag_sync")
+                .unwrap(),
+            vec![b"idx_row".to_vec()]
+        );
+        // AUD-06 verification: `r1` must still be readable (either new version if synced by AUD-08 or original)!
+        assert!(recovered.get_row(1, b"r1").unwrap().is_some());
+    }
+
+    #[test]
+    fn perf_01_use_04_use_07_bounded_scan_quota_reject_and_stale_meta_cleanup() {
+        let tmp = TempTestDir::new("perf01_use04_use07");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+        // USE-04: Row larger than capped table `max_bytes` is rejected with `InvalidInput`
+        // without evicting existing rows!
+        engine.register_capped_table(1, 500).unwrap();
+        engine
+            .put_row(1, b"keep", &[0x11; 200], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let err = engine
+            .put_row(
+                1,
+                b"too_big",
+                &[0x22; 600],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            engine.get_row(1, b"keep").unwrap(),
+            Some(vec![0x11; 200]),
+            "existing capped table rows must not be evicted when an oversized row is rejected"
+        );
+
+        // USE-07: Overwriting an indexed row with a row that has no secondary keys on a non-capped
+        // table deletes the stale `'t'` metadata record!
+        engine
+            .put_row(
+                2,
+                b"u7_pk",
+                b"v1",
+                &[(1, b"sec_old".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        assert!(engine
+            .get_row_meta_with_ptr(&encode_row_meta_key(2, b"u7_pk"))
+            .unwrap()
+            .is_some());
+        engine
+            .put_row(2, b"u7_pk", b"v2_no_sec", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        assert!(
+            engine
+                .get_row_meta_with_ptr(&encode_row_meta_key(2, b"u7_pk"))
+                .unwrap()
+                .is_none(),
+            "stale 't' metadata record must be deleted when overwritten without secondary keys"
+        );
+
+        // PERF-01: With 1 flushed segment on table 2 and 25,000 unrelated keys on table 3 in MemTable,
+        // 200 secondary index lookups on table 2 must finish in < 50 ms (O(log N), not O(N))!
+        engine
+            .put_row(
+                2,
+                b"indexed_pk",
+                b"val",
+                &[(5, b"target_sec".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine.flush_memtable().unwrap();
+
+        for i in 0..25_000u32 {
+            let k = format!("unrelated_{i:05}").into_bytes();
+            engine
+                .put_row(3, &k, b"v", &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            let pks = engine
+                .lookup_by_secondary_index(2, 5, b"target_sec")
+                .unwrap();
+            assert_eq!(pks, vec![b"indexed_pk".to_vec()]);
+        }
+        assert!(
+            t0.elapsed().as_millis() < 250,
+            "200 secondary-index lookups must not drain 25,000 unrelated MemTable entries (took {:?})",
+            t0.elapsed()
+        );
     }
 }

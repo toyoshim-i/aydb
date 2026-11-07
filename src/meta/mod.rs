@@ -471,6 +471,33 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let b_all_zero = slot_b_raw.iter().all(|&b| b == 0);
 
         if a_all_zero && b_all_zero {
+            // Guard against a missing or zeroed `boot_meta.db` destroying an existing database:
+            // if any managed segment/manifest file or non-empty WAL file already exists, refuse
+            // to initialize a blank state or run the orphan sweep (`AUD-09`).
+            for fname in fs.list_files()? {
+                if is_managed_segment_or_manifest(&fname) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
+                        ),
+                    ));
+                }
+                if fname == crate::wal::WAL_SYNC_FILE_NAME || fname == crate::wal::WAL_BUF_FILE_NAME
+                {
+                    if let Ok(wf) = fs.open_file(&fname, false, false, OpenHint::ImmutableRandom) {
+                        if wf.file_len().unwrap_or(0) > 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Case 3: Newly created database (or crash prior to first metadata commit).
             let initial_state = BootMetaState::default();
             let mut mgr = Self {
@@ -482,7 +509,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
             };
             mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
             mgr.active_slot = SlotIndex::SlotA;
-            mgr.sweep_orphans_and_pending_deletes(None)?;
             return Ok(mgr);
         }
 
@@ -526,6 +552,11 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         mgr.sweep_orphans_and_pending_deletes(standby_manifest_id)?;
         Ok(mgr)
+    }
+
+    /// Returns the underlying `boot_meta.db` file handle.
+    pub fn file(&self) -> &Arc<F::File> {
+        &self.file
     }
 
     /// Returns a shared reference to the current authoritative [`BootMetaState`].
@@ -1042,6 +1073,20 @@ mod tests {
         let locked_idx_name = format_idx_file_name(10);
         let orphan_idx_name = format_idx_file_name(99);
 
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open");
+            // Commit Gen 2 referencing `locked_idx_name`
+            mgr.commit_update(|s| {
+                s.idx_segments.push(IdxSegmentMeta {
+                    seq_id: 10,
+                    file_len: 4096,
+                    level: 0,
+                    record_count: 1,
+                });
+            })
+            .expect("commit gen 2");
+        }
+
         // Hold an open handle to `idx_000000000000000a.db` to simulate an antivirus filter
         // blocking DeleteFile while the segment is retired.
         let held_handle = fs
@@ -1055,9 +1100,16 @@ mod tests {
         drop(_orphan);
 
         {
-            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open");
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen with orphan");
             // Orphan `idx_99` should have been swept immediately on startup!
             assert!(!fs.list_files().unwrap().contains(&orphan_idx_name));
+
+            // Retire `locked_idx_name` and queue it for deletion while `held_handle` is open
+            mgr.commit_update(|s| {
+                s.idx_segments.clear();
+                s.queue_pending_delete(locked_idx_name.clone());
+            })
+            .expect("retire idx 10");
 
             // On Windows, `locked_idx_name` could not be deleted because `held_handle` is open;
             // verify it remains queued in `pending_delete_files` and persisted on the next commit.
@@ -1079,5 +1131,43 @@ mod tests {
         let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen after unlock");
         assert!(mgr.state().pending_delete_files.is_empty());
         assert!(!fs.list_files().unwrap().contains(&locked_idx_name));
+    }
+
+    #[test]
+    fn aud_09_missing_or_zeroed_boot_meta_refuses_to_destroy_existing_segments() {
+        let tmp = TempTestDir::new("aud_09_missing_boot_meta");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+
+        let idx_name = format_idx_file_name(1);
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
+            mgr.commit_update(|s| {
+                let id = s.allocate_seq_id();
+                s.idx_segments.push(IdxSegmentMeta {
+                    seq_id: id,
+                    file_len: 4096,
+                    level: 0,
+                    record_count: 10,
+                });
+            })
+            .expect("commit idx_1");
+            let _f = fs
+                .open_file(&idx_name, true, true, OpenHint::ImmutableRandom)
+                .expect("create idx_1");
+        }
+
+        // Delete `boot_meta.db` while `idx_0000000000000001.db` exists on disk
+        fs.remove_file(BOOT_META_FILE_NAME)
+            .expect("remove boot_meta.db");
+
+        let err = match BootMetaManager::open_or_recover(Arc::clone(&fs)) {
+            Ok(_) => panic!("open_or_recover must fail when boot_meta.db is missing"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            fs.list_files().unwrap().contains(&idx_name),
+            "existing segment file must NOT be deleted when boot_meta.db is missing or zeroed"
+        );
     }
 }

@@ -108,6 +108,10 @@ pub enum WalRecord {
     Delete {
         key: Vec<u8>,
     },
+    /// Marks the start of a multi-chunk transaction (`AUD-04`).
+    TxBegin,
+    /// Marks the final chunk of a multi-chunk transaction (`AUD-04`).
+    TxCommit,
 }
 
 /// An atomic group of [`WalRecord`] mutations assigned a single monotonically increasing `lsn`.
@@ -130,6 +134,7 @@ impl WalBatch {
                 WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
                 WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),
                 WalRecord::Delete { key } => 5 + key.len(),
+                WalRecord::TxBegin | WalRecord::TxCommit => 1,
             };
         }
         buf.reserve(extra);
@@ -157,6 +162,12 @@ impl WalBatch {
                     buf.push(3u8);
                     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     buf.extend_from_slice(key);
+                }
+                WalRecord::TxBegin => {
+                    buf.push(4u8);
+                }
+                WalRecord::TxCommit => {
+                    buf.push(5u8);
                 }
             }
         }
@@ -246,6 +257,12 @@ impl WalBatch {
                         u32::from_le_bytes(read_bytes(&mut data, 4)?.try_into().unwrap()) as usize;
                     let key = read_bytes(&mut data, klen)?.to_vec();
                     records.push(WalRecord::Delete { key });
+                }
+                4 => {
+                    records.push(WalRecord::TxBegin);
+                }
+                5 => {
+                    records.push(WalRecord::TxCommit);
                 }
                 other => {
                     return Err(io::Error::new(
@@ -394,6 +411,29 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     pub fn total_sectors(&self) -> usize {
         self.total_sectors
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discard_user_space_buffer_for_test(&mut self) {
+        self.dirty_in_user_space = false;
+    }
+
+    /// Grows the underlying WAL file if `target_size > current_size` to accommodate an oversized
+    /// multi-chunk transaction in a single epoch (`AUD-04`).
+    pub fn ensure_min_size(&mut self, target_size: u64) -> io::Result<()> {
+        let aligned = ((target_size + WAL_SECTOR_SIZE as u64 - 1) / WAL_SECTOR_SIZE as u64)
+            * WAL_SECTOR_SIZE as u64;
+        let new_sectors = (aligned / WAL_SECTOR_SIZE as u64) as usize;
+        if new_sectors > self.total_sectors {
+            let prealloc = match self.mode {
+                WalStreamMode::SyncSectorIsolated => PreallocStrategy::PhysicalZeroFill,
+                WalStreamMode::BufferedImmediateOsCache
+                | WalStreamMode::BufferedUserSpaceCoalesced => PreallocStrategy::LogicalExtendOnly,
+            };
+            self.file.preallocate(aligned, prealloc)?;
+            self.total_sectors = new_sectors;
+        }
+        Ok(())
     }
 
     /// Appends an atomic [`WalBatch`] to the WAL stream, fragmenting across 4 KB sectors if needed.
@@ -709,10 +749,12 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
 
                 match frag_type {
                     FragmentType::Full => {
-                        if partial_batch_buf.is_some() {
-                            sector_corrupt = true;
-                            break;
+                        if let Some(ref mut buf) = partial_batch_buf {
+                            // A previous `First`/`Middle` fragment chain was left dangling by a crash;
+                            // discard the incomplete partial batch and decode the new `Full` fragment (`AUD-01`).
+                            buf.clear();
                         }
+                        partial_batch_buf = None;
                         match WalBatch::decode(frag_data) {
                             Ok(batch) => batches.push(batch),
                             Err(_) => {
@@ -722,13 +764,15 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
                         }
                     }
                     FragmentType::First => {
-                        if partial_batch_buf.is_some() {
-                            sector_corrupt = true;
-                            break;
+                        if let Some(ref mut buf) = partial_batch_buf {
+                            // Discard any prior dangling `First`/`Middle` chain (`AUD-01`).
+                            buf.clear();
+                            buf.extend_from_slice(frag_data);
+                        } else {
+                            let mut buf = Vec::with_capacity(frag_len * 2);
+                            buf.extend_from_slice(frag_data);
+                            partial_batch_buf = Some(buf);
                         }
-                        let mut buf = Vec::with_capacity(frag_len * 2);
-                        buf.extend_from_slice(frag_data);
-                        partial_batch_buf = Some(buf);
                     }
                     FragmentType::Middle => {
                         if let Some(ref mut buf) = partial_batch_buf {
@@ -808,16 +852,52 @@ where
     let sync_rec = recover_single_wal_stream(sync_file, sync_epoch)?;
     let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
 
-    let sync_iter: Vec<WalBatch> = sync_rec
-        .batches
-        .into_iter()
-        .filter(|b| b.lsn > checkpoint_lsn)
-        .collect();
-    let buf_iter: Vec<WalBatch> = buf_rec
-        .batches
-        .into_iter()
-        .filter(|b| b.lsn > checkpoint_lsn)
-        .collect();
+    // Filter out uncommitted multi-chunk transactions (`TxBegin` without a matching `TxCommit`)
+    // per stream (`AUD-04`) while recording the highest LSN observed across all recovered batches.
+    let mut max_lsn = checkpoint_lsn;
+    let mut filter_committed_stream = |batches: Vec<WalBatch>| -> Vec<WalBatch> {
+        let mut out = Vec::with_capacity(batches.len());
+        let mut pending_tx: Option<Vec<WalBatch>> = None;
+        for mut b in batches {
+            if b.lsn > max_lsn {
+                max_lsn = b.lsn;
+            }
+            if b.lsn <= checkpoint_lsn {
+                continue;
+            }
+            let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
+            let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
+            b.records
+                .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
+
+            if has_begin {
+                // Start of a new multi-chunk transaction; discard any prior incomplete one.
+                let mut tx_vec = Vec::new();
+                if !b.records.is_empty() {
+                    tx_vec.push(b);
+                }
+                if has_commit {
+                    out.extend(tx_vec);
+                    pending_tx = None;
+                } else {
+                    pending_tx = Some(tx_vec);
+                }
+            } else if let Some(ref mut tx_vec) = pending_tx {
+                if !b.records.is_empty() {
+                    tx_vec.push(b);
+                }
+                if has_commit {
+                    out.extend(pending_tx.take().unwrap());
+                }
+            } else if !b.records.is_empty() {
+                out.push(b);
+            }
+        }
+        out
+    };
+
+    let sync_iter = filter_committed_stream(sync_rec.batches);
+    let buf_iter = filter_committed_stream(buf_rec.batches);
 
     // Two-way merge sort by ascending `lsn`.
     let mut merged = Vec::with_capacity(sync_iter.len() + buf_iter.len());
@@ -837,7 +917,6 @@ where
 
     // Reject any `WalBatch` atomically if any `PutBlobPtr` record in the batch references a blob
     // payload that did not reach disk before power loss.
-    let mut max_lsn = checkpoint_lsn;
     let mut validated_batches = Vec::with_capacity(merged.len());
     for batch in merged {
         if batch.lsn > max_lsn {
