@@ -33,13 +33,13 @@ flowchart TB
     end
 
     subgraph Adapter["aydb sqlite3_module Adapter (src/vtab/)"]
-        BestIdx["xBestIndex:<br/>1. PK = ? -> Plan::PointLookup (Cost = 1.0, Unique)<br/>2. SecondaryCol = ? -> Plan::SecondaryEq (Cost = 5.0)<br/>3. PK >= ? AND PK <= ? -> Plan::PkRange (Cost = 25.0)<br/>4. Full Scan -> Plan::FullScan (Cost = 10,000.0)"]
-        Filter["xFilter / xNext / xColumn:<br/>Translates sqlite3_value <-> Memcomparable Key & Binary Row"]
-        Update["xUpdate:<br/>INSERT / REPLACE / UPDATE / DELETE -> put_row / delete_row"]
+        BestIdx["xBestIndex:<br/>1. PK = ? -> Plan::PointLookup (Cost = 1.0, Unique)<br/>2. SecondaryCol = ? -> Plan::SecondaryEq (Cost = 5.0)<br/>3. PK Range + LIMIT + ORDER BY -> Plan::PkRange (Cost = 25.0)<br/>4. Full Scan + ORDER BY -> Plan::FullScan (Cost = 10,000.0)"]
+        Filter["xFilter / xNext / xColumn:<br/>Reusable Cursor Slab + Zero-Copy Column Projection"]
+        Update["xUpdate / xBegin / xCommit / xRollback:<br/>Direct Binary Row Encoding + Coalesced Batch Transactions"]
     end
 
     subgraph Engine["Phase 1 StorageEngine (src/engine/)"]
-        SE["StorageEngine<OsFs><br/>- wal_sync.db / wal_buf.db<br/>- MemTable & idx_<SeqID>.db (Bloom + Fence Pointers)<br/>- blob_std & blob_lru (MAX_BYTES Lazy LRU Eviction)"]
+        SE["StorageEngine<OsFs><br/>- wal_sync.db / wal_buf.db (Multi-Sector Coalesced Writes)<br/>- MemTable & idx_<SeqID>.db (Bloom + Fence Pointers)<br/>- blob_std & blob_lru (MAX_BYTES Lazy LRU Eviction)"]
     end
 
     Planner <--> BestIdx
@@ -53,6 +53,6 @@ flowchart TB
 
 | Step | Textbook Chapter | Rust Modules | Key Engineering Topics & Empirical Benchmarks |
 | :--- | :--- | :--- | :--- |
-| **Step 2-1** | [`01_SQLITE_VTAB_ADAPTER.md`](./01_SQLITE_VTAB_ADAPTER.md) | `src/vtab/ffi.rs`<br/>`src/vtab/row_codec.rs`<br/>`src/vtab/mod.rs` | - Compact multi-column binary row format (`NULL`/`INT`/`FLOAT`/`TEXT`/`BLOB`)<br/>- `CREATE VIRTUAL TABLE ... USING aydb(...)` DDL argument grammar<br/>- `xBestIndex` constraint pushdown (`PK = ?`, `PK` ranges, secondary index `col = ?`)<br/>- `xUpdate` conflict resolution (`INSERT OR REPLACE` / `UPDATE` / `DELETE`) |
-| **Step 2-2** | [`02_SQLITE_VS_AYDB_BENCHMARKS.md`](./02_SQLITE_VS_AYDB_BENCHMARKS.md) | `examples/sqlite_vs_aydb_bench.rs` | - **Benchmark 1:** Small Sync Config Updates (`128 B`, `SYNCHRONOUS = FULL` vs. `wal_sync.db`)<br/>- **Benchmark 2:** Large Blob Cache Churn (`16 KB` blobs, `MAX_BYTES` LRU Eviction: Vanilla SQLite B-Tree + SQL LRU vs. `aydb` Virtual Table WiscKey + Copy-less GC)<br/>- **Benchmark 3:** Read-Heavy Cache Hit LRU Tracking (`SELECT` + `UPDATE last_tick` in SQLite vs. `aydb` Coalesced In-Memory `AccessTracker`) |
-| **Step 2-3** | [`03_STANDARD_SQL_BENCHMARKS.md`](./03_STANDARD_SQL_BENCHMARKS.md) | `examples/standard_sql_bench.rs` | - **Suite 1:** SQLite Official `"Speedtest1"` Suite (`Tests 100..240`)<br/>- **Suite 2:** YCSB Workloads `A–F` (Zipfian $\theta = 0.99$, at `256 B` Inline & `2,048 B` WiscKey Separated)<br/>- **Suite 3:** TPC-B (`pgbench`-style) 4-Table OLTP Benchmark (`Buffered` & `Full Sync`) |
+| **Step 2-1** | [`01_SQLITE_VTAB_ADAPTER.md`](./01_SQLITE_VTAB_ADAPTER.md) | `src/vtab/ffi.rs`<br/>`src/vtab/row_codec.rs`<br/>`src/vtab/mod.rs` | - Compact multi-column binary row format (`NULL`/`INT`/`FLOAT`/`TEXT`/`BLOB`) with zero-copy `xColumn` projection (`project_column_zero_copy`) and direct `sqlite3_value*` encoding (`encode_sqlite_values_direct`)<br/>- `CREATE VIRTUAL TABLE ... USING aydb(...)` DDL argument grammar<br/>- `xBestIndex` constraint pushdown (`PK = ?`, `PK` ranges + `LIMIT` + `ORDER BY pk ASC`, secondary index `col = ?`)<br/>- Reusable contiguous cursor slab (`AydbCursor::slab` & `spans`) and lock-free reversible 8-byte `rowid` mapping<br/>- `xUpdate` conflict resolution & `xBegin`/`xCommit`/`xRollback` ACID transaction coalescing |
+| **Step 2-2** | [`02_SQLITE_VS_AYDB_BENCHMARKS.md`](./02_SQLITE_VS_AYDB_BENCHMARKS.md) | `examples/sqlite_vs_aydb_bench.rs` | - **Benchmark 1:** Small Sync Config Updates (`128 B`: **`12,808 tx/s` vs. `578 tx/s`**, **`22.2×` faster**)<br/>- **Benchmark 2:** Large Blob Cache Churn (`16 KB` blobs, `4.0 MB` Cap: **`153.4 MB/s` vs. `58.0 MB/s`**, **`2.64×` faster**, zero quota bloat)<br/>- **Benchmark 3:** Read-Heavy Cache Hit LRU Tracking (**`215,396 ops/s` vs. `22,691 ops/s`**, **`9.49×` faster**, `0 MB` disk writes) |
+| **Step 2-3** | [`03_STANDARD_SQL_BENCHMARKS.md`](./03_STANDARD_SQL_BENCHMARKS.md) | `examples/standard_sql_bench.rs` | - **Suite 1:** SQLite Official `"Speedtest1"` Suite (`Tests 100..240`: **`56.29 ms` vs. `62.85 ms`**, **`1.12×` faster overall**)<br/>- **Suite 2:** YCSB Workloads `A–F` (Zipfian $\theta = 0.99$: **`2.40×–10.60×` faster** at `256 B` Inline, up to **`1.23M ops/s`**; **`1.85×–8.10×` faster** on updates at `2,048 B` WiscKey)<br/>- **Suite 3:** TPC-B (`pgbench`-style) 4-Table OLTP Benchmark (**`117,368 TPS` (`7.54×`)** Buffered & **`11,417 TPS` (`19.65×`)** Full Sync) |
