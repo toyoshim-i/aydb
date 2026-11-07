@@ -1637,6 +1637,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
         }
+
+        self.reclaim_fully_dead_blob_segments()?;
         Ok(())
     }
 
@@ -1816,8 +1818,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.lru_blobs.remove(&key);
         }
 
-        let std_metas = self.build_std_blob_metas();
-        let lru_metas = self.build_lru_blob_metas();
+        let mut std_metas = self.build_std_blob_metas();
+        let prev_std = &self.meta_mgr.state().std_blob_segments;
+        for m in &mut std_metas {
+            m.dead_bytes = prev_std
+                .iter()
+                .find(|p| p.seq_id == m.seq_id)
+                .map(|p| p.dead_bytes)
+                .unwrap_or(0);
+        }
+        let mut lru_metas = self.build_lru_blob_metas();
+        let prev_lru = &self.meta_mgr.state().lru_blob_segments;
+        for m in &mut lru_metas {
+            m.dead_bytes = prev_lru
+                .iter()
+                .find(|p| p.table_id == m.table_id && p.seq_id == m.seq_id)
+                .map(|p| p.dead_bytes)
+                .unwrap_or(0);
+        }
         self.meta_mgr.commit_update(|st| {
             st.std_blob_segments = std_metas;
             st.lru_blob_segments = lru_metas;
