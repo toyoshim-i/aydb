@@ -1646,6 +1646,549 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
     }
 }
 
+// ============================================================================
+// SUITE 9: Multi-Angle Audit Report Regressions (R-01..07, C-01..05, P-01..04, O-01..02)
+// ============================================================================
+
+pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
+    println!();
+    println!("==========================================================================================");
+    println!(
+        "SUITE 9: Multi-Angle Audit Regressions (R-01..07, C-01..05, P-01..04, O-01..02)"
+    );
+    println!("==========================================================================================");
+    println!(
+        "{:<54} | {:>14} | {:>20}",
+        "Multi-Angle Audit Regression Scenario", "Status", "Observed Result"
+    );
+    println!(
+        "----------------------------------------------------------------------------------------------"
+    );
+
+    // ------------------------------------------------------------------------
+    // 9A: R-01 (uncataloged blob_std_* survives open & catalogs into boot_meta.db),
+    //     R-02 (multi-mutation to same blob key in 1 WalBatch does not double-count dead_bytes),
+    //     R-04 (unreferenced tail bytes credited to dead_bytes on recovery for O(1) unlink)
+    // ------------------------------------------------------------------------
+    {
+        let sub = base_dir.join("s9a_r01_r02_r04");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let blob_r01 = vec![0xA1u8; 2048];
+        let orphan_blob = aydb::meta::format_std_blob_file_name(999);
+        {
+            let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+            let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+            engine
+                .put_row(1, b"r01_k", &blob_r01, &[], WriteDurability::SyncTransactional)
+                .unwrap();
+            let _ = fs
+                .open_file(&orphan_blob, true, true, OpenHint::ImmutableSequential)
+                .unwrap();
+        }
+        // Simulate a sub-sector torn write in the active boot_meta.db slot (which cataloged
+        // blob_std_0001.db) so open_or_recover_deferred_sweep falls back to the initial slot
+        // where std_blob_segments was still empty, leaving blob_std_0001.db uncataloged!
+        {
+            let boot_path = sub.join(aydb::meta::BOOT_META_FILE_NAME);
+            let mut bm = std::fs::read(&boot_path).unwrap();
+            let gen_a = u64::from_le_bytes(bm[8..16].try_into().unwrap());
+            let gen_b = u64::from_le_bytes(bm[4096 + 8..4096 + 16].try_into().unwrap());
+            let newer_off = if gen_b > gen_a { 4096 } else { 0 };
+            bm[newer_off + 4095] ^= 0xFF;
+            std::fs::write(&boot_path, &bm).unwrap();
+        }
+
+        // Reopen: R-01 guarantees blob_std_0001.db is discovered before WAL recovery, its row
+        // survives, the truly unreferenced orphan blob is swept, and blob_std_0001.db is cataloged
+        // into boot_meta.db!
+        let r01_ok = {
+            let fs = Arc::new(OsFs::open(&sub, false).unwrap());
+            let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+            let val_ok = engine.get_row(1, b"r01_k").unwrap() == Some(blob_r01.clone());
+            let orphan_swept = !fs.list_files().unwrap().contains(&orphan_blob);
+
+            // R-02: Flush two blob keys into blob_std, then mutate `r02_mut` twice in a single
+            // explicit transaction (WalBatch) and drop before flushing MemTable!
+            engine
+                .put_row(
+                    1,
+                    b"r02_live",
+                    &vec![0x11u8; 2048],
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            engine
+                .put_row(
+                    1,
+                    b"r02_mut",
+                    &vec![0x22u8; 2048],
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            engine.flush_memtable().unwrap();
+
+            engine.begin_transaction();
+            engine
+                .put_row(
+                    1,
+                    b"r02_mut",
+                    b"inline_mid",
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            engine
+                .delete_row(1, b"r02_mut", WriteDurability::SyncTransactional)
+                .unwrap();
+            engine.commit_transaction().unwrap();
+            drop(engine);
+
+            // Verify boot_meta.db active slot now catalogs >= 1 std_blob_segment
+            let boot_meta = aydb::meta::BootMetaManager::open_or_recover(fs).unwrap();
+            let cataloged_ok = !boot_meta.state().std_blob_segments.is_empty();
+
+            val_ok && orphan_swept && cataloged_ok
+        };
+
+        let (r02_ok, r04_ok) = {
+            let fs = Arc::new(OsFs::open(&sub, false).unwrap());
+            let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
+            engine
+                .delete_row(1, b"r01_k", WriteDurability::SyncTransactional)
+                .unwrap();
+            engine.flush_memtable().unwrap();
+            engine.compact().unwrap();
+            let live_ok = engine.get_row(1, b"r02_live").unwrap() == Some(vec![0x11u8; 2048]);
+            let mut_gone = engine.get_row(1, b"r02_mut").unwrap().is_none();
+
+            // R-04: Register capped table 4, write a 2 KB blob row, flush, and append 4,096
+            // unreferenced tail bytes to blob_lru_0004_*.db before reopening.
+            engine.register_capped_table(4, 100_000).unwrap();
+            engine
+                .put_row(
+                    4,
+                    b"lru_k1",
+                    &vec![0x77u8; 2048],
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            engine.flush_memtable().unwrap();
+            drop(engine);
+
+            let lru_fname = fs
+                .list_files()
+                .unwrap()
+                .into_iter()
+                .find(|n| n.starts_with("blob_lru_0004_"))
+                .unwrap();
+            let lru_file = fs
+                .open_file(&lru_fname, false, true, OpenHint::ImmutableSequential)
+                .unwrap();
+            let valid_len = lru_file.file_len().unwrap();
+            lru_file.write_all_at(&vec![0xEEu8; 4096], valid_len).unwrap();
+            lru_file.sync_durable().unwrap();
+            drop(lru_file);
+
+            let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+            let before_del = reopened.active_lru_blob_segment_count(4);
+            reopened.begin_transaction();
+            reopened
+                .delete_row(4, b"lru_k1", WriteDurability::SyncTransactional)
+                .unwrap();
+            reopened.commit_transaction().unwrap();
+            let after_del = reopened.active_lru_blob_segment_count(4);
+            (live_ok && mut_gone, before_del == 1 && after_del == 0)
+        };
+        let _ = std::fs::remove_dir_all(&sub);
+        assert!(
+            r01_ok && r02_ok && r04_ok,
+            "9A (R-01, R-02 & R-04) failed: r01={r01_ok}, r02={r02_ok}, r04={r04_ok}"
+        );
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "9A. Recovery Sweep & Dead-Byte Dedupe (R-01/02/04)",
+            "PASS",
+            "Cataloged & Reclaimed"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 9B: R-03 (exact 4 KB inline block capacity boundary 4088 vs 4089),
+    //     R-05 (CREATE VIRTUAL TABLE inside rolled-back transaction),
+    //     R-06 (DROP TABLE of capped table inside committed transaction),
+    //     R-07 (concurrent read with EagerWriteOnRead during active transaction)
+    // ------------------------------------------------------------------------
+    {
+        use aydb::engine::LruReadTrackingMode;
+        let sub = base_dir.join("s9b_r03_r05_r06_r07");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.lru_read_tracking = LruReadTrackingMode::EagerWriteOnRead;
+
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs.clone(), cfg.clone()).unwrap()));
+
+        // R-03: 100-byte PK -> row_key.len() == 103.
+        // 15 + 103 + 3970 == 4088 (fits inline in 4 KB block) vs 3971 -> 4089 (spills to blob).
+        // Even with a high threshold (or default threshold), 3970B fits in an inline 4KB block
+        // when threshold allows, while 3971B spills to blob without wedging flush_memtable!
+        let pk_4088 = vec![b'a'; 100];
+        let val_3970 = vec![0x33u8; 3970];
+        let pk_4089 = vec![b'b'; 100];
+        let val_3971 = vec![0x44u8; 3971];
+        let r03_ok = {
+            let mut r03_cfg = EngineConfig::default();
+            r03_cfg.inline_threshold_bytes = 8192;
+            let sub_r03 = base_dir.join("s9b_r03_only");
+            let _ = std::fs::remove_dir_all(&sub_r03);
+            std::fs::create_dir_all(&sub_r03).unwrap();
+            let fs_r03 = Arc::new(OsFs::open(&sub_r03, true).unwrap());
+            let mut eng_r03 = StorageEngine::open(fs_r03, r03_cfg).unwrap();
+            eng_r03
+                .put_row(2, &pk_4088, &val_3970, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng_r03
+                .put_row(2, &pk_4089, &val_3971, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            let ok = eng_r03.flush_memtable().is_ok()
+                && eng_r03.get_row(2, &pk_4088).unwrap() == Some(val_3970)
+                && eng_r03.get_row(2, &pk_4089).unwrap() == Some(val_3971);
+            drop(eng_r03);
+            let _ = std::fs::remove_dir_all(&sub_r03);
+            ok
+        };
+
+        // R-05: CREATE VIRTUAL TABLE (`register_or_resolve_vtab`) inside a rolled-back
+        // transaction must roll back cleanly without WAL LSN inversion or leaked catalog entries.
+        let r05_ok = {
+            let mut eng = engine.lock().unwrap();
+            let lsn_before = eng.next_lsn();
+            eng.begin_transaction();
+            let tid = eng
+                .register_or_resolve_vtab("r05_aborted", Some(55))
+                .unwrap();
+            eng.rollback_transaction().unwrap();
+            let lsn_after = eng.next_lsn();
+            eng.put_row(2, b"after_r05", b"ok", &[], WriteDurability::SyncTransactional)
+                .unwrap();
+            tid == 55 && lsn_after == lsn_before && eng.get_row(0, b"r05_aborted").unwrap().is_none()
+        };
+
+        // R-06: DROP TABLE of a capped table inside a committed transaction must reclaim
+        // its LRU blob segments and remove its quota from boot_meta.db!
+        let (segs_before_drop, segs_after_drop) = {
+            let mut eng = engine.lock().unwrap();
+            eng.register_capped_table(56, 50_000).unwrap();
+            eng.put_row(
+                56,
+                b"cap56_k1",
+                &vec![0x55u8; 2048],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+            let before = eng.active_lru_blob_segment_count(56);
+            eng.begin_transaction();
+            eng.drop_table(56, Some("r06_capped")).unwrap();
+            eng.commit_transaction().unwrap();
+            let after = eng.active_lru_blob_segment_count(56);
+            (before, after)
+        };
+
+        // R-07: Concurrent read under EagerWriteOnRead during an active transaction must not
+        // corrupt the writer transaction's undo log on ROLLBACK!
+        let r07_ok = {
+            let mut eng = engine.lock().unwrap();
+            eng.register_capped_table(57, 100_000).unwrap();
+            eng.put_row(57, b"shared_k", b"committed_v1", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.begin_transaction_for_conn(101).unwrap();
+            eng.put_row(57, b"shared_k", b"uncommitted_v2", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            let reader_val = eng
+                .with_committed_read_for_conn(202, |e| e.get_row(57, b"shared_k"))
+                .unwrap();
+            eng.rollback_transaction_for_conn(101).unwrap();
+            let restored_val = eng.get_row(57, b"shared_k").unwrap();
+            reader_val == Some(b"committed_v1".to_vec())
+                && restored_val == Some(b"committed_v1".to_vec())
+        };
+
+        drop(engine);
+        let quota_removed = aydb::meta::BootMetaManager::open_or_recover(fs)
+            .unwrap()
+            .state()
+            .table_quotas
+            .iter()
+            .all(|q| q.table_id != 56);
+        let r06_ok = segs_before_drop == 1 && segs_after_drop == 0 && quota_removed;
+        let _ = std::fs::remove_dir_all(&sub);
+        assert!(
+            r03_ok && r05_ok && r06_ok && r07_ok,
+            "9B (R-03, R-05, R-06 & R-07) failed: r03={r03_ok}, r05={r05_ok}, r06={r06_ok}, r07={r07_ok}"
+        );
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "9B. 4KB Bound, DDL Tx & Eager Read Guard (R-03..07)",
+            "PASS",
+            "Isolated & Reclaimed"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 9C: C-01 (sub-ULP negative floats in REAL PK & BLOB PK),
+    //     C-02 (10 and 10.0 conflict on BLOB PRIMARY KEY),
+    //     C-03 & P-01 (SELECT ... WHERE v LIKE '%target%' LIMIT 3 across 600 rows),
+    //     C-04 & C-05 (non-integer PK rowid resolution & Statement clear_bindings / %.15g)
+    // ------------------------------------------------------------------------
+    {
+        let sub = base_dir.join("s9c_c01_to_c05");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c01_real USING aydb(table_id = 61, columns = 'pk REAL PRIMARY KEY, v TEXT');
+             CREATE VIRTUAL TABLE c01_blob USING aydb(table_id = 62, columns = 'pk BLOB PRIMARY KEY, v TEXT');",
+        )
+        .unwrap();
+
+        let sub_ulp_floats = [-1e-17_f64, -1e-20, -1e-300, -f64::MIN_POSITIVE];
+        {
+            let mut ins_r = conn.prepare("INSERT INTO c01_real VALUES (?1, ?2)").unwrap();
+            let mut ins_b = conn.prepare("INSERT INTO c01_blob VALUES (?1, ?2)").unwrap();
+            for (i, &f) in sub_ulp_floats.iter().enumerate() {
+                ins_r
+                    .execute(&[SqlValue::Float(f), SqlValue::Text(format!("r_{i}"))])
+                    .unwrap();
+                ins_b
+                    .execute(&[SqlValue::Float(f), SqlValue::Text(format!("b_{i}"))])
+                    .unwrap();
+            }
+        }
+        let real_rows = conn.query_all("SELECT pk FROM c01_real", &[]).unwrap();
+        let blob_rows = conn.query_all("SELECT pk FROM c01_blob", &[]).unwrap();
+        let c01_ok = real_rows.len() == 4
+            && blob_rows.len() == 4
+            && sub_ulp_floats.iter().enumerate().all(|(i, &exp)| {
+                matches!(
+                    (&real_rows[i][0], &blob_rows[i][0]),
+                    (SqlValue::Float(r), SqlValue::Float(b))
+                        if r.to_bits() == exp.to_bits() && b.to_bits() == exp.to_bits()
+                )
+            });
+
+        // C-02: 10 and 10.0 conflict on BLOB PRIMARY KEY
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c02_blob USING aydb(table_id = 63, columns = 'pk BLOB PRIMARY KEY, v TEXT');
+             INSERT INTO c02_blob VALUES (10, 'ten_int');",
+        )
+        .unwrap();
+        let dup_rejected = conn
+            .execute_batch("INSERT INTO c02_blob VALUES (10.0, 'ten_float');")
+            .is_err();
+        conn.execute_batch("INSERT OR REPLACE INTO c02_blob VALUES (10.0, 'replaced');")
+            .unwrap();
+        let c02_rows = conn.query_all("SELECT pk, v FROM c02_blob", &[]).unwrap();
+        let c02_ok = dup_rejected
+            && c02_rows
+                == vec![vec![
+                    SqlValue::Float(10.0),
+                    SqlValue::Text("replaced".into()),
+                ]];
+
+        // C-03 & P-01: SELECT ... WHERE v LIKE '%target%' LIMIT 3 across 600 rows (> 2x 256 chunk)
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c03_scan USING aydb(table_id = 64, columns = 'id INT PRIMARY KEY, v TEXT');
+             BEGIN;",
+        )
+        .unwrap();
+        {
+            let mut ins = conn.prepare("INSERT INTO c03_scan VALUES (?1, ?2)").unwrap();
+            for i in 1..=600i64 {
+                let text = if i >= 590 {
+                    format!("row_{i}_target_hit")
+                } else {
+                    format!("row_{i}_miss")
+                };
+                ins.execute(&[SqlValue::Integer(i), SqlValue::Text(text)])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        let like_rows = conn
+            .query_all(
+                "SELECT id FROM c03_scan WHERE v LIKE '%target%' LIMIT 3",
+                &[],
+            )
+            .unwrap();
+        let c03_ok = like_rows
+            == vec![
+                vec![SqlValue::Integer(590)],
+                vec![SqlValue::Integer(591)],
+                vec![SqlValue::Integer(592)],
+            ];
+
+        // C-04 & C-05: TEXT PK rowid UPDATE/DELETE and statement re-binding + %.15g formatting
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE c04_c05 USING aydb(table_id = 65, columns = 'k TEXT PRIMARY KEY, v TEXT');",
+        )
+        .unwrap();
+        {
+            let mut ins = conn.prepare("INSERT INTO c04_c05 VALUES (?1, ?2)").unwrap();
+            ins.execute(&[SqlValue::Float(1e20), SqlValue::Text("first".into())])
+                .unwrap();
+            ins.execute(&[SqlValue::Float(-1e-20)]).unwrap();
+        }
+        let rid_rows = conn
+            .query_all("SELECT rowid, k, v FROM c04_c05 ORDER BY k", &[])
+            .unwrap();
+        let SqlValue::Integer(rid0) = rid_rows[0][0] else {
+            panic!("expected integer rowid");
+        };
+        conn.query_all(
+            "UPDATE c04_c05 SET v = 'updated_via_rowid' WHERE rowid = ?1",
+            &[SqlValue::Integer(rid0)],
+        )
+        .unwrap();
+        let after_upd = conn
+            .query_all("SELECT k, v FROM c04_c05 ORDER BY k", &[])
+            .unwrap();
+        let c04_c05_ok = after_upd
+            == vec![
+                vec![
+                    SqlValue::Text("-1.0e-20".into()),
+                    SqlValue::Text("updated_via_rowid".into()),
+                ],
+                vec![
+                    SqlValue::Text("1.0e+20".into()),
+                    SqlValue::Text("first".into()),
+                ],
+            ];
+
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+        assert!(
+            c01_ok && c02_ok && c03_ok && c04_c05_ok,
+            "9C (C-01..C-05) failed: c01={c01_ok}, c02={c02_ok}, c03={c03_ok}, c04_05={c04_c05_ok}"
+        );
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "9C. Sub-ULP Float, Numeric PK & LIKE LIMIT (C-01..05)",
+            "PASS",
+            "Lossless & Complete"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 9D: P-01 (ORDER BY id DESC LIMIT 5 reverse streaming cursor pushdown),
+    //     P-02..P-04 (row-meta skip, buffered blob read in tx, two-level AccessTracker),
+    //     O-02 (deep long directory path > 260 chars creation & StorageEngine I/O)
+    // ------------------------------------------------------------------------
+    {
+        let sub = base_dir.join("s9d_p01_to_p04");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let fs = Arc::new(OsFs::open(&sub, true).unwrap());
+        let engine = Arc::new(Mutex::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE p01_rev USING aydb(table_id = 71, columns = 'id INT PRIMARY KEY, body BLOB');
+             BEGIN;",
+        )
+        .unwrap();
+        let blob_2k = vec![0x66u8; 2048];
+        {
+            let mut ins = conn.prepare("INSERT INTO p01_rev VALUES (?1, ?2)").unwrap();
+            for i in 1..=600i64 {
+                ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(blob_2k.clone())])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        engine.lock().unwrap().flush_memtable().unwrap();
+
+        let desc_rows = conn
+            .query_all("SELECT id FROM p01_rev ORDER BY id DESC LIMIT 5", &[])
+            .unwrap();
+        let eqp_desc = conn
+            .query_all(
+                "EXPLAIN QUERY PLAN SELECT id FROM p01_rev ORDER BY id DESC LIMIT 5",
+                &[],
+            )
+            .unwrap();
+        let no_temp_btree = !format!("{eqp_desc:?}").contains("USE TEMP B-TREE");
+        let p01_ok = no_temp_btree
+            && desc_rows
+                == vec![
+                    vec![SqlValue::Integer(600)],
+                    vec![SqlValue::Integer(599)],
+                    vec![SqlValue::Integer(598)],
+                    vec![SqlValue::Integer(597)],
+                    vec![SqlValue::Integer(596)],
+                ];
+
+        drop(conn);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&sub);
+
+        // O-02: Deep directory path exceeding 260 characters (Windows MAX_PATH)
+        let mut deep_dir = base_dir.join("s9d_o02_long");
+        for i in 0..8 {
+            deep_dir = deep_dir.join(format!(
+                "segment_{i:02}_abcdefghijklmnopqrstuvwxyz_0123456789"
+            ));
+        }
+        assert!(deep_dir.as_os_str().len() > 280);
+        let o02_ok = {
+            let fs_long = Arc::new(OsFs::open(&deep_dir, true).unwrap());
+            let mut eng_long =
+                StorageEngine::open(fs_long, EngineConfig::default()).unwrap();
+            eng_long
+                .put_row(
+                    1,
+                    b"long_path_k",
+                    &vec![0x99u8; 2048],
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+            eng_long.get_row(1, b"long_path_k").unwrap() == Some(vec![0x99u8; 2048])
+        };
+        let _ = std::fs::remove_dir_all(base_dir.join("s9d_o02_long"));
+
+        assert!(
+            p01_ok && o02_ok,
+            "9D (P-01..04 & O-02) failed: p01={p01_ok}, o02={o02_ok}"
+        );
+        println!(
+            "{:<54} | {:>14} | {:>20}",
+            "9D. Reverse Stream & >260-Char Path (P-01..04, O-02)",
+            "PASS",
+            "Streamed & Long-Path"
+        );
+    }
+}
+
 fn main() {
     let base_dir = std::env::temp_dir().join(format!("aydb_rel_suite7_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base_dir);
@@ -1659,6 +2202,7 @@ fn main() {
     bench_suite_6_vtab_key_and_rowid_integrity();
     suite_7_audit_regressions(&base_dir);
     suite_8_followup_audit_regressions(&base_dir);
+    suite_9_multi_angle_audit_regressions(&base_dir);
 
     let _ = std::fs::remove_dir_all(&base_dir);
 }

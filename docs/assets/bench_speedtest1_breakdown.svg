@@ -20,15 +20,15 @@
 
   <!-- Title & Subtitle -->
   <text x="32" y="38" fill="#f8fafc" font-size="18.5" font-weight="700">SQLite Speedtest1-Style Workload — Execution Time Breakdown (ms, Lower is Better)</text>
-  <text x="32" y="62" fill="#94a3b8" font-size="13">5,000 Indexed Rows across Tests 100–240 | BufferedImmediateOsCache vs. NORMAL: aydb 74.78 ms vs. SQLite 59.21 ms (0.79x)</text>
+  <text x="32" y="62" fill="#94a3b8" font-size="13">5,000 Indexed Rows across Tests 100–240 | BufferedImmediateOsCache vs. NORMAL: aydb 74.17 ms vs. SQLite 62.59 ms (0.84x)</text>
 
   <!-- Dedicated Legend Row (y = 78..92, generous spacing) -->
   <rect x="32" y="78" width="14" height="14" rx="3" fill="url(#sqliteWal)"/>
-  <text x="52" y="90" fill="#fde68a" font-size="12" font-weight="600">Vanilla SQLite (WAL: 59.21 ms)</text>
+  <text x="52" y="90" fill="#fde68a" font-size="12" font-weight="600">Vanilla SQLite (WAL: 62.59 ms)</text>
   <rect x="285" y="78" width="14" height="14" rx="3" fill="url(#aydbPre)"/>
   <text x="305" y="90" fill="#bfdbfe" font-size="12" font-weight="600">aydb Pre-Opt (93.36 ms)</text>
   <rect x="505" y="78" width="14" height="14" rx="3" fill="url(#aydbOpt)"/>
-  <text x="525" y="90" fill="#a7f3d0" font-size="12" font-weight="700">aydb Post-Audit (ImmediateOsCache + 2PC/Affinity: 74.78 ms)</text>
+  <text x="525" y="90" fill="#a7f3d0" font-size="12" font-weight="700">aydb Post-Audit (ImmediateOsCache + Streaming/2PC: 74.17 ms)</text>
 
   <!-- Left Panel: Individual Tests 100..240 (Max = 45 ms, y: 150..430, height = 280px, scale = 280/45 = 6.222 px/ms) -->
   <g stroke="#1e293b" stroke-width="1">
@@ -46,82 +46,82 @@
     <text x="57" y="185">40 ms</text>
   </g>
 
-  <!-- Test 100: 5K Bulk INSERT (SQLite 5.00 -> h=31, Pre 16.58 -> h=103, Opt 14.78 -> h=92) -->
-  <rect x="82" y="399" width="19" height="31" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 100: 5K Bulk INSERT (SQLite 5.41 -> h=34, Pre 16.58 -> h=103, Opt 16.20 -> h=101) -->
+  <rect x="82" y="396" width="19" height="34" rx="2" fill="url(#sqliteWal)"/>
   <rect x="104" y="327" width="19" height="103" rx="2" fill="url(#aydbPre)"/>
-  <rect x="126" y="338" width="19" height="92" rx="2" fill="url(#aydbOpt)"/>
-  <text x="91" y="391" fill="#fde68a" font-size="9.5" text-anchor="middle">5.0</text>
+  <rect x="126" y="329" width="19" height="101" rx="2" fill="url(#aydbOpt)"/>
+  <text x="91" y="388" fill="#fde68a" font-size="9.5" text-anchor="middle">5.4</text>
   <text x="113" y="319" fill="#93c5fd" font-size="9.5" text-anchor="middle">16.6</text>
-  <text x="135" y="330" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">14.8</text>
+  <text x="135" y="321" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">16.2</text>
   <text x="113" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 100</text>
   <text x="113" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">5K INSERT</text>
-  <text x="113" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.34x</text>
+  <text x="113" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.33x</text>
 
-  <!-- Test 130: 5K PK Point SELECT (SQLite 14.37 -> h=89, Pre 5.71 -> h=36, Opt 5.33 -> h=33) -->
-  <rect x="176" y="341" width="19" height="89" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 130: 5K PK Point SELECT (SQLite 14.70 -> h=91, Pre 5.71 -> h=36, Opt 4.89 -> h=30) -->
+  <rect x="176" y="339" width="19" height="91" rx="2" fill="url(#sqliteWal)"/>
   <rect x="198" y="394" width="19" height="36" rx="2" fill="url(#aydbPre)"/>
-  <rect x="220" y="397" width="19" height="33" rx="2" fill="url(#aydbOpt)"/>
-  <text x="185" y="333" fill="#fde68a" font-size="9.5" text-anchor="middle">14.4</text>
+  <rect x="220" y="400" width="19" height="30" rx="2" fill="url(#aydbOpt)"/>
+  <text x="185" y="331" fill="#fde68a" font-size="9.5" text-anchor="middle">14.7</text>
   <text x="207" y="386" fill="#93c5fd" font-size="9.5" text-anchor="middle">5.7</text>
-  <text x="229" y="389" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">5.3</text>
+  <text x="229" y="392" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">4.9</text>
   <text x="207" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 130</text>
   <text x="207" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">PK SELECT</text>
-  <text x="207" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">2.70x Faster</text>
+  <text x="207" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">3.01x Faster</text>
 
-  <!-- Test 140: 5K SecIdx SELECT (SQLite 15.15 -> h=94, Pre 8.43 -> h=52, Opt 6.62 -> h=41) -->
-  <rect x="270" y="336" width="19" height="94" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 140: 5K SecIdx SELECT (SQLite 16.17 -> h=101, Pre 8.43 -> h=52, Opt 7.25 -> h=45) -->
+  <rect x="270" y="329" width="19" height="101" rx="2" fill="url(#sqliteWal)"/>
   <rect x="292" y="378" width="19" height="52" rx="2" fill="url(#aydbPre)"/>
-  <rect x="314" y="389" width="19" height="41" rx="2" fill="url(#aydbOpt)"/>
-  <text x="279" y="328" fill="#fde68a" font-size="9.5" text-anchor="middle">15.2</text>
+  <rect x="314" y="385" width="19" height="45" rx="2" fill="url(#aydbOpt)"/>
+  <text x="279" y="321" fill="#fde68a" font-size="9.5" text-anchor="middle">16.2</text>
   <text x="301" y="370" fill="#93c5fd" font-size="9.5" text-anchor="middle">8.4</text>
-  <text x="323" y="381" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">6.6</text>
+  <text x="323" y="377" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">7.3</text>
   <text x="301" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 140</text>
   <text x="301" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">SecIdx SELECT</text>
-  <text x="301" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">2.29x Faster</text>
+  <text x="301" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">2.23x Faster</text>
 
-  <!-- Test 160: 1K PK Range Scan (SQLite 5.47 -> h=34, Pre 6.62 -> h=41, Opt 4.17 -> h=26) -->
-  <rect x="364" y="396" width="19" height="34" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 160: 1K PK Range Scan (SQLite 5.78 -> h=36, Pre 6.62 -> h=41, Opt 5.63 -> h=35) -->
+  <rect x="364" y="394" width="19" height="36" rx="2" fill="url(#sqliteWal)"/>
   <rect x="386" y="389" width="19" height="41" rx="2" fill="url(#aydbPre)"/>
-  <rect x="408" y="404" width="19" height="26" rx="2" fill="url(#aydbOpt)"/>
-  <text x="373" y="388" fill="#fde68a" font-size="9.5" text-anchor="middle">5.5</text>
+  <rect x="408" y="395" width="19" height="35" rx="2" fill="url(#aydbOpt)"/>
+  <text x="373" y="386" fill="#fde68a" font-size="9.5" text-anchor="middle">5.8</text>
   <text x="395" y="381" fill="#93c5fd" font-size="9.5" text-anchor="middle">6.6</text>
-  <text x="417" y="396" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">4.2</text>
+  <text x="417" y="387" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">5.6</text>
   <text x="395" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 160</text>
   <text x="395" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">PK Range(20)</text>
-  <text x="395" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">1.31x Faster</text>
+  <text x="395" y="485" fill="#34d399" font-size="10.5" font-weight="700" text-anchor="middle">1.03x Faster</text>
 
-  <!-- Test 210: 10x Full-Table GROUP BY (SQLite 10.11 -> h=63, Pre 40.53 -> h=252, Opt 16.51 -> h=103) -->
-  <rect x="458" y="367" width="19" height="63" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 210: 10x Full-Table GROUP BY (SQLite 10.43 -> h=65, Pre 40.53 -> h=252, Opt 12.67 -> h=79) -->
+  <rect x="458" y="365" width="19" height="65" rx="2" fill="url(#sqliteWal)"/>
   <rect x="480" y="178" width="19" height="252" rx="2" fill="url(#aydbPre)"/>
-  <rect x="502" y="327" width="19" height="103" rx="2" fill="url(#aydbOpt)"/>
-  <text x="467" y="359" fill="#fde68a" font-size="9.5" text-anchor="middle">10.1</text>
+  <rect x="502" y="351" width="19" height="79" rx="2" fill="url(#aydbOpt)"/>
+  <text x="467" y="357" fill="#fde68a" font-size="9.5" text-anchor="middle">10.4</text>
   <text x="489" y="170" fill="#93c5fd" font-size="9.5" text-anchor="middle">40.5</text>
-  <text x="511" y="319" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">16.5</text>
+  <text x="511" y="343" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">12.7</text>
   <text x="489" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 210</text>
   <text x="489" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">10x GROUP BY</text>
-  <text x="489" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.61x (-59%)</text>
+  <text x="489" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.82x (-69%)</text>
 
-  <!-- Test 230: 2.5K Indexed UPDATE (SQLite 4.14 -> h=26, Pre 7.45 -> h=46, Opt 12.09 -> h=75) -->
-  <rect x="552" y="404" width="19" height="26" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 230: 2.5K Indexed UPDATE (SQLite 4.58 -> h=28, Pre 7.45 -> h=46, Opt 12.49 -> h=78) -->
+  <rect x="552" y="402" width="19" height="28" rx="2" fill="url(#sqliteWal)"/>
   <rect x="574" y="384" width="19" height="46" rx="2" fill="url(#aydbPre)"/>
-  <rect x="596" y="355" width="19" height="75" rx="2" fill="url(#aydbOpt)"/>
-  <text x="561" y="396" fill="#fde68a" font-size="9.5" text-anchor="middle">4.1</text>
+  <rect x="596" y="352" width="19" height="78" rx="2" fill="url(#aydbOpt)"/>
+  <text x="561" y="394" fill="#fde68a" font-size="9.5" text-anchor="middle">4.6</text>
   <text x="583" y="376" fill="#93c5fd" font-size="9.5" text-anchor="middle">7.5</text>
-  <text x="605" y="347" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">12.1</text>
+  <text x="605" y="344" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">12.5</text>
   <text x="583" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 230</text>
   <text x="583" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">2.5K UPDATE</text>
-  <text x="583" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.34x</text>
+  <text x="583" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.37x</text>
 
-  <!-- Test 240: 2.5K DELETE + INSERT (SQLite 4.96 -> h=31, Pre 8.04 -> h=50, Opt 15.29 -> h=95) -->
-  <rect x="646" y="399" width="19" height="31" rx="2" fill="url(#sqliteWal)"/>
+  <!-- Test 240: 2.5K DELETE + INSERT (SQLite 5.52 -> h=34, Pre 8.04 -> h=50, Opt 15.05 -> h=94) -->
+  <rect x="646" y="396" width="19" height="34" rx="2" fill="url(#sqliteWal)"/>
   <rect x="668" y="380" width="19" height="50" rx="2" fill="url(#aydbPre)"/>
-  <rect x="690" y="335" width="19" height="95" rx="2" fill="url(#aydbOpt)"/>
-  <text x="655" y="391" fill="#fde68a" font-size="9.5" text-anchor="middle">5.0</text>
+  <rect x="690" y="336" width="19" height="94" rx="2" fill="url(#aydbOpt)"/>
+  <text x="655" y="388" fill="#fde68a" font-size="9.5" text-anchor="middle">5.5</text>
   <text x="677" y="372" fill="#93c5fd" font-size="9.5" text-anchor="middle">8.0</text>
-  <text x="699" y="327" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">15.3</text>
+  <text x="699" y="328" fill="#34d399" font-size="10" font-weight="700" text-anchor="middle">15.1</text>
   <text x="677" y="452" fill="#e2e8f0" font-size="11.5" font-weight="700" text-anchor="middle">Test 240</text>
   <text x="677" y="468" fill="#94a3b8" font-size="10" text-anchor="middle">DEL + INS</text>
-  <text x="677" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.32x</text>
+  <text x="677" y="485" fill="#cbd5e1" font-size="10" font-weight="600" text-anchor="middle">0.37x</text>
 
   <!-- Divider for Total Suite Panel -->
   <line x1="755" y1="120" x2="755" y2="490" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,4"/>
@@ -130,18 +130,18 @@
   <text x="850" y="132" fill="#f8fafc" font-size="13.5" font-weight="700" text-anchor="middle">Total Suite (ms)</text>
   <line x1="780" y1="430" x2="920" y2="430" stroke="#475569" stroke-width="1"/>
 
-  <!-- SQLite Total: 59.21 ms -> h = 166, y = 264 -->
-  <rect x="792" y="264" width="28" height="166" rx="3" fill="url(#sqliteWal)"/>
-  <text x="806" y="254" fill="#fde68a" font-size="11" font-weight="700" text-anchor="middle">59.2</text>
+  <!-- SQLite Total: 62.59 ms -> h = 175, y = 255 -->
+  <rect x="792" y="255" width="28" height="175" rx="3" fill="url(#sqliteWal)"/>
+  <text x="806" y="245" fill="#fde68a" font-size="11" font-weight="700" text-anchor="middle">62.6</text>
 
   <!-- aydb Pre Total: 93.36 ms -> h = 261, y = 169 -->
   <rect x="836" y="169" width="28" height="261" rx="3" fill="url(#aydbPre)"/>
   <text x="850" y="159" fill="#93c5fd" font-size="11" font-weight="700" text-anchor="middle">93.4</text>
 
-  <!-- aydb Opt Total: 74.78 ms -> h = 209, y = 221 -->
-  <rect x="880" y="221" width="28" height="209" rx="3" fill="url(#aydbOpt)"/>
-  <text x="894" y="211" fill="#34d399" font-size="11.5" font-weight="700" text-anchor="middle">74.8</text>
+  <!-- aydb Opt Total: 74.17 ms -> h = 208, y = 222 -->
+  <rect x="880" y="222" width="28" height="208" rx="3" fill="url(#aydbOpt)"/>
+  <text x="894" y="212" fill="#34d399" font-size="11.5" font-weight="700" text-anchor="middle">74.2</text>
 
-  <text x="850" y="454" fill="#34d399" font-size="12" font-weight="700" text-anchor="middle">0.79x (4MB MT)</text>
-  <text x="850" y="472" fill="#94a3b8" font-size="10.5" text-anchor="middle">234.5 ms (0.27x) at 128KB SST</text>
+  <text x="850" y="454" fill="#34d399" font-size="12" font-weight="700" text-anchor="middle">0.84x (4MB MT)</text>
+  <text x="850" y="472" fill="#94a3b8" font-size="10.5" text-anchor="middle">206.5 ms (0.31x) at 128KB SST</text>
 </svg>
