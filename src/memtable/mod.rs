@@ -3,7 +3,7 @@
 //! Absorbs the latest mutations (`InlineValue`, `BlobPtr`, or `Tombstone`) in sorted key order
 //! while enforcing a strict heap memory budget (e.g., 4 MB). Because large payloads (`>= 1 KB`)
 //! are separated into `blob_*.db` files before entering the `MemTable`, each large blob consumes
-//! only 21 bytes inside the `MemTable`.
+//! only 23 bytes inside the `MemTable`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -75,7 +75,7 @@ impl MemTable {
         self.upsert(key, IndexValue::Inline(value), lsn);
     }
 
-    /// Inserts or updates a key with a 21-byte out-of-line [`BlobPtr`].
+    /// Inserts or updates a key with a 23-byte out-of-line [`BlobPtr`].
     pub fn put_blob_ptr(&mut self, key: Vec<u8>, blob_ptr: BlobPtr, lsn: u64) {
         self.upsert(key, IndexValue::Blob(blob_ptr), lsn);
     }

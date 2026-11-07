@@ -55,6 +55,13 @@ pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
             return unsafe { crc32c_sse42(crc, data) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            // Safety: ARMv8 CRC32 extension support has been verified at runtime.
+            return unsafe { crc32c_aarch64(crc, data) };
+        }
+    }
     crc32c_software(crc, data)
 }
 
@@ -113,6 +120,25 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
         c = _mm_crc32_u8(c, b);
     }
 
+    !c
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
+
+    let mut c = !crc;
+    while data.len() >= 8 {
+        let word = u64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ]);
+        c = __crc32cd(c, word);
+        data = &data[8..];
+    }
+    for &b in data {
+        c = __crc32cb(c, b);
+    }
     !c
 }
 
