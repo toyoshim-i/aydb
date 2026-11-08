@@ -173,7 +173,7 @@ fn bench_small_sync_config_updates(root: &PathBuf) {
 
         println!(
             "{:<34} | {:>9.0}/s | {:>9.1} us | {:>9.1} us | {:>9.1} KB",
-            "aydb VTab (wal_sync WRITE_THROUGH)",
+            "aydb VTab (wal_sync)",
             (N_COMMITS as f64) / elapsed,
             percentile_us(&lats, 0.50),
             percentile_us(&lats, 0.99),

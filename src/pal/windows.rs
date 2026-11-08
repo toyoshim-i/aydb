@@ -42,7 +42,6 @@ const OPEN_EXISTING: DWORD = 3;
 const OPEN_ALWAYS: DWORD = 4;
 
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
-const FILE_FLAG_WRITE_THROUGH: DWORD = 0x8000_0000;
 const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x0800_0000;
 const FILE_FLAG_RANDOM_ACCESS: DWORD = 0x1000_0000;
@@ -233,7 +232,9 @@ impl WinPlatformFile {
         let mut flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
         match hint {
             OpenHint::MutableSyncLog => {
-                flags |= FILE_FLAG_WRITE_THROUGH;
+                // Durability comes from the explicit barrier. FILE_FLAG_WRITE_THROUGH is not
+                // used because NTFS holds such writes back while the file is being flushed,
+                // which would stop other commits from joining a group flush.
             }
             OpenHint::MutableBufferedLog => {
                 flags |= FILE_FLAG_SEQUENTIAL_SCAN;
@@ -496,8 +497,7 @@ impl PlatformFile for WinPlatformFile {
     }
 
     fn sync_barrier(&self) -> io::Result<()> {
-        // FILE_FLAG_WRITE_THROUGH alone can complete in a drive's volatile cache, so it does not
-        // make a write power-loss safe. Every barrier flushes the device, as on Unix.
+        // Every barrier flushes the device, as on Unix.
         self.sync_durable()
     }
 
