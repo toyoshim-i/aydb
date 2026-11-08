@@ -527,8 +527,10 @@ impl<F: PlatformFs> BootMetaManager<F> {
             return Ok(mgr);
         }
 
-        let parsed_a = Self::parse_and_load_slot(&fs, slot_a_raw);
-        let parsed_b = Self::parse_and_load_slot(&fs, slot_b_raw);
+        // Only genuine validation failures may demote a slot; any other I/O failure while
+        // reading it aborts the open so no older generation is silently selected and swept.
+        let parsed_a = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_a_raw))?;
+        let parsed_b = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_b_raw))?;
 
         let (winning_slot, winning_state, standby_manifest_id) = match (parsed_a, parsed_b) {
             (Ok(state_a), Ok(state_b)) => {
@@ -712,6 +714,34 @@ impl<F: PlatformFs> BootMetaManager<F> {
         file.write_all_at(&slot_buf, slot.byte_offset())?;
         file.sync_durable()?;
         Ok(())
+    }
+
+    /// Separates "slot content is invalid" from "reading the slot failed".
+    ///
+    /// Errors of kind `InvalidData` (CRC/magic/format violations), `UnexpectedEof` (truncated
+    /// manifest) and `NotFound` (the external manifest is genuinely absent: normal for the older
+    /// slot whose manifest was garbage-collected, and unrecoverable for the newer one) mean the
+    /// slot cannot be trusted and are returned as `Ok(Err(_))` so the caller may fall back to the
+    /// other slot. Every other kind (`PermissionDenied`, sharing violations, network errors, ...)
+    /// may be transient, so it is propagated as the outer `Err` and fails the open: nothing is
+    /// swept or overwritten and the caller can retry later.
+    fn fail_on_transient_io(
+        res: io::Result<BootMetaState>,
+    ) -> io::Result<io::Result<BootMetaState>> {
+        match res {
+            Ok(state) => Ok(Ok(state)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Ok(Err(e))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn parse_and_load_slot(
@@ -1067,6 +1097,100 @@ mod tests {
         assert_eq!(mgr.state().checkpoint_lsn, 7777);
         assert_eq!(mgr.state().idx_segments.len(), 200);
         assert_eq!(mgr.state().active_manifest_seq_id, Some(second_mf_id));
+    }
+
+    /// Test-only `PlatformFs` that fails manifest opens with a non-corruption error on demand.
+    struct FlakyManifestFs {
+        inner: OsFs,
+        fail_manifest_open: std::sync::atomic::AtomicBool,
+    }
+
+    impl PlatformFs for FlakyManifestFs {
+        type File = <OsFs as PlatformFs>::File;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            if rel_name.starts_with("manifest_")
+                && !create
+                && self
+                    .fail_manifest_open
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            self.inner.open_file(rel_name, create, writable, hint)
+        }
+
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+
+        fn root_path(&self) -> &std::path::Path {
+            self.inner.root_path()
+        }
+    }
+
+    #[test]
+    fn transient_manifest_io_error_does_not_roll_back_or_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = TempTestDir::new("flaky_manifest");
+        let fs = Arc::new(FlakyManifestFs {
+            inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
+            fail_manifest_open: AtomicBool::new(false),
+        });
+
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
+            mgr.commit_update(|s| {
+                for i in 0..200 {
+                    let seq_id = s.allocate_seq_id();
+                    let fname = format_idx_file_name(seq_id);
+                    let _ = fs
+                        .open_file(&fname, true, true, OpenHint::ImmutableRandom)
+                        .unwrap();
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id,
+                        file_len: 4096 * (i + 1),
+                        level: 1,
+                        record_count: 100,
+                    });
+                }
+            })
+            .expect("commit gen 2");
+            mgr.commit_update(|s| s.checkpoint_lsn = 4242)
+                .expect("commit gen 3");
+        }
+
+        let files_before = fs.list_files().unwrap();
+
+        fs.fail_manifest_open.store(true, Ordering::SeqCst);
+        let res = BootMetaManager::open_or_recover(Arc::clone(&fs));
+        assert_eq!(
+            res.err().expect("transient error must fail open").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let res = BootMetaManager::open_or_recover_deferred_sweep(Arc::clone(&fs));
+        assert_eq!(
+            res.err().expect("transient error must fail open").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs.list_files().unwrap(), files_before, "nothing may be swept");
+
+        fs.fail_manifest_open.store(false, Ordering::SeqCst);
+        let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen after clear");
+        assert_eq!(mgr.state().generation, 3);
+        assert_eq!(mgr.state().checkpoint_lsn, 4242);
+        assert_eq!(mgr.state().idx_segments.len(), 200);
     }
 
     #[test]
