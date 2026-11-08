@@ -4013,3 +4013,47 @@ fn explicit_table_id_cannot_alias_or_remap_a_persisted_table() {
     assert_eq!(engine.register_or_resolve_vtab("alpha", Some(5)).unwrap(), 5);
     assert_eq!(engine.register_or_resolve_vtab("alpha", None).unwrap(), 5);
 }
+
+#[test]
+fn buffered_recovery_stops_at_first_lost_blob() {
+    let tmp = TempTestDir::new("buf_prefix_recovery");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    cfg.max_blob_segment_bytes = 2048; // One 1,500 B blob per segment.
+
+    let payload = vec![0x5Au8; 1500];
+    {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        for k in [b"k1", b"k2", b"k3"] {
+            engine
+                .put_row(1, k, &payload, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        // Dropped without flushing: simulates a crash.
+    }
+
+    // Cut the blob segment holding k2 so it fails validation while k3's segment survives.
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(&tmp.path)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("blob_"))
+        })
+        .collect();
+    segs.sort();
+    assert!(segs.len() >= 3, "expected one blob segment per row");
+    let f = std::fs::OpenOptions::new().write(true).open(&segs[1]).unwrap();
+    f.set_len(0).unwrap();
+    drop(f);
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.get_row(1, b"k1").unwrap().unwrap(), payload);
+    assert!(engine.get_row(1, b"k2").unwrap().is_none());
+    assert!(
+        engine.get_row(1, b"k3").unwrap().is_none(),
+        "a buffered commit after a rolled-back one must not be replayed"
+    );
+}

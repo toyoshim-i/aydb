@@ -960,16 +960,25 @@ where
     // before stripping transaction markers, while recording the highest LSN observed across
     // all recovered batches.
     let mut max_lsn = checkpoint_lsn;
+    //
+    // With `prefix_only`, the stream is a commit-ordered prefix: emission stops at the first batch
+    // or transaction group whose blob validation returned `Ok(false)`, so no later batch is
+    // replayed past a rolled-back one. Remaining batches are still scanned for the highest LSN so
+    // that `next_lsn` never reuses a logged LSN.
     let mut filter_committed_stream =
-        |batches: Vec<WalBatch>, validate_blob: &mut V| -> io::Result<Vec<WalBatch>> {
+        |batches: Vec<WalBatch>,
+         validate_blob: &mut V,
+         prefix_only: bool|
+         -> io::Result<Vec<WalBatch>> {
             let mut out = Vec::with_capacity(batches.len());
             let mut pending_tx: Option<Vec<WalBatch>> = None;
+            let mut truncated = false;
 
             for mut b in batches {
                 if b.lsn > max_lsn {
                     max_lsn = b.lsn;
                 }
-                if b.lsn <= checkpoint_lsn {
+                if b.lsn <= checkpoint_lsn || truncated {
                     continue;
                 }
                 let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
@@ -986,6 +995,8 @@ where
                     if has_commit {
                         if batches_blobs_valid(&tx_vec, validate_blob)? {
                             out.extend(tx_vec);
+                        } else if prefix_only {
+                            truncated = true;
                         }
                         pending_tx = None;
                     } else {
@@ -999,19 +1010,26 @@ where
                         let completed_tx = pending_tx.take().unwrap();
                         if batches_blobs_valid(&completed_tx, validate_blob)? {
                             out.extend(completed_tx);
+                        } else if prefix_only {
+                            truncated = true;
                         }
                     }
-                } else if !b.records.is_empty()
-                    && batches_blobs_valid(core::slice::from_ref(&b), validate_blob)?
-                {
-                    out.push(b);
+                } else if !b.records.is_empty() {
+                    if batches_blobs_valid(core::slice::from_ref(&b), validate_blob)? {
+                        out.push(b);
+                    } else if prefix_only {
+                        truncated = true;
+                    }
                 }
             }
             Ok(out)
         };
 
-    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob)?;
-    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob)?;
+    // Sync-stream blobs are synced before the WAL record, so an invalid blob there is isolated.
+    // Buffered-stream blobs and records are flushed independently, so power loss can drop an
+    // earlier commit while a later one survives; replay must not expose that hole.
+    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob, false)?;
+    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob, true)?;
 
     // Two-way merge sort by ascending `lsn` by value (zero-clone).
     let mut merged = Vec::with_capacity(sync_batches.len() + buf_batches.len());
@@ -1546,11 +1564,69 @@ mod tests {
         .unwrap();
 
         let recovered_lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
-        assert_eq!(
-            recovered_lsns,
-            vec![3, 4],
-            "multi-chunk transaction [1, 2] with invalid blob in chunk 2 must be discarded as a unit"
+        assert!(
+            recovered_lsns.is_empty(),
+            "multi-chunk transaction [1, 2] with invalid blob in chunk 2 must be discarded as a unit,              and the buffered stream must not replay later transaction [3, 4] past it"
         );
+        assert_eq!(recovered.max_recovered_lsn, 4);
+    }
+
+    #[test]
+    fn buffered_stream_stops_at_first_invalid_blob_but_sync_stream_continues() {
+        let tmp = TempTestDir::new("buf_prefix");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let wal_size = 64 * 1024u64;
+        let mut sync_w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        let mut buf_w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            wal_size,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        let blob = |lsn: u64, seg_id: u64| {
+            WalBatch::new(
+                lsn,
+                vec![WalRecord::PutBlobPtr {
+                    key: format!("k{lsn}").into_bytes(),
+                    blob_ptr: BlobPtr {
+                        kind: BlobKind::Standard,
+                        table_id: 1,
+                        seg_id,
+                        offset: 0,
+                        len: 128,
+                        crc32c: 0,
+                    },
+                }],
+            )
+        };
+        // Segment 1 is valid; segment 2 is the blob lost by the simulated power failure.
+        buf_w.append_batch(&blob(1, 1)).unwrap();
+        sync_w.append_batch(&blob(2, 2)).unwrap();
+        buf_w.append_batch(&blob(3, 2)).unwrap();
+        sync_w.append_batch(&blob(4, 1)).unwrap();
+        buf_w.append_batch(&blob(5, 1)).unwrap();
+
+        let recovered = recover_two_streams(
+            &**sync_w.file(),
+            1,
+            &**buf_w.file(),
+            1,
+            0,
+            |ptr| Ok(ptr.seg_id == 1),
+        )
+        .unwrap();
+        let lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
+        assert_eq!(lsns, vec![1, 4]);
+        assert_eq!(recovered.max_recovered_lsn, 5);
     }
 
     // ---- Fault-injection helpers ----
