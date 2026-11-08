@@ -8,6 +8,7 @@ The site has three parts:
   figures from docs/assets copied next to them.
 * results.html: test and benchmark results collected by the CI workflow,
   with bar charts rendered as plain HTML and CSS.
+* charts/*.svg: the SQLite comparison charts as images, embedded by the README.
 
 Dependencies: Python 3 and the "markdown" package (pip install markdown).
 
@@ -28,6 +29,7 @@ import posixpath
 import re
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 
 import markdown
@@ -770,23 +772,160 @@ def computed_ratio(table, base_prefix, other_prefix):
     return values
 
 
-def sqlite_charts(data):
-    out = []
+SQLITE_NOTE = ("aydb relative to SQLite, log scale. Right of 1x: aydb is faster. "
+               "Left of 1x: SQLite is faster.")
+
+# Image names are part of the README, so they do not follow the section titles.
+SVG_SLUGS = [
+    (r"^SUITE 1\b", "speedtest"),
+    (r"^SUITE 2\b.*\b256 B\b", "ycsb-256"),
+    (r"^SUITE 2\b.*\b2048 B\b", "ycsb-2048"),
+    (r"^SUITE 3\b", "tpcb"),
+    (r"^SUITE 4\b", "sstable"),
+]
+SCENARIOS_TITLE = "Application scenarios (sqlite_vs_aydb_bench)"
+
+
+def sqlite_chart_specs(data):
+    """Return (slug, title, rows) for each SQLite comparison chart."""
+    specs = []
     order, merged = merged_tables(data, "standard_sql_bench")
-    note = ("aydb relative to SQLite, log scale. Right of 1x: aydb is faster. "
-            "Left of 1x: SQLite is faster.")
     for key in order:
         table = merged[key]
         if re.search(r"ratio|speedup", table["header"][-1], re.I):
-            out.append(ratio_chart(key[0], note, reported_ratio_rows(table)))
+            slug = next((name for pattern, name in SVG_SLUGS
+                         if re.search(pattern, key[0])), None)
+            specs.append((slug, key[0], reported_ratio_rows(table)))
     order, merged = merged_tables(data, "sqlite_vs_aydb_bench")
     rows = []
     for key in order:
         label = re.sub(r"^BENCHMARK \d+ \(Phase 2\):\s*", "", key[0])
         rows.append((label, computed_ratio(merged[key], "Vanilla", "aydb")))
-    out.append(ratio_chart("Application scenarios (sqlite_vs_aydb_bench)",
-                           note, rows))
-    return "\n".join(out)
+    specs.append(("scenarios", SCENARIOS_TITLE, rows))
+    return specs
+
+
+def sqlite_charts(data):
+    return "\n".join(ratio_chart(title, SQLITE_NOTE, rows)
+                     for _slug, title, rows in sqlite_chart_specs(data))
+
+
+SVG_STYLE = """
+svg { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --grid: #d1d9e0;
+      --s0: #2a78d6; --s1: #eb6834; --s2: #1baf7a; }
+@media (prefers-color-scheme: dark) {
+  svg { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --grid: #3d444d;
+        --s0: #3987e5; --s1: #d95926; --s2: #199e70; }
+}
+text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+       Arial, sans-serif; fill: var(--fg); }
+.title { font-size: 16px; font-weight: 600; }
+.note, .tick, .legend, .foot { fill: var(--muted); }
+.note, .legend { font-size: 13px; }
+.label { font-size: 13px; }
+.tick, .foot { font-size: 11px; }
+.tick { font-variant-numeric: tabular-nums; }
+.s0 { fill: var(--s0); }
+.s1 { fill: var(--s1); }
+.s2 { fill: var(--s2); }
+"""
+
+
+def svg_bar(x_start, x_end, y, height, grows_right, css_class):
+    """A bar with a rounded end at its data value and a square baseline."""
+    width = max(x_end - x_start, 2)
+    radius = min(4, width)
+    if grows_right:
+        path = ("M{x:.1f} {y}h{w:.1f}a{r:.1f} {r:.1f} 0 0 1 {r:.1f} {r:.1f}"
+                "v{v:.1f}a{r:.1f} {r:.1f} 0 0 1 -{r:.1f} {r:.1f}h-{w:.1f}z")
+    else:
+        path = ("M{e:.1f} {y}h-{w:.1f}a{r:.1f} {r:.1f} 0 0 0 -{r:.1f} {r:.1f}"
+                "v{v:.1f}a{r:.1f} {r:.1f} 0 0 0 {r:.1f} {r:.1f}h{w:.1f}z")
+    return '<path class="{}" d="{}"/>'.format(css_class, path.format(
+        x=x_start, e=x_end, y=y, w=width - radius, r=radius,
+        v=max(height - 2 * radius, 0)))
+
+
+def render_svg_chart(title, note, rows, footer):
+    """Render a ratio chart as a standalone image with its own background."""
+    width, pad, label_width = 960, 20, 340
+    plot_x, plot_width = pad + label_width + 12, width - (pad + label_width + 12) - pad - 8
+    bar, gap, row_pad = 10, 2, 7
+    row_height = 3 * bar + 2 * gap + 2 * row_pad
+    rows = [(label, values) for label, values in rows if values]
+    title_lines = textwrap.wrap(title, 104)
+    parts = []
+    y = pad + 12
+    for line in title_lines:
+        parts.append('<text class="title" x="{}" y="{}">{}</text>'.format(pad, y, esc(line)))
+        y += 21
+    parts.append('<text class="note" x="{}" y="{}">{}</text>'.format(pad, y - 1, esc(note)))
+    y += 22
+    legend_x = pad
+    for index, os_name in enumerate(OS_NAMES):
+        parts.append('<rect class="s{}" x="{}" y="{}" width="10" height="10" rx="2"/>'.format(
+            index, legend_x, y - 9))
+        parts.append('<text class="legend" x="{}" y="{}">{}</text>'.format(
+            legend_x + 16, y, esc(os_name)))
+        legend_x += 150
+    y += 14
+    if not rows:
+        parts.append('<text class="note" x="{}" y="{}">no result</text>'.format(pad, y + 16))
+        y += 30
+    else:
+        values = [value for _, per_os in rows for value, _ in per_os.values()]
+        position, base, ticks, tick_label = ratio_scale(values)
+        x_of = lambda value: plot_x + position(value) / 100 * plot_width
+        top, bottom = y, y + row_height * len(rows)
+        for tick in ticks:
+            parts.append(
+                '<line x1="{x:.1f}" x2="{x:.1f}" y1="{a}" y2="{b}" stroke="var({c})" '
+                'stroke-width="1"/>'.format(x=x_of(tick), a=top, b=bottom,
+                                            c="--muted" if tick == base else "--grid"))
+        for label, per_os in rows:
+            lines = textwrap.wrap(label, 46)
+            text_y = y + row_height / 2 + 4 - (len(lines) - 1) * 8
+            for line in lines:
+                parts.append('<text class="label" x="{}" y="{:.1f}">{}</text>'.format(
+                    pad, text_y, esc(line)))
+                text_y += 16
+            for index, os_name in enumerate(OS_NAMES):
+                if os_name not in per_os:
+                    continue
+                value = per_os[os_name][0]
+                bar_y = y + row_pad + index * (bar + gap)
+                start, end = sorted((x_of(base), x_of(value)))
+                parts.append(svg_bar(start, end, bar_y, bar, value >= base,
+                                     "s{}".format(index)))
+            y += row_height
+        for tick in ticks:
+            anchor = ("start" if position(tick) < 0.5 else
+                      "end" if position(tick) > 99.5 else "middle")
+            parts.append('<text class="tick" text-anchor="{}" x="{:.1f}" y="{}">{}</text>'.format(
+                anchor, x_of(tick), y + 15, esc(tick_label(tick))))
+        y += 22
+    y += 18
+    parts.append('<text class="foot" x="{}" y="{}">{}</text>'.format(pad, y, esc(footer)))
+    height = y + pad - 6
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" '
+        'height="{h}" role="img" aria-label="{a}"><title>{a}</title><style>{s}</style>'
+        '<rect width="{w}" height="{h}" rx="6" fill="var(--bg)"/>{p}</svg>\n'
+    ).format(w=width, h=height, a=esc(title), s=SVG_STYLE, p="".join(parts))
+
+
+def write_svg_charts(data, out, sha):
+    """Write one image per SQLite comparison chart. Every name is always written,
+    so that the README never links to a missing file."""
+    footer = "Commit {} · one CI run per OS on shared runners · details: results page".format(
+        sha[:7] if sha else "unknown")
+    specs = {slug: (title, rows) for slug, title, rows in sqlite_chart_specs(data) if slug}
+    directory = out / "charts"
+    directory.mkdir(exist_ok=True)
+    for slug in [name for _, name in SVG_SLUGS] + ["scenarios"]:
+        title, rows = specs.get(slug, (slug, []))
+        (directory / (slug + ".svg")).write_text(
+            render_svg_chart(title, SQLITE_NOTE, rows, footer), encoding="utf-8")
 
 
 def concurrent_read_charts(data):
@@ -906,6 +1045,7 @@ def build_results(artifacts, out, meta, repo_url):
     html_text = page("Test and benchmark results", "\n".join(body), "",
                      "results", "<style>{}</style>\n".format(CHART_CSS))
     (out / "results.html").write_text(html_text, encoding="utf-8")
+    write_svg_charts(data, out, sha)
 
 
 # --------------------------------------------------------------------------
