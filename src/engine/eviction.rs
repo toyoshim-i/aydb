@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 
+use crate::blob::BLOB_RECORD_HEADER_LEN;
 use crate::index::{IndexEntry, IndexValue};
 use crate::lru::{
     CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, RowMetaRecord,
@@ -265,16 +266,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             )?;
             let mut meta_map: HashMap<Vec<u8>, (RowMetaRecord, Option<BlobPtr>)> =
                 HashMap::with_capacity(meta_entries.len());
+            // `'t'` records stored as blobs that failed verification (pk -> (meta key, ptr)).
+            // They must NOT be regenerated as empty metadata (that would orphan the row's
+            // secondary-index entries); instead the row is reported to the corruption policy.
+            let mut corrupt_meta: HashMap<Vec<u8>, (Vec<u8>, BlobPtr)> = HashMap::new();
             for entry in meta_entries {
                 if entry.key.len() >= 3 {
                     let decoded = match entry.value {
                         IndexValue::Inline(bytes) => {
                             RowMetaRecord::from_bytes(&bytes).ok().map(|r| (r, None))
                         }
-                        IndexValue::Blob(ptr) => self
-                            .dereference_blob(&ptr, &entry.key)?
-                            .and_then(|bytes| RowMetaRecord::from_bytes(&bytes).ok())
-                            .map(|r| (r, Some(ptr))),
+                        IndexValue::Blob(ptr) => {
+                            match self.dereference_blob_lenient(&ptr, &entry.key)? {
+                                Some(bytes) => RowMetaRecord::from_bytes(&bytes)
+                                    .ok()
+                                    .map(|r| (r, Some(ptr))),
+                                None => {
+                                    corrupt_meta
+                                        .insert(entry.key[3..].to_vec(), (entry.key.clone(), ptr));
+                                    None
+                                }
+                            }
+                        }
                         IndexValue::Tombstone => None,
                     };
                     if let Some((rec, m_ptr)) = decoded {
@@ -329,12 +342,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 } else {
                     let val_len = match &entry.value {
                         IndexValue::Inline(v) => v.len(),
-                        IndexValue::Blob(ptr) => {
-                            (ptr.len as usize).saturating_sub(16 + entry.key.len())
-                        }
+                        IndexValue::Blob(ptr) => (ptr.len as usize)
+                            .saturating_sub(BLOB_RECORD_HEADER_LEN + entry.key.len()),
                         IndexValue::Tombstone => continue,
                     };
                     let logical_size = (pk.len() + val_len) as u32;
+                    if let Some((mkey, mptr)) = corrupt_meta.get(pk) {
+                        // Count the row at its estimated size; under `Evict` it is queued for
+                        // deletion (which cleans 'i'/'l' entries by scanning), under `Error` it
+                        // stays until the user deletes it. Never fail reconciliation/open.
+                        total_bytes = total_bytes.saturating_add(logical_size as u64);
+                        let _ = self.note_corrupt_blob(mkey, mptr);
+                        continue;
+                    }
                     total_bytes = total_bytes.saturating_add(logical_size as u64);
                     let tick = self.access_tracker.next_tick();
                     missing_records.push(WalRecord::PutInline {

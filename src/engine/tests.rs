@@ -2690,3 +2690,265 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
         assert_eq!(engine.get_row(1, &key(3)).unwrap(), Some(blob(3)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Blob corruption policy (`CorruptPolicy`, M4)
+// ---------------------------------------------------------------------------
+
+/// Locates the payload's last byte of the blob record referenced by the record at `key` (must be
+/// a blob pointer). Call after `flush_memtable` and BEFORE dropping the engine; the corruption
+/// itself is applied by `apply_blob_corruption` once the engine (exclusive handles on Windows)
+/// is gone.
+fn blob_corruption_target(engine: &StorageEngine<OsFs>, key: &[u8]) -> (String, u64) {
+    let Some((_, IndexValue::Blob(ptr))) = engine.lookup_raw_entry(key).unwrap() else {
+        panic!("key is not stored as a blob");
+    };
+    let name = match ptr.kind {
+        BlobKind::Standard => format_std_blob_file_name(ptr.seg_id),
+        BlobKind::Lru => format_lru_blob_file_name(ptr.table_id, ptr.seg_id),
+    };
+    (name, ptr.offset as u64 + ptr.len as u64 - 1)
+}
+
+fn apply_blob_corruption(dir: &std::path::Path, target: &(String, u64)) {
+    let path = dir.join(&target.0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[target.1 as usize] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+fn live_lru_pks(engine: &StorageEngine<OsFs>, table_id: u16) -> Vec<Vec<u8>> {
+    engine
+        .scan_merged_prefix(&encode_namespace_prefix(table_id, NS_LRU_QUEUE))
+        .unwrap()
+        .iter()
+        .filter(|e| !matches!(e.value, IndexValue::Tombstone))
+        .map(|e| {
+            crate::index::decode_lru_queue_key(table_id, &e.key)
+                .unwrap()
+                .1
+                .to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn corrupt_blob_uncapped_table_errors_on_read_and_delete_cleans_up() {
+    let tmp = TempTestDir::new("corrupt_uncapped");
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let payload = vec![0x42u8; 1000];
+    let target;
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
+        for (pk, tag) in [(&b"k1"[..], &b"tag_a"[..]), (b"k2", b"tag_b"), (b"k3", b"tag_c")] {
+            engine
+                .put_row(1, pk, &payload, &[(10, tag.to_vec())], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        target = blob_corruption_target(&engine, &encode_primary_row_key(1, b"k2"));
+    }
+    apply_blob_corruption(&tmp.path, &target);
+
+    let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.corrupt_policy(1), CorruptPolicy::Error);
+    assert_eq!(engine.corrupt_blob_detections(), 0);
+
+    let err = engine.get_row(1, b"k2").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains("table 1") && msg.contains("0x6b32"), "{msg}");
+    assert!(engine.corrupt_blob_detections() > 0);
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    assert_eq!(
+        engine
+            .get_row_into(1, b"k2", &mut slab, &mut spans)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        engine.scan_table(1).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    // Other rows are unaffected, and nothing was written by the failed reads.
+    assert_eq!(engine.get_row(1, b"k1").unwrap().unwrap(), payload);
+    assert_eq!(engine.get_row(1, b"k3").unwrap().unwrap(), payload);
+    assert_eq!(
+        engine.lookup_by_secondary_index(1, 10, b"tag_b").unwrap(),
+        vec![b"k2".to_vec()]
+    );
+
+    assert!(
+        engine
+            .delete_row(1, b"k2", WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, 10, b"tag_b")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), None);
+    assert_eq!(engine.scan_table(1).unwrap().len(), 2);
+}
+
+#[test]
+fn corrupt_blob_capped_table_evicts_row_at_next_write() {
+    let tmp = TempTestDir::new("corrupt_capped");
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let payload = vec![0x42u8; 1000];
+    let targets;
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
+        engine.register_capped_table(1, 10_000).unwrap();
+        for (pk, tag) in [(&b"k1"[..], &b"a"[..]), (b"k2", b"b"), (b"k3", b"c")] {
+            engine
+                .put_row(1, pk, &payload, &[(10, tag.to_vec())], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        targets = [
+            blob_corruption_target(&engine, &encode_primary_row_key(1, b"k2")),
+            blob_corruption_target(&engine, &encode_primary_row_key(1, b"k3")),
+        ];
+    }
+    for t in &targets {
+        apply_blob_corruption(&tmp.path, t);
+    }
+
+    let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.corrupt_policy(1), CorruptPolicy::Evict);
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        3 * 1002
+    );
+
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"k3").unwrap(), None);
+    assert!(engine.corrupt_blob_detections() >= 2);
+    // Reads never write: rows are still physically present until the next mutation.
+    assert!(engine.row_exists(1, b"k2").unwrap());
+    assert!(engine.get_row(1, b"k1").unwrap().is_some());
+
+    // Overwrite k3 inside a transaction (the queue is not drained while a tx is active).
+    engine.begin_transaction();
+    engine
+        .put_row(1, b"k3", b"fresh", &[(10, b"c".to_vec())], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(engine.row_exists(1, b"k2").unwrap());
+    // Committing the outermost tx drains the queue: k2 is physically removed, the overwritten
+    // k3 (pointer changed since detection) is kept.
+    engine.commit_transaction().unwrap();
+    assert!(!engine.row_exists(1, b"k2").unwrap());
+    assert!(engine.row_exists(1, b"k3").unwrap());
+    engine
+        .put_row(1, b"k4", b"v4", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(!engine.row_exists(1, b"k2").unwrap());
+    assert!(
+        engine
+            .lookup_raw_entry(&encode_row_meta_key(1, b"k2"))
+            .unwrap()
+            .is_none_or(|(_, v)| matches!(v, IndexValue::Tombstone))
+    );
+    let lru = live_lru_pks(&engine, 1);
+    assert!(!lru.contains(&b"k2".to_vec()));
+    assert!(lru.contains(&b"k3".to_vec()));
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, 10, b"b")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.get_row(1, b"k3").unwrap().unwrap(), b"fresh");
+    // k1 (1002) + k3 (2 + 5) + k4 (2 + 2)
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        1002 + 7 + 4
+    );
+}
+
+#[test]
+fn corrupt_spilled_row_meta_delete_still_cleans_secondary_and_lru() {
+    let tmp = TempTestDir::new("corrupt_meta");
+    let cfg = EngineConfig::default();
+    // 8 large secondary keys push the encoded `RowMetaRecord` past the inline block fit.
+    let sec: Vec<(u16, Vec<u8>)> = (0..8u16)
+        .map(|i| (20 + i, vec![b'a' + i as u8; 1500]))
+        .collect();
+    let targets;
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
+        engine.register_capped_table(2, 1_000_000).unwrap();
+        for table_id in [1u16, 2] {
+            engine
+                .put_row(table_id, b"pk", b"val", &sec, WriteDurability::BufferedFast)
+                .unwrap();
+            engine
+                .put_row(table_id, b"other", b"val", &sec[..1], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        targets = [1u16, 2].map(|t| blob_corruption_target(&engine, &encode_row_meta_key(t, b"pk")));
+    }
+    for t in &targets {
+        apply_blob_corruption(&tmp.path, t);
+    }
+
+    let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.capped_table_state(2).unwrap().max_bytes, 1_000_000);
+    for table_id in [1u16, 2] {
+        // Delete must succeed in `error` mode (table 1) and in `evict` mode (table 2).
+        // (Table 2's corrupt row is already queued by reconciliation and removed by the
+        // eviction drain at the start of `delete_row`, so its own result may be `false`.)
+        let deleted = engine
+            .delete_row(table_id, b"pk", WriteDurability::BufferedFast)
+            .unwrap();
+        assert!(deleted || table_id == 2);
+        for (idx, col) in &sec {
+            let pks = engine
+                .lookup_by_secondary_index(table_id, *idx, col)
+                .unwrap();
+            if *idx == 20 {
+                assert_eq!(pks, vec![b"other".to_vec()], "table {table_id}");
+            } else {
+                assert!(pks.is_empty(), "table {table_id} idx {idx} leaked");
+            }
+        }
+        assert_eq!(engine.get_row(table_id, b"pk").unwrap(), None);
+        assert_eq!(engine.get_row(table_id, b"other").unwrap().unwrap(), b"val");
+    }
+    assert_eq!(live_lru_pks(&engine, 2), vec![b"other".to_vec()]);
+    assert_eq!(
+        engine.capped_table_state(2).unwrap().current_logical_bytes,
+        (5 + 3) as u64
+    );
+    assert!(engine.corrupt_blob_detections() > 0);
+}
+
+#[test]
+fn corrupt_policy_override_and_defaults() {
+    let tmp = TempTestDir::new("corrupt_policy_defaults");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.register_capped_table(5, 10_000).unwrap();
+    assert_eq!(engine.corrupt_policy(1), CorruptPolicy::Error);
+    assert_eq!(engine.corrupt_policy(5), CorruptPolicy::Evict);
+    engine.set_table_corrupt_policy(5, CorruptPolicy::Error);
+    engine.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+    assert_eq!(engine.corrupt_policy(5), CorruptPolicy::Error);
+    assert_eq!(engine.corrupt_policy(1), CorruptPolicy::Evict);
+    engine.reset_table_corrupt_policy(5);
+    assert_eq!(engine.corrupt_policy(5), CorruptPolicy::Evict);
+}

@@ -22,7 +22,7 @@ pub const DEFAULT_INLINE_THRESHOLD: usize = 1024;
 pub const DEFAULT_MAX_BLOB_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 const BLOB_RECORD_MAGIC: &[u8; 4] = b"AYBL";
-const BLOB_RECORD_HEADER_LEN: usize = 16;
+pub const BLOB_RECORD_HEADER_LEN: usize = 16;
 /// Maximum user-space write buffer size (`256 KB`) in [`BlobSegmentWriter`] before flushing
 /// coalesced blob records to the OS file handle.
 const BLOB_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
@@ -217,10 +217,15 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
 
     /// Reads and verifies the blob payload referenced by `ptr`.
     ///
-    /// Following the `Write-Blob-Before-WAL` protocol:
-    /// - If the file was truncated before `offset + len` reached disk during a power outage,
-    ///   or if the magic/CRC32C/key check fails, returns `Ok(None)` (safe cache miss / uncommitted
-    ///   record) rather than raising a fatal corruption error.
+    /// Returns `Ok(Some(payload))` only when the record was read in full and passed the
+    /// magic / CRC32C / length / key checks, and `Ok(None)` when verification FAILED (short read,
+    /// bad magic, CRC mismatch, key mismatch). `Err` is reserved for genuine I/O errors.
+    ///
+    /// This layer does not decide what a verification failure means: after the engine has
+    /// opened, blobs referenced by durable index state were validated or synced beforehand, so
+    /// the engine treats `Ok(None)` as corruption and applies the per-table `on_corrupt` policy
+    /// (see `CorruptPolicy`) instead of reporting a plain cache miss. Only recovery
+    /// ([`Self::validate_blob_ptr`]) interprets a failure as "uncommitted record".
     pub fn read_blob(
         &self,
         ptr: &BlobPtr,

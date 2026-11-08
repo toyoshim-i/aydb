@@ -151,7 +151,7 @@ In a naive KV-separated engine, guaranteeing that a pointer in the WAL never poi
 
 Two `fsync` calls per write would halve throughput. Instead, `aydb` writes to `blob.db` using a fast buffered write **before** writing to `wal.db`, and embeds the blob's expected `BlobCRC32C` inside the WAL record (and index pointer).
 * In the normal case, the OS flushes dirty pages in arrival order, or both live in the OS cache.
-* If a sudden power outage occurs after the WAL sector hits disk but before the `blob.db` buffered write reaches physical media, recovery (or a subsequent read) recomputes the CRC of the target byte range in `blob.db`. Seeing either a truncated file or a CRC mismatch against `BlobCRC32C`, `aydb` safely treats that specific record as an incomplete/uncommitted write (or a cache miss `None`) rather than failing with database corruption!
+* If a sudden power outage occurs after the WAL sector hits disk but before the `blob.db` buffered write reaches physical media, recovery (or a subsequent read) recomputes the CRC of the target byte range in `blob.db`. Seeing either a truncated file or a CRC mismatch against `BlobCRC32C`, `aydb` safely treats that specific record as an incomplete/uncommitted write rather than failing with database corruption! This applies at recovery only; a blob that fails verification during a normal read after open is reported as corruption per the table's `on_corrupt` policy (see `docs/ARCHITECTURE.md` §4.3).
 
 ---
 

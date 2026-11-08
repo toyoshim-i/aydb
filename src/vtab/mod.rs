@@ -58,6 +58,9 @@ const PLAN_PK_RANGE: c_int = 3;
 const PLAN_SECONDARY_RANGE: c_int = 4;
 
 const POINT_FLAG_BY_ROWID: c_int = 0x01;
+/// Point lookup only needs existence + primary key (no value read), so a corrupt out-of-line
+/// blob never fails `DELETE ... WHERE pk = ?` / `SELECT pk ... WHERE pk = ?`.
+const POINT_FLAG_KEYS_ONLY: c_int = 0x02;
 
 const RANGE_FLAG_LOWER_INCLUSIVE: c_int = 0x01;
 const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
@@ -114,6 +117,23 @@ fn find_existing_pk_or_numeric_alt(
         }
     }
     Ok(None)
+}
+
+/// Point lookup used by `PLAN_PK_POINT`: reads the row value into the cursor slab, or (for
+/// keys-only plans) merely checks existence without touching any out-of-line blob.
+fn point_fetch(
+    eng: &mut StorageEngine<OsFs>,
+    table_id: u16,
+    pk: &[u8],
+    keys_only: bool,
+    slab: &mut Vec<u8>,
+    spans: &mut Vec<(usize, usize)>,
+) -> io::Result<bool> {
+    if keys_only {
+        eng.row_exists(table_id, pk)
+    } else {
+        eng.get_row_into(table_id, pk, slab, spans)
+    }
 }
 
 /// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code.
@@ -461,6 +481,11 @@ unsafe extern "system" fn vtab_create_or_connect(
                     return io_err_to_sqlite_rc(&e);
                 }
             }
+            // Runtime-only setting: re-derived from the DDL on every connect.
+            match ddl.on_corrupt {
+                Some(policy) => eng.set_table_corrupt_policy(resolved_id, policy),
+                None => eng.reset_table_corrupt_policy(resolved_id),
+            }
             resolved_id
         };
 
@@ -560,6 +585,12 @@ unsafe extern "system" fn vtab_best_index(
         let constraints = core::slice::from_raw_parts(info.aConstraint, n);
         let usages = core::slice::from_raw_parts_mut(info.aConstraintUsage, n);
 
+        // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected
+        let can_use_keys_only = info.colUsed == 0
+            || (vtab.pk_collation == ColCollation::Binary
+                && vtab.pk_col_idx < 63
+                && info.colUsed == (1u64 << vtab.pk_col_idx));
+
         // 1. Check for usable equality constraint (`=`) on Primary Key (or ROWID `-1`)
         for i in 0..n {
             if constraints[i].usable == 0 {
@@ -574,7 +605,10 @@ unsafe extern "system" fn vtab_best_index(
                 }
                 usages[i].argvIndex = 1;
                 usages[i].omit = 0;
-                let pt_flags = if col == -1 { POINT_FLAG_BY_ROWID } else { 0 };
+                let mut pt_flags = if col == -1 { POINT_FLAG_BY_ROWID } else { 0 };
+                if can_use_keys_only {
+                    pt_flags |= POINT_FLAG_KEYS_ONLY;
+                }
                 info.idxNum = PLAN_PK_POINT | (pt_flags << 8);
                 info.idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
                 info.estimatedCost = 1.0;
@@ -582,12 +616,6 @@ unsafe extern "system" fn vtab_best_index(
                 return SQLITE_OK;
             }
         }
-
-        // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected
-        let can_use_keys_only = info.colUsed == 0
-            || (vtab.pk_collation == ColCollation::Binary
-                && vtab.pk_col_idx < 63
-                && info.colUsed == (1u64 << vtab.pk_col_idx));
 
         // 2. Check for usable equality constraint (`=`) on a Secondary Index column
         for i in 0..n {
@@ -878,33 +906,45 @@ unsafe extern "system" fn vtab_filter(
                         return SQLITE_OK;
                     }
                     let pt_flags = (idx_num >> 8) & 0xFF;
+                    let pt_keys_only = (pt_flags & POINT_FLAG_KEYS_ONLY) != 0;
+                    cursor.keys_only = pt_keys_only;
                     if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
                         if let Some(rid) = extract_lossless_rowid_arg(val_ptr) {
                             if vtab.pk_affinity == ColumnAffinity::Integer {
                                 let pk_arr = encode_i64_tagged_key(rid);
-                                if let Err(e) = eng.get_row_into(
+                                match point_fetch(
+                                    eng,
                                     vtab.table_id,
                                     &pk_arr,
+                                    pt_keys_only,
                                     &mut cursor.slab,
                                     &mut cursor.spans,
                                 ) {
-                                    return io_err_to_sqlite_rc(&e);
+                                    Ok(true) => {
+                                        cursor.pks.push(pk_arr.to_vec());
+                                        cursor.lazy_blobs.push(None);
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => return io_err_to_sqlite_rc(&e),
                                 }
-                                cursor.pks.push(pk_arr.to_vec());
-                                cursor.lazy_blobs.push(None);
                             } else {
                                 match resolve_pk_for_rowid(vtab, eng, rid) {
                                     Ok(Some(mapped_pk)) => {
-                                        if let Err(e) = eng.get_row_into(
+                                        match point_fetch(
+                                            eng,
                                             vtab.table_id,
                                             &mapped_pk,
+                                            pt_keys_only,
                                             &mut cursor.slab,
                                             &mut cursor.spans,
                                         ) {
-                                            return io_err_to_sqlite_rc(&e);
+                                            Ok(true) => {
+                                                cursor.pks.push(mapped_pk);
+                                                cursor.lazy_blobs.push(None);
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => return io_err_to_sqlite_rc(&e),
                                         }
-                                        cursor.pks.push(mapped_pk);
-                                        cursor.lazy_blobs.push(None);
                                     }
                                     Ok(None) => {}
                                     Err(e) => return io_err_to_sqlite_rc(&e),
@@ -919,9 +959,11 @@ unsafe extern "system" fn vtab_filter(
                             vtab.pk_collation,
                             false,
                         );
-                        let found = match eng.get_row_into(
+                        let found = match point_fetch(
+                            eng,
                             vtab.table_id,
                             &pk_bytes,
+                            pt_keys_only,
                             &mut cursor.slab,
                             &mut cursor.spans,
                         ) {
@@ -936,9 +978,11 @@ unsafe extern "system" fn vtab_filter(
                             ColumnAffinity::Integer | ColumnAffinity::Numeric
                         ) {
                             if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
-                                match eng.get_row_into(
+                                match point_fetch(
+                                    eng,
                                     vtab.table_id,
                                     &alt,
+                                    pt_keys_only,
                                     &mut cursor.slab,
                                     &mut cursor.spans,
                                 ) {

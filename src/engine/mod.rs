@@ -15,12 +15,16 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::blob::{
-    BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_BLOB_SEGMENT_SIZE,
+    BLOB_RECORD_HEADER_LEN, BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_BLOB_SEGMENT_SIZE,
 };
-use crate::index::{DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue};
+use crate::index::{
+    DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, decode_lru_queue_key,
+    decode_secondary_index_pk_slice,
+};
 use crate::lru::{
     AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META,
     NS_SECONDARY_INDEX, RowMetaRecord, encode_lru_queue_key, encode_namespace_prefix,
@@ -39,6 +43,14 @@ use crate::wal::{
 };
 
 use self::tx::{SavepointMarker, TxMetaSnapshot};
+
+/// Result of a policy-free `'t'` row-meta lookup.
+pub(super) enum MetaLookup {
+    Absent,
+    Found(RowMetaRecord, Option<BlobPtr>),
+    /// Record exists but cannot be read/decoded (carries the spilled blob pointer, if any).
+    Corrupt(Option<BlobPtr>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExistingRowStatus {
@@ -60,6 +72,31 @@ pub enum WriteDurability {
     /// Logs to `wal_buf.db` (OS Page Cache), surviving application crashes (`kill -9`)
     /// with microsecond latency.
     BufferedFast,
+}
+
+/// What a read does when an out-of-line blob fails verification (CRC mismatch, bad magic, key
+/// mismatch, short read) or its segment is missing after the engine has opened.
+///
+/// After `StorageEngine::open`, every blob referenced by durable state has been validated
+/// (WAL-replayed pointers) or synced before its index checkpoint, so a verification failure
+/// means genuine corruption. Runtime-only: not persisted (the vtab re-applies it on connect).
+/// Defaults: capped tables use [`CorruptPolicy::Evict`], all others [`CorruptPolicy::Error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptPolicy {
+    /// Reads of the corrupt row fail with `io::ErrorKind::InvalidData` naming the table id and
+    /// primary key. Explicit deletes/overwrites of that row still succeed and clean up fully.
+    Error,
+    /// Reads treat the row as absent and the row is queued for automatic deletion at the next
+    /// safe mutating point (see `StorageEngine::drain_corrupt_evictions`).
+    Evict,
+}
+
+/// A queued automatic deletion of a row whose blob failed verification (`Evict` policy).
+struct PendingCorruptEviction {
+    /// Key of the record (`'r'` row or `'t'` row-meta) whose blob was corrupt.
+    key: Vec<u8>,
+    /// The blob pointer observed as corrupt; deletion only proceeds if it is still current.
+    ptr: BlobPtr,
 }
 
 /// Controls how the engine tracks read-path `AccessTick` updates on Capped Tables.
@@ -215,6 +252,14 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Set after a WAL append/sync failure (original error text). While set, every mutating
     /// operation fails and the engine must be reopened (the on-disk state is unknown).
     pub(super) poisoned: Option<String>,
+    /// Explicit per-table corruption policies (absent -> derived default, see
+    /// [`Self::corrupt_policy`]).
+    corrupt_policies: HashMap<u16, CorruptPolicy>,
+    /// Engine-wide count of blob verification failures observed by reads/cleanup paths.
+    corrupt_blob_detections: AtomicU64,
+    /// Rows awaiting automatic deletion under [`CorruptPolicy::Evict`]. Filled from `&self` read
+    /// paths (hence the `Mutex`); drained only by [`Self::drain_corrupt_evictions`].
+    pending_corrupt_evictions: Mutex<HashMap<(u16, Vec<u8>), PendingCorruptEviction>>,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -609,6 +654,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
             poisoned: None,
+            corrupt_policies: HashMap::new(),
+            corrupt_blob_detections: AtomicU64::new(0),
+            pending_corrupt_evictions: Mutex::new(HashMap::new()),
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
@@ -806,6 +854,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// quota registrations, and system catalog entries.
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
         self.check_not_poisoned()?;
+        self.corrupt_policies.remove(&table_id);
+        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
+            q.retain(|(tid, _), _| *tid != table_id);
+        }
         let mut records = Vec::new();
         let mut dead_ptrs = Vec::new();
 
@@ -910,6 +962,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         known_absent: bool,
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
+        self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -966,20 +1019,38 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         if existing != ExistingRowStatus::NotFound && self.may_have_row_meta(table_id)? {
-            if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
-                had_old_meta = true;
-                old_meta_blob_ptr = m_ptr;
-                old_logical_size = old_meta.logical_size as u64;
-                if is_capped && old_meta.recorded_tick > 0 {
-                    records.push(WalRecord::Delete {
-                        key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                    });
+            match self.get_row_meta_lookup(&meta_key)? {
+                MetaLookup::Found(old_meta, m_ptr) => {
+                    had_old_meta = true;
+                    old_meta_blob_ptr = m_ptr;
+                    old_logical_size = old_meta.logical_size as u64;
+                    if is_capped && old_meta.recorded_tick > 0 {
+                        records.push(WalRecord::Delete {
+                            key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
+                        });
+                    }
+                    for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
+                        records.push(WalRecord::Delete {
+                            key: encode_secondary_index_key(
+                                table_id,
+                                *old_idx_id,
+                                old_col_val,
+                                pk,
+                            ),
+                        });
+                    }
                 }
-                for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                    records.push(WalRecord::Delete {
-                        key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                    });
+                MetaLookup::Corrupt(m_ptr) => {
+                    // Unreadable metadata: find the old 'i'/'l' entries by scanning for `pk`.
+                    had_old_meta = true;
+                    old_meta_blob_ptr = m_ptr;
+                    let (orphans, est) = self.collect_orphans_for_pk(table_id, pk, &row_key)?;
+                    old_logical_size = est;
+                    for key in orphans {
+                        records.push(WalRecord::Delete { key });
+                    }
                 }
+                MetaLookup::Absent => {}
             }
         }
 
@@ -1154,6 +1225,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<bool> {
         self.check_not_poisoned()?;
+        self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1170,26 +1242,48 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             _ => None,
         };
 
-        let mut records = vec![WalRecord::Delete { key: row_key }];
+        let mut records = vec![WalRecord::Delete {
+            key: row_key.clone(),
+        }];
         let mut old_logical_size = 0u64;
         let mut old_meta_blob_ptr = None;
 
         if self.may_have_row_meta(table_id)? {
             let meta_key = encode_row_meta_key(table_id, pk);
-            if let Some((old_meta, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
-                old_meta_blob_ptr = m_ptr;
-                old_logical_size = old_meta.logical_size as u64;
-                if old_meta.recorded_tick > 0 {
-                    records.push(WalRecord::Delete {
-                        key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                    });
+            match self.get_row_meta_lookup(&meta_key)? {
+                MetaLookup::Found(old_meta, m_ptr) => {
+                    old_meta_blob_ptr = m_ptr;
+                    old_logical_size = old_meta.logical_size as u64;
+                    if old_meta.recorded_tick > 0 {
+                        records.push(WalRecord::Delete {
+                            key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
+                        });
+                    }
+                    for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
+                        records.push(WalRecord::Delete {
+                            key: encode_secondary_index_key(
+                                table_id,
+                                *old_idx_id,
+                                old_col_val,
+                                pk,
+                            ),
+                        });
+                    }
+                    records.push(WalRecord::Delete { key: meta_key });
                 }
-                for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                    records.push(WalRecord::Delete {
-                        key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                    });
+                MetaLookup::Corrupt(m_ptr) => {
+                    // Unreadable metadata: remove the 't' record and every 'i'/'l' entry for
+                    // `pk` found by scanning. The capped-table byte counter is reduced by an
+                    // estimate (pk length + value length taken from the row record).
+                    old_meta_blob_ptr = m_ptr;
+                    let (orphans, est) = self.collect_orphans_for_pk(table_id, pk, &row_key)?;
+                    old_logical_size = est;
+                    for key in orphans {
+                        records.push(WalRecord::Delete { key });
+                    }
+                    records.push(WalRecord::Delete { key: meta_key });
                 }
-                records.push(WalRecord::Delete { key: meta_key });
+                MetaLookup::Absent => {}
             }
         }
 
@@ -1317,6 +1411,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &heap_buf
         };
 
+        // Evict-policy tables verify blobs eagerly (a row cannot be skipped after emission).
+        let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
+        if !lazy_ok {
+            self.flush_active_blob_buffers()?;
+        }
         let mut hit = false;
         if let Some(mem_entry) = self.memtable.get(row_key) {
             match &mem_entry.value {
@@ -1328,9 +1427,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     hit = true;
                 }
                 IndexValue::Blob(ptr) => {
-                    spans.push((0, 0));
-                    lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
-                    hit = true;
+                    if lazy_ok {
+                        spans.push((0, 0));
+                        lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
+                        hit = true;
+                    } else {
+                        let start = slab.len();
+                        if self.read_flushed_blob_append_into(ptr, row_key, slab)? {
+                            spans.push((start, slab.len()));
+                            lazy_blobs.push(None);
+                            hit = true;
+                        }
+                    }
                 }
                 IndexValue::Tombstone => {}
             }
@@ -1346,9 +1454,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             hit = true;
                         }
                         IndexValue::Blob(ptr) => {
-                            spans.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
-                            hit = true;
+                            if lazy_ok {
+                                spans.push((0, 0));
+                                lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
+                                hit = true;
+                            } else {
+                                let start = slab.len();
+                                if self.read_flushed_blob_append_into(&ptr, row_key, slab)? {
+                                    spans.push((start, slab.len()));
+                                    lazy_blobs.push(None);
+                                    hit = true;
+                                }
+                            }
                         }
                         IndexValue::Tombstone => {}
                     }
@@ -1376,6 +1493,101 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         Ok(hit)
+    }
+
+    /// Sets the runtime blob-corruption policy for `table_id` (see [`CorruptPolicy`]).
+    pub fn set_table_corrupt_policy(&mut self, table_id: u16, policy: CorruptPolicy) {
+        self.corrupt_policies.insert(table_id, policy);
+    }
+
+    /// Removes any explicit policy for `table_id`, restoring the derived default.
+    pub fn reset_table_corrupt_policy(&mut self, table_id: u16) {
+        self.corrupt_policies.remove(&table_id);
+    }
+
+    /// Effective policy for `table_id`: the explicit setting, else `Evict` for capped tables and
+    /// `Error` for all others.
+    pub fn corrupt_policy(&self, table_id: u16) -> CorruptPolicy {
+        match self.corrupt_policies.get(&table_id) {
+            Some(p) => *p,
+            None if self.capped_tables.contains_key(&table_id) => CorruptPolicy::Evict,
+            None => CorruptPolicy::Error,
+        }
+    }
+
+    /// Number of blob verification failures (or dangling blob pointers) detected since open.
+    pub fn corrupt_blob_detections(&self) -> u64 {
+        self.corrupt_blob_detections.load(Ordering::Relaxed)
+    }
+
+    /// Records a detection only (used by cleanup paths that must tolerate corruption).
+    fn count_corrupt_detection(&self) {
+        self.corrupt_blob_detections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Applies the table's policy to a failed blob read of the record at `key`
+    /// (`[TableID | ns | pk]`), whose pointer is `ptr`. `Error` returns an `InvalidData` error
+    /// naming the table and primary key; `Evict` queues the row for deletion and returns `Ok`.
+    fn note_corrupt_blob(&self, key: &[u8], ptr: &BlobPtr) -> io::Result<()> {
+        self.count_corrupt_detection();
+        let (table_id, pk) = if key.len() >= 3 {
+            (u16::from_be_bytes([key[0], key[1]]), &key[3..])
+        } else {
+            (ptr.table_id, &key[..0])
+        };
+        match self.corrupt_policy(table_id) {
+            CorruptPolicy::Error => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt blob (verification failed or segment missing) for table {table_id} pk 0x{} (segment {}, offset {})",
+                    pk.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    ptr.seg_id,
+                    ptr.offset
+                ),
+            )),
+            CorruptPolicy::Evict => {
+                if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
+                    q.insert(
+                        (table_id, pk.to_vec()),
+                        PendingCorruptEviction {
+                            key: key.to_vec(),
+                            ptr: *ptr,
+                        },
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Deletes rows queued by [`CorruptPolicy::Evict`] reads.
+    ///
+    /// Funnel points: the start of `put_row_owned_with_hint`, `delete_row` and `flush_memtable`,
+    /// plus the end of the outermost `commit_transaction` (SQL statements write inside a
+    /// transaction, where draining is deferred). Never called from read paths, so a
+    /// connection that merely reads never writes. Does nothing while a transaction is active
+    /// or the engine is poisoned (entries stay queued). Each entry is re-checked: the row is
+    /// only deleted if its record still points to the same corrupt `BlobPtr` (it may have been
+    /// overwritten or deleted since). Deletes use `BufferedFast` durability.
+    pub(super) fn drain_corrupt_evictions(&mut self) -> io::Result<()> {
+        if self.tx_depth > 0 || self.poisoned.is_some() {
+            return Ok(());
+        }
+        let pending: Vec<((u16, Vec<u8>), PendingCorruptEviction)> =
+            match self.pending_corrupt_evictions.lock() {
+                Ok(mut q) if !q.is_empty() => q.drain().collect(),
+                _ => return Ok(()),
+            };
+        for ((table_id, pk), ev) in pending {
+            let still_corrupt = matches!(
+                self.lookup_raw_entry(&ev.key)?,
+                Some((_, IndexValue::Blob(p))) if p == ev.ptr
+            );
+            if still_corrupt {
+                self.delete_row(table_id, &pk, WriteDurability::BufferedFast)?;
+            }
+        }
+        Ok(())
     }
 
     /// Captures `ptr` together with a pinned handle to its segment file (see [`LazyBlob`]).
@@ -1419,10 +1631,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // handle sees them; harmless if the writer has since rolled to a new segment.
         self.ensure_blob_flushed(ptr)?;
         let Some(reader) = &lazy.reader else {
+            // Segment was already absent when the pointer was captured: dangling pointer.
+            self.note_corrupt_blob(row_key, ptr)?;
             return Ok(None);
         };
         let start = slab.len();
         if !reader.append_blob_into(ptr, Some(row_key), slab)? {
+            slab.truncate(start);
+            self.note_corrupt_blob(row_key, ptr)?;
             return Ok(None);
         }
         let end = slab.len();
@@ -1623,7 +1839,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Reads and verifies a blob; on failure applies the table's [`CorruptPolicy`]
+    /// (`Err(InvalidData)` for `Error`, `Ok(None)` + queued eviction for `Evict`).
     pub(super) fn dereference_blob(
+        &mut self,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let r = self.dereference_blob_raw(ptr, expected_key)?;
+        if r.is_none() {
+            self.note_corrupt_blob(expected_key, ptr)?;
+        }
+        Ok(r)
+    }
+
+    /// Like [`Self::dereference_blob`] but never applies the policy: a failure is only counted and
+    /// reported as `Ok(None)`. For cleanup/maintenance paths (delete, overwrite, compaction
+    /// relocation, capped-table reconciliation) that must tolerate corrupt blobs.
+    pub(super) fn dereference_blob_lenient(
+        &mut self,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let r = self.dereference_blob_raw(ptr, expected_key)?;
+        if r.is_none() {
+            self.count_corrupt_detection();
+        }
+        Ok(r)
+    }
+
+    fn dereference_blob_raw(
         &mut self,
         ptr: &BlobPtr,
         expected_key: &[u8],
@@ -1662,24 +1907,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
         let reader = match ptr.kind {
-            BlobKind::Standard => {
-                let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
-                    return Ok(false);
-                };
-                &b.reader
-            }
-            BlobKind::Lru => {
-                let Some(b) = self.lru_blobs.get(&(ptr.table_id, ptr.seg_id)) else {
-                    return Ok(false);
-                };
-                &b.reader
-            }
+            BlobKind::Standard => self.std_blobs.get(&ptr.seg_id).map(|b| &b.reader),
+            BlobKind::Lru => self
+                .lru_blobs
+                .get(&(ptr.table_id, ptr.seg_id))
+                .map(|b| &b.reader),
         };
-        if out.is_empty() {
-            reader.read_blob_into(ptr, Some(expected_key), out)
-        } else {
-            reader.append_blob_into(ptr, Some(expected_key), out)
+        let ok = match reader {
+            Some(reader) if out.is_empty() => reader.read_blob_into(ptr, Some(expected_key), out)?,
+            Some(reader) => reader.append_blob_into(ptr, Some(expected_key), out)?,
+            None => false,
+        };
+        if !ok {
+            // Corruption or dangling pointer: apply the table's policy (Err for `Error`).
+            self.note_corrupt_blob(expected_key, ptr)?;
         }
+        Ok(ok)
     }
 
     pub(super) fn commit_wal_and_memtable(
@@ -1856,28 +2099,81 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(has)
     }
 
+    /// Policy-free row-meta lookup used by delete/overwrite/eviction paths. An unreadable
+    /// `'t'` record (spilled blob failing verification, dangling pointer, or undecodable bytes)
+    /// is reported as [`MetaLookup::Corrupt`] instead of an error so callers can clean up.
+    pub(super) fn get_row_meta_lookup(&mut self, meta_key: &[u8]) -> io::Result<MetaLookup> {
+        let Some((_lsn, val)) = self.lookup_raw_entry(meta_key)? else {
+            return Ok(MetaLookup::Absent);
+        };
+        match val {
+            IndexValue::Inline(bytes) => Ok(match RowMetaRecord::from_bytes(&bytes) {
+                Ok(r) => MetaLookup::Found(r, None),
+                Err(_) => {
+                    self.count_corrupt_detection();
+                    MetaLookup::Corrupt(None)
+                }
+            }),
+            IndexValue::Blob(ptr) => match self.dereference_blob_lenient(&ptr, meta_key)? {
+                Some(bytes) => Ok(match RowMetaRecord::from_bytes(&bytes) {
+                    Ok(r) => MetaLookup::Found(r, Some(ptr)),
+                    Err(_) => MetaLookup::Corrupt(Some(ptr)),
+                }),
+                None => Ok(MetaLookup::Corrupt(Some(ptr))),
+            },
+            IndexValue::Tombstone => Ok(MetaLookup::Absent),
+        }
+    }
+
+    /// Convenience wrapper: `None` for absent or corrupt metadata.
     pub(super) fn get_row_meta_with_ptr(
         &mut self,
         meta_key: &[u8],
     ) -> io::Result<Option<(RowMetaRecord, Option<BlobPtr>)>> {
-        let Some((_lsn, val)) = self.lookup_raw_entry(meta_key)? else {
-            return Ok(None);
-        };
-        match val {
-            IndexValue::Inline(bytes) => {
-                Ok(RowMetaRecord::from_bytes(&bytes).ok().map(|r| (r, None)))
+        Ok(match self.get_row_meta_lookup(meta_key)? {
+            MetaLookup::Found(r, p) => Some((r, p)),
+            _ => None,
+        })
+    }
+
+    /// Fallback cleanup for a row whose `'t'` metadata is unreadable: returns the keys of every
+    /// secondary-index (`'i'`) and LRU-queue (`'l'`) entry of `table_id` whose trailing primary
+    /// key equals `pk`, found by scanning both namespaces, plus the best-effort logical size
+    /// estimate of the row (`pk.len()` + value length, derived from the row record itself).
+    fn collect_orphans_for_pk(
+        &self,
+        table_id: u16,
+        pk: &[u8],
+        row_key: &[u8],
+    ) -> io::Result<(Vec<Vec<u8>>, u64)> {
+        let mut keys = Vec::new();
+        let sec_prefix = encode_namespace_prefix(table_id, NS_SECONDARY_INDEX);
+        for e in self.scan_merged_prefix(&sec_prefix)? {
+            if matches!(e.value, IndexValue::Tombstone) || e.key.len() < 5 {
+                continue;
             }
-            IndexValue::Blob(ptr) => {
-                if let Some(bytes) = self.dereference_blob(&ptr, meta_key)? {
-                    Ok(RowMetaRecord::from_bytes(&bytes)
-                        .ok()
-                        .map(|r| (r, Some(ptr))))
-                } else {
-                    Ok(None)
-                }
+            let index_id = u16::from_be_bytes([e.key[3], e.key[4]]);
+            if decode_secondary_index_pk_slice(table_id, index_id, &e.key) == Some(pk) {
+                keys.push(e.key);
             }
-            IndexValue::Tombstone => Ok(None),
         }
+        let lru_prefix = encode_namespace_prefix(table_id, NS_LRU_QUEUE);
+        for e in self.scan_merged_prefix(&lru_prefix)? {
+            if matches!(e.value, IndexValue::Tombstone) {
+                continue;
+            }
+            if decode_lru_queue_key(table_id, &e.key).is_some_and(|(_, p)| p == pk) {
+                keys.push(e.key);
+            }
+        }
+        let value_len = match self.lookup_raw_entry(row_key)? {
+            Some((_, IndexValue::Inline(v))) => v.len(),
+            Some((_, IndexValue::Blob(p))) => {
+                (p.len as usize).saturating_sub(BLOB_RECORD_HEADER_LEN + row_key.len())
+            }
+            _ => 0,
+        };
+        Ok((keys, (pk.len() + value_len) as u64))
     }
 
     pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {

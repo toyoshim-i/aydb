@@ -281,6 +281,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if do_flush || self.memtable.should_flush() {
                 self.flush_memtable()?;
             }
+
+            // The transaction is durable at this point; remove rows queued by `Evict`-policy
+            // reads. Best effort: a failure here must not turn a successful commit into an error
+            // (the rows are simply re-detected and re-queued by the next read).
+            let _ = self.drain_corrupt_evictions();
         }
         Ok(())
     }

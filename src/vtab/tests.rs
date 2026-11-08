@@ -2313,3 +2313,127 @@ fn lazy_blob_dereference_in_cursor_short_range_and_sec_index() {
         ]
     );
 }
+
+/// Creates a 5-row table (`id` 1..=5, 4 KB BLOB each), flushes, closes everything, then flips
+/// the last byte of the blob record of `id = 3` in the single `blob_std_*.db` file.
+fn corrupt_third_blob_row(dir: &std::path::Path, table_opts: &str) {
+    let cfg = EngineConfig::default();
+    {
+        let fs = Arc::new(OsFs::open(dir, true).unwrap());
+        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE docs USING aydb(
+                table_id = 90,
+                {table_opts}
+                columns = 'id INTEGER PRIMARY KEY, body BLOB'
+            );"
+        ))
+        .unwrap();
+        for id in 1..=5i64 {
+            conn.query_all(
+                "INSERT INTO docs VALUES (?1, ?2)",
+                &[SqlValue::Integer(id), SqlValue::Blob(vec![id as u8; 4096])],
+            )
+            .unwrap();
+        }
+        engine.lock().unwrap().flush_memtable().unwrap();
+    }
+    let blob_files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            (n.starts_with("blob_std_") || n.starts_with("blob_lru_")) && n.ends_with(".db")
+        })
+        .collect();
+    assert_eq!(blob_files.len(), 1);
+    let path = blob_files[0].path();
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len() % 5, 0, "5 equally sized blob records expected");
+    let rec = bytes.len() / 5;
+    bytes[3 * rec - 1] ^= 0xFF; // last payload byte of record index 2 (`id = 3`)
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+fn reopen_docs(dir: &std::path::Path, table_opts: &str) -> (SqliteConnection, Arc<Mutex<StorageEngine<OsFs>>>) {
+    let fs = Arc::new(OsFs::open(dir, false).unwrap());
+    let engine = Arc::new(Mutex::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE docs USING aydb(
+            table_id = 90,
+            {table_opts}
+            columns = 'id INTEGER PRIMARY KEY, body BLOB'
+        );"
+    ))
+    .unwrap();
+    (conn, engine)
+}
+
+fn ids(rows: Vec<Vec<SqlValue>>) -> Vec<i64> {
+    rows.into_iter()
+        .map(|r| match r[0] {
+            SqlValue::Integer(v) => v,
+            _ => panic!("expected integer"),
+        })
+        .collect()
+}
+
+#[test]
+fn vtab_corrupt_blob_default_error_mode_select_fails_but_pk_and_delete_work() {
+    let tmp = TempTestDir::new("vtab_corrupt_error_mode");
+    corrupt_third_blob_row(&tmp.path, "");
+    let (conn, engine) = reopen_docs(&tmp.path, "");
+
+    let err = conn.query_all("SELECT * FROM docs", &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("malformed"),
+        "expected SQLITE_CORRUPT, got: {err}"
+    );
+    assert!(conn.query_all("SELECT body FROM docs WHERE id = 3", &[]).is_err());
+    assert!(engine.lock().unwrap().corrupt_blob_detections() > 0);
+
+    // PK-only queries never dereference blobs, so users can locate the bad rows.
+    assert_eq!(
+        ids(conn.query_all("SELECT id FROM docs ORDER BY id", &[]).unwrap()),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        ids(conn.query_all("SELECT id FROM docs WHERE id = 3", &[]).unwrap()),
+        vec![3]
+    );
+
+    conn.execute_batch("DELETE FROM docs WHERE id = 3;").unwrap();
+    let rows = conn.query_all("SELECT id, length(body) FROM docs ORDER BY id", &[]).unwrap();
+    assert_eq!(ids(rows.clone()), vec![1, 2, 4, 5]);
+    assert!(rows.iter().all(|r| r[1] == SqlValue::Integer(4096)));
+}
+
+#[test]
+fn vtab_corrupt_blob_on_corrupt_evict_hides_row_and_removes_it() {
+    let tmp = TempTestDir::new("vtab_corrupt_evict_mode");
+    corrupt_third_blob_row(&tmp.path, "on_corrupt = 'EVICT',");
+    let (conn, engine) = reopen_docs(&tmp.path, "on_corrupt = 'EVICT',");
+
+    let rows = conn.query_all("SELECT * FROM docs ORDER BY id", &[]).unwrap();
+    assert_eq!(ids(rows), vec![1, 2, 4, 5]);
+    assert_eq!(
+        ids(conn.query_all("SELECT id FROM docs WHERE id < 100 ORDER BY id", &[]).unwrap()),
+        vec![1, 2, 3, 4, 5],
+        "keys-only scans never verify blobs"
+    );
+    assert!(engine.lock().unwrap().corrupt_blob_detections() > 0);
+    assert!(engine.lock().unwrap().row_exists(90, &crate::vtab::row_codec::encode_i64_tagged_key(3)).unwrap());
+
+    // The next write removes the corrupt row physically.
+    conn.execute_batch("INSERT INTO docs VALUES (6, x'00');").unwrap();
+    assert_eq!(
+        ids(conn.query_all("SELECT id FROM docs ORDER BY id", &[]).unwrap()),
+        vec![1, 2, 4, 5, 6]
+    );
+}

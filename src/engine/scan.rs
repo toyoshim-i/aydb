@@ -11,7 +11,7 @@ use crate::lru::{
 use crate::pal::PlatformFs;
 use crate::wal::BlobPtr;
 
-use super::{LazyBlob, StorageEngine};
+use super::{CorruptPolicy, LazyBlob, StorageEngine};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MergedValueRef<'a> {
@@ -237,6 +237,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !keys_only {
             self.flush_active_blob_buffers()?;
         }
+        // Lazy dereference cannot skip a row once the cursor has emitted it, so tables whose
+        // corrupt rows must vanish (`CorruptPolicy::Evict`) verify blobs eagerly during the scan.
+        let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
 
         if self.idx_segments.is_empty() && !reverse {
             let lo = match lower {
@@ -279,7 +282,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                     }
                     IndexValue::Blob(ptr) => {
-                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                        if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                             spans_out.push((0, 0));
                             lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
                             pks_out.push(k[3..].to_vec());
@@ -290,8 +293,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             let start = slab_out.len();
                             if self.read_flushed_blob_append_into(ptr, k, slab_out)? {
                                 spans_out.push((start, slab_out.len()));
-                                last_pk_buf.clear();
-                                last_pk_buf.extend_from_slice(&k[3..]);
+                                if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                                    lazy_blobs.push(None);
+                                    pks_out.push(k[3..].to_vec());
+                                } else {
+                                    last_pk_buf.clear();
+                                    last_pk_buf.extend_from_slice(&k[3..]);
+                                }
                                 if spans_out.len() >= limit {
                                     break;
                                 }
@@ -332,7 +340,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         Ok(true)
                     }
                     MergedValueRef::Blob(ptr) => {
-                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                        if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                             spans_out.push((0, 0));
                             lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
                             pks_out.push(key[3..].to_vec());
@@ -341,8 +349,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             let start = slab_out.len();
                             if self.read_flushed_blob_append_into(&ptr, key, slab_out)? {
                                 spans_out.push((start, slab_out.len()));
-                                last_pk_buf.clear();
-                                last_pk_buf.extend_from_slice(&key[3..]);
+                                if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                                    lazy_blobs.push(None);
+                                    pks_out.push(key[3..].to_vec());
+                                } else {
+                                    last_pk_buf.clear();
+                                    last_pk_buf.extend_from_slice(&key[3..]);
+                                }
                                 Ok(true)
                             } else {
                                 Ok(false)

@@ -3,7 +3,7 @@
 use core::ffi::{c_char, c_int};
 use std::ffi::CStr;
 
-use crate::engine::WriteDurability;
+use crate::engine::{CorruptPolicy, WriteDurability};
 use crate::vtab::ffi::SQLITE_ERROR;
 use crate::vtab::row_codec::{ColCollation, ColumnAffinity};
 
@@ -13,6 +13,8 @@ pub(super) struct ParsedVtabDdl {
     pub(super) explicit_table_id: Option<u16>,
     pub(super) max_bytes: u64,
     pub(super) durability: WriteDurability,
+    /// Explicit `on_corrupt=error|evict`; `None` keeps the engine default (capped -> evict).
+    pub(super) on_corrupt: Option<CorruptPolicy>,
     pub(super) columns_spec: String,
     pub(super) col_names: Vec<String>,
     pub(super) col_affinities: Vec<ColumnAffinity>,
@@ -71,6 +73,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut explicit_table_id: Option<u16> = None;
         let mut max_bytes: u64 = 0;
         let mut durability = WriteDurability::BufferedFast;
+        let mut on_corrupt: Option<CorruptPolicy> = None;
         let mut columns_spec = String::from("key TEXT PRIMARY KEY, value BLOB");
         let mut indexes_spec = String::new();
 
@@ -98,6 +101,15 @@ pub(super) unsafe fn parse_vtab_ddl(
                             durability = WriteDurability::SyncTransactional;
                         } else {
                             durability = WriteDurability::BufferedFast;
+                        }
+                    }
+                    "on_corrupt" => {
+                        if val.eq_ignore_ascii_case("error") {
+                            on_corrupt = Some(CorruptPolicy::Error);
+                        } else if val.eq_ignore_ascii_case("evict") {
+                            on_corrupt = Some(CorruptPolicy::Evict);
+                        } else {
+                            return Err(SQLITE_ERROR);
                         }
                     }
                     "columns" => {
@@ -202,6 +214,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             explicit_table_id,
             max_bytes,
             durability,
+            on_corrupt,
             columns_spec,
             col_names,
             col_affinities,
@@ -211,5 +224,40 @@ pub(super) unsafe fn parse_vtab_ddl(
             pk_collation,
             secondary_indexes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn parse(opts: &[&str]) -> Result<ParsedVtabDdl, c_int> {
+        let mut args: Vec<CString> = ["aydb", "main", "t"]
+            .iter()
+            .map(|s| CString::new(*s).unwrap())
+            .collect();
+        args.extend(opts.iter().map(|s| CString::new(*s).unwrap()));
+        let ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
+        unsafe { parse_vtab_ddl(ptrs.len() as c_int, ptrs.as_ptr()) }
+    }
+
+    #[test]
+    fn on_corrupt_option_parsing() {
+        assert_eq!(parse(&[]).unwrap().on_corrupt, None);
+        assert_eq!(
+            parse(&["on_corrupt=error"]).unwrap().on_corrupt,
+            Some(CorruptPolicy::Error)
+        );
+        assert_eq!(
+            parse(&["on_corrupt = 'EVICT'"]).unwrap().on_corrupt,
+            Some(CorruptPolicy::Evict)
+        );
+        assert_eq!(
+            parse(&["max_bytes=10", "ON_CORRUPT=Evict"]).unwrap().on_corrupt,
+            Some(CorruptPolicy::Evict)
+        );
+        assert_eq!(parse(&["on_corrupt=ignore"]).err(), Some(SQLITE_ERROR));
+        assert_eq!(parse(&["on_corrupt="]).err(), Some(SQLITE_ERROR));
     }
 }

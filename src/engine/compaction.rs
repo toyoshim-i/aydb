@@ -26,6 +26,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_flush_on_commit = true;
             return Ok(());
         }
+        self.drain_corrupt_evictions()?;
         self.flush_memtable_no_auto_compact()?;
         if self.tx_depth == 0
             && self.config.auto_compact_segment_threshold > 1
@@ -204,7 +205,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if old_ptr.kind == BlobKind::Standard
                         && fragmented_seqs.contains(&old_ptr.seg_id)
                     {
-                        if let Some(payload) = self.dereference_blob(&old_ptr, &entry.key)? {
+                        if let Some(payload) = self.dereference_blob_lenient(&old_ptr, &entry.key)? {
                             let new_ptr = self.append_to_blob_segment(
                                 BlobKind::Standard,
                                 0,
