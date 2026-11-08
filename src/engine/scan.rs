@@ -167,6 +167,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &mut pks,
             &mut slab,
             &mut spans,
+            None,
         )?;
         Ok(pks)
     }
@@ -174,6 +175,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Streams live rows in `table_id` within `lower` and `upper` directly into `slab_out` and
     /// `spans_out` (or into `pks_out` when `keys_only` is `true` without dereferencing blobs)
     /// without intermediate per-row `Vec<u8>` allocations.
+    ///
+    /// When `lazy_blobs_out` is `Some`, out-of-line blobs are NOT read from disk during the scan;
+    /// instead, a placeholder span `(0, 0)` is recorded in `spans_out` and `Some(blob_ptr)` is pushed
+    /// to `lazy_blobs_out`, deferring disk I/O and CRC32C checks until `vtab_column` actually visits the row.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_range_into_slab(
         &mut self,
@@ -186,6 +191,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
+        mut lazy_blobs_out: Option<&mut Vec<Option<BlobPtr>>>,
     ) -> io::Result<()> {
         if limit == 0 {
             return Ok(());
@@ -261,27 +267,41 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         let start = slab_out.len();
                         slab_out.extend_from_slice(v);
                         spans_out.push((start, slab_out.len()));
-                        last_pk_buf.clear();
-                        last_pk_buf.extend_from_slice(&k[3..]);
+                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                            lazy_blobs.push(None);
+                            pks_out.push(k[3..].to_vec());
+                        } else {
+                            last_pk_buf.clear();
+                            last_pk_buf.extend_from_slice(&k[3..]);
+                        }
                         if spans_out.len() >= limit {
                             break;
                         }
                     }
                     IndexValue::Blob(ptr) => {
-                        let start = slab_out.len();
-                        if self.read_flushed_blob_append_into(ptr, k, slab_out)? {
-                            spans_out.push((start, slab_out.len()));
-                            last_pk_buf.clear();
-                            last_pk_buf.extend_from_slice(&k[3..]);
+                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                            spans_out.push((0, 0));
+                            lazy_blobs.push(Some(*ptr));
+                            pks_out.push(k[3..].to_vec());
                             if spans_out.len() >= limit {
                                 break;
+                            }
+                        } else {
+                            let start = slab_out.len();
+                            if self.read_flushed_blob_append_into(ptr, k, slab_out)? {
+                                spans_out.push((start, slab_out.len()));
+                                last_pk_buf.clear();
+                                last_pk_buf.extend_from_slice(&k[3..]);
+                                if spans_out.len() >= limit {
+                                    break;
+                                }
                             }
                         }
                     }
                     IndexValue::Tombstone => {}
                 }
             }
-            if !keys_only && !last_pk_buf.is_empty() {
+            if !keys_only && lazy_blobs_out.is_none() && !last_pk_buf.is_empty() {
                 pks_out.push(last_pk_buf);
             }
             return Ok(());
@@ -302,19 +322,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         let start = slab_out.len();
                         slab_out.extend_from_slice(v);
                         spans_out.push((start, slab_out.len()));
-                        last_pk_buf.clear();
-                        last_pk_buf.extend_from_slice(&key[3..]);
+                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                            lazy_blobs.push(None);
+                            pks_out.push(key[3..].to_vec());
+                        } else {
+                            last_pk_buf.clear();
+                            last_pk_buf.extend_from_slice(&key[3..]);
+                        }
                         Ok(true)
                     }
                     MergedValueRef::Blob(ptr) => {
-                        let start = slab_out.len();
-                        if self.read_flushed_blob_append_into(&ptr, key, slab_out)? {
-                            spans_out.push((start, slab_out.len()));
-                            last_pk_buf.clear();
-                            last_pk_buf.extend_from_slice(&key[3..]);
+                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                            spans_out.push((0, 0));
+                            lazy_blobs.push(Some(ptr));
+                            pks_out.push(key[3..].to_vec());
                             Ok(true)
                         } else {
-                            Ok(false)
+                            let start = slab_out.len();
+                            if self.read_flushed_blob_append_into(&ptr, key, slab_out)? {
+                                spans_out.push((start, slab_out.len()));
+                                last_pk_buf.clear();
+                                last_pk_buf.extend_from_slice(&key[3..]);
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
                         }
                     }
                 }
@@ -340,7 +372,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             )?;
         }
 
-        if !keys_only && !last_pk_buf.is_empty() {
+        if !keys_only && lazy_blobs_out.is_none() && !last_pk_buf.is_empty() {
             pks_out.push(last_pk_buf);
         }
         Ok(())
@@ -368,6 +400,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &mut unused_pks,
             slab,
             spans,
+            None,
         )
     }
 
@@ -522,6 +555,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
+        mut lazy_blobs_out: Option<&mut Vec<Option<BlobPtr>>>,
     ) -> io::Result<Option<Vec<u8>>> {
         if limit == 0 {
             return Ok(None);
@@ -531,6 +565,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if seek_slice > ub || (seek_slice == ub && (!cur_inc || !ub_inc)) {
                 return Ok(None);
             }
+        }
+
+        if !keys_only {
+            self.flush_active_blob_buffers()?;
         }
 
         let mut last_sec_key_buf: Vec<u8> = Vec::new();
@@ -648,7 +686,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             let scanned_count = batch_pks.len();
             for pk in &batch_pks {
-                self.get_row_into(table_id, pk, slab_out, spans_out)?;
+                if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                    if self.get_row_into_lazy(table_id, pk, slab_out, spans_out, lazy_blobs)? {
+                        pks_out.push(pk.clone());
+                    }
+                } else {
+                    self.get_row_into(table_id, pk, slab_out, spans_out)?;
+                }
             }
             if scanned_count < batch_need {
                 return Ok(None);

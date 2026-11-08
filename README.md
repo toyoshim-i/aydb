@@ -88,7 +88,7 @@ All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Vir
 | **YCSB-Style Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`362K`**] / `2 KB` WiscKey) | **`887K`** / `153K ops/s` | `291K` / `184K ops/s` | **`3.05×` [`1.24×` SST]** / `0.83×` |
 | **YCSB-Style Workload C** | 100% Point Read (`256 B` inline [SSTable: **`435K`**] / `2 KB` WiscKey) | **`1,208K`** / `188K ops/s` | `303K` / `192K ops/s` | **`3.98×` [`1.44×` SST]** / `0.98×` |
 | **YCSB-Style Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`890K` / `167K ops/s`** | `206K` / `105K ops/s` | **`4.32×` / `1.60×` faster** |
-| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey, 256-row chunk) | `105K` / `0.93K ops/s` | `107K` / `42.8K ops/s` | `0.98×` / `0.02×` |
+| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey, lazy dereference) | `105K` / `17.1K ops/s` | `107K` / `42.8K ops/s` | `0.98×` / `0.39×` |
 | **YCSB-Style Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`264K`** / `70.0K ops/s` | `176K` / `121K ops/s` | **`1.50×`** / `0.58×` |
 | **TPC-B-Style (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` `WRITE_THROUGH` vs `synchronous=FULL`) | **`13,817 TPS`** (**`9,969`** SSTable) | `529 TPS` (`439` SST) | **`26.12×` (`22.73×` SSTable)** |
 | **TPC-B-Style (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`110,257 TPS`** (**`45,774`** SSTable) | `15,576 TPS` (`15,506` SST) | **`7.08×` (`2.95×` SSTable)** |

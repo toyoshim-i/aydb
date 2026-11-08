@@ -77,7 +77,7 @@ To accelerate `Speedtest1`-style query and range-scan execution (`Tests 130, 140
 | **Workload B (Read Mostly)** | 95% Read / 5% Update | **`184,106 ops/s`** | `153,488 ops/s` | `0.83×` |
 | **Workload C (Read Only)** | 100% Point Read | **`191,615 ops/s`** | `187,949 ops/s` | `0.98×` |
 | **Workload D (Read Latest)** | 95% Read Latest / 5% Insert | `104,568 ops/s` | **`167,026 ops/s`** | **`1.60×` faster** |
-| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | **`42,821 ops/s`** | `927 ops/s` (`256`-row chunk) | `0.02×` |
+| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | **`42,821 ops/s`** | `17,066 ops/s` (Lazy Dereference) | `0.39×` |
 | **Workload F (Read-Modify-Write)** | 50% Read / 50% RMW | **`120,908 ops/s`** | `69,976 ops/s` | `0.58×` (`1.73×` slower) |
 
 ### Architectural Analysis of the `YCSB`-Style Results
@@ -86,8 +86,13 @@ To accelerate `Speedtest1`-style query and range-scan execution (`Tests 130, 140
 2. **Why `2,048 B` WiscKey `UPDATE`s (`Workload A` & `F`, `0.55×`–`0.58×`) Trail In-Cache SQLite, While `Workload D` (`1.60×`) Wins:**
    * **Virtual Table `UPDATE` Protocol on Separated Blobs (`Workload A` `0.55×`, `Workload F` `0.58×`):** With 4,000 × 2 KB rows (~8 MB), hot Zipfian keys reside inside SQLite's 2 MB in-process user-space `PCache`, so SQLite mutates B-Tree pages in-place in user-space RAM. By contrast, SQLite's Virtual Table `UPDATE` protocol MUST execute `xFilter` first—which reads the old 2 KB blob via a positional `ReadFile` syscall from `blob_std_*.db`—followed by `xRowid`/`xColumn`, and then appends a new 2 KB blob in `xUpdate`.
    * **Near-Parity Point Reads (`Workload C` `0.98×`) & `Workload D` Win (`1.60×`):** On pure point lookups (`Workload C`), `aydb` reaches `187.9K ops/s` vs. SQLite's `191.6K ops/s` (`0.98×`), reading directly into the cursor slab via stack-framed single-`ReadFile` dereferences. On `Workload D` (95% Read Latest / 5% Insert), `aydb` is **`1.60×` faster** (`167,026` vs. `104,568 ops/s`) because new inserts on a SQLite `TEXT PRIMARY KEY` table must allocate a new `rowid` and insert into both the main table B-Tree and `sqlite_autoindex`, whereas `aydb` stages the blob and inserts a single 23-byte `BlobPtr` into `MemTable`.
-3. **Chunked Streaming Cursor (`CURSOR_STREAM_CHUNK_ROWS = 256`) and `Workload E` (`LIMIT 10`):**
-   * To guarantee 100% SQL correctness when queries combine `LIMIT` with residual `WHERE` predicates that SQLite does not pass in `aConstraint` (such as `LIKE`, `OR`, or arbitrary expressions), `xBestIndex` lets SQLite's VDBE enforce `LIMIT`/`OFFSET` while `xFilter` streams rows in bounded `256`-row chunks (`CURSOR_STREAM_CHUNK_ROWS = 256`). On `Workload E` (`WHERE ycsb_key >= ? ORDER BY ycsb_key ASC LIMIT 10`), `xFilter` materializes one `256`-row chunk per scan (`105,312 ops/s` at `256 B` inline where values live in `MemTable`, and `927 ops/s` at `2,048 B` WiscKey where `xFilter` dereferences `256` separated blobs per chunk).
+3. **Chunked Streaming Cursor (`CURSOR_STREAM_CHUNK_ROWS = 256`) and Lazy Blob Dereference (`Workload E` `LIMIT 10`):**
+   * To guarantee 100% SQL correctness when queries combine `LIMIT` with residual `WHERE` predicates that SQLite does not pass in `aConstraint` (such as `LIKE`, `OR`, or arbitrary expressions), `xBestIndex` lets SQLite's VDBE enforce `LIMIT`/`OFFSET` while `xFilter` streams rows in bounded `256`-row chunks (`CURSOR_STREAM_CHUNK_ROWS = 256`).
+   * **The Over-Fetching Bottleneck:** On `Workload E` (`WHERE ycsb_key >= ? ORDER BY ycsb_key ASC LIMIT 10`), SQLite halts consumption after 10 rows. Eagerly reading all 256 external blobs in `scan_range_into_slab` meant that for every 10-row limit query, 246 unnecessary `ReadFile` + hardware `CRC32C` operations were performed upfront (dropping 2,048 B throughput to `927 ops/s` / `0.02×`).
+   * **Lazy Per-Row Blob Dereference in `AydbCursor`:** By storing placeholder spans `(0, 0)` and capturing `BlobPtr`s in `cursor.lazy_blobs`, `scan_range_into_slab` streams the 256 index keys into the cursor without reading external blobs. When SQLite's VDBE evaluates `vtab_column`:
+     - Primary key column projections (`pk_col_idx` with `ColCollation::Binary`) or rowids are decoded directly from `cursor.pks[cursor.pos]` without touching the blob or slab at all.
+     - When a non-PK column is evaluated, `dereference_lazy_blob_into` fetches the blob payload on-demand into `cursor.slab`, caches the span in `cursor.spans[cursor.pos]`, and clears `cursor.lazy_blobs[cursor.pos] = None` so subsequent column accesses for that row incur zero extra I/O.
+   * **Throughput Recovery:** With lazy dereference eliminating 25.6× wasteful blob reads, `Workload E` (2,048 B WiscKey) jumped from `927 ops/s` (`0.02×`) to **`17,066 ops/s` (`0.39×`)**—an **`18.4×` throughput speedup** over the eager-fetch baseline.
 
 ---
 

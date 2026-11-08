@@ -1207,6 +1207,141 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(hit)
     }
 
+    /// Point lookup of a row (`pk`) in `table_id` with lazy blob dereferencing:
+    /// if the row value is inline, appends it to `slab`, records `(start, end)` in `spans`, and pushes `None` to `lazy_blobs`.
+    /// if the row value is an external blob, records placeholder `(0, 0)` in `spans` and pushes `Some(ptr)` to `lazy_blobs`.
+    pub fn get_row_into_lazy(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(usize, usize)>,
+        lazy_blobs: &mut Vec<Option<BlobPtr>>,
+    ) -> io::Result<bool> {
+        let mut stack_buf = [0u8; 64];
+        let heap_buf;
+        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
+            let tb = table_id.to_be_bytes();
+            stack_buf[0] = tb[0];
+            stack_buf[1] = tb[1];
+            stack_buf[2] = NS_PRIMARY_ROW;
+            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
+            &stack_buf[..3 + pk.len()]
+        } else {
+            heap_buf = encode_primary_row_key(table_id, pk);
+            &heap_buf
+        };
+
+        let mut hit = false;
+        if let Some(mem_entry) = self.memtable.get(row_key) {
+            match &mem_entry.value {
+                IndexValue::Inline(bytes) => {
+                    let start = slab.len();
+                    slab.extend_from_slice(bytes);
+                    spans.push((start, slab.len()));
+                    lazy_blobs.push(None);
+                    hit = true;
+                }
+                IndexValue::Blob(ptr) => {
+                    spans.push((0, 0));
+                    lazy_blobs.push(Some(*ptr));
+                    hit = true;
+                }
+                IndexValue::Tombstone => {}
+            }
+        } else {
+            for seg in self.idx_segments.iter().rev() {
+                if let Some((_lsn, val)) = seg.get(row_key)? {
+                    match val {
+                        IndexValue::Inline(bytes) => {
+                            let start = slab.len();
+                            slab.extend_from_slice(&bytes);
+                            spans.push((start, slab.len()));
+                            lazy_blobs.push(None);
+                            hit = true;
+                        }
+                        IndexValue::Blob(ptr) => {
+                            spans.push((0, 0));
+                            lazy_blobs.push(Some(ptr));
+                            hit = true;
+                        }
+                        IndexValue::Tombstone => {}
+                    }
+                    break;
+                }
+            }
+        }
+
+        if hit
+            && matches!(lazy_blobs.last(), Some(None))
+            && self.capped_tables.contains_key(&table_id)
+        {
+            if self.in_committed_read_view {
+                self.access_tracker.record_read_hit(table_id, pk);
+            } else {
+                match self.config.lru_read_tracking {
+                    LruReadTrackingMode::CoalescedLazyPromotion => {
+                        self.access_tracker.record_read_hit(table_id, pk);
+                    }
+                    LruReadTrackingMode::EagerWriteOnRead => {
+                        self.eager_promote_lru_on_read(table_id, pk)?;
+                    }
+                }
+            }
+        }
+
+        Ok(hit)
+    }
+
+    /// Dereferences an out-of-line blob pointer on demand for a cursor row, appending the verified
+    /// blob payload to `slab` and returning its `(start_offset, end_offset)`.
+    /// Also updates LRU read tracking if `table_id` is a capped table.
+    pub fn dereference_lazy_blob_into(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        ptr: &BlobPtr,
+        slab: &mut Vec<u8>,
+    ) -> io::Result<Option<(usize, usize)>> {
+        let mut stack_buf = [0u8; 64];
+        let heap_buf;
+        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
+            let tb = table_id.to_be_bytes();
+            stack_buf[0] = tb[0];
+            stack_buf[1] = tb[1];
+            stack_buf[2] = NS_PRIMARY_ROW;
+            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
+            &stack_buf[..3 + pk.len()]
+        } else {
+            heap_buf = encode_primary_row_key(table_id, pk);
+            &heap_buf
+        };
+
+        self.ensure_blob_flushed(ptr)?;
+        let start = slab.len();
+        if !self.read_flushed_blob_append_into(ptr, row_key, slab)? {
+            return Ok(None);
+        }
+        let end = slab.len();
+
+        if self.capped_tables.contains_key(&table_id) {
+            if self.in_committed_read_view {
+                self.access_tracker.record_read_hit(table_id, pk);
+            } else {
+                match self.config.lru_read_tracking {
+                    LruReadTrackingMode::CoalescedLazyPromotion => {
+                        self.access_tracker.record_read_hit(table_id, pk);
+                    }
+                    LruReadTrackingMode::EagerWriteOnRead => {
+                        self.eager_promote_lru_on_read(table_id, pk)?;
+                    }
+                }
+            }
+        }
+
+        Ok(Some((start, end)))
+    }
+
     // =========================================================================
     // Internal Helper Methods
     // =========================================================================

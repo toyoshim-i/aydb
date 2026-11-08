@@ -1491,6 +1491,7 @@ fn size_tiered_auto_compaction_scan_keys_and_tx_budget() {
             &mut rev_pks,
             &mut rev_slab,
             &mut rev_spans,
+            None,
         )
         .unwrap();
     assert_eq!(rev_spans.len(), 2);
@@ -1944,6 +1945,7 @@ fn reverse_streaming_scan_row_meta_skip_and_tx_blob_read() {
                 &mut pks,
                 &mut slab,
                 &mut spans,
+                None,
             )
             .unwrap();
         assert_eq!(spans.len(), 5);
@@ -2132,6 +2134,7 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
                 &mut chunk_pks,
                 &mut slab,
                 &mut spans,
+                None,
             )
             .unwrap();
         assert!(slab.is_empty() && spans.is_empty());
@@ -2165,6 +2168,7 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
                 &mut pks,
                 &mut slab,
                 &mut spans,
+                None,
             )
             .unwrap();
         for (s, e) in spans {

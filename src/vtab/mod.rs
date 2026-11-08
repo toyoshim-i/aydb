@@ -30,10 +30,12 @@ use crate::vtab::ffi::{
     SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT,
     SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
     SQLITE_TEXT, sqlite3, sqlite3_context, sqlite3_declare_vtab, sqlite3_index_info, sqlite3_int64,
-    sqlite3_module, sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes, sqlite3_value_double,
-    sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_collation,
-    sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
+    sqlite3_module, sqlite3_result_error_code, sqlite3_result_int64, sqlite3_value,
+    sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
+    sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_collation, sqlite3_vtab_cursor,
+    sqlite3_vtab_on_conflict,
 };
+use crate::wal::BlobPtr;
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
     KEY_TAG_FLOAT_LT_I64_MIN, KEY_TAG_INTEGER, KEY_TAG_NULL, KEY_TAG_TEXT, SqlValue,
@@ -287,9 +289,12 @@ struct AydbCursor {
     slab: Vec<u8>,
     /// `(start_offset, end_offset)` into `slab` for each row.
     spans: Vec<(usize, usize)>,
-    /// Primary key bytes per row when `keys_only` is `true`, or the last fetched PK in
-    /// the current streaming batch when `keys_only` is `false`.
+    /// Primary key bytes per row.
     pks: Vec<Vec<u8>>,
+    /// Pending out-of-line blob pointer for lazy dereference in `vtab_column`.
+    /// When `Some(ptr)`, the row's blob payload has not been read into `slab` yet.
+    /// When `None`, the row was either inline or has already been dereferenced into `slab`.
+    lazy_blobs: Vec<Option<BlobPtr>>,
     /// True when the active scan only needs primary keys (`RANGE_FLAG_KEYS_ONLY`),
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
@@ -791,6 +796,7 @@ unsafe extern "system" fn vtab_open(
             slab: Vec::with_capacity(512),
             spans: Vec::with_capacity(16),
             pks: Vec::new(),
+            lazy_blobs: Vec::with_capacity(16),
             keys_only: false,
             pos: 0,
             streaming_active: false,
@@ -843,6 +849,7 @@ unsafe extern "system" fn vtab_filter(
         cursor.slab.clear();
         cursor.spans.clear();
         cursor.pks.clear();
+        cursor.lazy_blobs.clear();
         cursor.keys_only = false;
         cursor.pos = 0;
         cursor.streaming_active = false;
@@ -883,6 +890,8 @@ unsafe extern "system" fn vtab_filter(
                                 ) {
                                     return io_err_to_sqlite_rc(&e);
                                 }
+                                cursor.pks.push(pk_arr.to_vec());
+                                cursor.lazy_blobs.push(None);
                             } else {
                                 match resolve_pk_for_rowid(vtab, eng, rid) {
                                     Ok(Some(mapped_pk)) => {
@@ -894,6 +903,8 @@ unsafe extern "system" fn vtab_filter(
                                         ) {
                                             return io_err_to_sqlite_rc(&e);
                                         }
+                                        cursor.pks.push(mapped_pk);
+                                        cursor.lazy_blobs.push(None);
                                     }
                                     Ok(None) => {}
                                     Err(e) => return io_err_to_sqlite_rc(&e),
@@ -917,24 +928,26 @@ unsafe extern "system" fn vtab_filter(
                             Ok(b) => b,
                             Err(e) => return io_err_to_sqlite_rc(&e),
                         };
-                        // In SQLite (`10 == 10.0` across all affinities including `BLOB`),
-                        // if `pk_bytes` is an exact-integer number (`9`-byte `Integer(q)` or
-                        // `17`-byte `Float(q.0)`), also probe the dual exact-integer representation
-                        // if not found under the primary representation.
-                        if !found
-                            && !matches!(
-                                vtab.pk_affinity,
-                                ColumnAffinity::Integer | ColumnAffinity::Numeric
-                            )
-                        {
+                        if found {
+                            cursor.pks.push(pk_bytes);
+                            cursor.lazy_blobs.push(None);
+                        } else if !matches!(
+                            vtab.pk_affinity,
+                            ColumnAffinity::Integer | ColumnAffinity::Numeric
+                        ) {
                             if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
-                                if let Err(e) = eng.get_row_into(
+                                match eng.get_row_into(
                                     vtab.table_id,
                                     &alt,
                                     &mut cursor.slab,
                                     &mut cursor.spans,
                                 ) {
-                                    return io_err_to_sqlite_rc(&e);
+                                    Ok(true) => {
+                                        cursor.pks.push(alt);
+                                        cursor.lazy_blobs.push(None);
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => return io_err_to_sqlite_rc(&e),
                                 }
                             }
                         }
@@ -986,6 +999,7 @@ unsafe extern "system" fn vtab_filter(
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
                     ) {
                         Ok(last_opt) => last_opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
@@ -1090,6 +1104,7 @@ unsafe extern "system" fn vtab_filter(
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
                     ) {
                         Ok(last_opt) => last_opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
@@ -1159,6 +1174,7 @@ unsafe extern "system" fn vtab_filter(
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
                     ) {
                         return io_err_to_sqlite_rc(&e);
                     }
@@ -1192,6 +1208,7 @@ unsafe extern "system" fn vtab_filter(
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
                     ) {
                         return io_err_to_sqlite_rc(&e);
                     }
@@ -1236,6 +1253,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
             cursor.slab.clear();
             cursor.spans.clear();
             cursor.pks.clear();
+            cursor.lazy_blobs.clear();
             cursor.pos = 0;
 
             let mut eng = match vtab.engine.lock() {
@@ -1263,6 +1281,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
                     ) {
                         Ok(last_opt) => {
                             next_last_sec = last_opt;
@@ -1312,6 +1331,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     &mut cursor.pks,
                     &mut cursor.slab,
                     &mut cursor.spans,
+                    Some(&mut cursor.lazy_blobs),
                 ) {
                     return io_err_to_sqlite_rc(&e);
                 }
@@ -1364,7 +1384,7 @@ unsafe extern "system" fn vtab_column(
     i_col: c_int,
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        let cursor = &*(p_cursor as *const AydbCursor);
+        let cursor = &mut *(p_cursor as *mut AydbCursor);
         let vtab = &*(cursor.base.pVtab as *const AydbVTab);
         if cursor.keys_only {
             if cursor.pos >= cursor.pks.len() {
@@ -1387,13 +1407,60 @@ unsafe extern "system" fn vtab_column(
         if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
-        let (start, end) = cursor.spans[cursor.pos];
-        let row_bytes = &cursor.slab[start..end];
+
+        // Fast path 1: Rowid lookup via xColumn(p_cursor, p_ctx, -1)
         if i_col < 0 {
-            let rid = extract_rowid_from_row(row_bytes, vtab);
+            let rid = if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
+                extract_rowid_from_pk_bytes(pk_bytes, vtab)
+            } else {
+                let (start, end) = cursor.spans[cursor.pos];
+                extract_rowid_from_row(&cursor.slab[start..end], vtab)
+            };
             sqlite3_result_int64(p_ctx, rid);
             return SQLITE_OK;
         }
+
+        // Fast path 2: Primary Key column projection with Binary collation directly from cursor.pks
+        if i_col as usize == vtab.pk_col_idx && vtab.pk_collation == ColCollation::Binary {
+            if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
+                if let Some(val) = SqlValue::from_key_bytes(pk_bytes) {
+                    val.set_sqlite_result(p_ctx);
+                    return SQLITE_OK;
+                }
+            }
+        }
+
+        // Lazy Blob Dereference: If this row has a pending external blob that hasn't been read into slab yet
+        if let Some(Some(blob_ptr)) = cursor.lazy_blobs.get(cursor.pos).copied() {
+            let mut eng = match vtab.engine.lock() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            let Some(pk_bytes) = cursor.pks.get(cursor.pos) else {
+                return SQLITE_ERROR;
+            };
+            let conn_id = vtab.db as usize;
+            let deref_res = eng.with_committed_read_for_conn(conn_id, |eng| {
+                eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &blob_ptr, &mut cursor.slab)
+            });
+            let span = match deref_res {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    sqlite3_result_error_code(p_ctx, SQLITE_CORRUPT);
+                    return SQLITE_CORRUPT;
+                }
+                Err(e) => {
+                    let rc = io_err_to_sqlite_rc(&e);
+                    sqlite3_result_error_code(p_ctx, rc);
+                    return rc;
+                }
+            };
+            cursor.spans[cursor.pos] = span;
+            cursor.lazy_blobs[cursor.pos] = None;
+        }
+
+        let (start, end) = cursor.spans[cursor.pos];
+        let row_bytes = &cursor.slab[start..end];
         match project_column_zero_copy(row_bytes, i_col as usize, p_ctx) {
             Ok(()) => SQLITE_OK,
             Err(_) => SQLITE_ERROR,
@@ -1418,6 +1485,10 @@ unsafe extern "system" fn vtab_rowid(
         }
         if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
+        }
+        if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
+            *p_rowid = extract_rowid_from_pk_bytes(pk_bytes, vtab);
+            return SQLITE_OK;
         }
         let (start, end) = cursor.spans[cursor.pos];
         let row_bytes = &cursor.slab[start..end];

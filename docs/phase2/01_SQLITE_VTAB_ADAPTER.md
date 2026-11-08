@@ -88,6 +88,14 @@ To avoid allocating a new `Vec<(Vec<u8>, Vec<u8>)>` of heap-allocated rows on ev
 * **Plan 0 (`Full Table Scan`, `idxNum & 0xFF == 0`):**
   Calls `engine.scan_table_values_into(table_id, None, None, limit, &mut cursor.slab, &mut cursor.spans)` to stream live rows directly into the cursor's contiguous byte slab.
 
+### 3.2 Chunked 256-Row Streaming & Lazy Per-Row Blob Dereference
+To prevent allocating unbounded memory when scanning large tables while keeping SQLite VDBE query plans fully expressive (e.g. queries with residual `WHERE` filters, `LIMIT`, or `ORDER BY`), `AydbCursor` streams records in bounded chunks of `CURSOR_STREAM_CHUNK_ROWS = 256` rows.
+* **Separated Blob Over-Fetching Problem:** When records exceed the inline threshold (`> 1,024 B`) and reside in WiscKey `blob_std_*.db` segments, eagerly dereferencing all 256 blobs on every chunk fetch severely penalizes short range queries (such as `SELECT ... WHERE id >= ? LIMIT 10`), forcing ~25× unnecessary `ReadFile` + `CRC32C` operations for rows SQLite never examines.
+* **Lazy Blob Dereference Design:**
+  1. **Chunk Scan (`scan_range_into_slab` / `scan_secondary_index_into_slab`):** Inline values are appended to `cursor.slab` as usual. For external blobs (`ValueFormat::Blob(blob_ptr)`), the scanner flushes active writer buffers once, records a placeholder span `(0, 0)` in `cursor.spans`, and stores `Some(blob_ptr)` in `cursor.lazy_blobs: Vec<Option<BlobPtr>>`, preserving the primary key in `cursor.pks`.
+  2. **Fast-Path Column Projections:** In `vtab_column`, if the requested column is the primary key (`col_idx == vtab.pk_col_idx` with `ColCollation::Binary`) or the pseudo-rowid column (`i_col < 0`), `aydb` decodes the value directly from `cursor.pks[cursor.pos]` without touching the blob or the slab. On PK-only queries or `COUNT(*)`, zero external blobs are read!
+  3. **On-Demand Dereference:** When any non-PK column of a lazy row is requested, `StorageEngine::dereference_lazy_blob_into` fetches the blob payload directly into `cursor.slab`, updates `cursor.spans[cursor.pos]`, and resets `cursor.lazy_blobs[cursor.pos] = None`. All subsequent column accesses for that row read from the cached slab offset with zero extra I/O.
+
 ---
 
 ## 4. Mutation Mapping (`xUpdate`), Reversible `ROWID`, & Transaction Coalescing

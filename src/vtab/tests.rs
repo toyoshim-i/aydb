@@ -1238,12 +1238,10 @@ fn vtab_keys_only_projection_and_tx_budget() {
     );
 
     // Whereas projecting `body` (`SELECT body FROM docs`) DOES attempt to dereference the
-    // corrupted blob and skips all 5 rows (`Ok(false)` safe blob miss), proving that the
-    // keys-only queries above never touched `blob_std_*.db`!
-    assert_eq!(
-        conn.query_all("SELECT body FROM docs", &[]).unwrap(),
-        Vec::<Vec<SqlValue>>::new(),
-        "reading projected BLOB column must dereference blob_std and skip corrupted blobs"
+    // corrupted blob, proving that the keys-only queries above never touched `blob_std_*.db`!
+    assert!(
+        conn.query_all("SELECT body FROM docs", &[]).is_err(),
+        "reading projected BLOB column must dereference blob_std and fail on corrupted blobs"
     );
 
     // Verify `max_transaction_bytes` rejects an oversized SQL transaction cleanly
@@ -2118,4 +2116,200 @@ fn test_f1_through_f4_audit_regressions() {
         .query_all("SELECT id FROM n WHERE rowid = 'abc'", &[])
         .unwrap();
     assert_eq!(r5, Vec::<Vec<SqlValue>>::new());
+}
+
+#[test]
+fn lazy_blob_dereference_in_cursor_short_range_and_sec_index() {
+    let dir = TempTestDir::new("vtab_lazy_blob");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let engine = Arc::new(Mutex::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+
+    // 1. Table with 2 KB external WiscKey blobs
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_lazy USING aydb(
+            table_id = 55,
+            columns = 'id INT PRIMARY KEY, tag TEXT, payload BLOB'
+        );
+        BEGIN;",
+    )
+    .unwrap();
+
+    let payload_2k = vec![0x7Au8; 2048];
+    {
+        let mut ins = conn
+            .prepare("INSERT INTO t_lazy VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for i in 1..=50i64 {
+            let mut p = payload_2k.clone();
+            p[0] = (i & 0xFF) as u8;
+            ins.execute(&[
+                SqlValue::Integer(i),
+                SqlValue::Text(format!("tag_{i:03}")),
+                SqlValue::Blob(p),
+            ])
+            .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT;").unwrap();
+    engine.lock().unwrap().flush_memtable().unwrap();
+
+    // Insert 10 more in MemTable (total 60 rows)
+    conn.execute_batch("BEGIN;").unwrap();
+    {
+        let mut ins = conn
+            .prepare("INSERT INTO t_lazy VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for i in 51..=60i64 {
+            let mut p = payload_2k.clone();
+            p[0] = (i & 0xFF) as u8;
+            ins.execute(&[
+                SqlValue::Integer(i),
+                SqlValue::Text(format!("tag_{i:03}")),
+                SqlValue::Blob(p),
+            ])
+            .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT;").unwrap();
+
+    // A. Query only PK column: must succeed with zero blob reads
+    let pk_only = conn
+        .query_all("SELECT id FROM t_lazy WHERE id >= 10 LIMIT 5", &[])
+        .unwrap();
+    assert_eq!(
+        pk_only,
+        vec![
+            vec![SqlValue::Integer(10)],
+            vec![SqlValue::Integer(11)],
+            vec![SqlValue::Integer(12)],
+            vec![SqlValue::Integer(13)],
+            vec![SqlValue::Integer(14)],
+        ]
+    );
+
+    // B. Query multiple columns: lazy dereference for visited rows
+    let rows = conn
+        .query_all(
+            "SELECT id, tag, length(payload) FROM t_lazy WHERE id >= 20 LIMIT 4",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                SqlValue::Integer(20),
+                SqlValue::Text("tag_020".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(21),
+                SqlValue::Text("tag_021".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(22),
+                SqlValue::Text("tag_022".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(23),
+                SqlValue::Text("tag_023".into()),
+                SqlValue::Integer(2048)
+            ],
+        ]
+    );
+
+    // C. Non-sequential column projection and repetitive calls on the same row
+    let reorder = conn
+        .query_all(
+            "SELECT length(payload), id, tag, length(payload) FROM t_lazy WHERE id = 30",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        reorder,
+        vec![vec![
+            SqlValue::Integer(2048),
+            SqlValue::Integer(30),
+            SqlValue::Text("tag_030".into()),
+            SqlValue::Integer(2048)
+        ]]
+    );
+
+    // D. COUNT(*) range scan
+    let cnt = conn
+        .query_all("SELECT count(*) FROM t_lazy WHERE id >= 1", &[])
+        .unwrap();
+    assert_eq!(cnt, vec![vec![SqlValue::Integer(60)]]);
+
+    // 2. Secondary Index lazy blob dereference
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_sec_lazy USING aydb(
+            table_id = 56,
+            columns = 'id INT PRIMARY KEY, category TEXT, payload BLOB',
+            indexes = 'category'
+        );
+        BEGIN;",
+    )
+    .unwrap();
+
+    {
+        let mut ins = conn
+            .prepare("INSERT INTO t_sec_lazy VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for i in 1..=40i64 {
+            let cat = if i % 2 == 0 { "alpha" } else { "beta" };
+            ins.execute(&[
+                SqlValue::Integer(i),
+                SqlValue::Text(cat.into()),
+                SqlValue::Blob(payload_2k.clone()),
+            ])
+            .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT;").unwrap();
+    engine.lock().unwrap().flush_memtable().unwrap();
+
+    let sec_rows = conn
+        .query_all(
+            "SELECT id, category, length(payload) FROM t_sec_lazy WHERE category = 'alpha' LIMIT 5",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        sec_rows,
+        vec![
+            vec![
+                SqlValue::Integer(2),
+                SqlValue::Text("alpha".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(4),
+                SqlValue::Text("alpha".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(6),
+                SqlValue::Text("alpha".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(8),
+                SqlValue::Text("alpha".into()),
+                SqlValue::Integer(2048)
+            ],
+            vec![
+                SqlValue::Integer(10),
+                SqlValue::Text("alpha".into()),
+                SqlValue::Integer(2048)
+            ],
+        ]
+    );
 }
