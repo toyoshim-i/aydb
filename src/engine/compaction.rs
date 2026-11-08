@@ -470,8 +470,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ///
     /// Returns `Ok(false)` after deleting the output file if the inputs vanished (another
     /// compaction won), or if the job dropped tombstones but its inputs no longer start at index
-    /// 0. While a transaction is active only the segment list is committed (blob/quota metadata
-    /// may be provisional then).
+    /// 0. While a transaction is active or the memtable is not empty, only the segment list and
+    /// the pending deletes of the replaced files are committed: blob/quota metadata would include
+    /// effects of WAL records beyond the checkpoint, and fully-dead blob segments are reclaimed at
+    /// the next flush instead.
     ///
     /// The superseded `idx_<SeqID>.db` files are queued for deferred deletion. Their readers are
     /// dropped here, but a file still held open elsewhere (e.g. by another in-flight job's `Arc`)
@@ -518,13 +520,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .map(|r| format_idx_file_name(r.seq_id()))
             .collect();
 
-        let in_tx = self.tx_depth > 0;
-        let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if in_tx {
-            (Vec::new(), Vec::new(), Vec::new())
-        } else {
+        // Blob accounting (dead bytes, quotas, reclaim) may only be persisted when it reflects
+        // checkpointed state: WAL replay re-applies the increments of any record newer than the
+        // checkpoint, so persisting them here would count them twice after a crash. The memtable
+        // holds exactly the post-checkpoint mutations.
+        let persist_blob_state = self.tx_depth == 0 && self.memtable.is_empty();
+        let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if persist_blob_state {
             self.collect_fully_dead_blob_segments()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
         };
-        let blob_quota = if in_tx {
+        let blob_quota = if !persist_blob_state {
             None
         } else {
             let std_metas: Vec<StdBlobSegmentMeta> = self

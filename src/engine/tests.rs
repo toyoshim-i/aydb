@@ -3804,3 +3804,31 @@ fn sync_commit_hitting_wal_ring_full_survives_crash() {
         );
     }
 }
+
+#[test]
+fn background_install_with_dirty_memtable_does_not_persist_blob_accounting() {
+    let tmp = TempTestDir::new("install_dirty_memtable");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.max_blob_segment_bytes = 40 * 1024;
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    let v = vec![0xABu8; 16 * 1024];
+    let put = |e: &mut StorageEngine<OsFs>, k: &[u8], v: &[u8]| {
+        e.put_row(1, k, v, &[], WriteDurability::BufferedFast).unwrap();
+    };
+    put(&mut engine, b"k1", &v);
+    put(&mut engine, b"k2", &v);
+    engine.flush_memtable().unwrap();
+    put(&mut engine, b"k3", &v);
+    engine.flush_memtable().unwrap();
+    // The overwrite kills k1's blob, but only in the WAL; it is not checkpointed.
+    put(&mut engine, b"k1", b"small");
+    let job = engine.prepare_compaction().unwrap().unwrap();
+    let out = job.run().unwrap();
+    assert!(engine.install_compaction(out).unwrap());
+    drop(engine);
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(v));
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), Some(b"small".to_vec()));
+}
