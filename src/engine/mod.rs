@@ -12,6 +12,8 @@ mod reader;
 mod scan;
 mod tx;
 
+pub(crate) use tx::CommitStep;
+
 #[cfg(test)]
 mod tests;
 
@@ -269,6 +271,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) tx_depth: usize,
     /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction.
     pub(super) tx_owner_conn: Option<usize>,
+    /// Tracks a commit whose device flush is running outside the engine lock.
+    pub(super) commit_gate: Arc<tx::CommitGate>,
     /// True if `flush_memtable()` was requested during an active transaction.
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
@@ -713,6 +717,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             access_tracker: AccessTracker::new(1, 65_536),
             tx_depth: 0,
             tx_owner_conn: None,
+            commit_gate: Arc::new(tx::CommitGate::default()),
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
             compaction_hook: None,

@@ -21,9 +21,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::engine::{EngineReader, StorageEngine, WriteDurability};
+use crate::engine::{CommitStep, EngineReader, StorageEngine, WriteDurability};
 use crate::engine::LazyBlob;
-use crate::pal::{OsFile, OsFs};
+use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::parse_vtab_ddl;
 use crate::vtab::ffi::{
@@ -1925,9 +1925,19 @@ unsafe extern "system" fn vtab_update(
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.write() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
+        // A commit waiting for its device flush still owns the transaction. Wait for it rather
+        // than report SQLITE_BUSY for what used to be a wait on the engine lock.
+        let mut eng = loop {
+            let eng = match vtab.engine.write() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            let gate = eng.commit_gate();
+            if !gate.is_in_flight() {
+                break eng;
+            }
+            drop(eng);
+            gate.wait_idle();
         };
         if let Err(e) = eng.begin_transaction_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
@@ -1961,11 +1971,22 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.write() {
-            Ok(g) => g,
+        let step = match vtab.engine.write() {
+            Ok(mut eng) => eng.begin_commit_for_conn(vtab.db as usize),
             Err(_) => return SQLITE_ERROR,
         };
-        if let Err(e) = eng.commit_transaction_for_conn(vtab.db as usize) {
+        // The device flush runs without the engine lock so that readers are not held up by it.
+        let committed = step.and_then(|step| match step {
+            CommitStep::Done => Ok(()),
+            CommitStep::AwaitingSync(file) => {
+                let flushed = file.sync_barrier();
+                match vtab.engine.write() {
+                    Ok(mut eng) => eng.finish_commit_for_conn(flushed),
+                    Err(_) => Err(io::Error::other("engine lock poisoned")),
+                }
+            }
+        });
+        if let Err(e) = committed {
             if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
                 rmap.rollback_tx();
             }

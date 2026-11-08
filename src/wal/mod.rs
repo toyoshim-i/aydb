@@ -340,6 +340,8 @@ pub struct WalStreamWriter<F: PlatformFile> {
     scratch_encode_buf: Vec<u8>,
     /// Contiguous staging buffer for coalescing multi-sector batch writes into a single `write_all_at` syscall.
     multi_sector_buf: Vec<u8>,
+    /// When set, a synchronous append leaves the device barrier to the caller.
+    defer_barrier: bool,
 }
 
 impl<F: PlatformFile> WalStreamWriter<F> {
@@ -384,6 +386,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             backup_sector_buf: Box::new([0u8; WAL_SECTOR_SIZE]),
             scratch_encode_buf: Vec::with_capacity(512),
             multi_sector_buf: Vec::new(),
+            defer_barrier: false,
         })
     }
 
@@ -621,7 +624,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             self.multi_sector_buf.clear();
         }
 
-        if self.mode == WalStreamMode::SyncSectorIsolated {
+        if self.mode == WalStreamMode::SyncSectorIsolated && !self.defer_barrier {
             self.file.sync_barrier()?;
         }
 
@@ -629,6 +632,17 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             first_sector_idx,
             sectors_touched,
         })
+    }
+
+    /// Makes synchronous appends skip the device barrier until cleared. The caller then owes
+    /// a `sync_barrier` on [`Self::file_handle`] before treating the appends as durable.
+    pub(crate) fn set_defer_barrier(&mut self, defer: bool) {
+        self.defer_barrier = defer;
+    }
+
+    /// Returns a shared handle to the log file, usable without access to this writer.
+    pub(crate) fn file_handle(&self) -> Arc<F> {
+        Arc::clone(&self.file)
     }
 
     /// Flushes any pending user-space buffered sector data into the OS Page Cache.

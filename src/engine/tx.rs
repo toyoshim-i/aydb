@@ -2,16 +2,64 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::index::IndexValue;
 use crate::lru::CappedTableState;
 use crate::memtable::MemEntry;
-use crate::pal::PlatformFs;
+use crate::pal::{PlatformFile, PlatformFs};
 use crate::wal::{WalBatch, WalRecord};
 
 use super::reader::CxRef;
 use super::{EngineReader, StorageEngine, WriteDurability};
+
+/// Transactions larger than this are split into several WAL batches.
+const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
+
+/// How long [`CommitGate::wait_idle`] sleeps before the caller re-checks the engine.
+const COMMIT_GATE_WAIT: Duration = Duration::from_millis(50);
+
+/// Signals that a commit is waiting for its device flush outside the engine lock.
+///
+/// The owning connection still holds the transaction, so a writer arriving in that window
+/// waits here instead of failing with `SQLITE_BUSY`.
+#[derive(Default)]
+pub(crate) struct CommitGate {
+    in_flight: Mutex<bool>,
+    idle: Condvar,
+}
+
+impl CommitGate {
+    fn set(&self, in_flight: bool) {
+        *self.in_flight.lock().unwrap_or_else(PoisonError::into_inner) = in_flight;
+        if !in_flight {
+            self.idle.notify_all();
+        }
+    }
+
+    /// Returns `true` while a commit is waiting for its device flush.
+    pub(crate) fn is_in_flight(&self) -> bool {
+        *self.in_flight.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Blocks until the flush ends or a short timeout passes. Callers re-check the engine.
+    pub(crate) fn wait_idle(&self) {
+        let guard = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        if *guard {
+            let _ = self.idle.wait_timeout(guard, COMMIT_GATE_WAIT);
+        }
+    }
+}
+
+/// Outcome of [`StorageEngine::begin_commit_for_conn`].
+pub(crate) enum CommitStep<F: PlatformFile> {
+    /// The transaction is fully committed.
+    Done,
+    /// The WAL write is issued. Call `sync_barrier` on the file without holding the engine
+    /// lock, then pass the result to [`StorageEngine::finish_commit_for_conn`].
+    AwaitingSync(Arc<F>),
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct TxMetaSnapshot {
@@ -325,7 +373,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB) or a
         //    single batch that cannot fit even in an empty WAL file.
-        const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
         let wal_total_sectors = match effective_durability {
             WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
             WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
@@ -386,66 +433,132 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
-            // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
-            // moving its entries (no clones). On the failure path above the overlay is discarded
-            // and the MemTable never saw any of the transaction's data.
-            let overlay = core::mem::take(&mut self.tx_overlay.map);
-            self.tx_overlay.clear();
-            self.memtable.absorb(overlay);
-            self.tx_owner_conn = None;
-            self.tx_prepared = false;
-            self.tx_preparing = false;
-            self.pending_tx_bytes = 0;
-            self.savepoints.clear();
-            self.tx_start_meta = TxMetaSnapshot::default();
-
-            let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
-            for tid in capped_table_ids {
-                if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
-                    self.record_maintenance_failure(&e);
-                }
-            }
-
-            let dropped_tables = core::mem::take(&mut self.dropped_tables_in_tx);
-            let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
-            let mut dropped_any_capped = false;
-            for (tid, was_capped) in dropped_tables {
-                if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
-                    self.record_maintenance_failure(&e);
-                }
-                if was_capped {
-                    dropped_any_capped = true;
-                }
-            }
-            let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
-            let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
-            let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
-            if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
-                let quota_metas = self.build_quota_metas();
-                if let Err(e) = self.meta_mgr.commit_update(|st| {
-                    st.table_quotas = quota_metas;
-                }) {
-                    self.record_maintenance_failure(&e);
-                }
-            }
-
-            let maintenance = if do_compact {
-                self.compact()
-            } else if do_flush || self.memtable.should_flush() {
-                self.flush_memtable()
-            } else {
-                Ok(())
-            };
-            if let Err(e) = maintenance {
-                self.record_maintenance_failure(&e);
-            }
-
-            // The transaction is durable at this point; remove rows queued by `Evict`-policy
-            // reads. Best effort: a failure here must not turn a successful commit into an error
-            // (the rows are simply re-detected and re-queued by the next read).
-            let _ = self.drain_corrupt_evictions();
+            self.publish_committed_transaction();
         }
         Ok(())
+    }
+
+    /// Starts a commit for `conn_id` so that the device flush can run outside the engine lock.
+    ///
+    /// A prepared synchronous transaction that fits one WAL batch is written to the log but not
+    /// flushed, and stays active: other connections keep reading the committed state and
+    /// cannot write. Any other transaction is committed here and returns [`CommitStep::Done`].
+    pub(crate) fn begin_commit_for_conn(
+        &mut self,
+        conn_id: usize,
+    ) -> io::Result<CommitStep<FS::File>> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        let deferrable = self.tx_depth == 1
+            && self.tx_prepared
+            && self.pending_tx_sync
+            && self.pending_tx_record_count > 0
+            && self.pending_tx_buf.len() <= MAX_WAL_CHUNK_BYTES;
+        if !deferrable {
+            self.commit_transaction()?;
+            return Ok(CommitStep::Done);
+        }
+
+        // The depth is zero during the append so that a full WAL can rotate, as in
+        // `commit_transaction`.
+        self.tx_depth = 0;
+        self.sync_wal.set_defer_barrier(true);
+        let appended = self.flush_pending_tx_records();
+        self.sync_wal.set_defer_barrier(false);
+        self.tx_depth = 1;
+        if let Err(e) = appended {
+            let _ = self.rollback_transaction();
+            return Err(e);
+        }
+        self.commit_gate.set(true);
+        Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()))
+    }
+
+    /// Completes a commit started by [`Self::begin_commit_for_conn`] with the flush result.
+    ///
+    /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
+    /// the transaction is discarded from memory.
+    pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
+        let result = match flushed {
+            Ok(()) => {
+                self.tx_depth = 0;
+                self.publish_committed_transaction();
+                Ok(())
+            }
+            Err(e) => {
+                let e = self.poison(e);
+                let _ = self.rollback_transaction();
+                Err(e)
+            }
+        };
+        self.commit_gate.set(false);
+        result
+    }
+
+    /// Returns the gate that tracks a commit whose flush is outside the engine lock.
+    pub(crate) fn commit_gate(&self) -> Arc<CommitGate> {
+        Arc::clone(&self.commit_gate)
+    }
+
+    /// Makes a durably logged transaction visible and runs the post-commit maintenance.
+    fn publish_committed_transaction(&mut self) {
+        // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
+        // moving its entries (no clones). On the failure path above the overlay is discarded
+        // and the MemTable never saw any of the transaction's data.
+        let overlay = core::mem::take(&mut self.tx_overlay.map);
+        self.tx_overlay.clear();
+        self.memtable.absorb(overlay);
+        self.tx_owner_conn = None;
+        self.tx_prepared = false;
+        self.tx_preparing = false;
+        self.pending_tx_bytes = 0;
+        self.savepoints.clear();
+        self.tx_start_meta = TxMetaSnapshot::default();
+
+        let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
+        for tid in capped_table_ids {
+            if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
+                self.record_maintenance_failure(&e);
+            }
+        }
+
+        let dropped_tables = core::mem::take(&mut self.dropped_tables_in_tx);
+        let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
+        let mut dropped_any_capped = false;
+        for (tid, was_capped) in dropped_tables {
+            if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
+                self.record_maintenance_failure(&e);
+            }
+            if was_capped {
+                dropped_any_capped = true;
+            }
+        }
+        let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
+        let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
+        let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
+        if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
+            let quota_metas = self.build_quota_metas();
+            if let Err(e) = self.meta_mgr.commit_update(|st| {
+                st.table_quotas = quota_metas;
+            }) {
+                self.record_maintenance_failure(&e);
+            }
+        }
+
+        let maintenance = if do_compact {
+            self.compact()
+        } else if do_flush || self.memtable.should_flush() {
+            self.flush_memtable()
+        } else {
+            Ok(())
+        };
+        if let Err(e) = maintenance {
+            self.record_maintenance_failure(&e);
+        }
+
+        // The transaction is durable at this point; remove rows queued by `Evict`-policy
+        // reads. Best effort: a failure here must not turn a successful commit into an error
+        // (the rows are simply re-detected and re-queued by the next read).
+        let _ = self.drain_corrupt_evictions();
     }
 
     /// Commits an explicit transaction for SQLite connection `conn_id`.
@@ -640,7 +753,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.flush_active_blob_buffers()?;
         }
 
-        const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
         if self.pending_tx_buf.len() <= MAX_WAL_CHUNK_BYTES {
             // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
             // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.

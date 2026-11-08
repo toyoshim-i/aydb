@@ -4490,3 +4490,86 @@ fn point_lookups_resolve_newest_segment_for_inline_blob_and_deleted_rows() {
         assert_eq!(engine.get_row(1, pk).unwrap(), *want, "{pk:?}");
     }
 }
+
+#[test]
+fn deferred_sync_commit_hides_rows_until_the_flush_finishes() {
+    let tmp = TempTestDir::new("deferred_sync_visible");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(1, b"k", b"v", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+
+    let CommitStep::AwaitingSync(file) = engine.begin_commit_for_conn(1).unwrap() else {
+        panic!("a prepared synchronous transaction must defer its flush");
+    };
+    assert!(engine.commit_gate().is_in_flight());
+    assert!(!engine.read_needs_exclusive(2, 1));
+    let (mut slab, mut spans) = (Vec::new(), Vec::new());
+    let visible = engine
+        .reader_for_conn(2)
+        .get_row_into(1, b"k", &mut slab, &mut spans)
+        .unwrap();
+    assert!(!visible, "a commit must stay invisible until it is durable");
+    let err = engine.check_write_allowed_for_conn(2).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+    engine.finish_commit_for_conn(file.sync_barrier()).unwrap();
+    drop(file);
+    assert!(!engine.commit_gate().is_in_flight());
+    assert!(!engine.in_active_transaction());
+    assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
+
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    assert_eq!(reopened.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn failed_deferred_flush_poisons_the_engine_and_discards_the_transaction() {
+    let tmp = TempTestDir::new("deferred_sync_failure");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(1, b"k", b"v", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+    assert!(matches!(
+        engine.begin_commit_for_conn(1).unwrap(),
+        CommitStep::AwaitingSync(_)
+    ));
+
+    let flushed = Err(io::Error::other("simulated flush failure"));
+    assert!(engine.finish_commit_for_conn(flushed).is_err());
+    assert!(engine.is_poisoned());
+    assert!(!engine.commit_gate().is_in_flight());
+    assert!(!engine.in_active_transaction());
+    assert_eq!(engine.get_row(1, b"k").unwrap(), None);
+}
+
+#[test]
+fn buffered_commit_is_not_deferred() {
+    let tmp = TempTestDir::new("deferred_sync_buffered");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(1, b"k", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(matches!(
+        engine.begin_commit_for_conn(1).unwrap(),
+        CommitStep::Done
+    ));
+    assert!(!engine.commit_gate().is_in_flight());
+    assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
+}
