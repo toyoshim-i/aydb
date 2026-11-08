@@ -4491,42 +4491,176 @@ fn point_lookups_resolve_newest_segment_for_inline_blob_and_deleted_rows() {
     }
 }
 
+const GROUP_SYNC: WriteDurability = WriteDurability::SyncTransactional;
+
+fn open_group_engine(tmp: &TempTestDir) -> StorageEngine<OsFs> {
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    StorageEngine::open(fs, EngineConfig::default()).unwrap()
+}
+
+fn row_visible_to(engine: &StorageEngine<OsFs>, conn: usize, key: &[u8]) -> Option<Vec<u8>> {
+    let (mut slab, mut spans) = (Vec::new(), Vec::new());
+    engine
+        .reader_for_conn(conn)
+        .get_row_into(1, key, &mut slab, &mut spans)
+        .unwrap()
+        .then_some(slab)
+}
+
+type GroupTicket = (u64, Arc<<OsFs as PlatformFs>::File>, Arc<tx::CommitGate>);
+
+fn commit_into_group(
+    engine: &mut StorageEngine<OsFs>,
+    conn: usize,
+    key: &[u8],
+    value: &[u8],
+) -> GroupTicket {
+    engine.begin_transaction_for_conn(conn).unwrap();
+    engine.put_row(1, key, value, &[], GROUP_SYNC).unwrap();
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    match engine.begin_commit_for_conn(conn).unwrap() {
+        CommitStep::AwaitingGroup { lsn, file, gate } => (lsn, file, gate),
+        _ => panic!("a plain synchronous transaction must join the group commit"),
+    }
+}
+
+fn flush_group(engine: &mut StorageEngine<OsFs>, ticket: &GroupTicket) -> u64 {
+    let GroupRole::Lead(target) = ticket.2.join_group(ticket.0).unwrap() else {
+        panic!("no flush has run, so this commit must lead");
+    };
+    engine.finish_group_flush(target, ticket.1.sync_barrier()).unwrap();
+    target
+}
+
 #[test]
-fn deferred_sync_commit_hides_rows_until_the_flush_finishes() {
-    let tmp = TempTestDir::new("deferred_sync_visible");
+fn group_commit_is_visible_to_the_next_writer_but_not_to_readers_until_durable() {
+    let tmp = TempTestDir::new("group_visibility");
+    let mut engine = open_group_engine(&tmp);
+    let first = commit_into_group(&mut engine, 1, b"a", b"1");
+
+    assert!(!engine.in_active_transaction(), "the writer slot must be free");
+    assert_eq!(row_visible_to(&engine, 2, b"a"), None);
+
+    engine.begin_transaction_for_conn(2).unwrap();
+    assert_eq!(engine.get_row(1, b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(row_visible_to(&engine, 3, b"a"), None, "readers must wait for durability");
+    engine.rollback_transaction().unwrap();
+
+    flush_group(&mut engine, &first);
+    assert!(matches!(first.2.join_group(first.0).unwrap(), GroupRole::Durable));
+    assert_eq!(row_visible_to(&engine, 3, b"a"), Some(b"1".to_vec()));
+}
+
+#[test]
+fn one_flush_makes_every_appended_commit_durable_in_order() {
+    let tmp = TempTestDir::new("group_order");
+    let mut engine = open_group_engine(&tmp);
+    let first = commit_into_group(&mut engine, 1, b"k", b"old");
+    let second = commit_into_group(&mut engine, 2, b"k", b"new");
+    assert_eq!(engine.pending_group[1].1.len(), 1, "a batch must hold only its own writes");
+
+    assert_eq!(flush_group(&mut engine, &first), second.0);
+    assert!(matches!(second.2.join_group(second.0).unwrap(), GroupRole::Durable));
+    assert!(engine.pending_group.is_empty());
+    assert_eq!(row_visible_to(&engine, 9, b"k"), Some(b"new".to_vec()));
+}
+
+#[test]
+fn rolling_back_a_later_writer_keeps_the_earlier_group_commit() {
+    let tmp = TempTestDir::new("group_rollback");
+    let mut engine = open_group_engine(&tmp);
+    let first = commit_into_group(&mut engine, 1, b"a", b"1");
+    engine.begin_transaction_for_conn(2).unwrap();
+    engine.put_row(1, b"a", b"2", &[], GROUP_SYNC).unwrap();
+    engine.rollback_transaction_for_conn(2).unwrap();
+
+    flush_group(&mut engine, &first);
+    assert_eq!(row_visible_to(&engine, 9, b"a"), Some(b"1".to_vec()));
+}
+
+#[test]
+fn failed_group_flush_poisons_the_engine_and_fails_every_waiter() {
+    let tmp = TempTestDir::new("group_failure");
+    let mut engine = open_group_engine(&tmp);
+    let first = commit_into_group(&mut engine, 1, b"a", b"1");
+    let second = commit_into_group(&mut engine, 2, b"b", b"2");
+    let GroupRole::Lead(target) = first.2.join_group(first.0).unwrap() else {
+        panic!("this commit must lead");
+    };
+    let flushed = Err(io::Error::other("simulated flush failure"));
+    assert!(engine.finish_group_flush(target, flushed).is_err());
+
+    assert!(engine.is_poisoned());
+    assert!(second.2.join_group(second.0).is_err());
+    assert_eq!(row_visible_to(&engine, 9, b"a"), None);
+}
+
+#[test]
+fn memtable_flush_includes_commits_still_waiting_for_their_group_flush() {
+    let tmp = TempTestDir::new("group_flush_memtable");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+    let ticket = commit_into_group(&mut engine, 1, b"a", b"1");
+
+    engine.flush_memtable().unwrap();
+    assert!(engine.pending_group.is_empty());
+    assert!(matches!(ticket.2.join_group(ticket.0).unwrap(), GroupRole::Durable));
+
+    drop(ticket);
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    assert_eq!(reopened.get_row(1, b"a").unwrap(), Some(b"1".to_vec()));
+}
+
+#[test]
+fn buffered_commit_first_makes_earlier_group_commits_durable() {
+    let tmp = TempTestDir::new("group_then_buffered");
+    let mut engine = open_group_engine(&tmp);
+    let ticket = commit_into_group(&mut engine, 1, b"a", b"1");
+    engine.begin_transaction_for_conn(2).unwrap();
+    engine
+        .put_row(1, b"b", b"2", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(matches!(engine.begin_commit_for_conn(2).unwrap(), CommitStep::Done));
+
+    assert!(matches!(ticket.2.join_group(ticket.0).unwrap(), GroupRole::Durable));
+    assert_eq!(row_visible_to(&engine, 9, b"a"), Some(b"1".to_vec()));
+    assert_eq!(row_visible_to(&engine, 9, b"b"), Some(b"2".to_vec()));
+}
+
+#[test]
+fn transaction_without_writes_does_not_publish_undurable_commits() {
+    let tmp = TempTestDir::new("group_read_only");
+    let mut engine = open_group_engine(&tmp);
+    let _ticket = commit_into_group(&mut engine, 1, b"a", b"1");
+    engine.begin_transaction_for_conn(2).unwrap();
+    engine.commit_transaction_for_conn(2).unwrap();
+    assert_eq!(row_visible_to(&engine, 9, b"a"), None);
+}
+
+#[test]
+fn commit_needing_maintenance_flushes_with_the_transaction_still_active() {
+    let tmp = TempTestDir::new("deferred_sync_maintenance");
+    let mut engine = open_group_engine(&tmp);
     engine.begin_transaction_for_conn(1).unwrap();
-    engine
-        .put_row(1, b"k", b"v", &[], WriteDurability::SyncTransactional)
-        .unwrap();
-    engine
-        .prepare_commit_transaction(WriteDurability::SyncTransactional)
-        .unwrap();
+    engine.put_row(1, b"k", b"v", &[], GROUP_SYNC).unwrap();
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    engine.deferred_flush_on_commit = true;
 
     let CommitStep::AwaitingSync(file) = engine.begin_commit_for_conn(1).unwrap() else {
-        panic!("a prepared synchronous transaction must defer its flush");
+        panic!("a commit with deferred maintenance cannot join the group");
     };
-    assert!(engine.commit_gate().is_in_flight());
-    assert!(!engine.read_needs_exclusive(2, 1));
-    let (mut slab, mut spans) = (Vec::new(), Vec::new());
-    let visible = engine
-        .reader_for_conn(2)
-        .get_row_into(1, b"k", &mut slab, &mut spans)
-        .unwrap();
-    assert!(!visible, "a commit must stay invisible until it is durable");
+    assert!(engine.in_active_transaction());
+    assert_eq!(row_visible_to(&engine, 2, b"k"), None);
     let err = engine.check_write_allowed_for_conn(2).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 
     engine.finish_commit_for_conn(file.sync_barrier()).unwrap();
-    drop(file);
-    assert!(!engine.commit_gate().is_in_flight());
     assert!(!engine.in_active_transaction());
     assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
-
-    drop(engine);
-    let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
-    assert_eq!(reopened.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
@@ -4535,12 +4669,9 @@ fn failed_deferred_flush_poisons_the_engine_and_discards_the_transaction() {
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     engine.begin_transaction_for_conn(1).unwrap();
-    engine
-        .put_row(1, b"k", b"v", &[], WriteDurability::SyncTransactional)
-        .unwrap();
-    engine
-        .prepare_commit_transaction(WriteDurability::SyncTransactional)
-        .unwrap();
+    engine.put_row(1, b"k", b"v", &[], GROUP_SYNC).unwrap();
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    engine.deferred_flush_on_commit = true;
     assert!(matches!(
         engine.begin_commit_for_conn(1).unwrap(),
         CommitStep::AwaitingSync(_)
@@ -4549,7 +4680,6 @@ fn failed_deferred_flush_poisons_the_engine_and_discards_the_transaction() {
     let flushed = Err(io::Error::other("simulated flush failure"));
     assert!(engine.finish_commit_for_conn(flushed).is_err());
     assert!(engine.is_poisoned());
-    assert!(!engine.commit_gate().is_in_flight());
     assert!(!engine.in_active_transaction());
     assert_eq!(engine.get_row(1, b"k").unwrap(), None);
 }
@@ -4570,6 +4700,5 @@ fn buffered_commit_is_not_deferred() {
         engine.begin_commit_for_conn(1).unwrap(),
         CommitStep::Done
     ));
-    assert!(!engine.commit_gate().is_in_flight());
     assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
 }

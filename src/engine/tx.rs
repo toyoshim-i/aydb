@@ -17,38 +17,114 @@ use super::{EngineReader, StorageEngine, WriteDurability};
 /// Transactions larger than this are split into several WAL batches.
 const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
 
-/// How long [`CommitGate::wait_idle`] sleeps before the caller re-checks the engine.
+/// Upper bound on one condition-variable wait. Callers re-check their condition afterwards.
 const COMMIT_GATE_WAIT: Duration = Duration::from_millis(50);
 
-/// Signals that a commit is waiting for its device flush outside the engine lock.
-///
-/// The owning connection still holds the transaction, so a writer arriving in that window
-/// waits here instead of failing with `SQLITE_BUSY`.
+/// A failed group flush as reported to every commit of the group.
+fn group_flush_error(message: &str) -> io::Error {
+    io::Error::other(format!("group commit flush failed: {message}"))
+}
+
+#[derive(Default)]
+struct GateState {
+    /// Number of transactions that ended, used by writers waiting for their turn.
+    tx_ends: u64,
+    /// Highest LSN written to `wal_sync.db`.
+    appended: u64,
+    /// Every LSN below this value is durable.
+    durable_end: u64,
+    /// True while one commit is running the device flush for the group.
+    leader_active: bool,
+    failed: Option<String>,
+}
+
+/// Coordinates writers that wait for a transaction to end and commits that share a device flush.
 #[derive(Default)]
 pub(crate) struct CommitGate {
-    in_flight: Mutex<bool>,
-    idle: Condvar,
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+/// What a commit waiting for durability has to do next.
+pub(crate) enum GroupRole {
+    /// The commit's WAL batch is durable and published.
+    Durable,
+    /// The caller runs the device flush, which covers every batch up to this LSN.
+    Lead(u64),
 }
 
 impl CommitGate {
-    fn set(&self, in_flight: bool) {
-        *self.in_flight.lock().unwrap_or_else(PoisonError::into_inner) = in_flight;
-        if !in_flight {
-            self.idle.notify_all();
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn tx_ended(&self) {
+        self.lock().tx_ends += 1;
+        self.changed.notify_all();
+    }
+
+    fn note_appended(&self, lsn: u64) {
+        let mut state = self.lock();
+        state.appended = state.appended.max(lsn);
+    }
+
+    fn mark_durable(&self, lsn: u64, ends_leadership: bool) {
+        let mut state = self.lock();
+        state.durable_end = state.durable_end.max(lsn + 1);
+        if ends_leadership {
+            state.leader_active = false;
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, error: &io::Error) {
+        let mut state = self.lock();
+        state.failed = Some(error.to_string());
+        state.leader_active = false;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Count of ended transactions. Read it under the engine lock before waiting, so that a
+    /// transaction ending right after the lock is released is not missed.
+    pub(crate) fn tx_end_count(&self) -> u64 {
+        self.lock().tx_ends
+    }
+
+    /// Blocks until a transaction ended after `seen` or `timeout` passed.
+    pub(crate) fn wait_tx_end(&self, seen: u64, timeout: Duration) {
+        let guard = self.lock();
+        let _ = self
+            .changed
+            .wait_timeout_while(guard, timeout.min(COMMIT_GATE_WAIT), |s| s.tx_ends == seen);
+    }
+
+    /// Waits until the batch at `lsn` is durable or this caller has to run the device flush.
+    pub(crate) fn join_group(&self, lsn: u64) -> io::Result<GroupRole> {
+        let mut state = self.lock();
+        loop {
+            if let Some(message) = &state.failed {
+                return Err(group_flush_error(message));
+            }
+            if state.durable_end > lsn {
+                return Ok(GroupRole::Durable);
+            }
+            if !state.leader_active {
+                state.leader_active = true;
+                return Ok(GroupRole::Lead(state.appended));
+            }
+            state = self
+                .changed
+                .wait_timeout(state, COMMIT_GATE_WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
-    /// Returns `true` while a commit is waiting for its device flush.
-    pub(crate) fn is_in_flight(&self) -> bool {
-        *self.in_flight.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Blocks until the flush ends or a short timeout passes. Callers re-check the engine.
-    pub(crate) fn wait_idle(&self) {
-        let guard = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-        if *guard {
-            let _ = self.idle.wait_timeout(guard, COMMIT_GATE_WAIT);
-        }
+    /// Records that the flush leader could not report a result.
+    pub(crate) fn abandon_flush(&self, error: &io::Error) {
+        self.fail(error);
     }
 }
 
@@ -56,9 +132,17 @@ impl CommitGate {
 pub(crate) enum CommitStep<F: PlatformFile> {
     /// The transaction is fully committed.
     Done,
-    /// The WAL write is issued. Call `sync_barrier` on the file without holding the engine
-    /// lock, then pass the result to [`StorageEngine::finish_commit_for_conn`].
+    /// The WAL write is issued and the transaction stays active. Call `sync_barrier` on the file
+    /// without holding the engine lock, then pass the result to
+    /// [`StorageEngine::finish_commit_for_conn`].
     AwaitingSync(Arc<F>),
+    /// The WAL write is issued and the next writer may start. Loop on
+    /// [`CommitGate::join_group`] until the batch is durable.
+    AwaitingGroup {
+        lsn: u64,
+        file: Arc<F>,
+        gate: Arc<CommitGate>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -161,6 +245,31 @@ impl TxOverlay {
         true
     }
 
+    fn note_key(&mut self, key: &[u8]) {
+        match &mut self.min_key {
+            Some(min) if key < min.as_slice() => *min = key.to_vec(),
+            None => self.min_key = Some(key.to_vec()),
+            _ => {}
+        }
+        match &mut self.max_key {
+            Some(max) if key > max.as_slice() => *max = key.to_vec(),
+            None => self.max_key = Some(key.to_vec()),
+            _ => {}
+        }
+        let h1 = crate::util::crc32c::crc32c_append(0, key);
+        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, key);
+        self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
+        self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
+    }
+
+    /// Adds `entries`, which belong to earlier transactions, without an undo record.
+    fn seed(&mut self, entries: &BTreeMap<Vec<u8>, MemEntry>) {
+        for (key, entry) in entries {
+            self.note_key(key);
+            self.map.insert(key.clone(), entry.clone());
+        }
+    }
+
     pub(super) fn apply(&mut self, lsn: u64, rec: WalRecord, record_undo: bool) {
         let (key, value) = match rec {
             WalRecord::PutInline { key, value } => (key, IndexValue::Inline(value)),
@@ -168,21 +277,7 @@ impl TxOverlay {
             WalRecord::Delete { key } => (key, IndexValue::Tombstone),
             WalRecord::TxBegin | WalRecord::TxCommit => return,
         };
-
-        match &mut self.min_key {
-            Some(min) if key < *min => *min = key.clone(),
-            None => self.min_key = Some(key.clone()),
-            _ => {}
-        }
-        match &mut self.max_key {
-            Some(max) if key > *max => *max = key.clone(),
-            None => self.max_key = Some(key.clone()),
-            _ => {}
-        }
-        let h1 = crate::util::crc32c::crc32c_append(0, &key);
-        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, &key);
-        self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
-        self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
+        self.note_key(&key);
 
         if record_undo {
             let undo_key = key.clone();
@@ -262,6 +357,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_prepared = false;
             self.tx_preparing = false;
             self.pending_tx_bytes = 0;
+            self.seed_overlay_from_pending();
         }
         self.tx_depth += 1;
     }
@@ -288,6 +384,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_prepared = false;
             self.tx_preparing = false;
             self.pending_tx_bytes = 0;
+            self.seed_overlay_from_pending();
         }
         self.tx_depth += 1;
         Ok(())
@@ -424,6 +521,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Err(e);
             }
         }
+        if self.tx_depth == 1 {
+            if self.pending_tx_record_count == 0 {
+                // Nothing of its own to publish: drop what it saw from earlier, undurable commits.
+                self.tx_overlay.clear();
+            } else if let Err(e) = self.drain_pending_durable() {
+                let _ = self.rollback_transaction();
+                return Err(e);
+            }
+        }
         if self.tx_depth > 0 {
             self.tx_depth -= 1;
         }
@@ -440,9 +546,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Starts a commit for `conn_id` so that the device flush can run outside the engine lock.
     ///
-    /// A prepared synchronous transaction that fits one WAL batch is written to the log but not
-    /// flushed, and stays active: other connections keep reading the committed state and
-    /// cannot write. Any other transaction is committed here and returns [`CommitStep::Done`].
+    /// A plain prepared synchronous transaction is written to the log and handed over to the
+    /// group commit: the next writer can start at once and sees this transaction, while readers
+    /// do not until a flush has made it durable. A synchronous transaction that needs
+    /// post-commit maintenance is written to the log and stays active during its flush. Any
+    /// other transaction is committed here and returns [`CommitStep::Done`].
     pub(crate) fn begin_commit_for_conn(
         &mut self,
         conn_id: usize,
@@ -457,6 +565,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.commit_transaction()?;
             return Ok(CommitStep::Done);
         }
+        let groupable = self.capped_tables.is_empty()
+            && self.dropped_tables_in_tx.is_empty()
+            && !self.quotas_modified_in_tx
+            && !self.deferred_flush_on_commit
+            && !self.deferred_compact_on_commit
+            && !self.memtable.should_flush()
+            && !self.has_pending_corrupt_evictions();
+        if !groupable {
+            if let Err(e) = self.drain_pending_durable() {
+                let _ = self.rollback_transaction();
+                return Err(e);
+            }
+        }
 
         // The depth is zero during the append so that a full WAL can rotate, as in
         // `commit_transaction`.
@@ -469,8 +590,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let _ = self.rollback_transaction();
             return Err(e);
         }
-        self.commit_gate.set(true);
-        Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()))
+        if !groupable {
+            return Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()));
+        }
+
+        let lsn = self.next_lsn - 1;
+        let first_own_lsn = self.tx_start_meta.next_lsn;
+        let mut own_entries = core::mem::take(&mut self.tx_overlay.map);
+        self.tx_overlay.clear();
+        own_entries.retain(|_, entry| entry.lsn >= first_own_lsn);
+        self.pending_group.push_back((lsn, own_entries));
+        self.commit_gate.note_appended(lsn);
+        self.tx_depth = 0;
+        self.finalize_tx_state();
+        Ok(CommitStep::AwaitingGroup {
+            lsn,
+            file: self.sync_wal.file_handle(),
+            gate: Arc::clone(&self.commit_gate),
+        })
     }
 
     /// Completes a commit started by [`Self::begin_commit_for_conn`] with the flush result.
@@ -478,7 +615,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
     /// the transaction is discarded from memory.
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
-        let result = match flushed {
+        match flushed {
             Ok(()) => {
                 self.tx_depth = 0;
                 self.publish_committed_transaction();
@@ -489,12 +626,77 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let _ = self.rollback_transaction();
                 Err(e)
             }
-        };
-        self.commit_gate.set(false);
-        result
+        }
     }
 
-    /// Returns the gate that tracks a commit whose flush is outside the engine lock.
+    /// Publishes every group-committed batch up to `target` after the leader's device flush.
+    ///
+    /// A failed flush poisons the engine and fails every commit waiting on the group.
+    pub(crate) fn finish_group_flush(
+        &mut self,
+        target: u64,
+        flushed: io::Result<()>,
+    ) -> io::Result<()> {
+        match flushed {
+            Ok(()) => {
+                self.absorb_durable_through(target);
+                self.commit_gate.mark_durable(target, true);
+                Ok(())
+            }
+            Err(e) => {
+                self.commit_gate.fail(&e);
+                Err(self.poison(e))
+            }
+        }
+    }
+
+    /// Flushes and publishes every group-committed batch. Paths that rotate the WAL, flush the
+    /// MemTable, or write to it directly call this first, because they rely on the MemTable
+    /// holding all earlier commits.
+    pub(super) fn drain_pending_durable(&mut self) -> io::Result<()> {
+        let Some(&(target, _)) = self.pending_group.back() else {
+            return Ok(());
+        };
+        if let Err(e) = self.sync_wal.file_handle().sync_barrier() {
+            self.commit_gate.fail(&e);
+            return Err(self.poison(e));
+        }
+        self.absorb_durable_through(target);
+        self.commit_gate.mark_durable(target, false);
+        Ok(())
+    }
+
+    fn absorb_durable_through(&mut self, target: u64) {
+        while self.pending_group.front().is_some_and(|(lsn, _)| *lsn <= target) {
+            if let Some((_, entries)) = self.pending_group.pop_front() {
+                self.memtable.absorb(entries);
+            }
+        }
+    }
+
+    fn seed_overlay_from_pending(&mut self) {
+        let Self {
+            pending_group,
+            tx_overlay,
+            ..
+        } = self;
+        for (_, entries) in pending_group.iter() {
+            tx_overlay.seed(entries);
+        }
+    }
+
+    /// Clears the per-transaction state once the transaction no longer owns the writer slot.
+    fn finalize_tx_state(&mut self) {
+        self.tx_owner_conn = None;
+        self.tx_prepared = false;
+        self.tx_preparing = false;
+        self.pending_tx_bytes = 0;
+        self.savepoints.clear();
+        self.tx_start_meta = TxMetaSnapshot::default();
+        self.commit_gate.tx_ended();
+    }
+
+    /// Returns the gate that coordinates waiting writers and group commits.
     pub(crate) fn commit_gate(&self) -> Arc<CommitGate> {
         Arc::clone(&self.commit_gate)
     }
@@ -507,12 +709,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let overlay = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
         self.memtable.absorb(overlay);
-        self.tx_owner_conn = None;
-        self.tx_prepared = false;
-        self.tx_preparing = false;
-        self.pending_tx_bytes = 0;
-        self.savepoints.clear();
-        self.tx_start_meta = TxMetaSnapshot::default();
+        self.finalize_tx_state();
 
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in capped_table_ids {
@@ -591,6 +788,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_overlay.clear();
         let snap = core::mem::take(&mut self.tx_start_meta);
         self.restore_tx_state(0, &snap);
+        self.commit_gate.tx_ended();
         Ok(())
     }
 

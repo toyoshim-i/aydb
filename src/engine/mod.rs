@@ -12,7 +12,7 @@ mod reader;
 mod scan;
 mod tx;
 
-pub(crate) use tx::CommitStep;
+pub(crate) use tx::{CommitStep, GroupRole};
 
 #[cfg(test)]
 mod tests;
@@ -176,6 +176,9 @@ pub struct EngineConfig {
     /// Backpressure bound for `background_compaction`: once the segment count reaches this value
     /// the flush falls back to inline compaction. `0` means `2 * auto_compact_segment_threshold`.
     pub max_segments_before_inline_compaction: usize,
+    /// How long a SQL writer waits for another connection's transaction to end before failing
+    /// with `SQLITE_BUSY` (`0` fails immediately).
+    pub writer_wait_timeout_ms: u32,
     /// Maximum uncommitted transaction payload + WAL record budget in bytes (`0` = unlimited).
     pub max_transaction_bytes: usize,
     /// Total capacity for in-process verified 4 KB index block cache (`0` disables block cache).
@@ -199,6 +202,7 @@ impl Default for EngineConfig {
             auto_compact_segment_threshold: DEFAULT_AUTO_COMPACT_SEGMENT_THRESHOLD,
             background_compaction: false,
             max_segments_before_inline_compaction: 0,
+            writer_wait_timeout_ms: 1_000,
             max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
             block_cache_bytes: DEFAULT_BLOCK_CACHE_BYTES,
             blob_cache_bytes: DEFAULT_BLOB_CACHE_BYTES,
@@ -271,8 +275,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) tx_depth: usize,
     /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction.
     pub(super) tx_owner_conn: Option<usize>,
-    /// Tracks a commit whose device flush is running outside the engine lock.
+    /// Coordinates writers waiting for their turn and commits sharing a device flush.
     pub(super) commit_gate: Arc<tx::CommitGate>,
+    /// Committed batches written to `wal_sync.db` whose device flush has not finished, in LSN
+    /// order, as `(batch LSN, entries)`. The next writer's overlay starts from these entries;
+    /// readers see them only after they move to the `MemTable`.
+    pub(super) pending_group: std::collections::VecDeque<(u64, BTreeMap<Vec<u8>, crate::memtable::MemEntry>)>,
     /// True if `flush_memtable()` was requested during an active transaction.
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
@@ -718,6 +726,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_depth: 0,
             tx_owner_conn: None,
             commit_gate: Arc::new(tx::CommitGate::default()),
+            pending_group: std::collections::VecDeque::new(),
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
             compaction_hook: None,
@@ -822,6 +831,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.poisoned = Some(e.to_string());
         }
         e
+    }
+
+    /// How long a SQL writer waits for its turn before failing with `SQLITE_BUSY`.
+    pub(crate) fn writer_wait_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.config.writer_wait_timeout_ms))
+    }
+
+    pub(super) fn has_pending_corrupt_evictions(&self) -> bool {
+        self.pending_corrupt_evictions
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true)
     }
 
     pub fn next_lsn(&self) -> u64 {
@@ -2543,6 +2564,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(lsn);
         }
 
+        self.drain_pending_durable()?;
         let batch = WalBatch::new(lsn, records);
         let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
         batch.encode_into(&mut raw);
@@ -2604,6 +2626,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let outcome = r.map_err(|e| self.poison(e))?;
 
         if outcome == WalAppendOutcome::RingFull {
+            self.drain_pending_durable()?;
             if self.memtable.is_empty() {
                 self.rotate_wal_epochs_only()?;
             } else {

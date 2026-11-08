@@ -17,11 +17,12 @@ mod tests;
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;
 use std::io;
+use std::time::Instant;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::engine::{CommitStep, EngineReader, StorageEngine, WriteDurability};
+use crate::engine::{CommitStep, EngineReader, GroupRole, StorageEngine, WriteDurability};
 use crate::engine::LazyBlob;
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
@@ -1925,22 +1926,29 @@ unsafe extern "system" fn vtab_update(
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        // A commit waiting for its device flush still owns the transaction. Wait for it rather
-        // than report SQLITE_BUSY for what used to be a wait on the engine lock.
-        let mut eng = loop {
-            let eng = match vtab.engine.write() {
+        // Wait for a transaction on another connection to end. The wait is bounded because that
+        // connection may be held open by the same thread, which could never end it.
+        let mut deadline = None;
+        loop {
+            let mut eng = match vtab.engine.write() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
-            let gate = eng.commit_gate();
-            if !gate.is_in_flight() {
-                break eng;
+            match eng.begin_transaction_for_conn(vtab.db as usize) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let now = Instant::now();
+                    let end = *deadline.get_or_insert(now + eng.writer_wait_timeout());
+                    if now >= end {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                    let gate = eng.commit_gate();
+                    let seen = gate.tx_end_count();
+                    drop(eng);
+                    gate.wait_tx_end(seen, end - now);
+                }
+                Err(e) => return io_err_to_sqlite_rc(&e),
             }
-            drop(eng);
-            gate.wait_idle();
-        };
-        if let Err(e) = eng.begin_transaction_for_conn(vtab.db as usize) {
-            return io_err_to_sqlite_rc(&e);
         }
         if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
             rmap.begin_tx();
@@ -1985,6 +1993,22 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                     Err(_) => Err(io::Error::other("engine lock poisoned")),
                 }
             }
+            CommitStep::AwaitingGroup { lsn, file, gate } => loop {
+                match gate.join_group(lsn)? {
+                    GroupRole::Durable => break Ok(()),
+                    GroupRole::Lead(target) => {
+                        let flushed = file.sync_barrier();
+                        match vtab.engine.write() {
+                            Ok(mut eng) => eng.finish_group_flush(target, flushed)?,
+                            Err(_) => {
+                                let e = io::Error::other("engine lock poisoned");
+                                gate.abandon_flush(&e);
+                                break Err(e);
+                            }
+                        }
+                    }
+                }
+            },
         });
         if let Err(e) = committed {
             if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {

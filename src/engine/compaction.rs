@@ -138,6 +138,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
         self.drain_corrupt_evictions()?;
+        self.drain_pending_durable()?;
         if !self.memtable.is_empty() {
             return self.flush_memtable();
         }
@@ -190,6 +191,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_flush_on_commit = true;
             return Ok(());
         }
+        self.drain_pending_durable()?;
         self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {

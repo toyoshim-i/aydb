@@ -2874,3 +2874,45 @@ fn lazy_blob_scan_prefetches_each_window_and_survives_chunk_reloads() {
         assert_eq!(eng.blob_cache().hits(), 700 * (pass + 1), "pass {pass}");
     }
 }
+
+#[test]
+fn concurrent_sync_writers_queue_without_busy_or_lost_updates() {
+    const WRITERS: usize = 4;
+    const INCREMENTS: i64 = 50;
+    const DDL: &str =
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, durability='sync', columns='id INTEGER PRIMARY KEY, n INTEGER')";
+
+    let tmp = TempTestDir::new("vtab_group_commit");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let shared = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let setup = SqliteConnection::open_in_memory().unwrap();
+    setup.register_aydb_module(Arc::clone(&shared)).unwrap();
+    setup.execute_batch(DDL).unwrap();
+    setup.execute_batch("INSERT INTO t VALUES (1, 0);").unwrap();
+
+    let ready = Arc::new(std::sync::Barrier::new(WRITERS));
+    let threads: Vec<_> = (0..WRITERS)
+        .map(|_| {
+            let (shared, ready) = (Arc::clone(&shared), Arc::clone(&ready));
+            std::thread::spawn(move || {
+                let conn = SqliteConnection::open_in_memory().unwrap();
+                conn.register_aydb_module_with_options(shared, false).unwrap();
+                conn.execute_batch(DDL).unwrap();
+                ready.wait();
+                for _ in 0..INCREMENTS {
+                    conn.execute_batch("UPDATE t SET n = n + 1 WHERE id = 1;").unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    assert_eq!(
+        setup.query_all("SELECT n FROM t WHERE id = 1", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(WRITERS as i64 * INCREMENTS)]]
+    );
+}
