@@ -83,7 +83,7 @@ flowchart TB
     subgraph Disk["3. Non-Volatile Disk / Exclusive SMB Share (dwShareMode = 0)"]
         direction LR
         BootMeta["boot_meta.db (8 KB)<br/>Slot A (4 KB) | Slot B (4 KB)"]
-        WalFile["wal_sync.db (2 MB) & wal_buf.db (16 MB)<br/>4 KB Sector Rings with WalEpoch"]
+        WalFile["wal_sync.db (8 MB) & wal_buf.db (16 MB)<br/>4 KB Sector Rings with WalEpoch"]
         IdxFiles["idx_<SeqID>.db<br/>Immutable Sorted 4 KB Blocks"]
         BlobFiles["blob_std_<SeqID>.db<br/>blob_lru_<TblID>_<SeqID>.db"]
     end

@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph Disk["OS Cache Manager & Non-Volatile Storage (dwShareMode = 0)"]
         META["boot_meta.db (8 KB Ping-Pong)<br/>Rename-Free Atomic Manifest + Deferred GC"]
-        WAL["Dual-Stream Epoch WAL (src/wal/)<br/>wal_sync.db (2 MB WRITE_THROUGH) & wal_buf.db (16 MB Buffered)"]
+        WAL["Dual-Stream Epoch WAL (src/wal/)<br/>wal_sync.db (8 MB WRITE_THROUGH) & wal_buf.db (16 MB Buffered)"]
         IDX["idx_<SeqID>.db (RANDOM_ACCESS; SEQUENTIAL_SCAN in Compaction)<br/>Immutable 4 KB Offset-Indexed SSTables"]
         BLOB["blob_std_<SeqID>.db & blob_lru_<TblID>_<SeqID>.db<br/>Append-Only Blobs (Random Point Read + Buffered Append)"]
     end

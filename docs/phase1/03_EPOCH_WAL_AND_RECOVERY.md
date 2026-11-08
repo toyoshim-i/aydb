@@ -18,7 +18,7 @@ A conventional rolling WAL (creating a new log file per MemTable flush, appendin
 ### How `aydb` Solves All Four Challenges
 
 1. **Pre-Allocated Fixed-Size Sector Rings (`WalEpoch` Reuse):**
-   `wal_sync.db` (default `2 MB` = 512 sectors of 4 KB, `PhysicalZeroFill`) and `wal_buf.db` (default `16 MB` = 4,096 sectors of 4 KB, `LogicalExtendOnly`) are pre-allocated once and never resized or deleted. When a `MemTable` flushes, the engine increments `sync_wal_epoch` and `buf_wal_epoch` in `boot_meta.db` and wraps the write cursor back to Sector 0 with **zero file truncation and zero disk clearing**.
+   `wal_sync.db` (default `8 MB` = 2,048 sectors of 4 KB, `PhysicalZeroFill`) and `wal_buf.db` (default `16 MB` = 4,096 sectors of 4 KB, `LogicalExtendOnly`) are pre-allocated once and never resized or deleted. When a `MemTable` flushes, the engine increments `sync_wal_epoch` and `buf_wal_epoch` in `boot_meta.db` and wraps the write cursor back to Sector 0 with **zero file truncation and zero disk clearing**.
 2. **Strict Sector Isolation for `wal_sync.db` vs. Dense Sector Packing for `wal_buf.db`:**
    * **`wal_sync.db` (`Durability::Sync`):** Every synchronous commit batch advances to a fresh 4 KB sector boundary. Once a 4 KB sector in `wal_sync.db` is written and acknowledged, it is **never overwritten again during the same `WalEpoch`**, making torn-overwrite corruption of committed data mathematically impossible.
    * **`wal_buf.db` (`Durability::Buffered`):** Multiple buffered commits are packed back-to-back inside the current 4 KB sector buffer and written through to the OS Page Cache (`CcCopyWrite`), surviving `kill -9` / `TerminateProcess` while achieving high storage density.
@@ -137,7 +137,7 @@ WalRecord :=
 
 | Property | `wal_sync.db` (`Durability::Sync`) | `wal_buf.db` (`Durability::Buffered`) |
 | :--- | :--- | :--- |
-| **Default File Size** | `2 MB` (`512` sectors of 4 KB) | `16 MB` (`4,096` sectors of 4 KB) |
+| **Default File Size** | `8 MB` (`2,048` sectors of 4 KB) | `16 MB` (`4,096` sectors of 4 KB) |
 | **Pre-allocation** | `PreallocStrategy::PhysicalZeroFill` (`VDL == EOF`) | `PreallocStrategy::LogicalExtendOnly` |
 | **OS Open Hint** | `OpenHint::MutableSyncLog` (`FILE_FLAG_WRITE_THROUGH`) | `OpenHint::MutableBufferedLog` (`FILE_FLAG_SEQUENTIAL_SCAN`) |
 | **Sector Packing Policy** | **Sector-Isolated:** Every `append_batch` call starts at a fresh 4 KB sector boundary and advances the cursor to the next 4 KB boundary so committed sectors are never overwritten in place. | **Densely Packed:** Small batches are packed into the active 4 KB in-memory sector buffer (if remaining space `>= 3 + batch_bytes.len()`, or split across sectors) and immediately written to the OS Page Cache. |

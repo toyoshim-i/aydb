@@ -182,7 +182,7 @@ Every file stream on NTFS maintains three distinct 64-bit length pointers:
 ### 4.2 Tailored Pre-Allocation Strategy
 
 Thanks to our two-stream WAL separation (Design Decision 3), we get the best of both worlds:
-* **`boot_meta.db` (8 KB) & `wal_sync.db` (2 MB):** Physically zero-initialized upon creation (`PreallocStrategy::PhysicalZeroFill`) so `VDL == EOF` before the first transaction runs. Writing 2 MB of zeros takes `< 1 ms` on a local NVMe SSD and `~15 ms` over 1 Gbps SMB.
+* **`boot_meta.db` (8 KB) & `wal_sync.db` (8 MB by default):** Physically zero-initialized upon creation (`PreallocStrategy::PhysicalZeroFill`) so `VDL == EOF` before the first transaction runs. Writing 2 MB of zeros takes `< 1 ms` on a local NVMe SSD and `~15 ms` over 1 Gbps SMB.
 * **`wal_buf.db` (16 MB):** Because `wal_buf.db` uses buffered writes (not `FILE_FLAG_WRITE_THROUGH`), NTFS coalesces VDL updates lazily in memory during background flushing. We expose both `PhysicalZeroFill` and `LogicalExtendOnly` (`SetEndOfFile` / `posix_fallocate`) in the PAL so we can benchmark both strategies on local NTFS and SMB.
 
 ---

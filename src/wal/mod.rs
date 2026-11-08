@@ -17,8 +17,12 @@ pub const WAL_SYNC_FILE_NAME: &str = "wal_sync.db";
 /// Fixed filename for the buffered high-throughput WAL stream.
 pub const WAL_BUF_FILE_NAME: &str = "wal_buf.db";
 
-/// Default size for `wal_sync.db` (2 MB = 512 sectors of 4 KB).
-pub const DEFAULT_SYNC_WAL_SIZE: u64 = 2 * 1024 * 1024;
+/// Default size for `wal_sync.db` (8 MB = 2,048 sectors of 4 KB).
+///
+/// A synchronous commit occupies at least one sector, and a full WAL forces a MemTable flush
+/// regardless of how much the MemTable holds, so this size bounds the flush interval of small
+/// synchronous commits.
+pub const DEFAULT_SYNC_WAL_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Default size for `wal_buf.db` (16 MB = 4,096 sectors of 4 KB).
 pub const DEFAULT_BUF_WAL_SIZE: u64 = 16 * 1024 * 1024;
