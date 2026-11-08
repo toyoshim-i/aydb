@@ -11,7 +11,7 @@
 ### 1.1 Core Requirements
 
 * **Hybrid Workload Support:**
-  * **Settings & State Management:** Small records (tens to hundreds of bytes), random updates, immediate durability (full ACID guarantees).
+  * **Settings & State Management:** Small records (tens to hundreds of bytes), random updates, durability on return for `SyncTransactional` commits.
   * **Cache Management:** Medium-to-large payloads (blobs ranging from a few KB to several MB), high churn rates, and automatic LRU purging governed by per-table logical size limits (`MAX_BYTES`).
 * **Strict Heap Memory Bounds:**
   * The private working set (heap) consumed by the database engine itself must remain strictly bounded within a fixed budget of a few megabytes to tens of megabytes. Caching of index blocks and data payloads is delegated to the operating system's page cache (e.g., Windows Cache Manager).
@@ -82,25 +82,29 @@ To support both fast random updates of small configuration records and zero writ
 
 ---
 
-## 4. Crash Recovery and Durability (No-Corruption Guarantee)
+## 4. Crash Recovery and Durability
 
-`aydb` eliminates random-I/O flushes during normal transactions, guaranteeing resilience against power loss, OS panics, and forced process termination purely through sequential journal writes and ordered metadata updates.
+`aydb` avoids random-I/O flushes during normal transactions and relies on sequential journal writes and ordered metadata updates for crash consistency. The contract is deliberately narrow:
+
+* **`SyncTransactional` commits** are durable when the call returns; before one is appended, all earlier buffered commits are made durable first (prefix durability).
+* **`BufferedFast` commits** survive process crashes (`kill -9` / `TerminateProcess`) because they reach the OS page cache, but an OS crash or power loss may roll back recent buffered commits that were not yet synced.
+* Consistency rests on CRC-verified WAL sectors, `boot_meta.db` slots, and blobs, and **assumes the storage honours flush / write-through semantics**. It is exercised by deterministic fault-injection simulation (`FaultInjectingFs`), not by physical power-cut testing.
 
 ### 4.1 `boot_meta.db` Ping-Pong Buffer (Double Buffering)
 
 * Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B** (automatically extended with an auxiliary `boot_meta_ext_<Generation>.db` payload file if the catalog ever exceeds 4,028 bytes).
 * Layout of each 4 KB slot (64-byte fixed header + variable catalog payload + 4-byte slot trailer):
   `[Header(64B): Magic "AYBM"(4B) | Version(2B) |HeaderFlags(2B) | Generation(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | NextSeqID(8B) | IdxCount(2B) | StdBlobCount(2B) | LruBlobCount(2B) | QuotaCount(2B) | PendingDelCount(2B) | PayloadLen(2B) | HeaderCRC32C(4B)] + [CatalogPayload: ActiveIdxList | ActiveStdBlobList | ActiveLruBlobList | TableQuotaList | PendingDeleteList] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
-* When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected.
+* When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected. Fallback to the other slot happens only on genuine corruption (CRC / format failure or a missing external manifest); a transient I/O error fails the open instead of silently booting from an older generation.
 
 ### 4.2 Pre-Allocated Fixed-Size WAL and Physical Two-Stream Commit
 
 * **Zero-Fill-Free Reuse via Epoch Numbers:**
-  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 7-byte fragment headers (`[FragType (1B) | FragLen (2B) | FragCRC32C (4B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
+  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 7-byte fragment headers (`[FragType (1B) | FragLen (2B) | FragCRC32C (4B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented (and **both** epochs are rotated unconditionally on every `open`, even if recovery found nothing, so a stale same-epoch sector left behind by write-back reordering can never be replayed; this costs one `boot_meta.db` commit per open) and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
   1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written directly through to non-volatile storage.
-  2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, **losing zero data on application crashes or `TerminateProcess` / `kill -9`**. Only a full OS crash or power outage cleanly rolls back the last few seconds of unflushed buffered writes. During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
+  2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, so committed batches survive application crashes or `TerminateProcess` / `kill -9`. A full OS crash or power outage may roll back the most recent unflushed buffered writes. At every buffered-WAL sync point (prefix sync before a `wal_sync.db` append, transaction prepare, LRU segment reclaim) the open sector is **sealed**, so an already-synced sector is never rewritten in place by a later append (cost: at most one partly used 4 KB sector per sync point). During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
 
 ### 4.3 Consistency Protocol for KV Separation (`Write-Blob-Before-WAL`)
 
@@ -109,7 +113,9 @@ To prevent dangling pointers (where an index entry survives recovery but its tar
 1. **Write Ordering:** Always write `[Magic | BlobCRC32C | Key | Value]` to `blob_<SeqID>.db` first, and only then append the pointer record `[Key | BlobSegID | Offset | Len | BlobCRC32C]` to `wal.db`.
 2. **CRC Verification on Recovery and Read:**
    Expensive `FlushFileBuffers` calls on `blob` files are omitted on every write. Instead, during WAL replay after a power failure (or during normal reads), the engine verifies the `BlobCRC32C` stored in the WAL/index against the actual bytes in the `blob` file. If a power outage prevented the blob write from reaching disk (file truncated or CRC mismatch), the engine does **not** treat the database as corrupted; instead, it safely discards the uncommitted record. This validation happens only at startup (`recover_two_streams` + `validate_blob_ptr` for WAL-replayed pointers; blobs referenced from `idx` segments were synced before their checkpoint). After open, a blob that fails verification (CRC/magic/key mismatch, short read, missing segment) is genuine corruption and is **never** silently reported as absence: per-table `on_corrupt` policy either returns `InvalidData` / `SQLITE_CORRUPT` naming the table and primary key (`error`, default for uncapped tables; explicit deletes still succeed and clean up) or hides the row and queues it for automatic deletion at the next safe write (`evict`, default for capped tables). Both modes bump `StorageEngine::corrupt_blob_detections()`.
-3. **Recovery from SMB Write-Behind Failures:**
+3. **WAL Failure Poisons the Engine:**
+   If a WAL write or sync fails, the engine is poisoned: further mutations return errors until the database is reopened, while reads keep working. After reopen, the failed commit's outcome is unknown (it may or may not be present, but it is never partially applied).
+4. **Recovery from SMB Write-Behind Failures:**
    If a background flush error is detected on an SMB handle, the engine closes and reopens the file handles to discard any poisoned local OS cache pages and reconstructs the MemTable from the last verified checkpoint generation.
 
 ---

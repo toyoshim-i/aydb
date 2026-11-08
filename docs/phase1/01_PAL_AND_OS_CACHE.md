@@ -87,8 +87,8 @@ To achieve true lock-free parallel `pread`/`pwrite` semantics on Windows equival
 ## 3. Design Decision 3: Physical Two-Stream WAL Separation (`wal_sync.db` vs. `wal_buf.db`)
 
 `aydb` supports two durability tiers for mutations:
-* **`Durability::Sync`:** For critical settings and catalog changes; guaranteed to survive power loss and OS panics.
-* **`Durability::Buffered`:** For high-churn HTTP cache insertions and transient state; enters the OS page cache immediately (surviving application crashes or `TerminateProcess` / `kill -9`), without stalling on physical disk flushes.
+* **`Durability::Sync`:** For critical settings and catalog changes; durable when the commit returns (survives power loss and OS panics, assuming the device honours write-through), with earlier buffered commits made durable first.
+* **`Durability::Buffered`:** For high-churn HTTP cache insertions and transient state; enters the OS page cache immediately (surviving application crashes or `TerminateProcess` / `kill -9`; an OS crash or power loss may roll back the most recent ones), without stalling on physical disk flushes.
 
 ### 3.1 Why Single-File WAL Designs Fail Under Dual Durability
 

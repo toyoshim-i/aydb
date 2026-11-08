@@ -191,7 +191,7 @@ flowchart TD
 ```
 
 ### Handling Fallback When an External Manifest Is Missing
-If the higher-generation slot has `FLAG_EXTERNAL_MANIFEST = 1`, `BootMetaManager` also verifies that the referenced `manifest_<SeqID>.db` exists and matches `manifest_payload_crc32c`. If a disk fault corrupted the new manifest file, the manager automatically falls back to the other slot if that older slot is completely valid!
+If the higher-generation slot has `FLAG_EXTERNAL_MANIFEST = 1`, `BootMetaManager` also verifies that the referenced `manifest_<SeqID>.db` exists and matches `manifest_payload_crc32c`. If a disk fault corrupted the new manifest file, the manager falls back to the other slot if that older slot is completely valid. This fallback applies only to genuine corruption (CRC / format failure, missing manifest); a transient I/O error fails the open rather than booting from an older generation.
 
 ---
 

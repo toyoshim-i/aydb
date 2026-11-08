@@ -141,7 +141,7 @@ WalRecord :=
 | **Pre-allocation** | `PreallocStrategy::PhysicalZeroFill` (`VDL == EOF`) | `PreallocStrategy::LogicalExtendOnly` |
 | **OS Open Hint** | `OpenHint::MutableSyncLog` (`FILE_FLAG_WRITE_THROUGH`) | `OpenHint::MutableBufferedLog` (`FILE_FLAG_SEQUENTIAL_SCAN`) |
 | **Sector Packing Policy** | **Sector-Isolated:** Every `append_batch` call starts at a fresh 4 KB sector boundary and advances the cursor to the next 4 KB boundary so committed sectors are never overwritten in place. | **Densely Packed:** Small batches are packed into the active 4 KB in-memory sector buffer (if remaining space `>= 3 + batch_bytes.len()`, or split across sectors) and immediately written to the OS Page Cache. |
-| **Crash Guarantee** | Survives process crash, OS panic, and sudden power loss. | Survives process crash / `kill -9` / `TerminateProcess` (via OS Page Cache). Power loss rolls back only unflushed tail sectors. |
+| **Crash Guarantee** | Durable when the commit returns (survives process crash, OS panic, and power loss, assuming the device honours write-through). | Survives process crash / `kill -9` / `TerminateProcess` (via OS Page Cache). Power loss / OS crash may roll back recent unsynced commits. |
 
 #### Subtlety in `wal_buf.db` In-Place Sector Packing and Power Loss
 In `wal_buf.db`, suppose a 4 KB sector buffer in memory receives Batch 1 (`100 B`), which is written to `Sector k` in the OS Page Cache (`write_all_at`), and then receives Batch 2 (`100 B`), updating `Sector k` in the OS Page Cache with both Batch 1 and Batch 2.
@@ -176,6 +176,10 @@ flowchart TD
     Reassemble --> NextIdx["idx += 1"] --> LoopCheck
 ```
 
+Recovery halts at the first torn or old-epoch sector. Because write-back can reorder, later sectors of the same epoch may already be on disk beyond that point, so after recovery the engine **always rotates both WAL epochs** (flushing the MemTable first if non-empty, otherwise rotating epochs only) regardless of whether any batch was recovered. This costs one `boot_meta.db` commit per open and guarantees no pre-crash sector can be read as part of the new stream. Likewise, at each buffered-WAL durability point the open `wal_buf.db` sector is sealed (written, then the cursor advances to a fresh sector) so a synced sector is never rewritten in place; a torn rewrite would otherwise discard batches that were already synced while a later `wal_sync.db` batch depending on them survived. The cost is at most one partly used sector per sync point.
+
+If a WAL write or sync fails at runtime, the engine is poisoned: mutations fail until reopen, reads continue, and the failed commit's outcome is unknown after reopen (present or absent, never partial).
+
 Once both `sync_batches` and `buf_batches` have been recovered:
 1. Any batch with `batch.lsn <= boot_meta.checkpoint_lsn` is filtered out (already persisted in an `idx_<SeqID>.db` segment).
 2. The two sorted slices (`sync_batches` and `buf_batches`) are merged in $O(N)$ by ascending `batch.lsn`.
@@ -191,10 +195,10 @@ Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NT
 
 | WAL Stream & Mode | Records / Batch | Throughput (`records/sec`) | Latency / Record | Crash Resilience Guarantee |
 | :--- | ---: | ---: | ---: | :--- |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `12,736 rec/s` | `78.52 µs` | Power Loss + OS Panic + Process Kill |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `130,803 rec/s` | `7.65 µs` | Power Loss + OS Panic + Process Kill |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | **`568,372 rec/s`** | **`1.76 µs`** | Power Loss + OS Panic + Process Kill |
-| **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`282,076 rec/s`** | **`3.55 µs`** | Process Kill (`kill -9` / `TerminateProcess`) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `12,736 rec/s` | `78.52 µs` | Durable on return (assumes write-through is honoured) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `130,803 rec/s` | `7.65 µs` | Durable on return (assumes write-through is honoured) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | **`568,372 rec/s`** | **`1.76 µs`** | Durable on return (assumes write-through is honoured) |
+| **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`282,076 rec/s`** | **`3.55 µs`** | Survives process kill (`kill -9` / `TerminateProcess`); OS crash may lose recent tail |
 | **`wal_buf.db` (`BufferedUserSpaceCoalesced`)** | `1` | **`6,482,562 rec/s`** | **`0.15 µs` (`150 ns`)** | Flushed to OS Page Cache every 4 KB sector |
 
 ### 5.2 Epoch Rotation vs. Zero-Fill & Crash Recovery Scan Speed
@@ -206,7 +210,7 @@ Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NT
 
 #### Key Engineering Takeaways
 1. **Why Dual-Mode Buffering (`BufferedImmediateOsCache` vs. `BufferedUserSpaceCoalesced`) Matters:**
-   * Writing every single 80-byte record immediately to the OS Page Cache (`BufferedImmediateOsCache`) achieves **`282,076 records/sec` (`3.55 µs/op`)** while guaranteeing zero data loss even if the process is terminated via `TerminateProcess` (`kill -9`) a microsecond later.
+   * Writing every single 80-byte record immediately to the OS Page Cache (`BufferedImmediateOsCache`) achieves **`282,076 records/sec` (`3.55 µs/op`)** while keeping each commit in the OS page cache, so it survives the process being terminated via `TerminateProcess` (`kill -9`) a microsecond later (an OS crash or power loss could still roll it back).
    * For bulk cache imports where user-space 4 KB sector coalescing (`BufferedUserSpaceCoalesced`) is used, throughput jumps **`23×` to `6.48 million records/sec` (`150 ns/op`)** because only 1 `WriteFile` syscall is issued per ~50 records (every 4 KB).
 2. **Eliminating Checkpoint Stalls via `WalEpoch`:** Rotating `wal_buf.db` after a MemTable flush takes **`200 ns`** instead of an `11.15 ms` disk zero-fill, and recovering 50,000 buffered commits on startup finishes in **`8.84 ms`**.
 
