@@ -2814,3 +2814,63 @@ fn auto_rowid_continues_after_max_rowid_on_reconnect() {
     let rows = conn.query_all("SELECT max(id) FROM t", &[]).unwrap();
     assert_eq!(rows, vec![vec![SqlValue::Integer(1101)]]);
 }
+
+#[test]
+fn lazy_blob_scan_prefetches_each_window_and_survives_chunk_reloads() {
+    let tmp = TempTestDir::new("vtab_prefetch_windows");
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let make_blob = |id: i64| vec![(id % 251) as u8; 2048 + id as usize];
+
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg.clone()).unwrap()));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING aydb(
+                table_id = 81,
+                columns = 'id INTEGER PRIMARY KEY, body BLOB'
+            );",
+        )
+        .unwrap();
+        for id in 1..=700i64 {
+            conn.query_all(
+                "INSERT INTO docs VALUES (?1, ?2)",
+                &[SqlValue::Integer(id), SqlValue::Blob(make_blob(id))],
+            )
+            .unwrap();
+        }
+        engine.write().unwrap().flush_memtable().unwrap();
+    }
+
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE docs USING aydb(
+            table_id = 81,
+            columns = 'id INTEGER PRIMARY KEY, body BLOB'
+        );",
+    )
+    .unwrap();
+
+    // The cursor reloads its batch while streaming. Every window of upcoming blobs must be
+    // prefetched exactly when the previous window is used up, so no dereference misses the
+    // cache, and every payload must come back intact.
+    for pass in 0..2u64 {
+        let rows = conn
+            .query_all("SELECT id, body FROM docs ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 700);
+        for (i, row) in rows.iter().enumerate() {
+            let id = i as i64 + 1;
+            assert_eq!(row[0], SqlValue::Integer(id));
+            assert_eq!(row[1], SqlValue::Blob(make_blob(id)), "pass {pass} id {id}");
+        }
+        let eng = engine.read().unwrap();
+        assert_eq!(eng.blob_cache().misses(), 0, "pass {pass}");
+        assert_eq!(eng.blob_cache().hits(), 700 * (pass + 1), "pass {pass}");
+    }
+}

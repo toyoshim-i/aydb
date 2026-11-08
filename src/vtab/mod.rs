@@ -350,6 +350,10 @@ struct AydbCursor {
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
     pos: usize,
+    /// Exclusive end of the `lazy_blobs` window for which a prefetch was already issued in the
+    /// current batch. A new prefetch is built only when `pos` reaches it; it is reset together
+    /// with `lazy_blobs`.
+    prefetch_end: usize,
     /// True when more chunks may remain in the current range/full/secondary-index scan.
     streaming_active: bool,
     stream_lower: Option<(Vec<u8>, bool)>,
@@ -898,6 +902,7 @@ unsafe extern "system" fn vtab_open(
             lazy_blobs: Vec::with_capacity(16),
             keys_only: false,
             pos: 0,
+            prefetch_end: 0,
             streaming_active: false,
             stream_lower: None,
             stream_upper: None,
@@ -951,6 +956,7 @@ unsafe extern "system" fn vtab_filter(
         cursor.lazy_blobs.clear();
         cursor.keys_only = false;
         cursor.pos = 0;
+        cursor.prefetch_end = 0;
         cursor.streaming_active = false;
         cursor.stream_lower = None;
         cursor.stream_upper = None;
@@ -1367,6 +1373,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
             cursor.pks.clear();
             cursor.lazy_blobs.clear();
             cursor.pos = 0;
+            cursor.prefetch_end = 0;
 
             let conn_id = vtab.db as usize;
             let keys_only = cursor.keys_only;
@@ -1547,14 +1554,19 @@ unsafe extern "system" fn vtab_column(
             };
             let conn_id = vtab.db as usize;
 
+            // Prefetch the next window of up to 16 rows only once the previous window is used up,
+            // so the cache is not re-checked for the same blobs on every row.
             let mut upcoming: Vec<(&[u8], &LazyBlob<OsFile>)> = Vec::new();
-            let end = (cursor.pos + 16).min(cursor.lazy_blobs.len());
-            for i in cursor.pos..end {
-                if let Some(Some(lb)) = cursor.lazy_blobs.get(i) {
-                    if let Some(pk) = cursor.pks.get(i) {
-                        upcoming.push((pk.as_slice(), lb));
+            if cursor.pos >= cursor.prefetch_end {
+                let end = (cursor.pos + 16).min(cursor.lazy_blobs.len());
+                for i in cursor.pos..end {
+                    if let Some(Some(lb)) = cursor.lazy_blobs.get(i) {
+                        if let Some(pk) = cursor.pks.get(i) {
+                            upcoming.push((pk.as_slice(), lb));
+                        }
                     }
                 }
+                cursor.prefetch_end = end;
             }
 
             let Some(deref_res) = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
