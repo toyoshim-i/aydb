@@ -58,7 +58,7 @@ Both `wal_sync.db` and `wal_buf.db` use the exact same 4096-byte sector format. 
 | `14..16` | 2 B | `sector_flags` | `u16` (LE) | Reserved flags (`0`). |
 
 > **Why Checksum All 4092 Bytes (`4..4096`) Instead of Only `16 + valid_bytes`?**
-> Covering the full 4 KB sector through byte `4095` guarantees that even if a 4 KB write is torn across 512-byte sub-sectors, any stale bytes left at the tail of the sector from a previous epoch will invalidate `sector_crc32c`. And with SSE4.2 hardware CRC32C running at ~20 GB/s, checksumming 4092 bytes takes only **~200 nanoseconds**!
+> Covering the full 4 KB sector through byte `4095` guarantees that even if a 4 KB write is torn across 512-byte sub-sectors, any stale bytes left at the tail of the sector from a previous epoch will invalidate `sector_crc32c`. And with SSE4.2 hardware CRC32C running at ~30 GB/s, checksumming 4092 bytes takes only **~130 nanoseconds** (measured in Chapter 1.2).
 
 ### 2.2 Fragment Framing Inside `sector[16 .. 16 + valid_bytes]`
 
@@ -191,28 +191,28 @@ Once both `sync_batches` and `buf_batches` have been recovered:
 
 ## 5. Empirical Benchmark Results (`examples/meta_wal_bench.rs`)
 
-Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NTFS / NVMe).
+Executed via `cargo run --release --example meta_wal_bench` at commit `6ae760e` on Windows 11 (local NTFS, Crucial P3 NVMe SSD). Figures are medians of five runs.
 
 ### 5.1 WAL Write Throughput & Latency Across Durability Modes
 
 | WAL Stream & Mode | Records / Batch | Throughput (`records/sec`) | Latency / Record | Crash Resilience Guarantee |
 | :--- | ---: | ---: | ---: | :--- |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `1,081 rec/s` | `924.78 µs` | Durable on return (the device is flushed before each commit returns) |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `10,833 rec/s` | `92.31 µs` | Durable on return (the device is flushed before each commit returns) |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | `54,671 rec/s` | `18.29 µs` | Durable on return (the device is flushed before each commit returns) |
-| **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`282,076 rec/s`** | **`3.55 µs`** | Survives process kill (`kill -9` / `TerminateProcess`); OS crash may lose recent tail |
-| **`wal_buf.db` (`BufferedUserSpaceCoalesced`)** | `1` | **`6,482,562 rec/s`** | **`0.15 µs` (`150 ns`)** | Flushed to OS Page Cache every 4 KB sector |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `1,120 rec/s` | `892.48 µs` | Durable on return (the device is flushed before each commit returns) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `11,145 rec/s` | `89.73 µs` | Durable on return (the device is flushed before each commit returns) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | `55,714 rec/s` | `17.95 µs` | Durable on return (the device is flushed before each commit returns) |
+| **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`342,905 rec/s`** | **`2.92 µs`** | Survives process kill (`kill -9` / `TerminateProcess`); OS crash may lose recent tail |
+| **`wal_buf.db` (`BufferedUserSpaceCoalesced`)** | `1` | **`7,559,608 rec/s`** | **`0.13 µs` (`130 ns`)** | Flushed to OS Page Cache every 4 KB sector |
 
 ### 5.2 Epoch Rotation vs. Zero-Fill & Crash Recovery Scan Speed
 
 | Operation | Measured Time | Effective Bandwidth / Comparison |
 | :--- | ---: | :--- |
-| **$O(1)$ Epoch Rotation (`reset_for_new_epoch`)** | **`200 ns`** (`0.0002 ms`) | **`55,750×` faster** than zero-filling a 16 MB WAL (`11.15 ms`) |
-| **Crash Recovery Scan (`1,238` sectors / `50,000` batches)** | **`8.84 ms`** | **`547.3 MB/s`** (includes both 4 KB sector CRC32C and batch CRC32C verification) |
+| **$O(1)$ Epoch Rotation (`reset_for_new_epoch`)** | **`100 ns`** (`0.0001 ms`) | **`111,500×` faster** than zero-filling a 16 MB WAL (`11.15 ms`) |
+| **Crash Recovery Scan (`1,238` sectors / `50,000` batches)** | **`7.29 ms`** | **`663.0 MB/s`** (includes both 4 KB sector CRC32C and batch CRC32C verification) |
 
 #### Key Engineering Takeaways
 1. **Why Dual-Mode Buffering (`BufferedImmediateOsCache` vs. `BufferedUserSpaceCoalesced`) Matters:**
-   * Writing every single 80-byte record immediately to the OS Page Cache (`BufferedImmediateOsCache`) achieves **`282,076 records/sec` (`3.55 µs/op`)** while keeping each commit in the OS page cache, so it survives the process being terminated via `TerminateProcess` (`kill -9`) a microsecond later (an OS crash or power loss could still roll it back).
-   * For bulk cache imports where user-space 4 KB sector coalescing (`BufferedUserSpaceCoalesced`) is used, throughput jumps **`23×` to `6.48 million records/sec` (`150 ns/op`)** because only 1 `WriteFile` syscall is issued per ~50 records (every 4 KB).
-2. **Eliminating Checkpoint Stalls via `WalEpoch`:** Rotating `wal_buf.db` after a MemTable flush takes **`200 ns`** instead of an `11.15 ms` disk zero-fill, and recovering 50,000 buffered commits on startup finishes in **`8.84 ms`**.
+   * Writing every single 80-byte record immediately to the OS Page Cache (`BufferedImmediateOsCache`) achieves **`342,905 records/sec` (`2.92 µs/op`)** while keeping each commit in the OS page cache, so it survives the process being terminated via `TerminateProcess` (`kill -9`) a microsecond later (an OS crash or power loss could still roll it back).
+   * For bulk cache imports where user-space 4 KB sector coalescing (`BufferedUserSpaceCoalesced`) is used, throughput jumps **`22×` to `7.56 million records/sec` (`130 ns/op`)** because only 1 `WriteFile` syscall is issued per ~50 records (every 4 KB).
+2. **Eliminating Checkpoint Stalls via `WalEpoch`:** Rotating `wal_buf.db` after a MemTable flush takes **`100 ns`** instead of an `11.15 ms` disk zero-fill, and recovering 50,000 buffered commits on startup finishes in **`7.29 ms`**.
 

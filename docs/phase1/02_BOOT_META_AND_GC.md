@@ -225,24 +225,24 @@ To maintain zero external crate dependencies while achieving hardware-line-rate 
 
 ## 7. Empirical Benchmark Results (`examples/meta_wal_bench.rs`)
 
-Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NTFS / NVMe).
+Executed via `cargo run --release --example meta_wal_bench` at commit `6ae760e` on Windows 11 (local NTFS, Crucial P3 NVMe SSD). Figures are medians of five runs.
 
 ### 7.1 Benchmark 1: CRC32C Hardware (`SSE4.2`) vs. Software (`Slice-by-8`)
 
-| Payload Size | Software (`Slice-by-8`) | Hardware (`SSE4.2 _mm_crc32_u64`) | Speedup |
+| Payload Size | Software (`Slice-by-8`) | Hardware (`SSE4.2`, interleaved `_mm_crc32_u64`) | Speedup |
 | :--- | ---: | ---: | ---: |
-| **64 B** (`boot_meta` Slot Header) | `3.25 GB/s` (`20 ns`) | **`21.16 GB/s` (`3 ns`)** | **`6.52×`** |
-| **4 KB** (WAL Sector / Index Block) | `2.38 GB/s` (`1,720 ns`) | **`12.60 GB/s` (`325 ns`)** | **`5.29×`** |
-| **256 KB** (Blob / VACB Window) | `2.36 GB/s` (`111.1 µs`) | **`12.18 GB/s` (`21.5 µs`)** | **`5.16×`** |
+| **64 B** (`boot_meta` Slot Header) | `3.62 GB/s` (`18 ns`) | **`22.79 GB/s` (`3 ns`)** | **`6.30×`** |
+| **4 KB** (WAL Sector / Index Block) | `2.57 GB/s` (`1,597 ns`) | **`31.16 GB/s` (`131 ns`)** | **`12.15×`** |
+| **256 KB** (Blob / VACB Window) | `2.56 GB/s` (`102.5 µs`) | **`35.40 GB/s` (`7.4 µs`)** | **`13.83×`** |
 
 ### 7.2 Benchmark 2: `boot_meta.db` Inline 4 KB Ping-Pong vs. External Manifest Overflow
 
 | Checkpoint Mode | Catalog Size | Commit Latency (incl. `FlushFileBuffers`) | Relative Cost |
 | :--- | :--- | ---: | ---: |
-| **Inline Fast Path (`FLAG_EXTERNAL_MANIFEST = 0`)** | 10 Segments (`260 B <= 4028 B`) | **`864.4 µs / commit`** | `1.00×` |
-| **External Manifest Overflow (`FLAG_EXTERNAL_MANIFEST = 1`)** | 200 Segments (`4,820 B > 4028 B`) | `2,478.6 µs / commit` | `2.87×` |
+| **Inline Fast Path (`FLAG_EXTERNAL_MANIFEST = 0`)** | 10 Segments (`260 B <= 4028 B`) | **`899.8 µs / commit`** | `1.00×` |
+| **External Manifest Overflow (`FLAG_EXTERNAL_MANIFEST = 1`)** | 200 Segments (`4,820 B > 4028 B`) | `2,245.2 µs / commit` | `2.51×` |
 
 #### Key Engineering Takeaways
-1. **Sub-Microsecond 4 KB Sector Verification:** Hardware-accelerated `SSE4.2` CRC32C verifies a full 4 KB `boot_meta.db` slot or WAL sector in **`325 ns`**, making full-sector checksumming (including trailing zero-padding bytes to catch 512-byte sub-sector torn writes) effectively free compared to I/O latency.
-2. **Why the Hybrid Inline/Overflow Design Wins:** Keeping typical catalogs (`<= 4028 B`) inline inside the 4 KB `boot_meta.db` slot avoids **`2.87×`** the checkpoint latency (`864 µs` vs. `2,479 µs` for creating, syncing, and garbage-collecting an external `manifest_<SeqID>.db`), while seamlessly scaling when segment counts exceed 150+.
+1. **Sub-Microsecond 4 KB Sector Verification:** Hardware-accelerated `SSE4.2` CRC32C verifies a full 4 KB `boot_meta.db` slot or WAL sector in **`131 ns`**, making full-sector checksumming (including trailing zero-padding bytes to catch 512-byte sub-sector torn writes) effectively free compared to I/O latency.
+2. **Why the Hybrid Inline/Overflow Design Wins:** Keeping typical catalogs (`<= 4028 B`) inline inside the 4 KB `boot_meta.db` slot avoids **`2.51×`** the checkpoint latency (`900 µs` vs. `2,245 µs` for creating, syncing, and garbage-collecting an external `manifest_<SeqID>.db`), while seamlessly scaling when segment counts exceed 150+.
 

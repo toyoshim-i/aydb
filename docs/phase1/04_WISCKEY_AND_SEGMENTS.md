@@ -211,7 +211,7 @@ While sparse fence pointers and Bloom filters in heap memory keep default memory
 
 ## 5. Empirical Benchmark Results (`examples/wisckey_bench.rs`)
 
-Executed on Windows 11 NVMe via `cargo run --release --example wisckey_bench`.
+Executed via `cargo run --release --example wisckey_bench` at commit `6ae760e` on Windows 11 (local NTFS, Crucial P3 NVMe SSD). Figures are medians of five runs.
 
 ### 5.1 Benchmark 1: WiscKey KV Separation vs. Inline Storage (`INLINE_THRESHOLD` Validation)
 
@@ -219,18 +219,18 @@ Measuring 4-way merge compaction and point-read latency across 4 segments $\time
 
 | Value Size | Storage Mode | Point Read Latency | 4-Way Compaction Time | Compaction Write Volume | In-Heap Index (Fence + Bloom) |
 | :--- | :--- | ---: | ---: | ---: | ---: |
-| **128 B** | **Inline** | `3.91 µs` | `5.11 ms` | `0.91 MB` | `14.99 KB` |
-| **128 B** | **WiscKey** | `6.94 µs` | `3.42 ms` | `0.28 MB` | `9.62 KB` |
-| **512 B** | **Inline** | `4.26 µs` | `12.34 ms` | `3.37 MB` | `35.81 KB` |
-| **512 B** | **WiscKey** | `7.83 µs` | `3.84 ms` | `0.28 MB` | `9.62 KB` |
-| **1024 B** | **Inline** | `4.60 µs` | `28.15 ms` | `7.85 MB` | `73.73 KB` |
-| **1024 B** | **WiscKey** | `8.34 µs` | `2.98 ms` | `0.28 MB` | `9.62 KB` |
-| **2048 B** | **Inline** | `9.50 µs` | `80.12 ms` | `23.54 MB` | `206.54 KB` |
-| **2048 B** | **WiscKey** | `8.28 µs` | `2.74 ms` | `0.28 MB` | `9.62 KB` |
+| **128 B** | **Inline** | `3.07 µs` | `2.76 ms` | `0.91 MB` | `14.99 KB` |
+| **128 B** | **WiscKey** | `5.68 µs` | `1.97 ms` | `0.28 MB` | `9.62 KB` |
+| **512 B** | **Inline** | `3.35 µs` | `6.04 ms` | `3.37 MB` | `35.81 KB` |
+| **512 B** | **WiscKey** | `6.24 µs` | `1.95 ms` | `0.28 MB` | `9.62 KB` |
+| **1024 B** | **Inline** | `3.86 µs` | `12.51 ms` | `7.85 MB` | `73.73 KB` |
+| **1024 B** | **WiscKey** | `6.50 µs` | `2.03 ms` | `0.28 MB` | `9.62 KB` |
+| **2048 B** | **Inline** | `4.65 µs` | `37.48 ms` | `23.54 MB` | `206.54 KB` |
+| **2048 B** | **WiscKey** | `6.83 µs` | `1.93 ms` | `0.28 MB` | `9.62 KB` |
 
 * **Architectural Takeaway:**
-  * At **128 B**, Inline storage avoids a second `pread` (`3.91 µs` vs. `6.94 µs`) while adding minimal compaction overhead (`5.11 ms`).
-  * At **1024 B (`INLINE_THRESHOLD`)** and **2048 B**, Inline compaction write volume explodes to `7.85 MB` (`28×` WiscKey) and `23.54 MB` (`84×` WiscKey), slowing compaction by **`9.4×` to `29.2×`** and bloating in-heap sparse fence pointers by **`7.7×` to `21.5×`** (`206.54 KB` vs. `9.62 KB`) because each 4 KB block can only fit 1–3 entries! Meanwhile, WiscKey keeps compaction write volume (`0.28 MB`), compaction latency (`~2.7–3.8 ms`), and heap index footprint (`9.62 KB`) **completely invariant to value size**.
+  * At **128 B**, Inline storage avoids a second `pread` (`3.07 µs` vs. `5.68 µs`) while adding minimal compaction overhead (`2.76 ms`).
+  * At **1024 B (`INLINE_THRESHOLD`)** and **2048 B**, Inline compaction write volume explodes to `7.85 MB` (`28×` WiscKey) and `23.54 MB` (`84×` WiscKey), slowing compaction by **`6.2×` to `19.4×`** and bloating in-heap sparse fence pointers by **`7.7×` to `21.5×`** (`206.54 KB` vs. `9.62 KB`) because each 4 KB block can only fit 1–3 entries. Meanwhile, WiscKey keeps compaction write volume (`0.28 MB`), compaction latency (`~1.9–2.0 ms`), and heap index footprint (`9.62 KB`) **invariant to value size**.
 
 ### 5.2 Benchmark 2: Bloom Filter `bits_per_key` Trade-off Across 10 Active Segments
 
@@ -238,18 +238,18 @@ Measuring negative lookup latency (key absent from all 10 segments, but falling 
 
 | `bits_per_key` | Total Bloom RAM (10 Segs) | Measured False Positive Rate | Negative Lookup Latency | Oldest-Segment Hit Latency |
 | :--- | ---: | ---: | ---: | ---: |
-| **`0` (Disabled)** | `0.00 KB` | `100.00%` | `33.12 µs` | `33.02 µs` |
-| **`6 bits/key`** | `14.65 KB` | `5.41%` | `2.39 µs` (`13.9×` faster) | `5.47 µs` (`6.0×` faster) |
-| **`10 bits/key` (Default)** | `24.41 KB` | `1.02%` | **`0.75 µs` (`44.2×` faster)** | **`4.24 µs` (`7.8×` faster)** |
-| **`14 bits/key`** | `34.18 KB` | `0.15%` | `0.52 µs` (`63.7×` faster) | `3.77 µs` (`8.8×` faster) |
+| **`0` (Disabled)** | `0.00 KB` | `100.00%` | `28.36 µs` | `27.94 µs` |
+| **`6 bits/key`** | `14.65 KB` | `5.41%` | `2.14 µs` (`13.3×` faster) | `4.70 µs` (`5.9×` faster) |
+| **`10 bits/key` (Default)** | `24.41 KB` | `1.02%` | **`0.79 µs` (`35.9×` faster)** | **`3.63 µs` (`7.7×` faster)** |
+| **`14 bits/key`** | `34.18 KB` | `0.15%` | `0.50 µs` (`56.7×` faster) | `3.40 µs` (`8.2×` faster) |
 
 * **Architectural Takeaway:**
-  Without a Bloom Filter (`0 bits/key`), every negative lookup or oldest-segment lookup must issue 9–10 separate 4 KB positional `pread` syscalls (`33.12 µs`). At the default **`10 bits/key`** ($1.25\text{ B/key}$, `24.41 KB` total for 20,000 keys), false positives drop to **`1.02%`**, cutting negative lookup latency by **`44.2×`** (`0.75 µs`) and oldest-segment hit latency by **`7.8×`** (`4.24 µs` — paying practically a single `pread` on `seg[0]`).
+  Without a Bloom Filter (`0 bits/key`), every negative lookup or oldest-segment lookup must issue 9–10 separate 4 KB positional `pread` syscalls (`28.36 µs`). At the default **`10 bits/key`** ($1.25\text{ B/key}$, `24.41 KB` total for 20,000 keys), false positives drop to **`1.02%`**, cutting negative lookup latency by **`35.9×`** (`0.79 µs`) and oldest-segment hit latency by **`7.7×`** (`3.63 µs`, paying practically a single `pread` on `seg[0]`).
 
 ### 5.3 Benchmark 3: 4 KB Data Block In-Place Lookup (`u16` Offset Directory Binary Search vs. Linear Scan)
 
 | Lookup Algorithm Inside Verified 4 KB Block (`88` Entries) | Latency per Lookup | Relative Speedup |
 | :--- | ---: | ---: |
-| **$O(K)$ Sequential Entry Linear Scan** | `363.6 ns` | `1.00×` |
-| **$O(\log K)$ Downward-Growing `u16` Offset Directory Binary Search** | **`151.1 ns`** | **`2.41×` faster** |
+| **$O(K)$ Sequential Entry Linear Scan** | `331.6 ns` | `1.00×` |
+| **$O(\log K)$ Downward-Growing `u16` Offset Directory Binary Search** | **`84.8 ns`** | **`3.93×` faster** |
 

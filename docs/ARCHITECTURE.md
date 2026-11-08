@@ -300,7 +300,7 @@ pub trait PlatformFile: Send + Sync {
 
 ## 8. Performance Characteristics and Open Items
 
-Current measurements are published with every CI run at <https://toyoshim-i.github.io/aydb/results.html>. This section records why the engine behaves as it does, not figures, which change with the code.
+Measured figures are in the phase chapters, each labelled with the commit it was measured at, so that a figure matches the implementation its chapter describes. The CI results page (<https://toyoshim-i.github.io/aydb/results.html>) shows the latest run. This section records why the engine behaves as it does.
 
 ### 8.1 Compared with SQLite in WAL Mode
 
