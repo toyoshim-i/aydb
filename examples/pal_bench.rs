@@ -7,7 +7,8 @@
 //! 2. First-epoch vs. second-epoch 4 KB WAL sector write latency:
 //!    `PreallocStrategy::LogicalExtendOnly` (`VDL = 0`)
 //!    vs. `PreallocStrategy::PhysicalZeroFill` (`VDL = EOF`)
-//!    for both `MutableSyncLog` (`FILE_FLAG_WRITE_THROUGH`) and `MutableBufferedLog`.
+//!    for both `MutableSyncLog` and `MutableBufferedLog`. `MutableSyncLog` latency includes
+//!    `sync_barrier`, as the WAL does: write-through on Windows, a file sync on Unix.
 
 #![allow(
     clippy::collapsible_if,
@@ -47,7 +48,7 @@ fn bench_wal_prealloc_and_epochs(root: &PathBuf) {
     println!("========================================================================");
 
     for (label, hint, file_size_mb) in [
-        ("wal_sync.db (WRITE_THROUGH, 2 MB)", OpenHint::MutableSyncLog, 2usize),
+        ("wal_sync.db (durable per write, 2 MB)", OpenHint::MutableSyncLog, 2usize),
         ("wal_buf.db  (Buffered,     16 MB)", OpenHint::MutableBufferedLog, 16usize),
     ] {
         let total_bytes = (file_size_mb * 1024 * 1024) as u64;
@@ -89,6 +90,9 @@ fn bench_wal_prealloc_and_epochs(root: &PathBuf) {
                 let st = Instant::now();
                 file.write_all_at(&sector_buf, (s * 4096) as u64)
                     .expect("write e1");
+                if hint == OpenHint::MutableSyncLog {
+                    file.sync_barrier().expect("sync e1");
+                }
                 e1_lat.push(st.elapsed().as_nanos() as u64);
             }
             let e1_total_ms = e1_start.elapsed().as_secs_f64() * 1_000.0;
@@ -102,6 +106,9 @@ fn bench_wal_prealloc_and_epochs(root: &PathBuf) {
                 let st = Instant::now();
                 file.write_all_at(&sector_buf2, (s * 4096) as u64)
                     .expect("write e2");
+                if hint == OpenHint::MutableSyncLog {
+                    file.sync_barrier().expect("sync e2");
+                }
                 e2_lat.push(st.elapsed().as_nanos() as u64);
             }
             let e2_total_ms = e2_start.elapsed().as_secs_f64() * 1_000.0;
