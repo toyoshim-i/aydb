@@ -72,6 +72,22 @@ fn is_managed_segment_or_manifest(file_name: &str) -> bool {
             || file_name.starts_with("manifest_"))
 }
 
+/// Extracts the SeqID encoded in a managed segment or manifest file name
+/// (`idx_`, `blob_std_`, `blob_lru_<TblID>_` or `manifest_`).
+fn parse_managed_seq_id(file_name: &str) -> Option<u64> {
+    let stem = file_name.strip_suffix(".db")?;
+    let hex = if let Some(h) = stem.strip_prefix("idx_") {
+        h
+    } else if let Some(h) = stem.strip_prefix("blob_std_") {
+        h
+    } else if let Some(h) = stem.strip_prefix("blob_lru_") {
+        h.split_once('_')?.1
+    } else {
+        stem.strip_prefix("manifest_")?
+    };
+    u64::from_str_radix(hex, 16).ok()
+}
+
 /// Metadata descriptor for an active immutable index segment (`idx_<SeqID>.db`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdxSegmentMeta {
@@ -569,6 +585,26 @@ impl<F: PlatformFs> BootMetaManager<F> {
         })
     }
 
+    /// Durably advances `next_seq_id` past the SeqID of every managed segment or manifest file on
+    /// disk, cataloged or not. A crashed flush or compaction can leave an orphan whose SeqID was
+    /// never persisted; allocating that SeqID again would reuse the file name, and the existing
+    /// longer file would keep its stale tail (file names are never reused, see ARCHITECTURE.md
+    /// section 2.3). Must run before anything allocates a SeqID.
+    pub fn reserve_seq_ids_above_existing_files(&mut self) -> io::Result<()> {
+        let max_seen = self
+            .fs
+            .list_files()?
+            .iter()
+            .filter_map(|f| parse_managed_seq_id(f))
+            .max();
+        match max_seen {
+            Some(m) if m >= self.state.next_seq_id => {
+                self.commit_update(|st| st.next_seq_id = m.saturating_add(1))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Sweeps any unreferenced `idx_*`, `blob_std_*`, `blob_lru_*`, or `manifest_*` files on disk
     /// and processes `pending_delete_files`.
     pub fn sweep_orphans(&mut self) -> io::Result<()> {
@@ -932,6 +968,34 @@ mod tests {
     use super::*;
     use crate::pal::OsFs;
     use crate::util::test_util::TempTestDir;
+
+    #[test]
+    fn reserve_seq_ids_skips_every_existing_managed_file_name() {
+        let tmp = TempTestDir::new("reserve_seq");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
+        assert_eq!(mgr.state().next_seq_id, 1);
+
+        for (name, seq) in [
+            (format_idx_file_name(4), 4),
+            (format_std_blob_file_name(9), 9),
+            (format_lru_blob_file_name(3, 17), 17),
+            (format_manifest_file_name(12), 12),
+        ] {
+            std::fs::write(tmp.path.join(&name), b"orphan").unwrap();
+            mgr.reserve_seq_ids_above_existing_files().unwrap();
+            assert!(mgr.state().next_seq_id > seq, "{name}");
+        }
+        assert_eq!(mgr.state().next_seq_id, 18);
+
+        // The reservation is durable and idempotent.
+        let generation = mgr.state().generation;
+        mgr.reserve_seq_ids_above_existing_files().unwrap();
+        assert_eq!(mgr.state().generation, generation);
+        drop(mgr);
+        let reopened = BootMetaManager::open_or_recover_deferred_sweep(fs).unwrap();
+        assert_eq!(reopened.state().next_seq_id, 18);
+    }
 
     #[test]
     fn fresh_init_and_ping_pong_commits() {

@@ -3933,3 +3933,33 @@ fn transient_blob_read_error_during_recovery_fails_open_without_dropping_commit(
     let mut engine = StorageEngine::open(make_fs(), EngineConfig::default()).unwrap();
     assert_eq!(engine.get_row(1, b"k").unwrap(), Some(value));
 }
+
+#[test]
+fn orphan_segment_file_name_is_not_reused_after_crashed_flush() {
+    let tmp = TempTestDir::new("orphan_idx_reuse");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let cfg = EngineConfig::default();
+    let orphan_seq = {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        engine
+            .put_row(1, b"a", b"1", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        engine
+            .put_row(1, b"b", b"2", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.meta_mgr.state().next_seq_id
+    };
+    // A crashed flush left an uncataloged segment, longer than any segment recovery will write.
+    std::fs::write(
+        tmp.path.join(crate::meta::format_idx_file_name(orphan_seq)),
+        vec![0x5Au8; 64 * 1024],
+    )
+    .unwrap();
+
+    drop(StorageEngine::open(fs.clone(), cfg.clone()).unwrap());
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.get_row(1, b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(engine.get_row(1, b"b").unwrap(), Some(b"2".to_vec()));
+}

@@ -316,6 +316,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Opens or recovers a `StorageEngine` rooted at `fs`.
     pub fn open(fs: Arc<FS>, config: EngineConfig) -> io::Result<Self> {
         let mut meta_mgr = BootMetaManager::open_or_recover_deferred_sweep(fs.clone())?;
+        meta_mgr.reserve_seq_ids_above_existing_files()?;
         let state_snapshot = meta_mgr.state().clone();
 
         let block_cache = Arc::new(VerifiedBlockCache::new(config.block_cache_bytes));
@@ -624,14 +625,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true
         });
 
-        // Bump `next_seq_id` past any recovered blob segment SeqIDs if necessary
-        let max_blob_seq = std_blobs
-            .keys()
-            .copied()
-            .chain(lru_blobs.keys().map(|&(_, s)| s))
-            .max()
-            .unwrap_or(0);
-        if max_blob_seq >= meta_mgr.state().next_seq_id || had_uncataloged_live_blobs {
+        // Catalog uncataloged blob segments that turned out to hold live records. Their SeqIDs are
+        // already below `next_seq_id` (see `reserve_seq_ids_above_existing_files`).
+        if had_uncataloged_live_blobs {
             let std_metas: Vec<StdBlobSegmentMeta> = std_blobs
                 .iter()
                 .map(|(&seq_id, b)| StdBlobSegmentMeta {
@@ -650,9 +646,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 })
                 .collect();
             meta_mgr.commit_update(|st| {
-                if max_blob_seq >= st.next_seq_id {
-                    st.next_seq_id = max_blob_seq + 1;
-                }
                 st.std_blob_segments = std_metas;
                 st.lru_blob_segments = lru_metas;
             })?;
