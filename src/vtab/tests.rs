@@ -2785,3 +2785,32 @@ fn rollback_across_two_vtabs_keeps_committed_rows_and_lsn() {
         .unwrap();
     assert_eq!(rows.len(), 20);
 }
+
+#[test]
+fn auto_rowid_continues_after_max_rowid_on_reconnect() {
+    let tmp = TempTestDir::new("vtab_auto_rowid_reconnect");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let ddl = "CREATE VIRTUAL TABLE t USING aydb(columns='id INTEGER PRIMARY KEY, v TEXT')";
+    {
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(ddl).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        let mut ins = conn.prepare("INSERT INTO t VALUES (NULL, 'x')").unwrap();
+        for _ in 0..1100 {
+            ins.execute(&[]).unwrap();
+        }
+        drop(ins);
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(ddl).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (NULL, 'y')").unwrap();
+    let rows = conn.query_all("SELECT max(id) FROM t", &[]).unwrap();
+    assert_eq!(rows, vec![vec![SqlValue::Integer(1101)]]);
+}

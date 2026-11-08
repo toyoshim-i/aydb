@@ -470,6 +470,26 @@ pub(super) unsafe extern "system" fn destroy_aux_context(ptr: *mut c_void) {
     }));
 }
 
+/// Returns the largest integer-tagged primary key of `table_id`, or `None` if it has none.
+fn max_integer_rowid(eng: &mut StorageEngine<OsFs>, table_id: u16) -> io::Result<Option<i64>> {
+    let lower = [KEY_TAG_INTEGER];
+    let upper = [KEY_TAG_INTEGER + 1];
+    let (mut pks, mut slab, mut spans) = (Vec::new(), Vec::new(), Vec::new());
+    eng.scan_range_into_slab(
+        table_id,
+        Some((&lower, true)),
+        Some((&upper, false)),
+        true,
+        1,
+        true,
+        &mut pks,
+        &mut slab,
+        &mut spans,
+        None,
+    )?;
+    Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
+}
+
 unsafe extern "system" fn vtab_create_or_connect(
     db: *mut sqlite3,
     p_aux: *mut c_void,
@@ -539,6 +559,22 @@ unsafe extern "system" fn vtab_create_or_connect(
             return rc;
         }
 
+        // Resume automatic rowid assignment after the largest existing integer rowid so a
+        // reconnect does not restart the sequence at 1 and fall into the random-rowid fallback.
+        // A failed scan must not prevent the table from connecting (reads report the error
+        // themselves), so it leaves the counter at its initial value.
+        let initial_auto_rowid = if ddl.pk_affinity == ColumnAffinity::Integer {
+            match aux.engine.write() {
+                Ok(mut eng) => match max_integer_rowid(&mut eng, table_id) {
+                    Ok(Some(m)) if m >= 0 => m.saturating_add(1),
+                    _ => 0,
+                },
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+
         let vtab = Box::new(AydbVTab {
             base: sqlite3_vtab {
                 pModule: &AYDB_VTAB_MODULE,
@@ -559,7 +595,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             secondary_indexes: ddl.secondary_indexes,
             has_non_int_pks: AtomicBool::new(ddl.pk_affinity != ColumnAffinity::Integer),
             open_cursors: AtomicUsize::new(0),
-            next_auto_rowid: AtomicI64::new(0),
+            next_auto_rowid: AtomicI64::new(initial_auto_rowid),
             rowid_to_pk: Mutex::new(RowidMap::default()),
         });
 
