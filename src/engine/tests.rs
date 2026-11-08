@@ -2371,3 +2371,68 @@ fn wal_write_failure_poisons_engine_until_reopen() {
         assert_eq!(reopened.get_row(1, b"after").unwrap(), Some(b"v2".to_vec()));
     }
 }
+
+#[test]
+fn lazy_blob_survives_segment_reclaim_via_pinned_handle() {
+    let tmp = TempTestDir::new("lazy_blob_pinned");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.max_blob_segment_bytes = 4096; // roll after ~2 blobs so early segments become sealed
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    let val = |i: u8, gen_: u8| {
+        let mut v = vec![gen_; 2048];
+        v[0] = i;
+        v
+    };
+    for i in 0..8u8 {
+        let k = [b'k', i];
+        engine
+            .put_row(1, &k, &val(i, 0xA1), &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+
+    // Capture lazy pointers for the first rows (living in the oldest sealed segments).
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    let mut lazy = Vec::new();
+    for i in 0..2u8 {
+        assert!(
+            engine
+                .get_row_into_lazy(1, &[b'k', i], &mut slab, &mut spans, &mut lazy)
+                .unwrap()
+        );
+    }
+    let first_seg = lazy[0].as_ref().expect("blob row is lazy").ptr.seg_id;
+    assert!(engine.std_blobs.contains_key(&first_seg));
+
+    // Overwrite every row (original blobs become dead), then compact to reclaim segments.
+    for i in 0..8u8 {
+        let k = [b'k', i];
+        engine
+            .put_row(1, &k, &val(i, 0xB2), &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    engine.compact().unwrap();
+    engine.flush_memtable().unwrap();
+    engine.compact().unwrap();
+    assert!(
+        !engine.std_blobs.contains_key(&first_seg),
+        "original blob segment should have been reclaimed"
+    );
+
+    // Dereference through pinned handles must still return the original bytes.
+    for (i, lb) in lazy.iter().enumerate() {
+        let lb = lb.as_ref().unwrap();
+        let mut out = Vec::new();
+        let (s, e) = engine
+            .dereference_lazy_blob_into(1, &[b'k', i as u8], lb, &mut out)
+            .unwrap()
+            .expect("pinned blob must still be readable");
+        assert_eq!(&out[s..e], &val(i as u8, 0xA1)[..]);
+    }
+    // And the live rows read the new generation.
+    assert_eq!(engine.get_row(1, b"k\x00").unwrap(), Some(val(0, 0xB2)));
+}

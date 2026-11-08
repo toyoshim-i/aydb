@@ -11,7 +11,7 @@ use crate::lru::{
 use crate::pal::PlatformFs;
 use crate::wal::BlobPtr;
 
-use super::StorageEngine;
+use super::{LazyBlob, StorageEngine};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MergedValueRef<'a> {
@@ -191,7 +191,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<BlobPtr>>>,
+        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<()> {
         if limit == 0 {
             return Ok(());
@@ -281,7 +281,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     IndexValue::Blob(ptr) => {
                         if let Some(lazy_blobs) = &mut lazy_blobs_out {
                             spans_out.push((0, 0));
-                            lazy_blobs.push(Some(*ptr));
+                            lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
                             pks_out.push(k[3..].to_vec());
                             if spans_out.len() >= limit {
                                 break;
@@ -334,7 +334,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     MergedValueRef::Blob(ptr) => {
                         if let Some(lazy_blobs) = &mut lazy_blobs_out {
                             spans_out.push((0, 0));
-                            lazy_blobs.push(Some(ptr));
+                            lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
                             pks_out.push(key[3..].to_vec());
                             Ok(true)
                         } else {
@@ -555,7 +555,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<BlobPtr>>>,
+        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<Option<Vec<u8>>> {
         if limit == 0 {
             return Ok(None);

@@ -182,6 +182,16 @@ pub struct BlobSegmentReader<F: PlatformFile> {
     seq_id: u64,
 }
 
+impl<F: PlatformFile> Clone for BlobSegmentReader<F> {
+    /// Cheap clone: bumps the `Arc` refcount of the underlying file handle (pins the open file).
+    fn clone(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            seq_id: self.seq_id,
+        }
+    }
+}
+
 impl<F: PlatformFile> BlobSegmentReader<F> {
     pub fn new(file: Arc<F>, seq_id: u64) -> Self {
         Self { file, seq_id }

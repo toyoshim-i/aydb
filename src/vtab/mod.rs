@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{StorageEngine, WriteDurability};
-use crate::pal::OsFs;
+use crate::engine::LazyBlob;
+use crate::pal::{OsFile, OsFs};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::parse_vtab_ddl;
 use crate::vtab::ffi::{
@@ -35,7 +36,6 @@ use crate::vtab::ffi::{
     sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_collation, sqlite3_vtab_cursor,
     sqlite3_vtab_on_conflict,
 };
-use crate::wal::BlobPtr;
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
     KEY_TAG_FLOAT_LT_I64_MIN, KEY_TAG_INTEGER, KEY_TAG_NULL, KEY_TAG_TEXT, SqlValue,
@@ -294,7 +294,7 @@ struct AydbCursor {
     /// Pending out-of-line blob pointer for lazy dereference in `vtab_column`.
     /// When `Some(ptr)`, the row's blob payload has not been read into `slab` yet.
     /// When `None`, the row was either inline or has already been dereferenced into `slab`.
-    lazy_blobs: Vec<Option<BlobPtr>>,
+    lazy_blobs: Vec<Option<LazyBlob<OsFile>>>,
     /// True when the active scan only needs primary keys (`RANGE_FLAG_KEYS_ONLY`),
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
@@ -1431,7 +1431,7 @@ unsafe extern "system" fn vtab_column(
         }
 
         // Lazy Blob Dereference: If this row has a pending external blob that hasn't been read into slab yet
-        if let Some(Some(blob_ptr)) = cursor.lazy_blobs.get(cursor.pos).copied() {
+        if let Some(Some(lazy_blob)) = cursor.lazy_blobs.get(cursor.pos).cloned() {
             let mut eng = match vtab.engine.lock() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
@@ -1441,7 +1441,7 @@ unsafe extern "system" fn vtab_column(
             };
             let conn_id = vtab.db as usize;
             let deref_res = eng.with_committed_read_for_conn(conn_id, |eng| {
-                eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &blob_ptr, &mut cursor.slab)
+                eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &lazy_blob, &mut cursor.slab)
             });
             let span = match deref_res {
                 Ok(Some(s)) => s,

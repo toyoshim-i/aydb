@@ -116,6 +116,31 @@ impl Default for EngineConfig {
     }
 }
 
+/// A lazily-dereferenced out-of-line blob captured by a cursor.
+///
+/// Holds the blob pointer together with a clone of the owning segment's file handle (`reader`).
+/// Pinning the handle keeps the bytes readable even if the segment is compacted/reclaimed and
+/// removed from the engine maps before the cursor dereferences it:
+/// - Unix: an unlinked file stays readable through an open descriptor.
+/// - Windows: files are opened with share mode 0 so `DeleteFile` fails while the handle is open;
+///   the file name stays queued in `pending_delete_files` (see `try_process_pending_deletes` in
+///   `meta`, which keeps failed deletes queued and retries them on later commits/startup).
+///
+/// `reader` is `None` if the segment was already absent when the pointer was captured.
+pub struct LazyBlob<F: PlatformFile> {
+    pub ptr: BlobPtr,
+    reader: Option<BlobSegmentReader<F>>,
+}
+
+impl<F: PlatformFile> Clone for LazyBlob<F> {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            reader: self.reader.clone(),
+        }
+    }
+}
+
 pub(super) struct TrackedStdBlob<F: PlatformFile> {
     pub(super) reader: BlobSegmentReader<F>,
     pub(super) file_len: u64,
@@ -1252,7 +1277,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         slab: &mut Vec<u8>,
         spans: &mut Vec<(usize, usize)>,
-        lazy_blobs: &mut Vec<Option<BlobPtr>>,
+        lazy_blobs: &mut Vec<Option<LazyBlob<FS::File>>>,
     ) -> io::Result<bool> {
         let mut stack_buf = [0u8; 64];
         let heap_buf;
@@ -1280,7 +1305,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 IndexValue::Blob(ptr) => {
                     spans.push((0, 0));
-                    lazy_blobs.push(Some(*ptr));
+                    lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
                     hit = true;
                 }
                 IndexValue::Tombstone => {}
@@ -1298,7 +1323,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         IndexValue::Blob(ptr) => {
                             spans.push((0, 0));
-                            lazy_blobs.push(Some(ptr));
+                            lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
                             hit = true;
                         }
                         IndexValue::Tombstone => {}
@@ -1329,6 +1354,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(hit)
     }
 
+    /// Captures `ptr` together with a pinned handle to its segment file (see [`LazyBlob`]).
+    pub(super) fn pin_lazy_blob(&self, ptr: &BlobPtr) -> LazyBlob<FS::File> {
+        let reader = match ptr.kind {
+            BlobKind::Standard => self.std_blobs.get(&ptr.seg_id).map(|b| b.reader.clone()),
+            BlobKind::Lru => self
+                .lru_blobs
+                .get(&(ptr.table_id, ptr.seg_id))
+                .map(|b| b.reader.clone()),
+        };
+        LazyBlob { ptr: *ptr, reader }
+    }
+
     /// Dereferences an out-of-line blob pointer on demand for a cursor row, appending the verified
     /// blob payload to `slab` and returning its `(start_offset, end_offset)`.
     /// Also updates LRU read tracking if `table_id` is a capped table.
@@ -1336,9 +1373,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         &mut self,
         table_id: u16,
         pk: &[u8],
-        ptr: &BlobPtr,
+        lazy: &LazyBlob<FS::File>,
         slab: &mut Vec<u8>,
     ) -> io::Result<Option<(usize, usize)>> {
+        let ptr = &lazy.ptr;
         let mut stack_buf = [0u8; 64];
         let heap_buf;
         let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
@@ -1353,9 +1391,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &heap_buf
         };
 
+        // Flush buffered writer bytes (if the segment is still the active one) so the pinned
+        // handle sees them; harmless if the writer has since rolled to a new segment.
         self.ensure_blob_flushed(ptr)?;
+        let Some(reader) = &lazy.reader else {
+            return Ok(None);
+        };
         let start = slab.len();
-        if !self.read_flushed_blob_append_into(ptr, row_key, slab)? {
+        if !reader.append_blob_into(ptr, Some(row_key), slab)? {
             return Ok(None);
         }
         let end = slab.len();
