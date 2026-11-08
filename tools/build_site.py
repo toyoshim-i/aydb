@@ -41,6 +41,7 @@ BENCHES = [
     "standard_sql_bench",
     "sqlite_vs_aydb_bench",
     "concurrent_read_bench",
+    "concurrent_write_bench",
     "tx_isolation_read_bench",
     "compaction_latency_bench",
     "pal_bench",
