@@ -70,33 +70,39 @@ impl MemTable {
         self.highest_lsn
     }
 
-    pub fn set_highest_lsn(&mut self, lsn: u64) {
-        self.highest_lsn = lsn;
-    }
-
-    /// Restores `key` to its pre-mutation state (`prev`) during transaction/savepoint rollback
-    /// in $O(\log N)$ time while maintaining exact `approximate_bytes` accounting.
-    pub fn restore_entry(&mut self, key: Vec<u8>, prev: Option<MemEntry>) {
-        let klen = key.len();
-        match prev {
-            Some(prev_entry) => {
-                let prev_cost = prev_entry.approx_heap_bytes(klen);
-                if let Some(cur_entry) = self.map.insert(key, prev_entry) {
-                    let cur_cost = cur_entry.approx_heap_bytes(klen);
+    /// Moves every entry of a committed transaction overlay into this `MemTable` without
+    /// cloning keys or values. Each entry keeps the LSN it was assigned at mutation time and
+    /// replaces whatever the `MemTable` held for that key.
+    pub fn absorb(&mut self, mut entries: BTreeMap<Vec<u8>, MemEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        // Bulk path: when the overlay is not tiny relative to the table, rebuild with
+        // `BTreeMap::append` (O(n + m), overlay wins on equal keys) instead of n separate
+        // O(log m) inserts.
+        if entries.len().saturating_mul(8) >= self.map.len() {
+            for (k, e) in &entries {
+                if let Some(old) = self.map.get(k) {
                     self.approximate_bytes = self
                         .approximate_bytes
-                        .saturating_sub(cur_cost)
-                        .saturating_add(prev_cost);
-                } else {
-                    self.approximate_bytes = self.approximate_bytes.saturating_add(prev_cost);
+                        .saturating_sub(old.approx_heap_bytes(k.len()));
+                }
+                self.approximate_bytes = self
+                    .approximate_bytes
+                    .saturating_add(e.approx_heap_bytes(k.len()));
+                if e.lsn > self.highest_lsn {
+                    self.highest_lsn = e.lsn;
                 }
             }
-            None => {
-                if let Some(cur_entry) = self.map.remove(&key) {
-                    let cur_cost = cur_entry.approx_heap_bytes(klen);
-                    self.approximate_bytes = self.approximate_bytes.saturating_sub(cur_cost);
-                }
+            if self.map.is_empty() {
+                self.map = entries;
+            } else {
+                self.map.append(&mut entries);
             }
+            return;
+        }
+        for (key, entry) in entries {
+            self.upsert(key, entry.value, entry.lsn);
         }
     }
 

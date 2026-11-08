@@ -244,14 +244,15 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) pending_tx_record_count: u32,
     pub(super) pending_tx_bytes: usize,
     pub(super) pending_tx_sync: bool,
-    pub(super) tx_memtable_undo: Vec<(Vec<u8>, Option<crate::memtable::MemEntry>)>,
+    /// Uncommitted writes of the active explicit transaction (see [`tx::TxOverlay`]).
+    pub(super) tx_overlay: tx::TxOverlay,
     pub(super) tx_start_meta: TxMetaSnapshot,
     pub(super) savepoints: Vec<SavepointMarker>,
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
-    /// True while a non-owning connection is reading the temporary committed snapshot.
+    /// True while a non-owning connection reads: the transaction overlay is hidden.
     pub(super) in_committed_read_view: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
@@ -658,7 +659,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_tx_record_count: 0,
             pending_tx_bytes: 0,
             pending_tx_sync: false,
-            tx_memtable_undo: Vec::new(),
+            tx_overlay: tx::TxOverlay::default(),
             tx_start_meta: TxMetaSnapshot::default(),
             savepoints: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
@@ -1358,7 +1359,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut hit = false;
-        if let Some(mem_entry) = self.memtable.get(row_key) {
+        if let Some(mem_entry) = self.mem_get(row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -1449,7 +1450,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.flush_active_blob_buffers()?;
         }
         let mut hit = false;
-        if let Some(mem_entry) = self.memtable.get(row_key) {
+        if let Some(mem_entry) = self.mem_get(row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -1998,17 +1999,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
             self.pending_tx_record_count += records.len() as u32;
+            let record_undo = !self.savepoints.is_empty();
             for rec in records {
-                let undo_key = match &rec {
-                    WalRecord::PutInline { key, .. }
-                    | WalRecord::PutBlobPtr { key, .. }
-                    | WalRecord::Delete { key } => Some(key.clone()),
-                    WalRecord::TxBegin | WalRecord::TxCommit => None,
-                };
-                let prev = self.memtable.apply_single_wal_record(lsn, rec);
-                if let Some(k) = undo_key {
-                    self.tx_memtable_undo.push((k, prev));
-                }
+                self.tx_overlay.apply(lsn, rec, record_undo);
             }
             return Ok(lsn);
         }
@@ -2092,7 +2085,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn check_existing_row(&self, key: &[u8]) -> io::Result<ExistingRowStatus> {
-        if let Some(mem_entry) = self.memtable.get(key) {
+        if let Some(mem_entry) = self.mem_get(key) {
             return Ok(match &mem_entry.value {
                 IndexValue::Tombstone => ExistingRowStatus::NotFound,
                 IndexValue::Inline(_) => ExistingRowStatus::Inline,
@@ -2208,8 +2201,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok((keys, (pk.len() + value_len) as u64))
     }
 
+    /// Newest in-memory entry for `key` as seen by the current reader: the transaction overlay
+    /// (hidden for non-owner reads) over the committed `MemTable`.
+    #[inline]
+    pub(super) fn mem_get(&self, key: &[u8]) -> Option<&crate::memtable::MemEntry> {
+        if !self.in_committed_read_view {
+            if let Some(e) = self.tx_overlay.map.get(key) {
+                return Some(e);
+            }
+        }
+        self.memtable.get(key)
+    }
+
+    /// Overlay map visible to the current reader (empty for non-owner reads).
+    #[inline]
+    pub(super) fn visible_overlay(&self) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
+        static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
+        if self.in_committed_read_view {
+            &EMPTY
+        } else {
+            &self.tx_overlay.map
+        }
+    }
+
     pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
-        if let Some(mem_entry) = self.memtable.get(key) {
+        if let Some(mem_entry) = self.mem_get(key) {
             return Ok(Some((mem_entry.lsn, mem_entry.value.clone())));
         }
         for seg in self.idx_segments.iter().rev() {

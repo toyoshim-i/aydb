@@ -1829,7 +1829,7 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
                 WriteDurability::BufferedFast,
             )
             .unwrap();
-        let undo_len_before = engine.tx_memtable_undo.len();
+        let undo_len_before = engine.tx_overlay.undo.len();
 
         // Connection 2 reads `shared_k` via `with_committed_read_for_conn(202, ...)`
         let conn2_val = engine
@@ -1837,9 +1837,9 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
             .unwrap();
         assert_eq!(conn2_val, Some(b"committed_v1".to_vec()));
         assert_eq!(
-            engine.tx_memtable_undo.len(),
+            engine.tx_overlay.undo.len(),
             undo_len_before,
-            "concurrent committed read under EagerWriteOnRead must not append to Connection 1's tx_memtable_undo"
+            "concurrent committed read under EagerWriteOnRead must not append to Connection 1's tx_overlay undo log"
         );
 
         // Connection 1 must still see its uncommitted write `uncommitted_v2`, and rolling back
@@ -3149,4 +3149,276 @@ fn sync_compact_still_works_with_shared_segments() {
     assert!(engine.active_idx_segment_count() < 5);
     engine.compact().unwrap();
     assert_eq!(engine.active_idx_segment_count(), 1);
+}
+
+fn put_t(engine: &mut StorageEngine<OsFs>, k: &str, v: &str) {
+    engine
+        .put_row(1, k.as_bytes(), v.as_bytes(), &[], WriteDurability::BufferedFast)
+        .unwrap();
+}
+
+fn keys_of(engine: &mut StorageEngine<OsFs>, reverse: bool) -> Vec<String> {
+    let mut pks = Vec::new();
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    engine
+        .scan_range_into_slab(
+            1, None, None, reverse, usize::MAX, true, &mut pks, &mut slab, &mut spans, None,
+        )
+        .unwrap();
+    pks.into_iter()
+        .map(|k| String::from_utf8(k).unwrap())
+        .collect()
+}
+
+#[test]
+fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engine_state() {
+    let tmp = TempTestDir::new("overlay_non_owner");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    put_t(&mut engine, "committed", "c1");
+    let mem_len = engine.memtable.len();
+    let mem_bytes = engine.memtable.approximate_bytes();
+    let mem_hi = engine.memtable.highest_lsn();
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    put_t(&mut engine, "committed", "uncommitted_overwrite");
+    for i in 0..10_000u32 {
+        put_t(&mut engine, &format!("u{i:06}"), "x");
+    }
+    assert_eq!(engine.memtable.len(), mem_len, "tx writes must stay in the overlay");
+    assert_eq!(engine.memtable.approximate_bytes(), mem_bytes);
+    assert_eq!(engine.memtable.highest_lsn(), mem_hi);
+
+    let (v, miss, scanned) = engine.with_committed_read_for_conn(2, |e| {
+        (
+            e.get_row(1, b"committed").unwrap(),
+            e.get_row(1, b"u000123").unwrap(),
+            keys_of(e, false),
+        )
+    });
+    assert_eq!(v, Some(b"c1".to_vec()));
+    assert_eq!(miss, None);
+    assert_eq!(scanned, vec!["committed".to_string()]);
+    assert_eq!(engine.memtable.len(), mem_len);
+    assert_eq!(engine.memtable.approximate_bytes(), mem_bytes);
+    assert_eq!(engine.memtable.highest_lsn(), mem_hi);
+    assert!(!engine.in_committed_read_view);
+
+    // The owner still sees everything.
+    assert_eq!(
+        engine.get_row(1, b"committed").unwrap(),
+        Some(b"uncommitted_overwrite".to_vec())
+    );
+    assert_eq!(keys_of(&mut engine, false).len(), 10_001);
+
+    engine.commit_transaction_for_conn(1).unwrap();
+    assert_eq!(engine.memtable.len(), mem_len + 10_000);
+    assert!(engine.tx_overlay.map.is_empty());
+    assert_eq!(
+        engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"u000123").unwrap()),
+        Some(b"x".to_vec())
+    );
+}
+
+#[test]
+fn owner_scan_merges_overlay_with_tombstones_and_overwrites_forward_and_reverse() {
+    for flush_first in [false, true] {
+        let tmp = TempTestDir::new("overlay_scan_merge");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        for k in ["a", "b", "c", "d", "e"] {
+            put_t(&mut engine, k, "old");
+        }
+        if flush_first {
+            engine.flush_memtable().unwrap();
+            // Newer committed layer on top of the segment.
+            put_t(&mut engine, "c", "mem_c");
+            put_t(&mut engine, "z", "mem_z");
+        }
+
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine.delete_row(1, b"b", WriteDurability::BufferedFast).unwrap();
+        put_t(&mut engine, "c", "tx_c");
+        put_t(&mut engine, "bb", "tx_bb");
+        put_t(&mut engine, "0", "tx_0");
+        engine.delete_row(1, b"e", WriteDurability::BufferedFast).unwrap();
+
+        let mut expect: Vec<&str> = vec!["0", "a", "bb", "c", "d"];
+        if flush_first {
+            expect.push("z");
+        }
+        let fwd = keys_of(&mut engine, false);
+        assert_eq!(fwd, expect);
+        let mut rev_expect = expect.clone();
+        rev_expect.reverse();
+        assert_eq!(keys_of(&mut engine, true), rev_expect);
+        assert_eq!(engine.get_row(1, b"c").unwrap(), Some(b"tx_c".to_vec()));
+        assert_eq!(engine.get_row(1, b"b").unwrap(), None);
+        let rows = engine.scan_table(1).unwrap();
+        assert_eq!(rows.iter().find(|(k, _)| k == b"c").unwrap().1, b"tx_c");
+
+        // Non-owner sees only committed data.
+        let committed: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(flush_first.then(|| "z".to_string()))
+            .collect();
+        assert_eq!(
+            engine.with_committed_read_for_conn(2, |e| keys_of(e, false)),
+            committed
+        );
+        let non_owner_c = engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"c").unwrap());
+        assert_eq!(
+            non_owner_c,
+            Some(if flush_first { b"mem_c".to_vec() } else { b"old".to_vec() })
+        );
+
+        engine.commit_transaction_for_conn(1).unwrap();
+        assert_eq!(keys_of(&mut engine, false), expect);
+    }
+}
+
+#[test]
+fn savepoint_rollback_restores_overlay_precisely() {
+    let tmp = TempTestDir::new("overlay_savepoint");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    put_t(&mut engine, "base", "b0");
+    put_t(&mut engine, "gone", "g0");
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    put_t(&mut engine, "pre", "p1"); // before any savepoint: not undo-logged
+    engine.savepoint_for_conn(1, 1).unwrap();
+    put_t(&mut engine, "pre", "p2"); // overwrite of an overlay key
+    put_t(&mut engine, "base", "b1"); // overwrite of a committed key
+    put_t(&mut engine, "new_after_sp", "n"); // key first written after the savepoint
+    engine.delete_row(1, b"gone", WriteDurability::BufferedFast).unwrap();
+    engine.savepoint_for_conn(1, 2).unwrap();
+    put_t(&mut engine, "deeper", "d");
+    put_t(&mut engine, "new_after_sp", "n2");
+
+    engine.rollback_to_savepoint_for_conn(1, 2).unwrap();
+    assert_eq!(engine.get_row(1, b"deeper").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"new_after_sp").unwrap(), Some(b"n".to_vec()));
+
+    engine.rollback_to_savepoint_for_conn(1, 1).unwrap();
+    assert_eq!(engine.get_row(1, b"pre").unwrap(), Some(b"p1".to_vec()));
+    assert_eq!(engine.get_row(1, b"base").unwrap(), Some(b"b0".to_vec()));
+    assert_eq!(engine.get_row(1, b"gone").unwrap(), Some(b"g0".to_vec()));
+    assert_eq!(engine.get_row(1, b"new_after_sp").unwrap(), None);
+    assert_eq!(keys_of(&mut engine, false), vec!["base", "gone", "pre"]);
+
+    // Writes after the rollback still work and commit cleanly.
+    put_t(&mut engine, "after", "a");
+    engine.release_savepoint_for_conn(1, 1).unwrap();
+    engine.commit_transaction_for_conn(1).unwrap();
+    assert_eq!(keys_of(&mut engine, false), vec!["after", "base", "gone", "pre"]);
+}
+
+#[test]
+fn commit_wal_failure_leaves_memtable_without_tx_data_and_poisons_engine() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    struct FaultFile<F> {
+        inner: Arc<F>,
+        name: String,
+        fail_wal: Arc<AtomicBool>,
+    }
+    impl<F: PlatformFile> PlatformFile for FaultFile<F> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            if self.name.starts_with("wal_") && self.fail_wal.load(Ordering::SeqCst) {
+                return Err(io::Error::other("simulated WAL write failure"));
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+    struct FaultFs {
+        inner: OsFs,
+        fail_wal: Arc<AtomicBool>,
+    }
+    impl PlatformFs for FaultFs {
+        type File = FaultFile<<OsFs as PlatformFs>::File>;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+            Ok(Arc::new(FaultFile {
+                inner,
+                name: rel_name.to_string(),
+                fail_wal: Arc::clone(&self.fail_wal),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("overlay_commit_fault");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fs = Arc::new(FaultFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        fail_wal: Arc::clone(&fail),
+    });
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine
+        .put_row(1, b"committed", b"c", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let mem_len = engine.memtable.len();
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    for i in 0..50u32 {
+        let k = format!("tx{i:03}");
+        engine
+            .put_row(1, k.as_bytes(), b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    fail.store(true, Ordering::SeqCst);
+    assert!(engine.commit_transaction_for_conn(1).is_err());
+    fail.store(false, Ordering::SeqCst);
+
+    assert!(engine.is_poisoned());
+    assert_eq!(engine.memtable.len(), mem_len, "MemTable must hold no tx data");
+    assert!(engine.tx_overlay.map.is_empty());
+    assert!(!engine.in_active_transaction());
+    assert_eq!(engine.get_row(1, b"tx000").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"committed").unwrap(), Some(b"c".to_vec()));
+    assert!(
+        engine
+            .put_row(1, b"more", b"v", &[], WriteDurability::BufferedFast)
+            .is_err()
+    );
 }

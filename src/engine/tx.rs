@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::Arc;
 
+use crate::index::IndexValue;
 use crate::lru::CappedTableState;
+use crate::memtable::MemEntry;
 use crate::pal::PlatformFs;
-use crate::wal::WalBatch;
+use crate::wal::{WalBatch, WalRecord};
 
 use super::{StorageEngine, WriteDurability};
 
 #[derive(Clone, Default)]
 pub(crate) struct TxMetaSnapshot {
     pub(super) next_lsn: u64,
-    pub(super) memtable_highest_lsn: u64,
     pub(super) std_blobs: BTreeMap<u64, (u64, u64)>,
     pub(super) lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
     pub(super) capped_tables: HashMap<u16, CappedTableState>,
@@ -21,6 +22,61 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
     pub(super) quotas_modified_in_tx: bool,
+}
+
+/// Private, ordered write set of the active explicit transaction.
+///
+/// While `tx_depth > 0` every mutation lands here instead of in the shared `MemTable`, so the
+/// `MemTable` only ever holds committed data and non-owner readers never need to hide anything.
+/// Owner reads treat the overlay as the highest-precedence source (overlay > memtable > segments).
+///
+/// LSN note: overlay entries carry the `next_lsn` value of their mutation time, which is greater
+/// than every committed LSN. Merged scans nevertheless do not compare overlay LSNs; precedence is
+/// by source (see `MemView`), so correctness does not depend on that numeric property.
+#[derive(Default)]
+pub(crate) struct TxOverlay {
+    pub(super) map: BTreeMap<Vec<u8>, MemEntry>,
+    /// Per-key undo log (`key`, previous overlay entry), recorded only while at least one
+    /// savepoint exists. `rollback_to_savepoint` pops it back to the marker's length.
+    pub(super) undo: Vec<(Vec<u8>, Option<MemEntry>)>,
+}
+
+impl TxOverlay {
+    pub(super) fn clear(&mut self) {
+        self.map.clear();
+        self.undo.clear();
+    }
+
+    pub(super) fn apply(&mut self, lsn: u64, rec: WalRecord, record_undo: bool) {
+        let (key, value) = match rec {
+            WalRecord::PutInline { key, value } => (key, IndexValue::Inline(value)),
+            WalRecord::PutBlobPtr { key, blob_ptr } => (key, IndexValue::Blob(blob_ptr)),
+            WalRecord::Delete { key } => (key, IndexValue::Tombstone),
+            WalRecord::TxBegin | WalRecord::TxCommit => return,
+        };
+        if record_undo {
+            let undo_key = key.clone();
+            let prev = self.map.insert(key, MemEntry { lsn, value });
+            self.undo.push((undo_key, prev));
+        } else {
+            self.map.insert(key, MemEntry { lsn, value });
+        }
+    }
+
+    /// Pops undo entries until `undo.len() == target_len`, restoring the overlay exactly.
+    pub(super) fn rollback_to(&mut self, target_len: usize) {
+        while self.undo.len() > target_len {
+            let (key, prev) = self.undo.pop().unwrap();
+            match prev {
+                Some(e) => {
+                    self.map.insert(key, e);
+                }
+                None => {
+                    self.map.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -43,11 +99,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Begins an explicit batch transaction (`BEGIN`). Subsequent mutations apply immediately to
-    /// the in-memory `MemTable` (for read-your-own-writes visibility) while coalescing their
+    /// the private transaction overlay (for read-your-own-writes visibility) while coalescing their
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
         if self.tx_depth == 0 {
-            self.tx_memtable_undo.clear();
+            self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
@@ -73,7 +129,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
         if self.tx_depth == 0 {
-            self.tx_memtable_undo.clear();
+            self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
@@ -102,9 +158,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Executes a read closure `f` for `conn_id` against the committed snapshot.
-    /// If `conn_id` owns the active transaction (or no transaction is active), `f` sees the live
-    /// `MemTable` (read-your-own-writes). If another connection owns an active transaction,
-    /// uncommitted `MemTable` mutations are temporarily hidden so `conn_id` sees only committed data.
+    /// If `conn_id` owns the active transaction (or no transaction is active), `f` sees the
+    /// transaction overlay on top of the `MemTable` (read-your-own-writes). Otherwise `f` sees
+    /// the `MemTable` and segments only. This is a cheap view selection: no engine state is
+    /// modified and the cost is independent of the number of uncommitted mutations.
     pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, f: F) -> R
     where
         F: FnOnce(&mut Self) -> R,
@@ -113,43 +170,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return f(self);
         }
 
-        struct CommittedReadGuard<'a, FS: PlatformFs> {
+        struct ViewGuard<'a, FS: PlatformFs> {
             eng: &'a mut StorageEngine<FS>,
-            uncommitted_redo: Vec<(Vec<u8>, Option<crate::memtable::MemEntry>)>,
-            uncommitted_highest_lsn: u64,
             prev_in_view: bool,
         }
 
-        impl<'a, FS: PlatformFs> Drop for CommittedReadGuard<'a, FS> {
+        impl<FS: PlatformFs> Drop for ViewGuard<'_, FS> {
             fn drop(&mut self) {
-                while let Some((key, entry)) = self.uncommitted_redo.pop() {
-                    self.eng.memtable.restore_entry(key, entry);
-                }
-                self.eng
-                    .memtable
-                    .set_highest_lsn(self.uncommitted_highest_lsn);
                 self.eng.in_committed_read_view = self.prev_in_view;
             }
         }
 
         let prev_in_view = self.in_committed_read_view;
         self.in_committed_read_view = true;
-        let uncommitted_highest_lsn = self.memtable.highest_lsn();
-        let committed_highest_lsn = self.tx_start_meta.memtable_highest_lsn;
-        let mut uncommitted_redo = Vec::with_capacity(self.tx_memtable_undo.len());
-        for i in (0..self.tx_memtable_undo.len()).rev() {
-            let key = self.tx_memtable_undo[i].0.clone();
-            let prev_entry = self.tx_memtable_undo[i].1.clone();
-            let cur_entry = self.memtable.get(&key).cloned();
-            self.memtable.restore_entry(key.clone(), prev_entry);
-            uncommitted_redo.push((key, cur_entry));
-        }
-        self.memtable.set_highest_lsn(committed_highest_lsn);
-
-        let guard = CommittedReadGuard {
+        let guard = ViewGuard {
             eng: self,
-            uncommitted_redo,
-            uncommitted_highest_lsn,
             prev_in_view,
         };
         f(guard.eng)
@@ -173,7 +208,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         // 1. Run capped-table quota evictions while `tx_depth > 0` so eviction mutations are
-        //    recorded in `pending_tx_buf` and `tx_memtable_undo` (fully undoable on `xRollback`!).
+        //    recorded in `pending_tx_buf` and `tx_overlay` (fully undoable on `xRollback`!).
         self.tx_preparing = true;
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in capped_table_ids {
@@ -244,12 +279,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
+            // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
+            // moving its entries (no clones). On the failure path above the overlay is discarded
+            // and the MemTable never saw any of the transaction's data.
+            let overlay = core::mem::take(&mut self.tx_overlay.map);
+            self.tx_overlay.clear();
+            self.memtable.absorb(overlay);
             self.tx_owner_conn = None;
             self.tx_prepared = false;
             self.tx_preparing = false;
             self.pending_tx_bytes = 0;
             self.savepoints.clear();
-            self.tx_memtable_undo.clear();
             self.tx_start_meta = TxMetaSnapshot::default();
 
             let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
@@ -311,6 +351,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
         self.pending_tx_sync = false;
+        self.tx_overlay.clear();
         let snap = core::mem::take(&mut self.tx_start_meta);
         self.restore_tx_state(0, &snap);
         Ok(())
@@ -333,6 +374,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
             implicit_tx = self.savepoints[pos].implicit_tx;
             self.savepoints.truncate(pos);
+            if self.savepoints.is_empty() {
+                self.tx_overlay.undo.clear();
+            }
         }
         let buf_offset = if self.pending_tx_record_count == 0 {
             0
@@ -347,7 +391,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_tx_bytes: self.pending_tx_bytes,
             pending_tx_sync: self.pending_tx_sync,
             implicit_tx,
-            undo_len: self.tx_memtable_undo.len(),
+            undo_len: self.tx_overlay.undo.len(),
             meta_snapshot,
         });
     }
@@ -368,6 +412,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
             let implicit_tx = self.savepoints[pos].implicit_tx;
             self.savepoints.truncate(pos);
+            if self.savepoints.is_empty() {
+                self.tx_overlay.undo.clear();
+            }
             if implicit_tx && self.tx_depth == 1 {
                 self.commit_transaction()?;
             }
@@ -411,7 +458,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(super) fn capture_tx_meta_snapshot(&self) -> TxMetaSnapshot {
         TxMetaSnapshot {
             next_lsn: self.next_lsn,
-            memtable_highest_lsn: self.memtable.highest_lsn(),
             std_blobs: self
                 .std_blobs
                 .iter()
@@ -431,11 +477,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn restore_tx_state(&mut self, undo_target_len: usize, snap: &TxMetaSnapshot) {
-        while self.tx_memtable_undo.len() > undo_target_len {
-            let (key, prev_entry) = self.tx_memtable_undo.pop().unwrap();
-            self.memtable.restore_entry(key, prev_entry);
-        }
-        self.memtable.set_highest_lsn(snap.memtable_highest_lsn);
+        self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = snap.next_lsn;
         for (&seq, b) in &mut self.std_blobs {
             let (snap_len, snap_dead) = snap.std_blobs.get(&seq).copied().unwrap_or((0, 0));

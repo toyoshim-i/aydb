@@ -4,6 +4,7 @@ use std::io;
 use std::ops::Bound;
 
 use crate::index::{IndexEntry, IndexValue};
+use crate::memtable::MemEntry;
 use crate::lru::{
     NS_PRIMARY_ROW, decode_primary_row_key, decode_secondary_index_pk_slice,
     encode_namespace_prefix, encode_primary_row_key, encode_secondary_index_exact_prefix,
@@ -252,7 +253,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 None => Bound::Unbounded,
             };
             let mut last_pk_buf: Vec<u8> = Vec::new();
-            for (k, entry) in self.memtable.iter_range(lo, hi) {
+            for (k, entry, _) in self.mem_view(lo, hi) {
                 if !k.starts_with(&prefix) {
                     break;
                 }
@@ -457,11 +458,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 None => Bound::Unbounded,
             };
             let entries: Vec<(Vec<u8>, IndexValue)> = self
-                .memtable
-                .iter_range(lo, hi)
-                .take_while(|(k, _)| k.starts_with(&prefix))
-                .filter(|(_, e)| !matches!(e.value, IndexValue::Tombstone))
-                .map(|(k, e)| (k.clone(), e.value.clone()))
+                .mem_view(lo, hi)
+                .take_while(|(k, _, _)| k.starts_with(&prefix))
+                .filter(|(_, e, _)| !matches!(e.value, IndexValue::Tombstone))
+                .map(|(k, e, _)| (k.clone(), e.value.clone()))
                 .collect();
             let mut rows = Vec::new();
             for (k, value) in entries {
@@ -518,9 +518,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let prefix = encode_secondary_index_exact_prefix(table_id, index_id, col_val);
         if self.idx_segments.is_empty() {
             let mut pks = Vec::new();
-            for (k, entry) in self
-                .memtable
-                .iter_range(Bound::Included(prefix.as_slice()), Bound::Unbounded)
+            for (k, entry, _) in self.mem_view(Bound::Included(prefix.as_slice()), Bound::Unbounded)
             {
                 if !k.starts_with(&prefix) {
                     break;
@@ -598,7 +596,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Some((ub, false)) => Bound::Excluded(ub),
                     None => Bound::Unbounded,
                 };
-                for (k, entry) in self.memtable.iter_range(lo, hi) {
+                for (k, entry, _) in self.mem_view(lo, hi) {
                     if !k.starts_with(prefix) {
                         break;
                     }
@@ -658,7 +656,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Some((ub, false)) => Bound::Excluded(ub),
                     None => Bound::Unbounded,
                 };
-                for (k, entry) in self.memtable.iter_range(lo, hi) {
+                for (k, entry, _) in self.mem_view(lo, hi) {
                     if !k.starts_with(prefix) {
                         break;
                     }
@@ -798,10 +796,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         };
 
-        let mut mem_iter = self
-            .memtable
-            .iter_range(range.lo_bound(), range.hi_bound())
-            .peekable();
+        let mut mem_iter = MemView::new(
+            self.memtable.iter_range(range.lo_bound(), range.hi_bound()),
+            self.visible_overlay()
+                .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
+            false,
+        );
         let mut mem_exhausted = false;
 
         let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
@@ -827,9 +827,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut min_key: Option<&[u8]> = None;
 
             if !mem_exhausted {
-                if let Some(&(k, _)) = mem_iter.peek() {
-                    if range.in_upper_and_prefix(k.as_slice()) {
-                        min_key = Some(k.as_slice());
+                if let Some(k) = mem_iter.peek_key() {
+                    if range.in_upper_and_prefix(k) {
+                        min_key = Some(k);
                     } else {
                         mem_exhausted = true;
                     }
@@ -858,21 +858,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             target_key_buf.clear();
             target_key_buf.extend_from_slice(target_key_slice);
 
-            let mut best_mem_entry: Option<(u64, &IndexValue)> = None;
-            if !mem_exhausted {
-                if let Some(&(k, _)) = mem_iter.peek() {
-                    if k.as_slice() == target_key_buf.as_slice() {
-                        let (_, mem_entry) = mem_iter.next().unwrap();
-                        best_mem_entry = Some((mem_entry.lsn, &mem_entry.value));
-                    }
-                }
+            // `(lsn, value, from_overlay)`: overlay entries always win over segments by source
+            // precedence; memtable entries are compared against segments by LSN.
+            let mut best_mem_entry: Option<(u64, &IndexValue, bool)> = None;
+            if !mem_exhausted && mem_iter.peek_key() == Some(target_key_buf.as_slice()) {
+                let (_, mem_entry, from_overlay) = mem_iter.advance().unwrap();
+                best_mem_entry = Some((mem_entry.lsn, &mem_entry.value, from_overlay));
             }
 
             let mut best_seg_meta: Option<(u64, u8)> = None;
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem = best_mem_entry.is_none_or(|(m_lsn, _)| raw.lsn > m_lsn);
+                    let beats_mem =
+                        best_mem_entry.is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
                     if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
@@ -903,7 +902,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         ));
                     }
                 }
-            } else if let Some((mem_lsn, mem_val)) = best_mem_entry {
+            } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
                 match mem_val {
                     IndexValue::Inline(v) => {
                         if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
@@ -947,11 +946,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         };
 
-        let mut mem_iter = self
-            .memtable
-            .iter_range(range.lo_bound(), range.hi_bound())
-            .rev()
-            .peekable();
+        let mut mem_iter = MemView::new(
+            self.memtable.iter_range(range.lo_bound(), range.hi_bound()),
+            self.visible_overlay()
+                .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
+            true,
+        );
         let mut mem_exhausted = false;
 
         let seg_upper_arg = range.seg_upper_arg();
@@ -978,9 +978,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut max_key: Option<&[u8]> = None;
 
             if !mem_exhausted {
-                if let Some(&(k, _)) = mem_iter.peek() {
-                    if range.in_lower_and_prefix(k.as_slice()) {
-                        max_key = Some(k.as_slice());
+                if let Some(k) = mem_iter.peek_key() {
+                    if range.in_lower_and_prefix(k) {
+                        max_key = Some(k);
                     } else {
                         mem_exhausted = true;
                     }
@@ -1009,21 +1009,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             target_key_buf.clear();
             target_key_buf.extend_from_slice(target_key_slice);
 
-            let mut best_mem_entry: Option<(u64, &IndexValue)> = None;
-            if !mem_exhausted {
-                if let Some(&(k, _)) = mem_iter.peek() {
-                    if k.as_slice() == target_key_buf.as_slice() {
-                        let (_, mem_entry) = mem_iter.next().unwrap();
-                        best_mem_entry = Some((mem_entry.lsn, &mem_entry.value));
-                    }
-                }
+            // `(lsn, value, from_overlay)`: overlay entries always win over segments by source
+            // precedence; memtable entries are compared against segments by LSN.
+            let mut best_mem_entry: Option<(u64, &IndexValue, bool)> = None;
+            if !mem_exhausted && mem_iter.peek_key() == Some(target_key_buf.as_slice()) {
+                let (_, mem_entry, from_overlay) = mem_iter.advance().unwrap();
+                best_mem_entry = Some((mem_entry.lsn, &mem_entry.value, from_overlay));
             }
 
             let mut best_seg_meta: Option<(u64, u8)> = None;
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem = best_mem_entry.is_none_or(|(m_lsn, _)| raw.lsn > m_lsn);
+                    let beats_mem =
+                        best_mem_entry.is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
                     if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
@@ -1054,7 +1053,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         ));
                     }
                 }
-            } else if let Some((mem_lsn, mem_val)) = best_mem_entry {
+            } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
                 match mem_val {
                     IndexValue::Inline(v) => {
                         if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
@@ -1072,5 +1071,95 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         Ok(())
+    }
+}
+
+type MemRange<'a> = std::collections::btree_map::Range<'a, Vec<u8>, MemEntry>;
+
+/// Single ordered source made of the committed `MemTable` and the visible transaction overlay.
+///
+/// Yields `(key, entry, from_overlay)`; when both hold a key the overlay entry is returned and the
+/// `MemTable` entry is skipped (source precedence, independent of LSN values). `reverse` selects
+/// descending order (both ranges are consumed from the back).
+pub(super) struct MemView<'a> {
+    mem: MemRange<'a>,
+    ov: MemRange<'a>,
+    mem_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
+    ov_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
+    reverse: bool,
+}
+
+impl<'a> MemView<'a> {
+    fn new(mut mem: MemRange<'a>, mut ov: MemRange<'a>, reverse: bool) -> Self {
+        let mem_head = if reverse { mem.next_back() } else { mem.next() };
+        let ov_head = if reverse { ov.next_back() } else { ov.next() };
+        Self {
+            mem,
+            ov,
+            mem_head,
+            ov_head,
+            reverse,
+        }
+    }
+
+    /// True when the overlay head is emitted before (or instead of) the memtable head.
+    #[inline]
+    fn overlay_first(&self) -> Option<bool> {
+        match (self.mem_head, self.ov_head) {
+            (None, None) => None,
+            (Some(_), None) => Some(false),
+            (None, Some(_)) => Some(true),
+            (Some((mk, _)), Some((ok, _))) => {
+                let ord = if self.reverse { ok.cmp(mk) } else { mk.cmp(ok) };
+                // Equal keys: the overlay shadows the memtable entry.
+                Some(ord != std::cmp::Ordering::Less)
+            }
+        }
+    }
+
+    #[inline]
+    fn peek_key(&self) -> Option<&'a [u8]> {
+        match self.overlay_first()? {
+            true => self.ov_head.map(|(k, _)| k.as_slice()),
+            false => self.mem_head.map(|(k, _)| k.as_slice()),
+        }
+    }
+
+    fn advance(&mut self) -> Option<(&'a Vec<u8>, &'a MemEntry, bool)> {
+        let from_overlay = self.overlay_first()?;
+        if from_overlay {
+            let (k, e) = self.ov_head.take()?;
+            self.ov_head = if self.reverse { self.ov.next_back() } else { self.ov.next() };
+            if self.mem_head.is_some_and(|(mk, _)| mk == k) {
+                self.mem_head = if self.reverse { self.mem.next_back() } else { self.mem.next() };
+            }
+            Some((k, e, true))
+        } else {
+            let (k, e) = self.mem_head.take()?;
+            self.mem_head = if self.reverse { self.mem.next_back() } else { self.mem.next() };
+            Some((k, e, false))
+        }
+    }
+}
+
+impl<'a> Iterator for MemView<'a> {
+    type Item = (&'a Vec<u8>, &'a MemEntry, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance()
+    }
+}
+
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Ascending view over the committed `MemTable` plus the transaction overlay visible to the
+    /// current reader.
+    #[inline]
+    pub(super) fn mem_view<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> MemView<'a> {
+        MemView::new(
+            self.memtable.iter_range(lo, hi),
+            self.visible_overlay().range::<[u8], _>((lo, hi)),
+            false,
+        )
     }
 }
