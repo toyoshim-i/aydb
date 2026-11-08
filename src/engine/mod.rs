@@ -713,7 +713,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_corrupt_evictions: Mutex::new(HashMap::new()),
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
-        engine.reconcile_capped_tables_after_recovery()?;
 
         // Always rotate both WAL epochs after recovery, even when nothing was recovered.
         // Recovery halts at the first torn/old sector, but later sectors of the SAME epoch may
@@ -722,11 +721,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // data into those stale same-epoch sectors, replaying batches that were never recovered
         // the first time (with colliding LSNs). A fresh epoch makes every pre-crash sector
         // unreadable as part of the new stream. Cost: one boot_meta commit per open.
+        // Rotation must precede reconciliation, which appends to the WAL.
         if !engine.memtable.is_empty() {
             engine.flush_memtable()?;
         } else {
             engine.rotate_wal_epochs_only()?;
         }
+
+        // Reconciliation records land in the fresh epoch and are replayed by the next recovery.
+        engine.reconcile_capped_tables_after_recovery()?;
 
         // Now that WAL recovery and the post-recovery checkpoint are complete, sweep any truly
         // orphaned segment/manifest files and process pending deletes!

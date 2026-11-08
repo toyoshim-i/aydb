@@ -4080,3 +4080,52 @@ fn buffered_recovery_stops_at_first_lost_blob() {
         "a buffered commit after a rolled-back one must not be replayed"
     );
 }
+
+#[test]
+fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
+    let tmp = TempTestDir::new("reconcile_after_rotation");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let cfg = EngineConfig::default();
+
+    {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        for k in [b"a", b"b", b"c"] {
+            engine
+                .put_row(1, k, b"value", &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        // Persist a quota for table 1 although its rows carry no row-meta or LRU entries.
+        engine
+            .meta_mgr
+            .commit_update(|st| {
+                st.table_quotas = vec![crate::meta::TableQuotaMeta {
+                    table_id: 1,
+                    eviction_policy: EvictionPolicy::Lru,
+                    max_bytes: 1 << 20,
+                    current_logical_bytes: 0,
+                }];
+            })
+            .unwrap();
+    }
+
+    let epochs = {
+        let engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        // Reconciliation appended its records after the epoch rotation, so they are still
+        // pending in the MemTable and backed only by the fresh WAL epoch.
+        assert!(!engine.memtable.is_empty());
+        assert_eq!(engine.sync_wal.active_epoch(), engine.meta_mgr.state().sync_wal_epoch);
+        assert_eq!(engine.buf_wal.active_epoch(), engine.meta_mgr.state().buf_wal_epoch);
+        assert!(engine.capped_table_state(1).unwrap().current_logical_bytes > 0);
+        (engine.sync_wal.active_epoch(), engine.buf_wal.active_epoch())
+        // Dropped without flushing: simulates a crash.
+    };
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert!(engine.sync_wal.active_epoch() > epochs.0);
+    assert!(engine.buf_wal.active_epoch() > epochs.1);
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(engine.get_row(1, k).unwrap(), Some(b"value".to_vec()));
+    }
+    assert!(engine.capped_table_state(1).unwrap().current_logical_bytes > 0);
+}
