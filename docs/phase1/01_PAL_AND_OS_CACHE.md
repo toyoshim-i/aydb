@@ -16,7 +16,7 @@ Because `aydb` delegates page caching of immutable `idx_<SeqID>.db` and `blob_*_
 
 | Option | Mechanism | Advantages | Disadvantages & Failure Modes |
 | :--- | :--- | :--- | :--- |
-| **Option A: Positional System Calls** *(Selected)*<br/>Win: `ReadFile` + `OVERLAPPED`<br/>Unix: `pread` / `pwrite` | Issue an explicit offset-based read into a caller-supplied buffer (e.g., a 4 KB stack/heap buffer). | 1. **Graceful I/O Error Handling:** Disk errors or SMB disconnects return a normal `io::Result::Err` that the engine can handle safely.<br/>2. **Deterministic Handle Release:** Closing the file handle immediately releases all kernel references, allowing instant `DeleteFile`.<br/>3. **Minimal `unsafe` Footprint.** | **Syscall + `memcpy` Overhead:** Every 4 KB block lookup incurs a user/kernel transition (~150–300 ns) and a 4 KB memory copy from the OS cache into user space. |
+| **Option A: Positional System Calls** *(Selected)*<br/>Win: `ReadFile` + `OVERLAPPED`<br/>Unix: `pread` / `pwrite` | Issue an explicit offset-based read into a caller-supplied buffer (e.g., a 4 KB stack/heap buffer). | 1. **Graceful I/O Error Handling:** Disk errors or SMB disconnects return a normal `io::Result::Err` that the engine can handle safely.<br/>2. **Deterministic Handle Release:** Closing the file handle immediately releases all kernel references, allowing instant `DeleteFile`.<br/>3. **Minimal `unsafe` Footprint.** | **Syscall, Copy & CRC Overhead:** Every 4 KB block lookup incurs a user/kernel transition (~150–300 ns), a 4 KB memory copy from the OS cache into user space, and a CPU-bound 4 KB CRC32C verification pass (~1–2 µs). Mitigated by pairing with an optional bounded verified user-space block cache (§1.3). |
 | **Option B: Memory-Mapped Files (`mmap`)**<br/>Win: `CreateFileMapping` + `MapViewOfFile`<br/>Unix: `mmap` | Map the segment file directly into the process's virtual address space and dereference pointers directly. | **Zero Syscall & Zero Copy:** Cache hits resolve at raw CPU memory bus speed (a few nanoseconds) via hardware page tables. | **Fatal Crash on SMB / Bad Sectors:** If an SMB connection drops or a storage read fails while dereferencing a mapped pointer, the CPU raises a hardware page-fault exception (`EXCEPTION_IN_PAGE_ERROR` on Windows, `SIGBUS` on Unix), immediately terminating the process.<br/>**Delayed Deletion & Working Set Bloat:** Mapped views inflate process working set accounting and can delay `DeleteFile` on Windows. |
 
 ### 1.2 Why `mmap` Is Unacceptable for `aydb`
@@ -24,6 +24,24 @@ Because `aydb` delegates page caching of immutable `idx_<SeqID>.db` and `blob_*_
 In safe Rust, dereferencing a `&[u8]` slice backed by `mmap` assumes the underlying memory is always valid. If the file resides on an SMB share (e.g., enterprise folder redirection or a NAS) and the network experiences a transient drop during a page fault, the Windows Memory Manager cannot populate the page and raises structured exception `0xC0000006` (`STATUS_IN_PAGE_ERROR`). Standard Rust error handling (`Result<T, E>`) cannot catch hardware page faults; the entire host desktop application crashes instantly.
 
 With **Option A (Positional System Calls)**, the kernel's Cache Manager (`CcCopyRead` on Windows) accesses the exact same physical RAM pages in the OS Standby/System Cache, copies the 4 KB block inside a kernel `__try / __except` block, and converts any underlying SMB or disk failure into a clean error code returned to `ReadFile`.
+
+### 1.3 Complementary Caching: OS Page Cache + Optional Bounded Verified Block Cache
+
+While Option A delivers rock-solid crash safety across network glitches and bad sectors, delegating *all* block access purely to the OS page cache introduces a throughput bottleneck on hot point lookups:
+1. **User/Kernel Transition Overhead:** Every `ReadFile` or `pread` incurs CPU mode switching and kernel dispatch overhead.
+2. **Kernel Cache Copy (`CcCopyRead`):** The Windows Cache Manager copies the 4 KB page from its kernel Virtual Address Control Block (VACB) mapping into the application buffer.
+3. **Repeated 4 KB CRC32C Verification:** Because the OS page cache contains raw storage pages that could theoretically suffer undetected in-memory corruption or bit-rot, every uncached block read must run a full-block CRC32C verification pass across 4,092 payload bytes.
+
+To eliminate this repeated overhead without violating bounded-memory requirements, `aydb` pairs the OS page cache with an **optional, strictly-bounded verified user-space block and blob cache** (`block_cache_bytes` and `blob_cache_bytes` in `EngineConfig`):
+
+* **Complementary Division of Labor:**
+  * **OS Page Cache (Primary Storage Tier):** Manages raw file page residency, asynchronous write-behind buffering, and zero-copy sequential read-ahead in 256 KB VACB windows. It absorbs the vast majority of disk I/O across the entire database volume without requiring a massive in-process buffer pool.
+  * **User-Space Verified Block/Blob Cache (Hot-Tier Acceleration):** Keeps hot, already-verified 4 KB index blocks and small blobs ($\le 16\text{ KB}$) in process heap memory.
+* **Key Invariants and Performance Advantages:**
+  * **Zero Syscall & Zero CRC Recalculation:** Cache hits bypass `ReadFile`/`pread` entirely and serve data in tens of nanoseconds. Because blocks were already verified when inserted into the cache, repeated CRC32C calculations are eliminated on hot internal and leaf index blocks.
+  * **Strict Deterministic Bounds:** Total private heap consumption is strictly capped at `memtable_capacity_bytes + block_cache_bytes + blob_cache_bytes + sparse_fence_metadata`. Setting both cache budgets to `0` reverts cleanly to the pure OS-cache-only model for ultra-constrained environments.
+  * **Immutability & Zero Cache Invalidation Complexity:** SSTable segments and blob files are immutable with strictly monotonic `SeqID`s. Cached entries never become stale while the segment is active. When compaction or LRU reclamation retires a segment, all cache entries for that `SeqID` are discarded wholesale.
+  * **Scan Resistance:** Compaction bulk inputs (`BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table scans bypass cache insertion to avoid displacing hot point-lookup data.
 
 ---
 
@@ -190,7 +208,7 @@ Standard Win32 file paths are limited to `MAX_PATH = 260` characters unless pref
 ### 5.3 Cross-Platform Handle Pool & Descriptor Limits
 
 * **On Windows (Local NTFS & SMB):** Every open segment handle holds an SMB `Read-Write-Handle (RWH) Lease`. Closing a handle immediately revokes or downgrades the lease and forces an SMB2 `CREATE` / `CLOSE` network round-trip on the next access. Because Windows supports millions of handles per process, the PAL's `HandlePool` sets the default open-handle cap on Windows to `usize::MAX` (keeping all active segments open until retired by compaction/eviction).
-* **On POSIX (macOS / Linux):** macOS defaults to a strict soft limit of `RLIMIT_NOFILE = 256` file descriptors per process. On POSIX targets, `HandlePool` pins critical files (`boot_meta.db`, `wal_sync.db`, `wal_buf.db`, and hot `idx` segments) and maintains an LRU descriptor cache (default cap: `128`) for cold `blob` segments, transparently closing and reopening descriptors on demand while holding an advisory `flock(LOCK_EX | LOCK_NB)` on a dedicated `db.lock` file to match Windows's `dwShareMode = 0` single-host guarantee.
+* **On POSIX (macOS / Linux):** macOS defaults to a strict soft limit of `RLIMIT_NOFILE = 256` file descriptors per process. On POSIX targets, `HandlePool` (`src/pal/unix.rs`) pins critical files (`boot_meta.db`, `wal_sync.db`, `wal_buf.db`, and hot `idx` segments) and maintains a **reference-aware LRU descriptor cache** (default cap: `128`) across idle segment handles. The pool bounds the number of simultaneously open OS file descriptors without evicting handles that are currently pinned by an active `Arc` reference, an open `LazyBlob` cursor, or an in-flight `pread`. Cold unpinned handles are transparently closed and reopened on demand while holding an advisory `flock(LOCK_EX | LOCK_NB)` on a dedicated `db.lock` file to match Windows's `dwShareMode = 0` single-host guarantee.
 
 ---
 
@@ -239,6 +257,14 @@ pub trait PlatformFile: Send + Sync + 'static {
 
     /// Reads up to `buf.len()` bytes starting at `offset`, returning the number of bytes read.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+
+    /// Batched positional reads at multiple offsets (e.g., WiscKey blob prefetch in range scans).
+    ///
+    /// Allows range scans projecting blob columns to submit multiple `(offset, &mut [u8])`
+    /// read requests across a segment in a single operation:
+    /// - Windows: Dispatches multiple concurrent OVERLAPPED ReadFile requests.
+    /// - Unix: Executes sequential pread calls (or batch submissions via io_uring).
+    fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()>;
 
     /// Writes all bytes in `buf` starting at `offset`.
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
@@ -291,6 +317,15 @@ pub trait PlatformFs: Send + Sync + 'static {
     fn root_path(&self) -> &Path;
 }
 ```
+
+### 6.1 Batched Positional Reads via `PlatformFile::read_many_at`
+
+Range scans that project out-of-line WiscKey blob columns can incur significant random read latency if blobs are dereferenced one-by-one synchronously. When a query scans a range of rows, the cursor streams index entries in chunks (`CURSOR_STREAM_CHUNK_ROWS`). For all rows within the chunk that reference out-of-line blobs in the same blob segment, their target offsets and lengths are known in advance.
+
+`PlatformFile::read_many_at` accepts a slice of `(offset, &mut [u8])` buffers and executes them as a batch:
+* **On Windows:** Leverages `FILE_FLAG_OVERLAPPED` handles to dispatch multiple concurrent `ReadFile` system calls without waiting synchronously between requests. The kernel's I/O subsystem can dispatch these requests in parallel to the NVMe controller or pipeline them over the SMB network, overlapping transfer latency and dramatically improving throughput for multi-row scans (e.g., YCSB E).
+* **On POSIX:** Issues sequential `pread` calls in user space, with an upgrade path to batch submission via `io_uring` on modern Linux kernels.
+* **Projection-Aware Triggering:** Batched prefetching is only triggered when the SQL query's column projection (`colUsed` in SQLite's `xBestIndex`) actually requires blob payload columns, avoiding unnecessary I/O when queries only inspect inline keys or counts.
 
 ---
 

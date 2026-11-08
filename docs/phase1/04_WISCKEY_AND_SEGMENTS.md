@@ -8,12 +8,12 @@ This chapter defines the detailed architecture of **Step 1-4: Out-of-Line Blob S
 
 In a classic LSM-Tree (such as LevelDB or RocksDB), keys and values are stored together inside sorted SSTable files. Whenever background compaction merges overlapping SSTables to reclaim overwritten or deleted entries, every value is read from disk and rewritten to a new SSTable—producing a write amplification factor of $10\times$ to $30\times$.
 
-`aydb` implements **WiscKey-style Key-Value Separation** governed by `INLINE_THRESHOLD` (default: `1024 bytes`):
+`aydb` implements **WiscKey-style Key-Value Separation** to decouple LSM compaction bandwidth from payload volume. Small records remain stored inline within index blocks, while larger payloads are appended to dedicated blob files and referenced via compact 23-byte pointers:
 
 ```mermaid
 flowchart TB
     subgraph Write["Mutation Arrival (put / batch_write)"]
-        KV["(Key, Value)"] --> SizeCheck{"Value.len() >= 1024 B<br/>(or Key+Val > MaxInline)?"}
+        KV["(Key, Value)"] --> SizeCheck{"Value.len() >= inline_threshold<br/>(or Key+Val > MaxInline)?"}
     end
 
     subgraph OutOfLine["Out-of-Line Blob Path (Large Payload)"]
@@ -33,6 +33,25 @@ flowchart TB
         Flush --> Compact["Merge-Sort Compaction:<br/>Copies ONLY Keys, Small Inline Values, and 23B BlobPtrs!<br/>Multi-MB Blobs in blob_*.db Are NEVER Copied!"]
     end
 ```
+
+### 1.1 Configurable Inline Thresholds (`inline_threshold_bytes` & `inline_max`)
+
+The boundary between inline and out-of-line storage is fully configurable:
+* **Global Engine Default (`EngineConfig::inline_threshold_bytes`):** Defaults to `1024 bytes` (`1 KB`).
+* **Per-Table Virtual Table DDL (`inline_max=<bytes>`):** Allows individual tables to specify custom inline limits (e.g., `CREATE VIRTUAL TABLE documents USING aydb(inline_max=2048, ...);`).
+* **Physical Upper Bound (`IndexEntry::inline_fits_in_block`):**
+  An inline entry must fit entirely within a single 4 KB index block without crossing block boundaries. Because each 4 KB block reserves an 8-byte trailer and a 2-byte offset directory entry per record, the physical upper bound is strictly enforced:
+  $$13 + \text{key\_len} + \text{val\_len} \le \text{MAX\_SINGLE\_BLOCK\_ENTRY\_BYTES}$$
+  This limits the maximum possible inline threshold to approximately $3.5\text{ KB} - 4\text{ KB}$ minus the primary key length.
+
+### 1.2 Workload Trade-Offs and Defaults
+
+Selecting the appropriate inline threshold balances write amplification against point-read latency:
+
+1. **Why 1 KB Remains the Default for Capped LRU Tables (`blob_lru`):**
+   For tables declared with logical size bounds (`MAX_BYTES`) and automatic LRU purging (`EVICTION = 'LRU'`), maintaining the `1 KB` threshold is essential. Capped tables place large payloads into dedicated `blob_lru_<TblID>_<SeqID>.db` files. When all blobs in an LRU generation are evicted, the engine drops the entire segment file via an $O(1)$ file deletion (Copy-less Eviction) with **zero compaction overhead**. If multi-kilobyte payloads were stored inline inside `idx_*.db`, reclaiming their space would require rewriting entire SSTables during compaction, causing severe write stalls on high-churn caches.
+2. **Raising `inline_max` for 1 KB – 3 KB Workloads (e.g., YCSB 2 KB Records):**
+   WiscKey separation is most effective when values are large (multiple kilobytes to megabytes) and write amplification dominates. For medium-sized records ($1\text{ KB} - 3\text{ KB}$), the extra random I/O indirection (a separate `ReadFile` and CRC check on `blob_*.db`) costs more latency than WiscKey saves on write amplification. Raising `inline_max` to `2048` or `3500` eliminates this second read, bringing point-read performance close to in-process B-Trees, at the expense of fewer entries per 4 KB index block (more fence pointers in heap) and higher compaction write volume.
 
 ---
 
@@ -99,7 +118,7 @@ To avoid scanning all 4 KB data blocks when reopening a database at startup, `id
 +-----------------------------------------------------------------------+
 ```
 
-At runtime, **only the Bloom Filter and the Sparse Fence Pointer Directory remain in process heap memory**. The 4 KB Data Blocks stay on disk / in the OS Page Cache and are fetched via a single 4 KB `read_exact_at` call on demand.
+At runtime, **the Bloom Filter and the Sparse Fence Pointer Directory remain in process heap memory** (consuming only hundreds of KB to a few MB). By default, the 4 KB Data Blocks stay on disk / in the OS Page Cache and are fetched via a single 4 KB `read_exact_at` call on demand; when the optional verified block cache is enabled (`block_cache_bytes > 0`), hot verified 4 KB data blocks are retained in user space (§3.4).
 
 ### 3.2 Exact 4096-Byte Index Data Block Layout
 
@@ -143,6 +162,29 @@ Inside each 4 KB Data Block, sorted entries grow **upward** from byte `0`, while
    * When `bloom.may_contain(key)` returns `true`, the reader binary-searches `fence_pointers` (`partition_point(|fp| fp.first_key.as_slice() <= key)`):
      * If the partition point is `0`, `key` is smaller than the very first key in the segment $\rightarrow$ immediate miss with zero I/O!
      * Otherwise, candidate block index is `b = partition_point - 1`. Because keys never span across 4 KB blocks, **at most one 4 KB block (`b`) can possibly contain `key`**. The reader issues a single `read_exact_at(4096, b * 4096)`, verifies `block_crc32c`, and binary-searches the block's `u16` offset directory!
+
+### 3.4 Optional Bounded Verified Block Cache & Small Blob Cache
+
+While sparse fence pointers and Bloom filters in heap memory keep default memory overhead minimal, reading uncached 4 KB blocks from the OS page cache still requires a user/kernel privilege transition (`NtReadFile` / `pread`) plus a hardware CRC32C verification pass over 4,092 bytes. For workloads where point-read latency is critical, `aydb` supports an **optional, strictly-bounded in-process cache** for verified blocks and small blobs configured via `EngineConfig`:
+
+#### 1. Cache Partitioning and Keying
+* **4 KB Index Block Cache (`block_cache_bytes`):**
+  * **Key:** `(seq_id: u64, block_idx: u32)`
+  * **Value:** The verified 4096-byte `idx` data block.
+  * **Verification Skip:** Data enters the cache only after successfully passing `block_crc32c` validation. Cache hits skip the 4 KB CRC32C recalculation entirely, reducing lookup latency from microseconds to tens of nanoseconds.
+* **Small Blob Record Cache (`blob_cache_bytes`):**
+  * **Key:** `(kind: BlobKind, table_id: u16, seg_id: u64, offset: u32)`
+  * **Value:** Verified payload for small blobs ($\le 16\text{ KB}$).
+  * **Independent Sub-Budget:** Small blobs are allocated from a separate memory pool so high-churn blob access cannot evict hot 4 KB index blocks.
+  * **Active Segment Append Safety:** For the currently active, append-only blob segment, records are eligible for caching **only if they reside strictly below `flushed_offset()`**. Uncommitted or in-flight appends at the segment tail are never cached.
+
+#### 2. Lifetime, Invalidation, and Scan Resistance
+* **Immutability & Zero Cache Invalidation Hazards:** Completed `idx` and `blob` segments are immutable and `SeqID`s are never recycled (`ARCHITECTURE.md` §2.3). Consequently, cached blocks and blobs remain permanently valid for the entire active lifetime of the segment.
+* **Automatic Invalidation on Segment Compaction/Reclamation:** When background compaction commits a replacement index segment, or when LRU reclamation deletes an obsolete `blob_lru` segment file, all cache entries corresponding to the retired `seq_id` are purged wholesale.
+* **Scan-Resistance (Bulk Scan Bypass):** Compaction readers (opened with `OpenHint::BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table sequential scans bypass insertion into the cache (read-through without caching), preventing bulk sequential operations from polluting or displacing the hot point-lookup cache working set.
+* **Strict Heap Determinism:** Total process memory consumed by the database engine remains strictly bounded and deterministic:
+  $$\text{Total Heap} = \text{memtable\_capacity\_bytes} + \text{block\_cache\_bytes} + \text{blob\_cache\_bytes} + \text{sparse\_fence\_metadata}$$
+  Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` (the default) completely disables in-process block caching, preserving the zero-cache footprint for memory-constrained environments.
 
 ---
 

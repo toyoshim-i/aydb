@@ -13,8 +13,11 @@
 * **Hybrid Workload Support:**
   * **Settings & State Management:** Small records (tens to hundreds of bytes), random updates, durability on return for `SyncTransactional` commits.
   * **Cache Management:** Medium-to-large payloads (blobs ranging from a few KB to several MB), high churn rates, and automatic LRU purging governed by per-table logical size limits (`MAX_BYTES`).
-* **Strict Heap Memory Bounds:**
-  * The private working set (heap) consumed by the database engine itself must remain strictly bounded within a fixed budget of a few megabytes to tens of megabytes. Caching of index blocks and data payloads is delegated to the operating system's page cache (e.g., Windows Cache Manager).
+* **Zero-Allocation & Bounded Memory Footprint:**
+  * The private working set (heap) consumed by the database engine itself remains strictly bounded within a deterministic budget of a few megabytes to tens of megabytes (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`).
+  * **Primary Storage Caching via OS Page Cache:** Raw file caching, OS-level write-behind, and sequential readahead are delegated to the host operating system's page cache (e.g., Windows Cache Manager VACBs).
+  * **Optional Bounded Verified Block/Blob Cache:** Rather than a blanket prohibition on in-process caching, the engine supports an optional, strictly-bounded user-space cache for verified 4 KB index blocks (`block_cache_bytes`) and small verified blobs (`blob_cache_bytes` in `EngineConfig`).
+    * *Rationale:* While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread` via `CcCopyRead`) plus a full-block CRC32C pass. On Windows, this overhead amounts to microseconds per lookup. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, reducing lookup latency to tens of nanoseconds while keeping total process memory strictly bounded and deterministic (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
 * **Optimization for Windows FS (NTFS) and SMB (CIFS / Samba):**
   * Must operate without performance degradation or data corruption not only on local NTFS volumes, but also over SMB/CIFS shares common in enterprise folder redirection, roaming profiles, and WSL/container mounts.
 * **Cross-Platform Portability:**
@@ -72,13 +75,19 @@ To support both fast random updates of small configuration records and zero writ
   `[Kind (1B) | TableID (2B) | SegID (8B) | Offset (4B) | Length (4B) | ValueCRC32C (4B)]`.
   Consequently, index compaction never copies large blob payloads.
 
-### 3.2 Two-Tier Index Management Under Strict Heap Limits
+### 3.2 Index Storage: Immutable Offset-Indexed SSTables (`idx_*.db`) and Bounded Caching
 
 * **Writable MemTable (In-Memory, Fixed Size Cap: e.g., 4 MB – 8 MB):**
-  An in-memory B-Tree or SkipList absorbing the latest writes. Once it reaches its memory cap, it is flushed to disk as an immutable `idx_<SeqID>.db` segment.
-* **Immutable Index Segments (OS Cache-Backed):**
-  On-disk `idx_<SeqID>.db` files are organized into 4 KB blocks. The database process keeps **only the first key of each 4 KB block (Sparse Fence Pointers) and a Bloom Filter in heap memory (consuming only a few hundred KB to a few MB)**, maintaining no custom in-process buffer pool for data blocks.
-  During lookups, the engine locates the target block offset via the fence pointers and issues a direct `ReadFile` (`pread`) call, reading the 4 KB block straight from the OS page cache (Windows Standby List). This keeps application private memory minimal while utilizing available host RAM for caching.
+  An in-memory B-Tree or SkipList absorbing the latest writes. Once it reaches its memory cap (`memtable_capacity_bytes`), it is flushed to disk as an immutable `idx_<SeqID>.db` segment.
+* **Immutable Index Segments (Sparse Fence Pointers & In-Heap Bloom Filters):**
+  On-disk `idx_<SeqID>.db` files are organized into 4 KB blocks. The database process keeps **only the first key of each 4 KB block (Sparse Fence Pointers) and a Bloom Filter in heap memory (consuming only a few hundred KB to a few MB)**. During lookups, the engine locates the target block offset via binary search over the fence pointers and reads the 4 KB block.
+* **Complementary Caching Architecture: OS Page Cache + Optional Bounded Verified Cache:**
+  * **OS Page Cache as Primary Substrate:** The host OS page cache (Windows Standby List / VACBs, Linux page cache) serves as the primary data cache, handling physical file buffering, write-behind, and sequential read-ahead without custom in-process buffer pool bloat.
+  * **Optional Bounded Verified Block Cache (`block_cache_bytes`):** Caches 4 KB `idx_*.db` data blocks in user-space fixed slots indexed by `(seq_id, block_idx)` **after** CRC32C verification.
+  * **Optional Bounded Small Blob Cache (`blob_cache_bytes`):** Caches verified small blob payloads ($\le 16\text{ KB}$) indexed by `(BlobKind, table_id, seg_id, offset)` with a dedicated sub-budget so that large-blob churn cannot evict index blocks. For the append-only active blob segment, only records below `flushed_offset()` are cached.
+  * **Rationale:** While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread`) plus a full-block CRC32C pass. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, dropping read latency from microseconds to tens of nanoseconds while keeping total memory strictly bounded and deterministic (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
+  * **Immutability & Zero Cache Invalidation Hazard:** Because `idx` and `blob` segments are immutable and `SeqID`s are never reused (`ARCHITECTURE.md` §2.3), cached entries never become stale. Invalidation is needed only when a segment is retired (during compaction commit or LRU segment reclamation), where all cached blocks for that `seq_id` are purged.
+  * **Scan-Resistance:** Compaction bulk inputs (`BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table scans bypass cache insertion (read-through without caching), preventing batch passes from displacing hot point-lookup working sets.
 
 ---
 
@@ -189,6 +198,11 @@ pub trait PlatformFile: Send + Sync {
     /// - Unix: pread (FileExt::read_exact_at)
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
 
+    /// Batched positional reads for scatter/gather prefetching (e.g., WiscKey blob dereferencing)
+    /// - Win: Parallel asynchronous ReadFile calls via OVERLAPPED handles
+    /// - Unix: Sequential pread calls (or io_uring batching)
+    fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()>;
+
     /// Thread-safe positional write at a given offset
     /// - Win: WriteFile with OVERLAPPED(Offset, OffsetHigh)
     /// - Unix: pwrite (FileExt::write_all_at)
@@ -214,8 +228,8 @@ pub trait PlatformFile: Send + Sync {
 }
 ```
 
-> **Note on File Descriptor Limits (e.g., macOS `RLIMIT_NOFILE = 256`):**
-> The file manager layer managing `PlatformFile` instances maintains a configurable LRU cache cap on open file descriptors (effectively unlimited on Windows to preserve SMB leases, and capped at e.g. 64–128 descriptors on POSIX). When the cap is reached on POSIX, cold `blob` segments are transparently closed and reopened on demand.
+> **Note on File Descriptor Limits & POSIX `HandlePool` (e.g., macOS `RLIMIT_NOFILE = 256`):**
+> On Windows, every open segment handle holds an SMB `Read-Write-Handle (RWH) Lease`; because Windows supports millions of handles per process, segment handles remain open until segment retirement. On POSIX targets, where `RLIMIT_NOFILE` can be as low as 256, the file manager maintains a reference-aware `HandlePool` (`src/pal/unix.rs`) with a configurable descriptor cap (default: 128). The pool bounds the number of simultaneously open OS file descriptors across idle segment handles using LRU eviction, without evicting or closing handles that are currently pinned by an active `Arc` reference, an open `LazyBlob` cursor, or an in-flight `pread`. Cold unpinned handles are transparently closed and reopened on demand.
 
 ---
 
