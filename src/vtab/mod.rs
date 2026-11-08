@@ -19,9 +19,9 @@ use std::ffi::CString;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::engine::{StorageEngine, WriteDurability};
+use crate::engine::{EngineReader, StorageEngine, WriteDurability};
 use crate::engine::LazyBlob;
 use crate::pal::{OsFile, OsFs};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
@@ -123,7 +123,7 @@ fn find_existing_pk_or_numeric_alt(
 /// Point lookup used by `PLAN_PK_POINT`: reads the row value into the cursor slab, or (for
 /// keys-only plans) merely checks existence without touching any out-of-line blob.
 fn point_fetch(
-    eng: &mut StorageEngine<OsFs>,
+    eng: &EngineReader<'_, OsFs>,
     table_id: u16,
     pk: &[u8],
     keys_only: bool,
@@ -135,6 +135,34 @@ fn point_fetch(
     } else {
         eng.get_row_into(table_id, pk, slab, spans)
     }
+}
+
+/// Runs read callback body `f` with the cheapest sufficient engine lock.
+///
+/// The lock choice is made while holding the shared lock: if `read_needs_exclusive` is false the
+/// body runs on a shared-access [`EngineReader`] (many readers in parallel); otherwise the shared
+/// lock is released first (never upgraded in place) and the body runs under the write lock via
+/// `with_committed_read_for_conn`, which re-resolves the state and so needs no recheck. Returns
+/// `None` if the lock is poisoned. `f` may run a second time if a shared-lock read reports that it
+/// needed exclusive access (defensive; cannot happen when the decision rules hold).
+fn with_read_access<R>(
+    engine: &RwLock<StorageEngine<OsFs>>,
+    conn_id: usize,
+    table_id: u16,
+    mut f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
+) -> Option<R> {
+    {
+        let g = engine.read().ok()?;
+        if !g.read_needs_exclusive(conn_id, table_id) {
+            let rd = g.reader_for_conn(conn_id);
+            let r = f(&rd);
+            if !rd.needs_exclusive_retry() {
+                return Some(r);
+            }
+        }
+    }
+    let mut g = engine.write().ok()?;
+    Some(g.with_committed_read_for_conn(conn_id, f))
 }
 
 /// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code.
@@ -212,17 +240,17 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
     }
 }
 
-fn resolve_pk_for_rowid<F: crate::pal::PlatformFs>(
+fn resolve_pk_for_rowid(
     vtab: &AydbVTab,
-    eng: &mut StorageEngine<F>,
     target_rid: i64,
+    scan_all_keys: impl FnOnce(u16) -> io::Result<Vec<Vec<u8>>>,
 ) -> io::Result<Option<Vec<u8>>> {
     if let Ok(rmap) = vtab.rowid_to_pk.lock() {
         if let Some(pk) = rmap.get_pk(target_rid) {
             return Ok(Some(pk.clone()));
         }
     }
-    let all_keys = eng.scan_keys_range(vtab.table_id, None, None, usize::MAX)?;
+    let all_keys = scan_all_keys(vtab.table_id)?;
     let mut found = None;
     if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
         for pk in all_keys {
@@ -272,7 +300,7 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
 };
 
 pub(super) struct ModuleAuxContext {
-    pub(super) engine: Arc<Mutex<StorageEngine<OsFs>>>,
+    pub(super) engine: Arc<RwLock<StorageEngine<OsFs>>>,
     /// Background compaction worker; joined when the module (and thus this context) is dropped.
     pub(super) _compaction_worker: Option<compaction_worker::CompactionWorker>,
 }
@@ -281,7 +309,7 @@ pub(super) struct ModuleAuxContext {
 pub(super) struct AydbVTab {
     base: sqlite3_vtab,
     db: *mut sqlite3,
-    engine: Arc<Mutex<StorageEngine<OsFs>>>,
+    engine: Arc<RwLock<StorageEngine<OsFs>>>,
     table_id: u16,
     table_name: String,
     durability: WriteDurability,
@@ -463,7 +491,7 @@ unsafe extern "system" fn vtab_create_or_connect(
 
         // Resolve or auto-assign unique `table_id` and register Capped Table if `max_bytes > 0`
         let table_id = {
-            let mut eng = match aux.engine.lock() {
+            let mut eng = match aux.engine.write() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
@@ -494,14 +522,14 @@ unsafe extern "system" fn vtab_create_or_connect(
 
         let declare_sql = format!("CREATE TABLE x({})", ddl.columns_spec);
         let Ok(c_sql) = CString::new(declare_sql) else {
-            if let Ok(mut eng) = aux.engine.lock() {
+            if let Ok(mut eng) = aux.engine.write() {
                 eng.unregister_vtab(table_id, &ddl.table_name);
             }
             return SQLITE_ERROR;
         };
         let rc = sqlite3_declare_vtab(db, c_sql.as_ptr());
         if rc != SQLITE_OK {
-            if let Ok(mut eng) = aux.engine.lock() {
+            if let Ok(mut eng) = aux.engine.write() {
                 eng.unregister_vtab(table_id, &ddl.table_name);
             }
             return rc;
@@ -542,7 +570,7 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
         if !p_vtab.is_null() {
             unsafe {
                 let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
-                if let Ok(mut eng) = vtab.engine.lock() {
+                if let Ok(mut eng) = vtab.engine.write() {
                     eng.unregister_vtab(vtab.table_id, &vtab.table_name);
                 }
             }
@@ -558,7 +586,7 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab_ref = &*(p_vtab as *const AydbVTab);
                 {
-                    let mut eng = match vtab_ref.engine.lock() {
+                    let mut eng = match vtab_ref.engine.write() {
                         Ok(g) => g,
                         Err(_) => return SQLITE_ERROR,
                     };
@@ -891,13 +919,9 @@ unsafe extern "system" fn vtab_filter(
         cursor.stream_sec_index_id = None;
         cursor.stream_sec_prefix.clear();
 
-        let mut eng = match vtab.engine.lock() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
-        };
         let conn_id = vtab.db as usize;
 
-        eng.with_committed_read_for_conn(conn_id, |eng| {
+        with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
             let base_plan = idx_num & 0xFF;
             match base_plan {
                 PLAN_PK_POINT => {
@@ -931,7 +955,7 @@ unsafe extern "system" fn vtab_filter(
                                     Err(e) => return io_err_to_sqlite_rc(&e),
                                 }
                             } else {
-                                match resolve_pk_for_rowid(vtab, eng, rid) {
+                                match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
                                     Ok(Some(mapped_pk)) => {
                                         match point_fetch(
                                             eng,
@@ -1278,6 +1302,7 @@ unsafe extern "system" fn vtab_filter(
 
             SQLITE_OK
         })
+        .unwrap_or(SQLITE_ERROR)
     }))
     .unwrap_or(SQLITE_ERROR)
 }
@@ -1303,10 +1328,6 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
             cursor.lazy_blobs.clear();
             cursor.pos = 0;
 
-            let mut eng = match vtab.engine.lock() {
-                Ok(g) => g,
-                Err(_) => return SQLITE_ERROR,
-            };
             let conn_id = vtab.db as usize;
             let keys_only = cursor.keys_only;
 
@@ -1316,7 +1337,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .as_ref()
                     .map(|(b, inc)| (b.as_slice(), *inc));
                 let mut next_last_sec: Option<Vec<u8>> = None;
-                let rc = eng.with_committed_read_for_conn(conn_id, |eng| {
+                let rc = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
                     match eng.scan_secondary_index_into_slab(
                         vtab.table_id,
                         sec_index_id,
@@ -1336,7 +1357,8 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                         }
                         Err(e) => io_err_to_sqlite_rc(&e),
                     }
-                });
+                })
+                .unwrap_or(SQLITE_ERROR);
                 if rc != SQLITE_OK {
                     cursor.streaming_active = false;
                     return rc;
@@ -1367,7 +1389,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .map(|(b, inc)| (b.as_slice(), *inc))
             };
 
-            let rc = eng.with_committed_read_for_conn(conn_id, |eng| {
+            let rc = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
                 if let Err(e) = eng.scan_range_into_slab(
                     vtab.table_id,
                     lower_ref,
@@ -1383,7 +1405,8 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     return io_err_to_sqlite_rc(&e);
                 }
                 SQLITE_OK
-            });
+            })
+            .unwrap_or(SQLITE_ERROR);
             if rc != SQLITE_OK {
                 cursor.streaming_active = false;
                 return rc;
@@ -1479,17 +1502,15 @@ unsafe extern "system" fn vtab_column(
 
         // Lazy Blob Dereference: If this row has a pending external blob that hasn't been read into slab yet
         if let Some(Some(lazy_blob)) = cursor.lazy_blobs.get(cursor.pos).cloned() {
-            let mut eng = match vtab.engine.lock() {
-                Ok(g) => g,
-                Err(_) => return SQLITE_ERROR,
-            };
             let Some(pk_bytes) = cursor.pks.get(cursor.pos) else {
                 return SQLITE_ERROR;
             };
             let conn_id = vtab.db as usize;
-            let deref_res = eng.with_committed_read_for_conn(conn_id, |eng| {
+            let Some(deref_res) = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
                 eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &lazy_blob, &mut cursor.slab)
-            });
+            }) else {
+                return SQLITE_ERROR;
+            };
             let span = match deref_res {
                 Ok(Some(s)) => s,
                 Ok(None) => {
@@ -1553,7 +1574,7 @@ unsafe extern "system" fn vtab_update(
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1572,7 +1593,7 @@ unsafe extern "system" fn vtab_update(
                     }
                     return SQLITE_OK;
                 } else {
-                    let old_pk_opt = match resolve_pk_for_rowid(vtab, &mut eng, rid) {
+                    let old_pk_opt = match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
                         Ok(opt) => opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
                     };
@@ -1713,7 +1734,7 @@ unsafe extern "system" fn vtab_update(
                 if vtab.pk_affinity == ColumnAffinity::Integer {
                     old_pk_opt = Some((encode_i64_tagged_key(rid).to_vec(), None));
                 } else {
-                    let mapped = match resolve_pk_for_rowid(vtab, &mut eng, rid) {
+                    let mapped = match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
                         Ok(opt) => opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
                     };
@@ -1838,7 +1859,7 @@ unsafe extern "system" fn vtab_update(
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1856,7 +1877,7 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1874,7 +1895,7 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1895,7 +1916,7 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1913,7 +1934,7 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1931,7 +1952,7 @@ unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint:
 unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
@@ -1955,7 +1976,7 @@ unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c
 unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.lock() {
+        let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };

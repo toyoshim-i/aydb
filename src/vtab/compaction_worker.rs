@@ -1,4 +1,4 @@
-//! Optional background compaction worker for the shared `Arc<Mutex<StorageEngine<OsFs>>>`.
+//! Optional background compaction worker for the shared `Arc<RwLock<StorageEngine<OsFs>>>`.
 //!
 //! The worker thread runs the 3-phase compaction protocol so that the expensive K-way merge
 //! happens with the engine mutex RELEASED:
@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -51,11 +51,11 @@ struct Entry {
     alive: Arc<AtomicBool>,
 }
 
-/// One worker per engine instance, keyed by the address of the engine `Mutex` (stable and
+/// One worker per engine instance, keyed by the address of the engine `RwLock` (stable and
 /// unique while the worker holds an `Arc` to it). Registrations are refcounted.
 static REGISTRY: Mutex<Option<HashMap<usize, Entry>>> = Mutex::new(None);
 
-fn key_of(engine: &Arc<Mutex<StorageEngine<OsFs>>>) -> usize {
+fn key_of(engine: &Arc<RwLock<StorageEngine<OsFs>>>) -> usize {
     Arc::as_ptr(engine) as usize
 }
 
@@ -63,13 +63,13 @@ fn key_of(engine: &Arc<Mutex<StorageEngine<OsFs>>>) -> usize {
 /// engine shuts the worker down.
 pub(crate) struct CompactionWorker {
     key: usize,
-    engine: Arc<Mutex<StorageEngine<OsFs>>>,
+    engine: Arc<RwLock<StorageEngine<OsFs>>>,
 }
 
 impl CompactionWorker {
     /// Registers with the engine's worker, spawning it (and switching the engine into
     /// background-compaction mode) if this is the first registration.
-    pub(crate) fn spawn(engine: Arc<Mutex<StorageEngine<OsFs>>>) -> Option<Self> {
+    pub(crate) fn spawn(engine: Arc<RwLock<StorageEngine<OsFs>>>) -> Option<Self> {
         let key = key_of(&engine);
         let mut reg = REGISTRY.lock().ok()?;
         let map = reg.get_or_insert_with(HashMap::new);
@@ -82,7 +82,7 @@ impl CompactionWorker {
             cv: Condvar::new(),
         });
         {
-            let mut eng = engine.lock().ok()?;
+            let mut eng = engine.write().ok()?;
             let hook_signal = Arc::clone(&signal);
             eng.set_compaction_hook(Some(Arc::new(move || hook_signal.notify())));
             eng.set_background_compaction(true);
@@ -97,7 +97,7 @@ impl CompactionWorker {
             })
             .ok();
         if handle.is_none() {
-            if let Ok(mut eng) = engine.lock() {
+            if let Ok(mut eng) = engine.write() {
                 eng.set_compaction_hook(None);
                 eng.set_background_compaction(false);
             }
@@ -153,7 +153,7 @@ impl Drop for CompactionWorker {
         if let Ok(reg) = REGISTRY.lock() {
             let replaced = reg.as_ref().is_some_and(|m| m.contains_key(&self.key));
             if !replaced {
-                if let Ok(mut eng) = self.engine.lock() {
+                if let Ok(mut eng) = self.engine.write() {
                     eng.set_compaction_hook(None);
                     eng.set_background_compaction(false);
                 }
@@ -165,7 +165,7 @@ impl Drop for CompactionWorker {
 /// Test support: `(registrations, worker_thread_alive)` for `engine`, if a worker is registered.
 #[cfg(test)]
 pub(crate) fn worker_stats(
-    engine: &Arc<Mutex<StorageEngine<OsFs>>>,
+    engine: &Arc<RwLock<StorageEngine<OsFs>>>,
 ) -> Option<(usize, Arc<AtomicBool>)> {
     let reg = REGISTRY.lock().ok()?;
     let e = reg.as_ref()?.get(&key_of(engine))?;
@@ -176,7 +176,7 @@ fn is_shutdown(signal: &Signal) -> bool {
     signal.state.lock().map(|s| s.shutdown).unwrap_or(true)
 }
 
-fn worker_loop(engine: Arc<Mutex<StorageEngine<OsFs>>>, signal: Arc<Signal>) {
+fn worker_loop(engine: Arc<RwLock<StorageEngine<OsFs>>>, signal: Arc<Signal>) {
     loop {
         {
             let Ok(mut st) = signal.state.lock() else {
@@ -206,7 +206,7 @@ fn worker_loop(engine: Arc<Mutex<StorageEngine<OsFs>>>, signal: Arc<Signal>) {
             }
             // Phase 1: prepare under the lock (cheap).
             let job = {
-                let Ok(mut eng) = engine.lock() else {
+                let Ok(mut eng) = engine.write() else {
                     return;
                 };
                 if !eng.compaction_pending() {
@@ -222,7 +222,7 @@ fn worker_loop(engine: Arc<Mutex<StorageEngine<OsFs>>>, signal: Arc<Signal>) {
                 break;
             };
             // Phase 3: install under the lock (cheap).
-            let Ok(mut eng) = engine.lock() else {
+            let Ok(mut eng) = engine.write() else {
                 return;
             };
             match eng.install_compaction(out) {

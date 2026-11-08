@@ -4,7 +4,7 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::engine::StorageEngine;
 use crate::pal::OsFs;
@@ -61,7 +61,7 @@ impl SqliteConnection {
     /// [`Self::register_aydb_module_with_options`] to keep compaction inline instead.
     pub fn register_aydb_module(
         &self,
-        engine: Arc<Mutex<StorageEngine<OsFs>>>,
+        engine: Arc<RwLock<StorageEngine<OsFs>>>,
     ) -> io::Result<()> {
         self.register_aydb_module_with_options(engine, true)
     }
@@ -71,7 +71,7 @@ impl SqliteConnection {
     /// (default: inline compaction inside the write path).
     pub fn register_aydb_module_with_options(
         &self,
-        engine: Arc<Mutex<StorageEngine<OsFs>>>,
+        engine: Arc<RwLock<StorageEngine<OsFs>>>,
         background_compaction: bool,
     ) -> io::Result<()> {
         let c_name = CString::new("aydb").unwrap();

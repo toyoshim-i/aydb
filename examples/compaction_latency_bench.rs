@@ -5,7 +5,7 @@
 //! commit pays when it has to run a whole merge while holding the engine mutex.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use aydb::engine::{EngineConfig, StorageEngine, WriteDurability};
@@ -27,7 +27,7 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
         background_compaction: background,
         ..Default::default()
     };
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker = background.then(|| {
@@ -36,7 +36,7 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let job = {
-                    let mut e = engine.lock().unwrap();
+                    let mut e = engine.write().unwrap();
                     if e.compaction_pending() {
                         e.prepare_compaction().unwrap()
                     } else {
@@ -46,7 +46,7 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
                 match job {
                     Some(job) => {
                         let out = job.run().unwrap();
-                        engine.lock().unwrap().install_compaction(out).unwrap();
+                        engine.write().unwrap().install_compaction(out).unwrap();
                     }
                     None => std::thread::sleep(Duration::from_millis(1)),
                 }
@@ -60,7 +60,7 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
         let key = format!("key{i:09}");
         let t = Instant::now();
         engine
-            .lock()
+            .write()
             .unwrap()
             .put_row(1, key.as_bytes(), &payload, &[], WriteDurability::BufferedFast)
             .unwrap();
@@ -70,7 +70,7 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
     if let Some(w) = worker {
         w.join().unwrap();
     }
-    let segs = engine.lock().unwrap().active_idx_segment_count();
+    let segs = engine.write().unwrap().active_idx_segment_count();
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
     (lat, segs)

@@ -3157,6 +3157,19 @@ fn put_t(engine: &mut StorageEngine<OsFs>, k: &str, v: &str) {
         .unwrap();
 }
 
+fn keys_of_r(r: &crate::engine::EngineReader<'_, OsFs>, reverse: bool) -> Vec<String> {
+    let mut pks = Vec::new();
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    r.scan_range_into_slab(
+        1, None, None, reverse, usize::MAX, true, &mut pks, &mut slab, &mut spans, None,
+    )
+    .unwrap();
+    pks.into_iter()
+        .map(|k| String::from_utf8(k).unwrap())
+        .collect()
+}
+
 fn keys_of(engine: &mut StorageEngine<OsFs>, reverse: bool) -> Vec<String> {
     let mut pks = Vec::new();
     let mut slab = Vec::new();
@@ -3194,7 +3207,7 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
         (
             e.get_row(1, b"committed").unwrap(),
             e.get_row(1, b"u000123").unwrap(),
-            keys_of(e, false),
+            keys_of_r(e, false),
         )
     });
     assert_eq!(v, Some(b"c1".to_vec()));
@@ -3203,7 +3216,8 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
     assert_eq!(engine.memtable.len(), mem_len);
     assert_eq!(engine.memtable.approximate_bytes(), mem_bytes);
     assert_eq!(engine.memtable.highest_lsn(), mem_hi);
-    assert!(!engine.in_committed_read_view);
+    assert_eq!(engine.read_view_for_conn(1), ReadView::Owner);
+    assert_eq!(engine.read_view_for_conn(2), ReadView::Committed);
 
     // The owner still sees everything.
     assert_eq!(
@@ -3265,7 +3279,7 @@ fn owner_scan_merges_overlay_with_tombstones_and_overwrites_forward_and_reverse(
             .chain(flush_first.then(|| "z".to_string()))
             .collect();
         assert_eq!(
-            engine.with_committed_read_for_conn(2, |e| keys_of(e, false)),
+            engine.with_committed_read_for_conn(2, |e| keys_of_r(e, false)),
             committed
         );
         let non_owner_c = engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"c").unwrap());
@@ -3421,4 +3435,129 @@ fn commit_wal_failure_leaves_memtable_without_tx_data_and_poisons_engine() {
             .put_row(1, b"more", b"v", &[], WriteDurability::BufferedFast)
             .is_err()
     );
+}
+
+/// Runs `f` on a helper thread and fails the test if it does not finish in `secs` (deadlock guard).
+fn run_with_timeout(secs: u64, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => h.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("test body did not finish within {secs}s (deadlock?)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => h.join().unwrap(),
+    }
+}
+
+fn pair_value(n: u32) -> Vec<u8> {
+    // Alternate inline (50 B) and out-of-line blob (3000 B) payloads.
+    let len = if n.is_multiple_of(2) { 50 } else { 3000 };
+    format!("{n:08}").bytes().cycle().take(len).collect()
+}
+
+#[test]
+fn read_view_and_exclusive_rules() {
+    let tmp = TempTestDir::new("read_rules");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut eng = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    put_t(&mut eng, "k", "v");
+    assert_eq!(eng.read_view_for_conn(1), ReadView::Owner);
+    assert!(!eng.read_needs_exclusive(1, 1));
+    assert!(!eng.read_needs_exclusive(2, 1));
+
+    eng.begin_transaction_for_conn(1).unwrap();
+    assert_eq!(eng.read_view_for_conn(1), ReadView::Owner);
+    assert_eq!(eng.read_view_for_conn(2), ReadView::Committed);
+    assert!(eng.read_needs_exclusive(1, 1));
+    assert!(!eng.read_needs_exclusive(2, 1));
+
+    // The owner's uncommitted blob lives in the writer buffer: a shared-access reader refuses
+    // to read it (and says so), the exclusive path flushes and succeeds.
+    eng.put_row(1, b"big", &pair_value(1), &[], WriteDurability::BufferedFast)
+        .unwrap();
+    {
+        let r = eng.reader_for_conn(1);
+        assert!(r.get_row(1, b"big").is_err());
+        assert!(r.needs_exclusive_retry());
+    }
+    assert_eq!(
+        eng.with_committed_read_for_conn(1, |r| r.get_row(1, b"big")).unwrap(),
+        Some(pair_value(1))
+    );
+    assert_eq!(
+        eng.reader_for_conn(2).get_row(1, b"big").unwrap(),
+        None,
+        "uncommitted blob invisible to other connections"
+    );
+    eng.commit_transaction_for_conn(1).unwrap();
+    assert!(!eng.read_needs_exclusive(1, 1));
+    assert_eq!(
+        eng.reader_for_conn(2).get_row(1, b"big").unwrap(),
+        Some(pair_value(1))
+    );
+}
+
+#[test]
+fn concurrent_shared_readers_never_see_torn_or_uncommitted_pairs() {
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicBool;
+    run_with_timeout(120, || {
+        let tmp = TempTestDir::new("rw_readers");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        {
+            let mut g = engine.write().unwrap();
+            for k in [&b"a"[..], b"b"] {
+                g.put_row(1, k, &pair_value(0), &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..6usize)
+            .map(|t| {
+                let (engine, stop) = (engine.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let conn = 100 + t;
+                    let mut reads = 0u64;
+                    let (mut slab, mut spans) = (Vec::new(), Vec::new());
+                    while !stop.load(Ordering::Relaxed) {
+                        let g = engine.read().unwrap();
+                        assert!(!g.read_needs_exclusive(conn, 1));
+                        let r = g.reader_for_conn(conn);
+                        let a = r.get_row(1, b"a").unwrap().unwrap();
+                        let b = r.get_row(1, b"b").unwrap().unwrap();
+                        assert_eq!(a, b, "torn pair");
+                        slab.clear();
+                        spans.clear();
+                        assert!(r.get_row_into(1, b"a", &mut slab, &mut spans).unwrap());
+                        assert_eq!(&slab[..], &a[..]);
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        for n in 1..=300u32 {
+            engine.write().unwrap().begin_transaction_for_conn(1).unwrap();
+            for k in [&b"a"[..], b"b"] {
+                let mut g = engine.write().unwrap();
+                g.put_row(1, k, &pair_value(n), &[], WriteDurability::BufferedFast)
+                    .unwrap();
+                // Owner reads its own uncommitted (possibly buffered blob) value: exclusive path.
+                assert!(g.read_needs_exclusive(1, 1));
+                let own = g.with_committed_read_for_conn(1, |r| r.get_row(1, k)).unwrap();
+                assert_eq!(own, Some(pair_value(n)));
+            }
+            engine.write().unwrap().commit_transaction_for_conn(1).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total > 0);
+    });
 }

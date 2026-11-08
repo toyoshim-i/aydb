@@ -10,7 +10,8 @@ use crate::memtable::MemEntry;
 use crate::pal::PlatformFs;
 use crate::wal::{WalBatch, WalRecord};
 
-use super::{StorageEngine, WriteDurability};
+use super::reader::CxRef;
+use super::{EngineReader, StorageEngine, WriteDurability};
 
 #[derive(Clone, Default)]
 pub(crate) struct TxMetaSnapshot {
@@ -157,37 +158,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    /// Executes a read closure `f` for `conn_id` against the committed snapshot.
+    /// Executes a read closure `f` for `conn_id` with exclusive engine access.
+    ///
     /// If `conn_id` owns the active transaction (or no transaction is active), `f` sees the
     /// transaction overlay on top of the `MemTable` (read-your-own-writes). Otherwise `f` sees
-    /// the `MemTable` and segments only. This is a cheap view selection: no engine state is
+    /// the committed data only. The view is a cheap per-call selection: no engine state is
     /// modified and the cost is independent of the number of uncommitted mutations.
-    pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, f: F) -> R
+    ///
+    /// Because access is exclusive, the closure may be re-run once after the engine flushed a
+    /// buffered blob the reader needed (it must be free of side effects before its first read
+    /// result), and `EagerWriteOnRead` promotions queued by the closure are applied afterwards
+    /// (their errors are not reported). Prefer [`Self::reader_for_conn`] under a shared lock
+    /// when [`Self::read_needs_exclusive`] is `false`. The closure must return read errors (not
+    /// panic on them) so the retry can happen.
+    pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, mut f: F) -> R
     where
-        F: FnOnce(&mut Self) -> R,
+        F: FnMut(&EngineReader<'_, FS>) -> R,
     {
-        if self.tx_depth == 0 || self.tx_owner_conn == Some(conn_id) {
-            return f(self);
-        }
-
-        struct ViewGuard<'a, FS: PlatformFs> {
-            eng: &'a mut StorageEngine<FS>,
-            prev_in_view: bool,
-        }
-
-        impl<FS: PlatformFs> Drop for ViewGuard<'_, FS> {
-            fn drop(&mut self) {
-                self.eng.in_committed_read_view = self.prev_in_view;
-            }
-        }
-
-        let prev_in_view = self.in_committed_read_view;
-        self.in_committed_read_view = true;
-        let guard = ViewGuard {
-            eng: self,
-            prev_in_view,
-        };
-        f(guard.eng)
+        let view = self.read_view_for_conn(conn_id);
+        self.run_read(view, |eng, cx| {
+            f(&EngineReader {
+                eng,
+                cx: CxRef::Borrowed(cx),
+            })
+        })
+        .0
     }
 
     /// Prepares the active transaction for commit (`xSync` two-phase commit phase 1).

@@ -27,7 +27,7 @@
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use aydb::engine::{EngineConfig, StorageEngine};
@@ -138,7 +138,7 @@ fn bench_small_sync_config_updates(root: &PathBuf) {
         let sub = root.join("aydb_sync_cfg");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
 
@@ -276,7 +276,7 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
         cfg.max_blob_segment_bytes = 1024 * 1024; // 1.0 MB blob_lru segments
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
@@ -416,7 +416,7 @@ fn bench_read_heavy_cache_lru_tracking(root: &PathBuf) {
         let sub = root.join("aydb_read_lru");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
 

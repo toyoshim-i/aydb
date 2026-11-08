@@ -10,7 +10,7 @@ fn sqlite_vtab_point_lookup_secondary_index_range_and_capped_lru() {
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 256;
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module(engine.clone()).unwrap();
@@ -183,7 +183,7 @@ fn sqlite_vtab_point_lookup_secondary_index_range_and_capped_lru() {
 fn sqlite_vtab_real_pk_8byte_text_pk_crc_collision_and_limit_pushdown() {
     let tmp = TempTestDir::new("vtab_regressions");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -365,7 +365,7 @@ fn sqlite_vtab_real_pk_8byte_text_pk_crc_collision_and_limit_pushdown() {
 fn pk_uniqueness_on_conflict_and_table_id_registry() {
     let tmp = TempTestDir::new("vtab_pk_uniqueness");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -504,7 +504,7 @@ fn pk_uniqueness_on_conflict_and_table_id_registry() {
 fn storage_class_key_tags_auto_rowid_and_mixed_range() {
     let tmp = TempTestDir::new("vtab_storage_class_tags");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -646,7 +646,7 @@ fn io_and_corrupt_errors_propagate_from_filter_and_update() {
     let cfg = EngineConfig::default();
     {
         let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg.clone()).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg.clone()).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
 
@@ -666,7 +666,7 @@ fn io_and_corrupt_errors_propagate_from_filter_and_update() {
         conn.execute_batch("COMMIT;").unwrap();
 
         // Flush to disk so `idx_*.db` has multiple 4 KB blocks (block 0 has catalog, block 1 has id=60)
-        engine.lock().unwrap().flush_memtable().unwrap();
+        engine.write().unwrap().flush_memtable().unwrap();
     }
 
     // Corrupt the second 4 KB data block (offset 4096 + 16) of `idx_*.db` while handles are closed
@@ -689,7 +689,7 @@ fn io_and_corrupt_errors_propagate_from_filter_and_update() {
 
     // Reopen engine and VTab; point query, full scan, and DELETE/UPDATE on block 1 must return Err
     let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module(engine).unwrap();
     conn.execute_batch(
@@ -721,7 +721,7 @@ fn io_and_corrupt_errors_propagate_from_filter_and_update() {
 fn full_scan_limit_pushdown_and_rowid_map_compaction() {
     let tmp = TempTestDir::new("vtab_limit_and_rowid_map");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -781,7 +781,7 @@ fn full_scan_limit_pushdown_and_rowid_map_compaction() {
 fn savepoints_drop_table_paren_columns_and_panic_safety() {
     let tmp = TempTestDir::new("vtab_savepoints_drop_table");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -873,7 +873,7 @@ fn savepoints_drop_table_paren_columns_and_panic_safety() {
 fn cross_connection_transaction_isolation_and_two_phase_sync_rollback() {
     let tmp = TempTestDir::new("vtab_conn_isolation");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let shared = Arc::new(Mutex::new(
+    let shared = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
 
@@ -971,7 +971,7 @@ fn cross_connection_transaction_isolation_and_two_phase_sync_rollback() {
 fn affinity_collation_unified_numeric_sorting_and_max_rowid() {
     let tmp = TempTestDir::new("vtab_affinity_collation");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let shared = Arc::new(Mutex::new(
+    let shared = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1158,7 +1158,7 @@ fn vtab_keys_only_projection_and_tx_budget() {
 
     {
         let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs.clone(), cfg.clone()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1180,7 +1180,7 @@ fn vtab_keys_only_projection_and_tx_budget() {
             )
             .unwrap();
         }
-        engine.lock().unwrap().flush_memtable().unwrap();
+        engine.write().unwrap().flush_memtable().unwrap();
     }
 
     // Corrupt the out-of-line `blob_std_*.db` payload bytes on disk while handles are closed
@@ -1198,7 +1198,7 @@ fn vtab_keys_only_projection_and_tx_budget() {
     assert!(found_blob);
 
     let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module(engine).unwrap();
     conn.execute_batch(
@@ -1266,7 +1266,7 @@ fn vtab_keys_only_projection_and_tx_budget() {
 fn sub_ulp_float_keys_numeric_duals_like_limit_and_statement_rebind() {
     let tmp = TempTestDir::new("vtab_float_duals_and_rebind");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1559,7 +1559,7 @@ fn sub_ulp_float_keys_numeric_duals_like_limit_and_statement_rebind() {
 fn chunked_streaming_cursor_and_order_by_pk_desc_pushdown() {
     let dir = TempTestDir::new("vtab_chunked_streaming");
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
 
@@ -1586,7 +1586,7 @@ fn chunked_streaming_cursor_and_order_by_pk_desc_pushdown() {
         }
     }
     conn.execute_batch("COMMIT;").unwrap();
-    engine.lock().unwrap().flush_memtable().unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
 
     conn.execute_batch("BEGIN;").unwrap();
     {
@@ -1668,7 +1668,7 @@ fn chunked_streaming_cursor_and_order_by_pk_desc_pushdown() {
 fn rowid_map_rollback_and_sync_catalog_durability() {
     let dir = TempTestDir::new("vtab_rowid_rollback_sync_cat");
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap(),
     ));
 
@@ -1795,7 +1795,7 @@ fn rowid_map_rollback_and_sync_catalog_durability() {
 fn secondary_index_streaming_range_scan_and_rowid_compaction() {
     let dir = TempTestDir::new("vtab_sec_idx_stream_range");
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1824,7 +1824,7 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
         .unwrap();
     }
     conn.execute_batch("COMMIT;").unwrap();
-    engine.lock().unwrap().flush_memtable().unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
 
     conn.execute_batch("BEGIN;").unwrap();
     for i in 351..=650i64 {
@@ -1966,7 +1966,7 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
 fn test_f1_through_f4_audit_regressions() {
     let tmp = TempTestDir::new("audit_regressions");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
 
@@ -2122,7 +2122,7 @@ fn test_f1_through_f4_audit_regressions() {
 fn lazy_blob_dereference_in_cursor_short_range_and_sec_index() {
     let dir = TempTestDir::new("vtab_lazy_blob");
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
 
@@ -2156,7 +2156,7 @@ fn lazy_blob_dereference_in_cursor_short_range_and_sec_index() {
         }
     }
     conn.execute_batch("COMMIT;").unwrap();
-    engine.lock().unwrap().flush_memtable().unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
 
     // Insert 10 more in MemTable (total 60 rows)
     conn.execute_batch("BEGIN;").unwrap();
@@ -2274,7 +2274,7 @@ fn lazy_blob_dereference_in_cursor_short_range_and_sec_index() {
         }
     }
     conn.execute_batch("COMMIT;").unwrap();
-    engine.lock().unwrap().flush_memtable().unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
 
     let sec_rows = conn
         .query_all(
@@ -2320,7 +2320,7 @@ fn corrupt_third_blob_row(dir: &std::path::Path, table_opts: &str) {
     let cfg = EngineConfig::default();
     {
         let fs = Arc::new(OsFs::open(dir, true).unwrap());
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
         conn.execute_batch(&format!(
@@ -2338,7 +2338,7 @@ fn corrupt_third_blob_row(dir: &std::path::Path, table_opts: &str) {
             )
             .unwrap();
         }
-        engine.lock().unwrap().flush_memtable().unwrap();
+        engine.write().unwrap().flush_memtable().unwrap();
     }
     let blob_files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -2357,9 +2357,9 @@ fn corrupt_third_blob_row(dir: &std::path::Path, table_opts: &str) {
     std::fs::write(&path, &bytes).unwrap();
 }
 
-fn reopen_docs(dir: &std::path::Path, table_opts: &str) -> (SqliteConnection, Arc<Mutex<StorageEngine<OsFs>>>) {
+fn reopen_docs(dir: &std::path::Path, table_opts: &str) -> (SqliteConnection, Arc<RwLock<StorageEngine<OsFs>>>) {
     let fs = Arc::new(OsFs::open(dir, false).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -2396,7 +2396,7 @@ fn vtab_corrupt_blob_default_error_mode_select_fails_but_pk_and_delete_work() {
         "expected SQLITE_CORRUPT, got: {err}"
     );
     assert!(conn.query_all("SELECT body FROM docs WHERE id = 3", &[]).is_err());
-    assert!(engine.lock().unwrap().corrupt_blob_detections() > 0);
+    assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
 
     // PK-only queries never dereference blobs, so users can locate the bad rows.
     assert_eq!(
@@ -2427,8 +2427,8 @@ fn vtab_corrupt_blob_on_corrupt_evict_hides_row_and_removes_it() {
         vec![1, 2, 3, 4, 5],
         "keys-only scans never verify blobs"
     );
-    assert!(engine.lock().unwrap().corrupt_blob_detections() > 0);
-    assert!(engine.lock().unwrap().row_exists(90, &crate::vtab::row_codec::encode_i64_tagged_key(3)).unwrap());
+    assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
+    assert!(engine.write().unwrap().row_exists(90, &crate::vtab::row_codec::encode_i64_tagged_key(3)).unwrap());
 
     // The next write removes the corrupt row physically.
     conn.execute_batch("INSERT INTO docs VALUES (6, x'00');").unwrap();
@@ -2447,7 +2447,7 @@ fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
     cfg.auto_compact_segment_threshold = 4;
     // Only the worker can compact: the inline backpressure fallback is effectively disabled.
     cfg.max_segments_before_inline_compaction = 10_000;
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
     {
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -2470,7 +2470,7 @@ fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let (segs, pending) = {
-                let eng = engine.lock().unwrap();
+                let eng = engine.write().unwrap();
                 (eng.active_idx_segment_count(), eng.compaction_pending())
             };
             if !pending && segs < 4 {
@@ -2493,7 +2493,7 @@ fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
     // Connection closed: the module aux context was dropped, the worker joined (it owned an
     // engine Arc clone) and the engine is back to inline compaction.
     assert_eq!(Arc::strong_count(&engine), 1, "worker thread must be joined on drop");
-    let eng = engine.lock().unwrap();
+    let eng = engine.write().unwrap();
     assert!(!eng.compaction_pending() || eng.active_idx_segment_count() >= 4);
 }
 
@@ -2507,7 +2507,7 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
     cfg.memtable_capacity_bytes = 8 * 1024;
     cfg.auto_compact_segment_threshold = 4;
     cfg.max_segments_before_inline_compaction = 10_000;
-    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
     let conn1 = SqliteConnection::open_in_memory().unwrap();
     conn1.register_aydb_module(engine.clone()).unwrap();
@@ -2520,7 +2520,7 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
     drop(conn1);
     assert_eq!(worker_stats(&engine).unwrap().0, 1);
     assert!(alive.load(Ordering::SeqCst));
-    assert!(engine.lock().unwrap().background_compaction_enabled());
+    assert!(engine.write().unwrap().background_compaction_enabled());
 
     // Compaction still progresses through the surviving registration.
     conn2
@@ -2535,7 +2535,7 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
     }
     drop(ins);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while engine.lock().unwrap().compaction_pending() {
+    while engine.write().unwrap().compaction_pending() {
         assert!(std::time::Instant::now() < deadline, "no compaction progress");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -2543,6 +2543,144 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
     drop(conn2);
     assert!(worker_stats(&engine).is_none());
     assert!(!alive.load(Ordering::SeqCst), "worker thread joined");
-    assert!(!engine.lock().unwrap().background_compaction_enabled());
+    assert!(!engine.write().unwrap().background_compaction_enabled());
     assert_eq!(Arc::strong_count(&engine), 1);
+}
+
+/// Runs `f` on a helper thread and fails the test if it does not finish in `secs` (deadlock guard).
+fn run_with_timeout(secs: u64, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => h.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("test body did not finish within {secs}s (deadlock?)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => h.join().unwrap(),
+    }
+}
+
+fn pair_text(n: u32) -> String {
+    let len = if n.is_multiple_of(2) { 40 } else { 3000 };
+    format!("{n:08}").chars().cycle().take(len).collect()
+}
+
+#[test]
+fn concurrent_sql_readers_see_only_committed_atomic_pairs() {
+    use std::sync::atomic::AtomicBool;
+    run_with_timeout(180, || {
+        let tmp = TempTestDir::new("vtab_conc_readers");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        const DDL: &str = "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');";
+        let writer = SqliteConnection::open_in_memory().unwrap();
+        writer.register_aydb_module_with_options(engine.clone(), false).unwrap();
+        writer.execute_batch(DDL).unwrap();
+        writer
+            .execute_batch(&format!(
+                "INSERT INTO t VALUES (1, '{0}'), (2, '{0}');",
+                pair_text(0)
+            ))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        // Readers register their table before the writer's first transaction (DDL on another
+        // connection is refused while a transaction is active).
+        let ready = Arc::new(std::sync::Barrier::new(5));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (engine, stop, ready) = (engine.clone(), stop.clone(), ready.clone());
+                std::thread::spawn(move || {
+                    let conn = SqliteConnection::open_in_memory().unwrap();
+                    conn.register_aydb_module_with_options(engine, false).unwrap();
+                    conn.execute_batch(DDL).unwrap();
+                    ready.wait();
+                    let mut st = conn.prepare("SELECT v FROM t WHERE id BETWEEN 1 AND 2 ORDER BY id").unwrap();
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let rows = st.query(&[]).unwrap();
+                        assert_eq!(rows.len(), 2);
+                        assert_eq!(rows[0][0], rows[1][0], "torn or uncommitted pair");
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+
+        ready.wait();
+        let mut upd = writer.prepare("UPDATE t SET v = ? WHERE id = ?").unwrap();
+        let mut sel = writer.prepare("SELECT v FROM t WHERE id = 1").unwrap();
+        for n in 1..=150u32 {
+            writer.execute_batch("BEGIN;").unwrap();
+            for id in [1i64, 2] {
+                upd.execute(&[SqlValue::Text(pair_text(n)), SqlValue::Integer(id)]).unwrap();
+            }
+            // The owner reads its own uncommitted value (exclusive path) mid-transaction.
+            let rows = sel.query(&[]).unwrap();
+            assert_eq!(rows[0][0], SqlValue::Text(pair_text(n)));
+            writer.execute_batch("COMMIT;").unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total > 0);
+    });
+}
+
+#[test]
+fn owner_reads_own_uncommitted_blob_while_other_connection_reads_committed() {
+    use std::sync::atomic::AtomicBool;
+    run_with_timeout(120, || {
+        let tmp = TempTestDir::new("vtab_owner_blob");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        const DDL: &str = "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');";
+        let a = SqliteConnection::open_in_memory().unwrap();
+        a.register_aydb_module_with_options(engine.clone(), false).unwrap();
+        a.execute_batch(DDL).unwrap();
+        let old = pair_text(1);
+        let new = pair_text(3);
+        a.execute_batch(&format!("INSERT INTO t VALUES (1, '{old}');")).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let (engine, stop, old, ready) =
+                (engine.clone(), stop.clone(), old.clone(), ready.clone());
+            std::thread::spawn(move || {
+                let b = SqliteConnection::open_in_memory().unwrap();
+                b.register_aydb_module_with_options(engine, false).unwrap();
+                b.execute_batch(DDL).unwrap();
+                ready.wait();
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let rows = b.query_all("SELECT v FROM t WHERE id = 1", &[]).unwrap();
+                    assert_eq!(rows[0][0], SqlValue::Text(old.clone()));
+                    n += 1;
+                }
+                n
+            })
+        };
+        ready.wait();
+        a.execute_batch("BEGIN;").unwrap();
+        a.execute_batch(&format!("UPDATE t SET v = '{new}' WHERE id = 1;")).unwrap();
+        for _ in 0..200 {
+            let rows = a.query_all("SELECT v FROM t WHERE id = 1", &[]).unwrap();
+            assert_eq!(rows[0][0], SqlValue::Text(new.clone()));
+            let rows = a.query_all("SELECT v FROM t", &[]).unwrap();
+            assert_eq!(rows[0][0], SqlValue::Text(new.clone()));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+        a.execute_batch("COMMIT;").unwrap();
+        let rows = a.query_all("SELECT v FROM t WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows[0][0], SqlValue::Text(new));
+    });
 }

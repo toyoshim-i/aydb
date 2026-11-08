@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use aydb::engine::{EngineConfig, StorageEngine, WriteDurability};
@@ -837,7 +837,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let fs = Arc::new(OsFs::open(&dir, true).unwrap());
-    let engine = Arc::new(Mutex::new(
+    let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1115,7 +1115,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1211,7 +1211,7 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
         let os_fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(os_fs, EngineConfig::default()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1276,7 +1276,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let shared = Arc::new(Mutex::new(
+        let shared = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
 
@@ -1319,7 +1319,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
 
         // Two-phase `xSync` (`prepare_commit_transaction`) + rollback on a capped table restores quota-evicted rows
         let two_phase_ok = {
-            let mut eng = shared.lock().unwrap();
+            let mut eng = shared.write().unwrap();
             eng.register_capped_table(9, 300).unwrap();
             eng.put_row(9, b"r1", &vec![0x11u8; 150], &[], WriteDurability::BufferedFast)
                 .unwrap();
@@ -1454,7 +1454,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let shared = Arc::new(Mutex::new(
+        let shared = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1567,7 +1567,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         std::fs::create_dir_all(&sub_p02).unwrap();
         {
             let fs = Arc::new(OsFs::open(&sub_p02, true).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1584,7 +1584,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
                 )
                 .unwrap();
             }
-            engine.lock().unwrap().flush_memtable().unwrap();
+            engine.write().unwrap().flush_memtable().unwrap();
         }
         // Overwrite `blob_std_*.db` with 0xFF so any blob read would fail CRC verification
         for entry in std::fs::read_dir(&sub_p02).unwrap().flatten() {
@@ -1597,7 +1597,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         }
         let keys_only_ok = {
             let fs = Arc::new(OsFs::open(&sub_p02, false).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1847,7 +1847,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let mut cfg = EngineConfig::default();
         cfg.lru_read_tracking = LruReadTrackingMode::EagerWriteOnRead;
 
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs.clone(), cfg.clone()).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs.clone(), cfg.clone()).unwrap()));
 
         // Exact 4 KB block boundary: 100-byte PK -> row_key.len() == 103.
         // 15 + 103 + 3970 == 4088 (fits inline in 4 KB block) vs 3971 -> 4089 (spills to blob).
@@ -1882,7 +1882,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         // Rolled-back DDL: CREATE VIRTUAL TABLE (`register_or_resolve_vtab`) inside a rolled-back
         // transaction must roll back cleanly without WAL LSN inversion or leaked catalog entries.
         let r05_ok = {
-            let mut eng = engine.lock().unwrap();
+            let mut eng = engine.write().unwrap();
             let lsn_before = eng.next_lsn();
             eng.begin_transaction();
             let tid = eng
@@ -1898,7 +1898,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         // Committed DROP: DROP TABLE of a capped table inside a committed transaction must reclaim
         // its LRU blob segments and remove its quota from boot_meta.db!
         let (segs_before_drop, segs_after_drop) = {
-            let mut eng = engine.lock().unwrap();
+            let mut eng = engine.write().unwrap();
             eng.register_capped_table(56, 50_000).unwrap();
             eng.put_row(
                 56,
@@ -1919,7 +1919,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         // Active Tx read: Concurrent read under EagerWriteOnRead during an active transaction must not
         // corrupt the writer transaction's undo log on ROLLBACK!
         let r07_ok = {
-            let mut eng = engine.lock().unwrap();
+            let mut eng = engine.write().unwrap();
             eng.register_capped_table(57, 100_000).unwrap();
             eng.put_row(57, b"shared_k", b"committed_v1", &[], WriteDurability::BufferedFast)
                 .unwrap();
@@ -1966,7 +1966,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         std::fs::create_dir_all(&sub).unwrap();
 
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -2117,7 +2117,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         std::fs::create_dir_all(&sub).unwrap();
 
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let engine = Arc::new(Mutex::new(
+        let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs, EngineConfig::default()).unwrap(),
         ));
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -2137,7 +2137,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             }
         }
         conn.execute_batch("COMMIT;").unwrap();
-        engine.lock().unwrap().flush_memtable().unwrap();
+        engine.write().unwrap().flush_memtable().unwrap();
 
         let desc_rows = conn
             .query_all("SELECT id FROM p01_rev ORDER BY id DESC LIMIT 5", &[])
@@ -2211,7 +2211,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
 
         let (rid_a, rid_b) = {
             let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -2274,11 +2274,11 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         // Reopen from disk without prior MemTable flush and verify quota + catalog + data restoration
         let n01_to_n04_ok = {
             let fs = Arc::new(OsFs::open(&sub, false).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let has_quota = engine
-                .lock()
+                .write()
                 .unwrap()
                 .capped_table_state(1)
                 .map(|s| s.max_bytes == 250_000)
@@ -2329,7 +2329,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_collation");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 
@@ -2385,7 +2385,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_rowid_order");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 
@@ -2417,7 +2417,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_cross_conn");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
 
         let conn1 = SqliteConnection::open_in_memory().unwrap();
         conn1.register_aydb_module(eng.clone()).unwrap();
@@ -2475,7 +2475,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_numeric_rowid");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(Mutex::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 

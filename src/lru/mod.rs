@@ -4,6 +4,7 @@
 pub use crate::index::key_codec;
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use key_codec::{
@@ -54,20 +55,31 @@ impl CappedTableState {
 /// (`remove_key`) probe by `&[u8]` (`Borrow<[u8]>`) with zero heap allocations.
 pub struct AccessTracker {
     next_tick: AtomicU64,
+    max_entries: usize,
+    /// Interior mutability so committed-view reads (`&self`) can record hits. The lock is held
+    /// only for in-memory map updates and never across I/O.
+    inner: Mutex<TrackerInner>,
+}
+
+#[derive(Default)]
+struct TrackerInner {
     /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys.
     hot_ticks: std::collections::BTreeMap<u16, HashMap<Vec<u8>, u64>>,
     total_entries: usize,
-    max_entries: usize,
 }
 
 impl AccessTracker {
     pub fn new(initial_tick: u64, max_entries: usize) -> Self {
         Self {
             next_tick: AtomicU64::new(initial_tick.max(1)),
-            hot_ticks: std::collections::BTreeMap::new(),
-            total_entries: 0,
             max_entries: max_entries.max(64),
+            inner: Mutex::new(TrackerInner::default()),
         }
+    }
+
+    #[inline]
+    fn lock(&self) -> std::sync::MutexGuard<'_, TrackerInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Allocates the next monotonically increasing `AccessTick`.
@@ -96,17 +108,19 @@ impl AccessTracker {
     /// Records a read hit in RAM (`O(1)` hash map update, zero disk I/O).
     /// Updates existing hot keys in place with zero heap allocation.
     /// Returns the newly assigned `AccessTick`.
-    pub fn record_read_hit(&mut self, table_id: u16, pk: &[u8]) -> u64 {
+    pub fn record_read_hit(&self, table_id: u16, pk: &[u8]) -> u64 {
         let tick = self.next_tick();
-        if let Some(table_map) = self.hot_ticks.get_mut(&table_id) {
+        let mut g = self.lock();
+        let inner = &mut *g;
+        if let Some(table_map) = inner.hot_ticks.get_mut(&table_id) {
             if let Some(slot) = table_map.get_mut(pk) {
                 *slot = tick;
                 return tick;
             }
         }
-        if self.total_entries >= self.max_entries {
+        if inner.total_entries >= self.max_entries {
             // Evict the oldest half of tracked in-memory ticks if bounded capacity is reached
-            let mut ticks: Vec<u64> = self
+            let mut ticks: Vec<u64> = inner
                 .hot_ticks
                 .values()
                 .flat_map(|m| m.values().copied())
@@ -115,32 +129,34 @@ impl AccessTracker {
                 ticks.sort_unstable();
                 let median = ticks[ticks.len() / 2];
                 let mut kept = 0usize;
-                for m in self.hot_ticks.values_mut() {
+                for m in inner.hot_ticks.values_mut() {
                     m.retain(|_, &mut v| v > median);
                     kept += m.len();
                 }
-                self.total_entries = kept;
+                inner.total_entries = kept;
             }
         }
-        let table_map = self
+        let cap = self.max_entries.min(4096);
+        let table_map = inner
             .hot_ticks
             .entry(table_id)
-            .or_insert_with(|| HashMap::with_capacity(self.max_entries.min(4096)));
+            .or_insert_with(|| HashMap::with_capacity(cap));
         if table_map.insert(pk.to_vec(), tick).is_none() {
-            self.total_entries += 1;
+            inner.total_entries += 1;
         }
         tick
     }
 
     /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
-    pub fn take_hot_tick(&mut self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        if self.total_entries == 0 {
+    pub fn take_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
+        let mut g = self.lock();
+        if g.total_entries == 0 {
             return None;
         }
-        let removed = self.hot_ticks.get_mut(&table_id)?.remove(pk);
+        let removed = g.hot_ticks.get_mut(&table_id)?.remove(pk);
         if removed.is_some() {
-            self.total_entries = self.total_entries.saturating_sub(1);
+            g.total_entries = g.total_entries.saturating_sub(1);
         }
         removed
     }
@@ -148,32 +164,34 @@ impl AccessTracker {
     /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        if self.total_entries == 0 {
+        let g = self.lock();
+        if g.total_entries == 0 {
             return None;
         }
-        self.hot_ticks.get(&table_id)?.get(pk).copied()
+        g.hot_ticks.get(&table_id)?.get(pk).copied()
     }
 
     /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete)
     /// with zero allocation.
     #[inline]
-    pub fn remove_key(&mut self, table_id: u16, pk: &[u8]) {
-        if self.total_entries == 0 {
+    pub fn remove_key(&self, table_id: u16, pk: &[u8]) {
+        let mut g = self.lock();
+        if g.total_entries == 0 {
             return;
         }
-        if let Some(table_map) = self.hot_ticks.get_mut(&table_id) {
+        if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
             if table_map.remove(pk).is_some() {
-                self.total_entries = self.total_entries.saturating_sub(1);
+                g.total_entries = g.total_entries.saturating_sub(1);
             }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.total_entries
+        self.lock().total_entries
     }
 
     pub fn is_empty(&self) -> bool {
-        self.total_entries == 0
+        self.len() == 0
     }
 }
 
@@ -229,7 +247,7 @@ mod tests {
 
     #[test]
     fn access_tracker_two_level_map_borrows_slice_and_bounds_capacity() {
-        let mut tracker = AccessTracker::new(100, 64);
+        let tracker = AccessTracker::new(100, 64);
         assert!(tracker.is_empty());
         assert_eq!(tracker.len(), 0);
 

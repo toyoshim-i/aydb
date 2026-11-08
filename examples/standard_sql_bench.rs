@@ -51,7 +51,7 @@
 
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use aydb::engine::{EngineConfig, StorageEngine};
@@ -136,7 +136,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         .unwrap();
 
     let fs = Arc::new(OsFs::open(sub.join("aydb"), true).unwrap());
-    let shared_engine = Arc::new(Mutex::new(
+    let shared_engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let ay_conn = SqliteConnection::open_in_memory().unwrap();
@@ -599,7 +599,7 @@ fn bench_speedtest1_suite(root: &PathBuf) {
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
         cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
@@ -870,7 +870,7 @@ fn bench_ycsb_suite(root: &PathBuf) {
             let sub = root.join(format!("ycsb_ay_{val_size}"));
             let _ = std::fs::remove_dir_all(&sub);
             let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1032,7 +1032,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
             let sub = root.join("tpcb_ay_norm");
             let _ = std::fs::remove_dir_all(&sub);
             let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1086,7 +1086,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
             let sub = root.join("tpcb_ay_full");
             let _ = std::fs::remove_dir_all(&sub);
             let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-            let engine = Arc::new(Mutex::new(
+            let engine = Arc::new(RwLock::new(
                 StorageEngine::open(fs, EngineConfig::default()).unwrap(),
             ));
             let conn = SqliteConnection::open_in_memory().unwrap();
@@ -1163,7 +1163,7 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let mut cfg = EngineConfig::default();
         cfg.memtable_capacity_bytes = 128 * 1024;
         cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
         conn.execute_batch(
@@ -1218,7 +1218,7 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
         cfg.memtable_capacity_bytes = 128 * 1024;
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
         conn.execute_batch(
@@ -1276,7 +1276,7 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
         cfg.memtable_capacity_bytes = 128 * 1024;
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
         conn.execute_batch(
@@ -1325,7 +1325,7 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
         let mut cfg = EngineConfig::default();
         cfg.memtable_capacity_bytes = 128 * 1024;
-        let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
         conn.execute_batch(

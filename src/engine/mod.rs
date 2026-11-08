@@ -8,6 +8,7 @@
 mod compaction;
 pub use compaction::{CompactionJob, CompactionOutput};
 mod eviction;
+mod reader;
 mod scan;
 mod tx;
 
@@ -43,6 +44,8 @@ use crate::wal::{
     recover_two_streams,
 };
 
+pub use self::reader::{EngineReader, ReadView};
+use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx};
 use self::tx::{SavepointMarker, TxMetaSnapshot};
 
 /// Result of a policy-free `'t'` row-meta lookup.
@@ -252,8 +255,6 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
-    /// True while a non-owning connection reads: the transaction overlay is hidden.
-    pub(super) in_committed_read_view: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
     /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys.
@@ -664,7 +665,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             savepoints: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
             quotas_modified_in_tx: false,
-            in_committed_read_view: false,
             active_vtab_ids: HashMap::new(),
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
@@ -1218,36 +1218,195 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    /// Point lookup of a row (`pk`) in `table_id`.
-    /// If `table_id` is a Capped Table, updates its `AccessTick` according to `config.lru_read_tracking`.
+    /// Point lookup of a row (`pk`) in `table_id` (owner view: sees this engine's own
+    /// transaction overlay). If `table_id` is a Capped Table, updates its `AccessTick`
+    /// according to `config.lru_read_tracking`.
     pub fn get_row(&mut self, table_id: u16, pk: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.owner_read(|eng, cx| eng.get_row_cx(cx, table_id, pk))
+    }
+
+    pub(super) fn get_row_cx(
+        &self,
+        cx: &ReadCtx,
+        table_id: u16,
+        pk: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
         let row_key = encode_primary_row_key(table_id, pk);
-        let Some((_lsn, idx_val)) = self.lookup_raw_entry(&row_key)? else {
+        let Some((_lsn, idx_val)) = self.lookup_raw_entry_view(cx.view, &row_key)? else {
             return Ok(None);
         };
 
         let resolved = match idx_val {
             IndexValue::Inline(bytes) => Some(bytes),
-            IndexValue::Blob(ptr) => self.dereference_blob(&ptr, &row_key)?,
-            IndexValue::Tombstone => None,
-        };
-
-        if resolved.is_some() && self.capped_tables.contains_key(&table_id) {
-            if self.in_committed_read_view {
-                self.access_tracker.record_read_hit(table_id, pk);
-            } else {
-                match self.config.lru_read_tracking {
-                    LruReadTrackingMode::CoalescedLazyPromotion => {
-                        self.access_tracker.record_read_hit(table_id, pk);
-                    }
-                    LruReadTrackingMode::EagerWriteOnRead => {
-                        self.eager_promote_lru_on_read(table_id, pk)?;
+            IndexValue::Blob(ptr) => {
+                self.ensure_flushed_cx(cx, &ptr)?;
+                match self.read_blob_ref(&ptr, &row_key)? {
+                    Some(v) => Some(v),
+                    None => {
+                        self.note_corrupt_blob(&row_key, &ptr)?;
+                        None
                     }
                 }
             }
+            IndexValue::Tombstone => None,
+        };
+
+        if resolved.is_some() {
+            self.track_read_hit(cx, table_id, pk);
         }
 
         Ok(resolved)
+    }
+
+    /// Records an LRU read hit for capped tables: queued for an eager WAL promotion when the
+    /// reader has exclusive access and `EagerWriteOnRead` is configured, otherwise coalesced
+    /// in RAM (interior-mutable tracker, safe under a shared lock).
+    #[inline]
+    pub(super) fn track_read_hit(&self, cx: &ReadCtx, table_id: u16, pk: &[u8]) {
+        if !self.capped_tables.contains_key(&table_id) {
+            return;
+        }
+        if cx.eager_ok
+            && cx.view == ReadView::Owner
+            && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+        {
+            cx.eager_hits.borrow_mut().push((table_id, pk.to_vec()));
+        } else {
+            self.access_tracker.record_read_hit(table_id, pk);
+        }
+    }
+
+    /// Whether `ptr` lives in an active writer's not-yet-flushed buffer.
+    #[inline]
+    pub(super) fn blob_unflushed(&self, ptr: &BlobPtr) -> bool {
+        let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
+        match ptr.kind {
+            BlobKind::Standard => self
+                .active_std_writer
+                .as_ref()
+                .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
+            BlobKind::Lru => self
+                .active_lru_writers
+                .get(&ptr.table_id)
+                .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
+        }
+    }
+
+    /// True if any active blob writer holds buffered (unflushed) bytes.
+    pub(super) fn any_blob_unflushed(&self) -> bool {
+        self.active_std_writer
+            .as_ref()
+            .is_some_and(|w| w.current_len() > w.flushed_offset())
+            || self
+                .active_lru_writers
+                .values()
+                .any(|w| w.current_len() > w.flushed_offset())
+    }
+
+    /// Read-path replacement for `ensure_blob_flushed` under `&self`. Committed blobs are always
+    /// flushed to the OS handle before their WAL record is appended, so a committed-view read
+    /// never finds an unflushed pointer (debug-asserted). The owner view may reference its own
+    /// uncommitted blobs: the read is aborted with `cx.need_flush` set and the exclusive caller
+    /// flushes and retries.
+    #[inline]
+    pub(super) fn ensure_flushed_cx(&self, cx: &ReadCtx, ptr: &BlobPtr) -> io::Result<()> {
+        if !self.blob_unflushed(ptr) {
+            return Ok(());
+        }
+        debug_assert!(
+            cx.view == ReadView::Owner,
+            "committed-view read hit an unflushed blob pointer"
+        );
+        cx.need_flush.set(true);
+        Err(io::Error::other(NEED_FLUSH_MSG))
+    }
+
+    /// Owner-view scans that read blob payloads need every buffered byte on the OS handle.
+    pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx) -> io::Result<()> {
+        if cx.view == ReadView::Owner && self.any_blob_unflushed() {
+            cx.need_flush.set(true);
+            return Err(io::Error::other(NEED_FLUSH_MSG));
+        }
+        Ok(())
+    }
+
+    /// Resolves the read view of `conn_id`: the owner of the active transaction (or any
+    /// connection while no transaction is active) sees the transaction overlay; every other
+    /// connection sees committed data only.
+    #[inline]
+    pub fn read_view_for_conn(&self, conn_id: usize) -> ReadView {
+        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
+            ReadView::Committed
+        } else {
+            ReadView::Owner
+        }
+    }
+
+    /// True if reads of `table_id` by `conn_id` need `&mut` access (exclusive lock): the
+    /// connection owns the active transaction (its reads may touch its own unflushed blobs), or
+    /// `EagerWriteOnRead` tracking applies to a capped table. Otherwise
+    /// [`Self::reader_for_conn`] under a shared lock is sufficient.
+    pub fn read_needs_exclusive(&self, conn_id: usize, table_id: u16) -> bool {
+        if self.read_view_for_conn(conn_id) == ReadView::Committed {
+            return false;
+        }
+        self.tx_depth > 0
+            || (self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+                && self.capped_tables.contains_key(&table_id))
+    }
+
+    /// Shared-access reader for `conn_id` (see [`EngineReader`]). Must only be used when
+    /// [`Self::read_needs_exclusive`] is `false`; otherwise reads may fail with an
+    /// "unflushed blob" error and `EagerWriteOnRead` is downgraded to coalesced tracking.
+    pub fn reader_for_conn(&self, conn_id: usize) -> EngineReader<'_, FS> {
+        EngineReader {
+            eng: self,
+            cx: CxRef::Owned(ReadCtx::new(self.read_view_for_conn(conn_id), false)),
+        }
+    }
+
+    /// Runs `f` with exclusive access in `view`: flushes buffered blobs and retries when the
+    /// reader asks for it, then applies queued eager LRU promotions. The second tuple element
+    /// carries a flush/promotion error (the read result itself is returned untouched).
+    pub(super) fn run_read<R>(
+        &mut self,
+        view: ReadView,
+        mut f: impl FnMut(&Self, &ReadCtx) -> R,
+    ) -> (R, Option<io::Error>) {
+        let mut attempts = 0;
+        loop {
+            let cx = ReadCtx::new(view, true);
+            let r = f(&*self, &cx);
+            if cx.need_flush.get() && attempts < 2 {
+                attempts += 1;
+                if let Err(e) = self.flush_active_blob_buffers() {
+                    return (r, Some(e));
+                }
+                continue;
+            }
+            let hits = cx.eager_hits.take();
+            let mut err = None;
+            for (table_id, pk) in hits {
+                if let Err(e) = self.eager_promote_lru_on_read(table_id, &pk) {
+                    err = Some(e);
+                    break;
+                }
+            }
+            return (r, err);
+        }
+    }
+
+    pub(super) fn owner_read<R>(
+        &mut self,
+        f: impl FnMut(&Self, &ReadCtx) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let (r, extra) = self.run_read(ReadView::Owner, f);
+        match (r, extra) {
+            (Ok(v), None) => Ok(v),
+            (Ok(_), Some(e)) => Err(e),
+            (Err(e), Some(flush_err)) if e.to_string() == NEED_FLUSH_MSG => Err(flush_err),
+            (Err(e), _) => Err(e),
+        }
     }
 
     /// Deletes a row (`pk`) in `table_id`, cascading tombstones to its secondary indexes and LRU queue.
@@ -1344,6 +1503,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         slab: &mut Vec<u8>,
         spans: &mut Vec<(usize, usize)>,
     ) -> io::Result<bool> {
+        self.owner_read(|eng, cx| eng.get_row_into_cx(cx, table_id, pk, slab, spans))
+    }
+
+    pub(super) fn get_row_into_cx(
+        &self,
+        cx: &ReadCtx,
+        table_id: u16,
+        pk: &[u8],
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(usize, usize)>,
+    ) -> io::Result<bool> {
         let mut stack_buf = [0u8; 64];
         let heap_buf;
         let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
@@ -1359,7 +1529,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut hit = false;
-        if let Some(mem_entry) = self.mem_get(row_key) {
+        if let Some(mem_entry) = self.mem_get_view(cx.view, row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -1370,7 +1540,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Blob(ptr) => {
                     let ptr_copy = *ptr;
                     let start = slab.len();
-                    if self.dereference_blob_append_into(&ptr_copy, row_key, slab)? {
+                    if self.dereference_blob_append_into_cx(cx, &ptr_copy, row_key, slab)? {
                         spans.push((start, slab.len()));
                         hit = true;
                     }
@@ -1389,7 +1559,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         IndexValue::Blob(ptr) => {
                             let start = slab.len();
-                            if self.dereference_blob_append_into(&ptr, row_key, slab)? {
+                            if self.dereference_blob_append_into_cx(cx, &ptr, row_key, slab)? {
                                 spans.push((start, slab.len()));
                                 hit = true;
                             }
@@ -1401,19 +1571,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        if hit && self.capped_tables.contains_key(&table_id) {
-            if self.in_committed_read_view {
-                self.access_tracker.record_read_hit(table_id, pk);
-            } else {
-                match self.config.lru_read_tracking {
-                    LruReadTrackingMode::CoalescedLazyPromotion => {
-                        self.access_tracker.record_read_hit(table_id, pk);
-                    }
-                    LruReadTrackingMode::EagerWriteOnRead => {
-                        self.eager_promote_lru_on_read(table_id, pk)?;
-                    }
-                }
-            }
+        if hit {
+            self.track_read_hit(cx, table_id, pk);
         }
 
         Ok(hit)
@@ -1424,6 +1583,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// if the row value is an external blob, records placeholder `(0, 0)` in `spans` and pushes `Some(ptr)` to `lazy_blobs`.
     pub fn get_row_into_lazy(
         &mut self,
+        table_id: u16,
+        pk: &[u8],
+        slab: &mut Vec<u8>,
+        spans: &mut Vec<(usize, usize)>,
+        lazy_blobs: &mut Vec<Option<LazyBlob<FS::File>>>,
+    ) -> io::Result<bool> {
+        self.owner_read(|eng, cx| {
+            eng.get_row_into_lazy_cx(cx, table_id, pk, slab, spans, lazy_blobs)
+        })
+    }
+
+    pub(super) fn get_row_into_lazy_cx(
+        &self,
+        cx: &ReadCtx,
         table_id: u16,
         pk: &[u8],
         slab: &mut Vec<u8>,
@@ -1447,10 +1620,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Evict-policy tables verify blobs eagerly (a row cannot be skipped after emission).
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
         if !lazy_ok {
-            self.flush_active_blob_buffers()?;
+            self.ensure_all_flushed_cx(cx)?;
         }
         let mut hit = false;
-        if let Some(mem_entry) = self.mem_get(row_key) {
+        if let Some(mem_entry) = self.mem_get_view(cx.view, row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -1507,22 +1680,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        if hit
-            && matches!(lazy_blobs.last(), Some(None))
-            && self.capped_tables.contains_key(&table_id)
-        {
-            if self.in_committed_read_view {
-                self.access_tracker.record_read_hit(table_id, pk);
-            } else {
-                match self.config.lru_read_tracking {
-                    LruReadTrackingMode::CoalescedLazyPromotion => {
-                        self.access_tracker.record_read_hit(table_id, pk);
-                    }
-                    LruReadTrackingMode::EagerWriteOnRead => {
-                        self.eager_promote_lru_on_read(table_id, pk)?;
-                    }
-                }
-            }
+        if hit && matches!(lazy_blobs.last(), Some(None)) {
+            self.track_read_hit(cx, table_id, pk);
         }
 
         Ok(hit)
@@ -1645,6 +1804,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lazy: &LazyBlob<FS::File>,
         slab: &mut Vec<u8>,
     ) -> io::Result<Option<(usize, usize)>> {
+        self.owner_read(|eng, cx| eng.dereference_lazy_blob_into_cx(cx, table_id, pk, lazy, slab))
+    }
+
+    pub(super) fn dereference_lazy_blob_into_cx(
+        &self,
+        cx: &ReadCtx,
+        table_id: u16,
+        pk: &[u8],
+        lazy: &LazyBlob<FS::File>,
+        slab: &mut Vec<u8>,
+    ) -> io::Result<Option<(usize, usize)>> {
         let ptr = &lazy.ptr;
         let mut stack_buf = [0u8; 64];
         let heap_buf;
@@ -1660,9 +1830,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &heap_buf
         };
 
-        // Flush buffered writer bytes (if the segment is still the active one) so the pinned
-        // handle sees them; harmless if the writer has since rolled to a new segment.
-        self.ensure_blob_flushed(ptr)?;
+        // The pinned handle must see the blob bytes: committed blobs are always flushed; the
+        // owner view may need its writer buffer flushed first (exclusive caller retries).
+        self.ensure_flushed_cx(cx, ptr)?;
         let Some(reader) = &lazy.reader else {
             // Segment was already absent when the pointer was captured: dangling pointer.
             self.note_corrupt_blob(row_key, ptr)?;
@@ -1676,20 +1846,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         let end = slab.len();
 
-        if self.capped_tables.contains_key(&table_id) {
-            if self.in_committed_read_view {
-                self.access_tracker.record_read_hit(table_id, pk);
-            } else {
-                match self.config.lru_read_tracking {
-                    LruReadTrackingMode::CoalescedLazyPromotion => {
-                        self.access_tracker.record_read_hit(table_id, pk);
-                    }
-                    LruReadTrackingMode::EagerWriteOnRead => {
-                        self.eager_promote_lru_on_read(table_id, pk)?;
-                    }
-                }
-            }
-        }
+        self.track_read_hit(cx, table_id, pk);
 
         Ok(Some((start, end)))
     }
@@ -1907,6 +2064,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
         self.ensure_blob_flushed(ptr)?;
+        self.read_blob_ref(ptr, expected_key)
+    }
+
+    /// Reads and verifies a blob that is already flushed (no policy applied).
+    pub(super) fn read_blob_ref(
+        &self,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
         match ptr.kind {
             BlobKind::Standard => {
                 let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
@@ -1923,13 +2089,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    pub(super) fn dereference_blob_append_into(
-        &mut self,
+    pub(super) fn dereference_blob_append_into_cx(
+        &self,
+        cx: &ReadCtx,
         ptr: &BlobPtr,
         expected_key: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
-        self.ensure_blob_flushed(ptr)?;
+        self.ensure_flushed_cx(cx, ptr)?;
         self.read_flushed_blob_append_into(ptr, expected_key, out)
     }
 
@@ -2085,7 +2252,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn check_existing_row(&self, key: &[u8]) -> io::Result<ExistingRowStatus> {
-        if let Some(mem_entry) = self.mem_get(key) {
+        self.check_existing_row_view(ReadView::Owner, key)
+    }
+
+    pub(super) fn check_existing_row_view(
+        &self,
+        view: ReadView,
+        key: &[u8],
+    ) -> io::Result<ExistingRowStatus> {
+        if let Some(mem_entry) = self.mem_get_view(view, key) {
             return Ok(match &mem_entry.value {
                 IndexValue::Tombstone => ExistingRowStatus::NotFound,
                 IndexValue::Inline(_) => ExistingRowStatus::Inline,
@@ -2201,11 +2376,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok((keys, (pk.len() + value_len) as u64))
     }
 
-    /// Newest in-memory entry for `key` as seen by the current reader: the transaction overlay
-    /// (hidden for non-owner reads) over the committed `MemTable`.
+    /// Newest in-memory entry for `key` as seen by `view`: the transaction overlay (hidden for
+    /// the committed view) over the committed `MemTable`.
     #[inline]
-    pub(super) fn mem_get(&self, key: &[u8]) -> Option<&crate::memtable::MemEntry> {
-        if !self.in_committed_read_view {
+    pub(super) fn mem_get_view(
+        &self,
+        view: ReadView,
+        key: &[u8],
+    ) -> Option<&crate::memtable::MemEntry> {
+        if view == ReadView::Owner {
             if let Some(e) = self.tx_overlay.map.get(key) {
                 return Some(e);
             }
@@ -2213,11 +2392,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.memtable.get(key)
     }
 
-    /// Overlay map visible to the current reader (empty for non-owner reads).
+    /// Overlay map visible to `view` (empty for the committed view).
     #[inline]
-    pub(super) fn visible_overlay(&self) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
+    pub(super) fn visible_overlay(
+        &self,
+        view: ReadView,
+    ) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
         static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
-        if self.in_committed_read_view {
+        if view == ReadView::Committed {
             &EMPTY
         } else {
             &self.tx_overlay.map
@@ -2225,7 +2407,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
-        if let Some(mem_entry) = self.mem_get(key) {
+        self.lookup_raw_entry_view(ReadView::Owner, key)
+    }
+
+    pub(super) fn lookup_raw_entry_view(
+        &self,
+        view: ReadView,
+        key: &[u8],
+    ) -> io::Result<Option<(u64, IndexValue)>> {
+        if let Some(mem_entry) = self.mem_get_view(view, key) {
             return Ok(Some((mem_entry.lsn, mem_entry.value.clone())));
         }
         for seg in self.idx_segments.iter().rev() {
