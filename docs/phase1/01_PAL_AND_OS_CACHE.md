@@ -193,7 +193,7 @@ Thanks to our two-stream WAL separation (Design Decision 3), we get the best of 
 
 | `OpenHint` Variant | Target Files | Windows Flags (`CreateFileW`) | Linux (`fcntl` / `fadvise`) | macOS (`fcntl`) | Kernel Behavior |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `MutableSyncLog` | `boot_meta.db`,<br/>`wal_sync.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_WRITE_THROUGH` | `O_DSYNC` (or `fdatasync`) | `F_BARRIERFSYNC` / `F_FULLFSYNC` | Writes go through OS cache directly to non-volatile media; no stale cache views. |
+| `MutableSyncLog` | `boot_meta.db`,<br/>`wal_sync.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_WRITE_THROUGH` | `fdatasync` after each append | `F_FULLFSYNC` after each append | Writes go through OS cache directly to non-volatile media; no stale cache views. |
 | `MutableBufferedLog` | `wal_buf.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Fast buffered sequential appends in 256 KB VACB views; survives process crash. |
 | `ImmutableRandom` | `idx_<SeqID>.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_RANDOM_ACCESS` | `POSIX_FADV_RANDOM` | `F_RDAHEAD(0)` | Disables speculative read-ahead so 4 KB point lookups do not fetch 252 KB of unused neighbors. |
 | `ImmutableSequential` | `blob_std_<SeqID>.db`,<br/>`blob_lru_<TblID>_<SeqID>.db` | `FILE_FLAG_OVERLAPPED` only (`FILE_FLAG_SEQUENTIAL_SCAN` is deliberately omitted) | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Blob files serve random point reads, so the Windows implementation avoids asynchronous 256 KB VACB read-ahead on them. |
