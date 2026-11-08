@@ -359,6 +359,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Commits an explicit batch transaction (`COMMIT`), writing all coalesced [`crate::wal::WalRecord`]
     /// entries in a single [`WalBatch`] syscall (or chunked batches if exceeding 512 KB)!
+    ///
+    /// An `Err` means the transaction was not committed (preparation or the WAL append failed, and
+    /// the transaction was rolled back). Once the WAL append has succeeded the transaction is
+    /// durable and this returns `Ok`, even if the follow-up maintenance (blob reclaim, quota
+    /// persistence, compaction, flush) fails; such failures are counted in
+    /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
         if self.tx_depth == 1 && !self.tx_prepared {
             let durability = if self.pending_tx_sync {
@@ -395,14 +401,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
             let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
             for tid in capped_table_ids {
-                self.reclaim_fully_dead_lru_blob_segments(tid)?;
+                if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
+                    self.record_maintenance_failure(&e);
+                }
             }
 
             let dropped_tables = core::mem::take(&mut self.dropped_tables_in_tx);
             let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
             let mut dropped_any_capped = false;
             for (tid, was_capped) in dropped_tables {
-                self.reclaim_fully_dead_lru_blob_segments(tid)?;
+                if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
+                    self.record_maintenance_failure(&e);
+                }
                 if was_capped {
                     dropped_any_capped = true;
                 }
@@ -412,15 +422,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
             if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
                 let quota_metas = self.build_quota_metas();
-                self.meta_mgr.commit_update(|st| {
+                if let Err(e) = self.meta_mgr.commit_update(|st| {
                     st.table_quotas = quota_metas;
-                })?;
+                }) {
+                    self.record_maintenance_failure(&e);
+                }
             }
 
-            if do_compact {
-                self.compact()?;
+            let maintenance = if do_compact {
+                self.compact()
             } else if do_flush || self.memtable.should_flush() {
-                self.flush_memtable()?;
+                self.flush_memtable()
+            } else {
+                Ok(())
+            };
+            if let Err(e) = maintenance {
+                self.record_maintenance_failure(&e);
             }
 
             // The transaction is durable at this point; remove rows queued by `Evict`-policy

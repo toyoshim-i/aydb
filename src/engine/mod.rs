@@ -281,6 +281,11 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Set after a WAL append/sync failure (original error text). While set, every mutating
     /// operation fails and the engine must be reopened (the on-disk state is unknown).
     pub(super) poisoned: Option<String>,
+    /// Number of post-commit maintenance steps (flush, quota eviction, reclaim, compaction) that
+    /// failed after their triggering write was already committed.
+    maintenance_failures: AtomicU64,
+    /// Text of the most recent post-commit maintenance failure.
+    last_maintenance_error: Mutex<Option<String>>,
     /// Explicit per-table corruption policies (absent -> derived default, see
     /// [`Self::corrupt_policy`]).
     corrupt_policies: HashMap<u16, CorruptPolicy>,
@@ -697,6 +702,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
             poisoned: None,
+            maintenance_failures: AtomicU64::new(0),
+            last_maintenance_error: Mutex::new(None),
             corrupt_policies: HashMap::new(),
             table_inline_thresholds: BTreeMap::new(),
             scratch_wal_encoded: Vec::with_capacity(1024),
@@ -733,6 +740,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
+    }
+
+    /// Returns how many post-commit maintenance steps have failed. The writes that triggered them
+    /// were committed; the work is retried because `should_flush` stays true and an exceeded quota
+    /// stays exceeded.
+    pub fn maintenance_failures(&self) -> u64 {
+        self.maintenance_failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns the text of the most recent post-commit maintenance failure, if any.
+    pub fn last_maintenance_error(&self) -> Option<String> {
+        self.last_maintenance_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Records a failure of a maintenance step that ran after its write was committed, so the
+    /// caller still sees the commit as successful. WAL I/O failures have already poisoned the
+    /// engine at their source.
+    pub(super) fn record_maintenance_failure(&self, e: &io::Error) {
+        self.maintenance_failures.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_maintenance_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
     }
 
     /// Fails with an `io::ErrorKind::Other` error if a prior WAL I/O failure poisoned the engine.
@@ -1282,7 +1315,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .saturating_add(logical_size as u64);
         }
         if is_capped && self.tx_depth == 0 {
-            self.evict_until_within_quota(table_id, durability)?;
+            // The row is committed; an exceeded quota is re-evaluated by the next write.
+            if let Err(e) = self.evict_until_within_quota(table_id, durability) {
+                self.record_maintenance_failure(&e);
+            }
         }
 
         Ok(())
@@ -2481,8 +2517,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         res?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
         self.memtable.apply_wal_batch_owned(batch);
+        // The batch is committed; a failed flush is retried because `should_flush` stays true.
         if self.memtable.should_flush() {
-            self.flush_memtable()?;
+            if let Err(e) = self.flush_memtable() {
+                self.record_maintenance_failure(&e);
+            }
         }
         Ok(lsn)
     }

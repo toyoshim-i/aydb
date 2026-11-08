@@ -397,12 +397,35 @@ fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
     engine.flush_memtable().unwrap();
     drop(engine);
 
-    let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let mut reopened = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
     for i in 0..20u32 {
         let k = format!("k_{i:02}").into_bytes();
         let expected = format!("v_{i:02}").into_bytes();
         assert_eq!(reopened.get_row(1, &k).unwrap(), Some(expected));
     }
+    drop(reopened);
+
+    // A flush triggered by a write that is already committed must not fail that write.
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 256;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.maintenance_failures(), 0);
+    fail_flag.store(true, Ordering::SeqCst);
+    engine
+        .put_row(1, b"post", &[0x11u8; 512], &[], WriteDurability::BufferedFast)
+        .expect("a committed write must not report a post-commit flush failure");
+    assert_eq!(engine.maintenance_failures(), 1);
+    assert!(
+        engine
+            .last_maintenance_error()
+            .unwrap()
+            .contains("simulated boot_meta write failure")
+    );
+    assert!(!engine.is_poisoned());
+    assert_eq!(engine.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
+    fail_flag.store(false, Ordering::SeqCst);
+    engine.flush_memtable().unwrap();
+    assert_eq!(engine.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
 }
 
 #[test]
