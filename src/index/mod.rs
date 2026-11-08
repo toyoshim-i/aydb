@@ -580,6 +580,15 @@ impl<'a> IdxBlockReader<'a> {
 
     /// Searches for `target_key` in $O(\log K)$ time using the downward-growing `u16` offset directory.
     pub fn lookup_binary_search(&self, target_key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
+        match self.find_raw(target_key)? {
+            Some(raw) => Ok(Some((raw.lsn, raw.decode_value()?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Binary-searches for `target_key` and returns the matching entry borrowed from the block,
+    /// without decoding or copying its value.
+    pub fn find_raw(&self, target_key: &[u8]) -> io::Result<Option<RawIdxEntry<'a>>> {
         let mut low = 0usize;
         let mut high = self.num_entries;
         while low < high {
@@ -588,10 +597,7 @@ impl<'a> IdxBlockReader<'a> {
             match k.cmp(target_key) {
                 Ordering::Less => low = mid + 1,
                 Ordering::Greater => high = mid,
-                Ordering::Equal => {
-                    let entry = self.decode_entry_at(mid)?;
-                    return Ok(Some((entry.lsn, entry.value)));
-                }
+                Ordering::Equal => return Ok(Some(self.raw_entry_at(mid)?)),
             }
         }
         Ok(None)
@@ -1151,7 +1157,29 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     /// 3. Reads a single 4 KB data block (from verified block cache or OS Page Cache) and
     ///    binary-searches its `u16` offset directory in $O(\log K)$.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
-        if !self.may_contain_key(key) || !self.bloom.may_contain(key) {
+        self.get_hashed(key, BloomFilter::hash_pair(key))
+    }
+
+    /// Like [`Self::get`], with the Bloom hash pair of `key` (from [`BloomFilter::hash_pair`])
+    /// supplied by the caller so that a probe across several segments hashes the key once.
+    pub fn get_hashed(
+        &self,
+        key: &[u8],
+        hash: (u32, u32),
+    ) -> io::Result<Option<(u64, IndexValue)>> {
+        self.visit_hashed(key, hash, |raw| Ok((raw.lsn, raw.decode_value()?)))
+    }
+
+    /// Looks up `key` and passes the matching entry, borrowed from the block, to `visit`, so the
+    /// caller can copy the value straight to its destination instead of through an owned
+    /// [`IndexValue`]. Returns `None` without calling `visit` when the key is absent.
+    pub fn visit_hashed<R>(
+        &self,
+        key: &[u8],
+        hash: (u32, u32),
+        visit: impl FnOnce(RawIdxEntry<'_>) -> io::Result<R>,
+    ) -> io::Result<Option<R>> {
+        if !self.may_contain_key(key) || !self.bloom.may_contain_hashed(hash.0, hash.1) {
             return Ok(None);
         }
 
@@ -1167,12 +1195,19 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         // is zeroed and no block copy is made.
         if let Some(cache) = &self.block_cache {
             if let Some(block) = cache.get_arc(self.seq_id, block_idx) {
-                return IdxBlockReader::open_preverified(&block)?.lookup_binary_search(key);
+                let reader = IdxBlockReader::open_preverified(&block)?;
+                return match reader.find_raw(key)? {
+                    Some(raw) => visit(raw).map(Some),
+                    None => Ok(None),
+                };
             }
         }
         let mut block_buf = [0u8; IDX_BLOCK_SIZE];
         let reader = self.read_block_from_disk(block_idx, &mut block_buf, true)?;
-        reader.lookup_binary_search(key)
+        match reader.find_raw(key)? {
+            Some(raw) => visit(raw).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Reads all entries in this segment in sorted order.
@@ -1890,5 +1925,51 @@ mod tests {
         assert_eq!(cache.hits() + cache.misses(), 202);
         assert!(cache.hits() > 190);
         assert_eq!(seg.get(b"key_99999").unwrap(), None);
+    }
+
+    #[test]
+    fn hashed_lookup_and_visitor_match_get_for_every_value_type() {
+        let tmp = TempTestDir::new("idx_visit_hashed");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let ptr = BlobPtr {
+            kind: BlobKind::Standard,
+            table_id: 3,
+            seg_id: 9,
+            offset: 128,
+            len: 4096,
+            crc32c: 0xABCD,
+        };
+        let mut mt = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
+        mt.put_inline(b"inline".to_vec(), b"payload".to_vec(), 1);
+        mt.put_blob_ptr(b"blob".to_vec(), ptr, 2);
+        mt.delete(b"gone".to_vec(), 3);
+        let mut seg = mt.flush_to_segment(&fs, 1, 10).expect("flush");
+        seg.set_block_cache(Some(Arc::new(VerifiedBlockCache::new(1 << 20))));
+
+        // Run twice so that both the disk path and the cached-block path are exercised.
+        for _ in 0..2 {
+            for key in [&b"inline"[..], b"blob", b"gone", b"absent"] {
+                let hash = BloomFilter::hash_pair(key);
+                let owned = seg.get(key).unwrap();
+                assert_eq!(seg.get_hashed(key, hash).unwrap(), owned);
+                let visited = seg
+                    .visit_hashed(key, hash, |raw| {
+                        Ok((raw.lsn, raw.val_type, raw.val_bytes.to_vec()))
+                    })
+                    .unwrap();
+                match (&owned, &visited) {
+                    (None, None) => {}
+                    (Some((lsn, IndexValue::Inline(v))), Some((l, 1, b))) => {
+                        assert_eq!((lsn, v), (l, b));
+                    }
+                    (Some((lsn, IndexValue::Blob(p))), Some((l, 2, b))) => {
+                        assert_eq!(lsn, l);
+                        assert_eq!(*p, RawIdxEntry::decode_blob_ptr(b).unwrap());
+                    }
+                    (Some((lsn, IndexValue::Tombstone)), Some((l, 3, _))) => assert_eq!(lsn, l),
+                    other => panic!("visitor and owned lookup disagree: {other:?}"),
+                }
+            }
+        }
     }
 }

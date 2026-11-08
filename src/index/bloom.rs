@@ -102,7 +102,15 @@ impl BloomFilter {
             return true;
         }
         let (h1, h2) = Self::hash_pair(key);
+        self.may_contain_hashed(h1, h2)
+    }
 
+    /// Like [`Self::may_contain`], with the pair from [`Self::hash_pair`] already computed.
+    #[inline]
+    pub fn may_contain_hashed(&self, h1: u32, h2: u32) -> bool {
+        if self.num_bits == 0 {
+            return true;
+        }
         let mut h = h1;
         for _ in 0..self.num_probes {
             let bit_idx = (h % self.num_bits) as usize;

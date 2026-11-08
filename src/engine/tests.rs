@@ -4426,3 +4426,67 @@ fn crash_with_wal_contents_runs_full_capped_reconcile() {
         assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()), "{k:?}");
     }
 }
+
+#[test]
+fn point_lookups_resolve_newest_segment_for_inline_blob_and_deleted_rows() {
+    let tmp = TempTestDir::new("point_lookup_segments");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 128;
+    cfg.auto_compact_segment_threshold = 100;
+    let wal = WriteDurability::BufferedFast;
+    let big = |b: u8| vec![b; 1000];
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    engine.put_row(1, b"inline", b"v1", &[], wal).unwrap();
+    engine.put_row(1, b"blob", &big(1), &[], wal).unwrap();
+    engine.put_row(1, b"gone", b"v1", &[], wal).unwrap();
+    engine.put_row(1, b"flip", b"small", &[], wal).unwrap();
+    engine.flush_memtable().unwrap();
+    engine.put_row(1, b"inline", b"v2", &[], wal).unwrap();
+    engine.put_row(1, b"blob", &big(2), &[], wal).unwrap();
+    engine.delete_row(1, b"gone", wal).unwrap();
+    engine.put_row(1, b"flip", &big(3), &[], wal).unwrap();
+    engine.flush_memtable().unwrap();
+    engine.put_row(1, b"later", b"v1", &[], wal).unwrap();
+    engine.flush_memtable().unwrap();
+    assert!(engine.memtable.is_empty());
+    assert!(engine.idx_segments.len() >= 3);
+
+    let expected: [(&[u8], Option<Vec<u8>>); 6] = [
+        (b"inline", Some(b"v2".to_vec())),
+        (b"blob", Some(big(2))),
+        (b"gone", None),
+        (b"flip", Some(big(3))),
+        (b"later", Some(b"v1".to_vec())),
+        (b"absent", None),
+    ];
+    for (pk, want) in &expected {
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        let hit = engine.get_row_into(1, pk, &mut slab, &mut spans).unwrap();
+        assert_eq!(hit, want.is_some(), "{pk:?}");
+        if let Some(want) = want {
+            let (s, e) = spans[0];
+            assert_eq!(&slab[s..e], want.as_slice(), "{pk:?}");
+        }
+
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        let mut lazy = Vec::new();
+        let hit = engine
+            .get_row_into_lazy(1, pk, &mut slab, &mut spans, &mut lazy)
+            .unwrap();
+        assert_eq!(hit, want.is_some(), "{pk:?}");
+        if let Some(want) = want {
+            match &lazy[0] {
+                None => {
+                    let (s, e) = spans[0];
+                    assert_eq!(&slab[s..e], want.as_slice(), "{pk:?}");
+                }
+                Some(lb) => assert_eq!(lb.ptr.len as usize, 16 + 3 + pk.len() + want.len()),
+            }
+        }
+        assert_eq!(engine.get_row(1, pk).unwrap(), *want, "{pk:?}");
+    }
+}

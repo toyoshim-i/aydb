@@ -25,8 +25,8 @@ use crate::blob::{
 };
 use crate::cache::{BlobCacheKey, VerifiedBlobCache, VerifiedBlockCache};
 use crate::index::{
-    DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, decode_lru_queue_key,
-    decode_secondary_index_pk_slice,
+    BloomFilter, DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue,
+    RawIdxEntry, decode_lru_queue_key, decode_secondary_index_pk_slice,
 };
 use crate::lru::{
     AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META,
@@ -62,6 +62,30 @@ pub(super) enum ExistingRowStatus {
     NotFound,
     Inline,
     Blob(BlobPtr),
+}
+
+/// Outcome of probing one `idx` segment for a row key without materializing its value.
+enum SegProbe {
+    /// The inline value was appended to the caller's slab.
+    Inline,
+    Blob(BlobPtr),
+    Tombstone,
+}
+
+/// Classifies a borrowed segment entry, appending an inline value to `slab`.
+fn probe_raw_into_slab(raw: RawIdxEntry<'_>, slab: &mut Vec<u8>) -> io::Result<SegProbe> {
+    match raw.val_type {
+        1 => {
+            slab.extend_from_slice(raw.val_bytes);
+            Ok(SegProbe::Inline)
+        }
+        2 => Ok(SegProbe::Blob(RawIdxEntry::decode_blob_ptr(raw.val_bytes)?)),
+        3 => Ok(SegProbe::Tombstone),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown IndexValue type_tag: {other}"),
+        )),
+    }
 }
 
 /// Durability guarantee requested for a write or delete operation.
@@ -1677,23 +1701,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Tombstone => {}
             }
         } else {
+            let hash = BloomFilter::hash_pair(row_key);
             for seg in self.idx_segments.iter().rev() {
-                if let Some((_lsn, val)) = seg.get(row_key)? {
-                    match val {
-                        IndexValue::Inline(bytes) => {
-                            let start = slab.len();
-                            slab.extend_from_slice(&bytes);
+                let start = slab.len();
+                let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
+                if let Some(probe) = probe {
+                    match probe {
+                        SegProbe::Inline => {
                             spans.push((start, slab.len()));
                             hit = true;
                         }
-                        IndexValue::Blob(ptr) => {
-                            let start = slab.len();
+                        SegProbe::Blob(ptr) => {
                             if self.dereference_blob_append_into_cx(cx, &ptr, row_key, slab)? {
                                 spans.push((start, slab.len()));
                                 hit = true;
                             }
                         }
-                        IndexValue::Tombstone => {}
+                        SegProbe::Tombstone => {}
                     }
                     break;
                 }
@@ -1778,31 +1802,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Tombstone => {}
             }
         } else {
+            let hash = BloomFilter::hash_pair(row_key);
             for seg in self.idx_segments.iter().rev() {
-                if let Some((_lsn, val)) = seg.get(row_key)? {
-                    match val {
-                        IndexValue::Inline(bytes) => {
-                            let start = slab.len();
-                            slab.extend_from_slice(&bytes);
+                let start = slab.len();
+                let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
+                if let Some(probe) = probe {
+                    match probe {
+                        SegProbe::Inline => {
                             spans.push((start, slab.len()));
                             lazy_blobs.push(None);
                             hit = true;
                         }
-                        IndexValue::Blob(ptr) => {
+                        SegProbe::Blob(ptr) => {
                             if lazy_ok {
                                 spans.push((0, 0));
                                 lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
                                 hit = true;
-                            } else {
-                                let start = slab.len();
-                                if self.read_flushed_blob_append_into(&ptr, row_key, slab)? {
-                                    spans.push((start, slab.len()));
-                                    lazy_blobs.push(None);
-                                    hit = true;
-                                }
+                            } else if self.read_flushed_blob_append_into(&ptr, row_key, slab)? {
+                                spans.push((start, slab.len()));
+                                lazy_blobs.push(None);
+                                hit = true;
                             }
                         }
-                        IndexValue::Tombstone => {}
+                        SegProbe::Tombstone => {}
                     }
                     break;
                 }
@@ -2617,13 +2639,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Blob(ptr) => ExistingRowStatus::Blob(*ptr),
             });
         }
+        let hash = BloomFilter::hash_pair(key);
         for seg in self.idx_segments.iter().rev() {
-            if let Some((_lsn, val)) = seg.get(key)? {
-                return Ok(match val {
-                    IndexValue::Tombstone => ExistingRowStatus::NotFound,
-                    IndexValue::Inline(_) => ExistingRowStatus::Inline,
-                    IndexValue::Blob(ptr) => ExistingRowStatus::Blob(ptr),
-                });
+            let status = seg.visit_hashed(key, hash, |raw| match raw.val_type {
+                1 => Ok(ExistingRowStatus::Inline),
+                2 => Ok(ExistingRowStatus::Blob(RawIdxEntry::decode_blob_ptr(
+                    raw.val_bytes,
+                )?)),
+                3 => Ok(ExistingRowStatus::NotFound),
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown IndexValue type_tag: {other}"),
+                )),
+            })?;
+            if let Some(status) = status {
+                return Ok(status);
             }
         }
         Ok(ExistingRowStatus::NotFound)
@@ -2768,8 +2798,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(mem_entry) = self.mem_get_view(view, key) {
             return Ok(Some((mem_entry.lsn, mem_entry.value.clone())));
         }
+        let hash = BloomFilter::hash_pair(key);
         for seg in self.idx_segments.iter().rev() {
-            if let Some((lsn, val)) = seg.get(key)? {
+            if let Some((lsn, val)) = seg.get_hashed(key, hash)? {
                 return Ok(Some((lsn, val)));
             }
         }
