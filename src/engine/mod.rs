@@ -48,6 +48,10 @@ pub(super) enum ExistingRowStatus {
 }
 
 /// Durability guarantee requested for a write or delete operation.
+///
+/// If a WAL append or sync fails, the call returns an error and the engine becomes *poisoned*
+/// (see [`StorageEngine::is_poisoned`]): the on-disk outcome of the failed write is unknown, so
+/// after reopening the failed write may or may not be present (but never partially applied).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteDurability {
     /// Logs to `wal_sync.db` (`FILE_FLAG_WRITE_THROUGH` / `O_DSYNC`), surviving immediate
@@ -183,6 +187,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) last_buf_append_lsn: u64,
     /// Highest LSN in `buf_wal` synced to durable storage.
     pub(super) last_buf_synced_lsn: u64,
+    /// Set after a WAL append/sync failure (original error text). While set, every mutating
+    /// operation fails and the engine must be reopened (the on-disk state is unknown).
+    pub(super) poisoned: Option<String>,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -554,6 +561,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
+            poisoned: None,
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
@@ -577,6 +585,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Returns the next LSN that will be assigned to a WAL batch.
+    /// Returns true if a WAL append/sync failure poisoned this engine. Reads keep working, but
+    /// all mutations fail until the engine is reopened.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// Fails with an `io::ErrorKind::Other` error if a prior WAL I/O failure poisoned the engine.
+    pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
+        match &self.poisoned {
+            None => Ok(()),
+            Some(msg) => Err(io::Error::other(format!(
+                "engine is poisoned by an earlier WAL I/O failure and must be reopened: {msg}"
+            ))),
+        }
+    }
+
+    /// Records a WAL I/O failure (first one wins) and returns the original error.
+    pub(super) fn poison(&mut self, e: io::Error) -> io::Error {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(e.to_string());
+        }
+        e
+    }
+
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
     }
@@ -624,6 +656,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         explicit_id: Option<u16>,
         durability: WriteDurability,
     ) -> io::Result<u16> {
+        self.check_not_poisoned()?;
         let norm_name = table_name.trim().to_ascii_lowercase();
         let catalog_prefix = [0u8, 0u8, b'c'];
         let entries = self.scan_merged_prefix(&catalog_prefix)?;
@@ -723,6 +756,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// index entries (`'i'`), row metadata (`'t'`), LRU queue entries (`'l'`), capped table
     /// quota registrations, and system catalog entries.
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
+        self.check_not_poisoned()?;
         let mut records = Vec::new();
         let mut dead_ptrs = Vec::new();
 
@@ -826,6 +860,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
         known_absent: bool,
     ) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1069,6 +1104,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         durability: WriteDurability,
     ) -> io::Result<bool> {
+        self.check_not_poisoned()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1584,6 +1620,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         records: Vec<WalRecord>,
         durability: WriteDurability,
     ) -> io::Result<u64> {
+        self.check_not_poisoned()?;
         let lsn = self.next_lsn;
 
         if self.tx_depth > 0 {
@@ -1651,6 +1688,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         encoded: &[u8],
         durability: WriteDurability,
     ) -> io::Result<()> {
+        self.check_not_poisoned()?;
         let batch_lsn = if encoded.len() >= 8 {
             u64::from_le_bytes(encoded[0..8].try_into().unwrap())
         } else {
@@ -1664,15 +1702,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && self.last_buf_append_lsn > self.last_buf_synced_lsn
         {
             self.sync_active_blob_writers()?;
-            self.buf_wal.flush_buffered_to_os()?;
-            self.buf_wal.file().sync_barrier()?;
+            let r = self
+                .buf_wal
+                .flush_buffered_to_os()
+                .and_then(|()| self.buf_wal.file().sync_barrier());
+            r.map_err(|e| self.poison(e))?;
             self.last_buf_synced_lsn = self.last_buf_append_lsn;
         }
 
-        let outcome = match durability {
-            WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded)?,
-            WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded)?,
+        // A failed append/sync leaves the on-disk outcome of this batch unknown (it may or may not
+        // be replayed after restart), so the engine is poisoned and must be reopened.
+        let r = match durability {
+            WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded),
+            WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded),
         };
+        let outcome = r.map_err(|e| self.poison(e))?;
 
         if outcome == WalAppendOutcome::RingFull {
             if self.memtable.is_empty() {
@@ -1680,10 +1724,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else {
                 self.flush_memtable()?;
             }
-            let retry = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded)?,
-                WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded)?,
+            let r = match durability {
+                WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded),
+                WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded),
             };
+            let retry = r.map_err(|e| self.poison(e))?;
             if retry == WalAppendOutcome::RingFull {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,

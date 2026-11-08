@@ -959,9 +959,15 @@ fn crash_consistency_and_failed_write_rollback() {
             .is_err()
     );
     assert_eq!(engine.get_row(1, b"r1").unwrap(), Some(orig_blob.clone()));
+    // A failed WAL write poisons the engine; reopen (without power loss) to continue.
+    assert!(engine.is_poisoned());
+    fs.fail_wal_writes.store(false, Ordering::SeqCst);
+    drop(engine);
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    assert!(!engine.is_poisoned());
+    assert_eq!(engine.get_row(1, b"r1").unwrap(), Some(orig_blob.clone()));
 
     // Failing commit_transaction must roll back MemTable!
-    fs.fail_wal_writes.store(false, Ordering::SeqCst);
     engine.begin_transaction();
     engine
         .put_row(1, b"tx_fail_k", b"tx_val", &[], WriteDurability::BufferedFast)
@@ -969,10 +975,14 @@ fn crash_consistency_and_failed_write_rollback() {
     fs.fail_wal_writes.store(true, Ordering::SeqCst);
     assert!(engine.commit_transaction().is_err());
     fs.fail_wal_writes.store(false, Ordering::SeqCst);
+    assert!(engine.is_poisoned());
     assert!(
         engine.get_row(1, b"tx_fail_k").unwrap().is_none(),
         "failed commit_transaction must roll back unlogged MemTable mutations"
     );
+    drop(engine);
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    assert!(engine.get_row(1, b"tx_fail_k").unwrap().is_none());
 
     // Overwrite `r1` with `BufferedFast` (making `blob_std_1` 100% dead in RAM),
     // then trigger `evict_until_within_quota` on capped Table 2, then simulate power loss!
@@ -1024,7 +1034,7 @@ fn crash_consistency_and_failed_write_rollback() {
             WriteDurability::BufferedFast,
         )
         .unwrap();
-    std::mem::forget(engine);
+    drop(engine);
     fs.simulate_power_loss();
 
     let mut recovered = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
@@ -2241,4 +2251,123 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
         engine.get_row(2, b"frag_blob_5").unwrap().unwrap(),
         vec![0xABu8; 300]
     );
+}
+
+#[test]
+fn wal_write_failure_poisons_engine_until_reopen() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    struct WalFaultFile<F> {
+        inner: Arc<F>,
+        is_wal: bool,
+        fail_next_wal_write: Arc<AtomicBool>,
+    }
+
+    impl<F: PlatformFile> PlatformFile for WalFaultFile<F> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            if self.is_wal && self.fail_next_wal_write.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("simulated WAL write failure"));
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct WalFaultFs {
+        inner: OsFs,
+        fail_next_wal_write: Arc<AtomicBool>,
+    }
+
+    impl PlatformFs for WalFaultFs {
+        type File = WalFaultFile<<OsFs as PlatformFs>::File>;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+            Ok(Arc::new(WalFaultFile {
+                inner,
+                is_wal: rel_name == "wal_sync.db" || rel_name == "wal_buf.db",
+                fail_next_wal_write: Arc::clone(&self.fail_next_wal_write),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    for durability in [WriteDurability::SyncTransactional, WriteDurability::BufferedFast] {
+        let tmp = TempTestDir::new("wal_poison");
+        let flag = Arc::new(AtomicBool::new(false));
+        let fs = Arc::new(WalFaultFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            fail_next_wal_write: Arc::clone(&flag),
+        });
+
+        let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+        engine.put_row(1, b"before", b"v0", &[], durability).unwrap();
+        assert!(!engine.is_poisoned());
+
+        flag.store(true, Ordering::SeqCst);
+        let err = engine
+            .put_row(1, b"failed", b"v1", &[], durability)
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated WAL write failure"));
+        assert!(engine.is_poisoned());
+
+        let err2 = engine
+            .put_row(1, b"after", b"v2", &[], durability)
+            .unwrap_err();
+        assert!(err2.to_string().contains("poisoned"));
+        assert!(err2.to_string().contains("simulated WAL write failure"));
+        assert!(engine.delete_row(1, b"before", durability).is_err());
+        assert!(engine.flush_memtable().is_err());
+        assert!(engine.compact().is_err());
+
+        // Reads keep working and never see the failed or rejected writes.
+        assert_eq!(engine.get_row(1, b"before").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(engine.get_row(1, b"failed").unwrap(), None);
+        assert_eq!(engine.get_row(1, b"after").unwrap(), None);
+        drop(engine);
+
+        let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        assert!(!reopened.is_poisoned());
+        assert_eq!(reopened.get_row(1, b"before").unwrap(), Some(b"v0".to_vec()));
+        reopened
+            .put_row(1, b"after", b"v2", &[], durability)
+            .unwrap();
+        assert_eq!(reopened.get_row(1, b"after").unwrap(), Some(b"v2".to_vec()));
+    }
 }

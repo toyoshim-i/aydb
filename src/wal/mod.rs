@@ -438,7 +438,36 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     }
 
     /// Appends pre-encoded batch bytes.
-    pub fn append_raw_batch(&mut self, mut remaining: &[u8]) -> io::Result<WalAppendOutcome> {
+    ///
+    /// Failure-atomic with respect to writer state: if any write or sync fails, the cursor
+    /// (`current_sector_idx`, `current_valid_bytes`, `dirty_in_user_space`, `sector_buf`) is restored
+    /// to its pre-call value. Restoring is safe even if some bytes reached disk: the next append
+    /// rewrites the same sectors starting at the same index, and any leftover trailing sectors of a
+    /// failed multi-sector batch are `Middle`/`Last` fragments without a preceding `First`, which
+    /// recovery rejects. The on-disk outcome of the failed batch is nevertheless *unknown*, so
+    /// callers should treat the stream as poisoned (see `StorageEngine::is_poisoned`).
+    pub fn append_raw_batch(&mut self, remaining: &[u8]) -> io::Result<WalAppendOutcome> {
+        let saved_idx = self.current_sector_idx;
+        let saved_valid = self.current_valid_bytes;
+        let saved_dirty = self.dirty_in_user_space;
+        // A partially filled sector holds earlier committed bytes that must survive a rollback.
+        // When `valid == 0` the buffer is all zeros, so no copy is needed.
+        let saved_buf = (saved_valid > 0).then(|| Box::new(self.sector_buf));
+        let res = self.append_raw_batch_inner(remaining);
+        if res.is_err() {
+            self.current_sector_idx = saved_idx;
+            self.current_valid_bytes = saved_valid;
+            self.dirty_in_user_space = saved_dirty;
+            match saved_buf {
+                Some(b) => self.sector_buf.copy_from_slice(&*b),
+                None => self.sector_buf.fill(0),
+            }
+            self.multi_sector_buf.clear();
+        }
+        res
+    }
+
+    fn append_raw_batch_inner(&mut self, mut remaining: &[u8]) -> io::Result<WalAppendOutcome> {
         if remaining.is_empty() {
             return Ok(WalAppendOutcome::Appended {
                 first_sector_idx: self.current_sector_idx,
@@ -582,6 +611,8 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     /// Flushes any pending user-space buffered sector data into the OS Page Cache.
     pub fn flush_buffered_to_os(&mut self) -> io::Result<()> {
+        // `seal_and_write_current_sector` does not touch the cursor, so on error the state
+        // (still dirty) is unchanged and a later flush can retry.
         if self.dirty_in_user_space && self.current_valid_bytes > 0 {
             self.seal_and_write_current_sector()?;
             self.dirty_in_user_space = false;
@@ -1453,5 +1484,178 @@ mod tests {
             vec![3, 4],
             "multi-chunk transaction [1, 2] with invalid blob in chunk 2 must be discarded as a unit"
         );
+    }
+
+    // ---- Fault-injection helpers ----
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        fail_write: Arc<AtomicBool>,
+        fail_sync: Arc<AtomicBool>,
+    }
+
+    impl PlatformFile for FailFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            if self.fail_write.swap(false, Ordering::SeqCst) {
+                // Simulate a partial write: first sector lands, then error.
+                let n = buf.len().min(WAL_SECTOR_SIZE);
+                let _ = self.inner.write_all_at(&buf[..n], offset);
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, t: u64, s: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(t, s)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            if self.fail_sync.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("injected sync failure"));
+            }
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, o: u64, l: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(o, l)
+        }
+    }
+
+    struct FailFs {
+        inner: OsFs,
+        fail_write: Arc<AtomicBool>,
+        fail_sync: Arc<AtomicBool>,
+    }
+
+    impl PlatformFs for FailFs {
+        type File = FailFile;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<FailFile>> {
+            Ok(Arc::new(FailFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                fail_write: self.fail_write.clone(),
+                fail_sync: self.fail_sync.clone(),
+            }))
+        }
+        fn remove_file(&self, n: &str) -> io::Result<()> {
+            self.inner.remove_file(n)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &std::path::Path {
+            self.inner.root_path()
+        }
+    }
+
+    fn put_batch(lsn: u64, key: &[u8], len: usize) -> WalBatch {
+        WalBatch::new(
+            lsn,
+            vec![WalRecord::PutInline {
+                key: key.to_vec(),
+                value: vec![0x42u8; len],
+            }],
+        )
+    }
+
+    fn fail_fs(name: &str) -> (TempTestDir, FailFs, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let tmp = TempTestDir::new(name);
+        let w = Arc::new(AtomicBool::new(false));
+        let s = Arc::new(AtomicBool::new(false));
+        let fs = FailFs {
+            inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
+            fail_write: w.clone(),
+            fail_sync: s.clone(),
+        };
+        (tmp, fs, w, s)
+    }
+
+    fn recover_lsns(fs: &FailFs, name: &str, epoch: u64) -> Vec<u64> {
+        let f = fs
+            .open_file(name, false, false, OpenHint::MutableSyncLog)
+            .unwrap();
+        recover_single_wal_stream(&*f, epoch)
+            .unwrap()
+            .batches
+            .iter()
+            .map(|b| b.lsn)
+            .collect()
+    }
+
+    #[test]
+    fn sync_multi_sector_write_failure_leaves_no_hole() {
+        let (_tmp, fs, fail_w, _) = fail_fs("wal_fail_sync_multi");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        let before = w.current_sector_idx();
+        fail_w.store(true, Ordering::SeqCst);
+        assert!(w.append_batch(&put_batch(2, b"big", 13_000)).is_err());
+        assert_eq!(w.current_sector_idx(), before, "cursor must be restored");
+        w.append_batch(&put_batch(3, b"c", 10)).unwrap();
+        drop(w);
+        assert_eq!(recover_lsns(&fs, WAL_SYNC_FILE_NAME, 1), vec![1, 3]);
+    }
+
+    #[test]
+    fn sync_barrier_failure_restores_cursor() {
+        let (_tmp, fs, _, fail_s) = fail_fs("wal_fail_barrier");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        let before = w.current_sector_idx();
+        fail_s.store(true, Ordering::SeqCst);
+        assert!(w.append_batch(&put_batch(2, b"b", 10)).is_err());
+        assert_eq!(w.current_sector_idx(), before);
+        w.append_batch(&put_batch(3, b"c", 10)).unwrap();
+        drop(w);
+        assert_eq!(recover_lsns(&fs, WAL_SYNC_FILE_NAME, 1), vec![1, 3]);
+    }
+
+    #[test]
+    fn buffered_write_failure_does_not_resurrect_failed_batch() {
+        let (_tmp, fs, fail_w, _) = fail_fs("wal_fail_buffered");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        fail_w.store(true, Ordering::SeqCst);
+        assert!(w.append_batch(&put_batch(2, b"failed", 10)).is_err());
+        w.append_batch(&put_batch(3, b"c", 10)).unwrap();
+        drop(w);
+        assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 3]);
     }
 }

@@ -21,6 +21,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// If called while an explicit transaction is active (`tx_depth > 0`), defers checkpointing
     /// until `commit_transaction` so provisional state is never published to SSTables.
     pub fn flush_memtable(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             self.deferred_flush_on_commit = true;
             return Ok(());
@@ -36,6 +37,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn flush_memtable_no_auto_compact(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             self.deferred_flush_on_commit = true;
             return Ok(());
@@ -135,6 +137,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn rotate_wal_epochs_only(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.buf_wal.flush_buffered_to_os()?;
         let new_sync_epoch = self.sync_wal.active_epoch() + 1;
         let new_buf_epoch = self.buf_wal.active_epoch() + 1;
@@ -154,6 +157,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
     /// and can be reclaimed in $O(1)$.
     pub fn relocate_fragmented_std_blobs(&mut self, dead_ratio_threshold: f64) -> io::Result<usize> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             return Ok(0);
         }
@@ -234,6 +238,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// If called while an explicit transaction is active (`tx_depth > 0`), defers compaction
     /// until `commit_transaction`.
     pub fn compact(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             self.deferred_compact_on_commit = true;
             return Ok(());
@@ -353,6 +358,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ///   with `drop_tombstones = false` (preserving tombstones that may shadow keys in older
     ///   segments `0..start_idx`) and skips whole-database blob relocation.
     pub fn compact_auto_tiered(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             self.deferred_compact_on_commit = true;
             return Ok(());

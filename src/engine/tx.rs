@@ -65,6 +65,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection already holds
     /// an active transaction on this `StorageEngine`.
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -454,6 +455,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.pending_tx_record_count == 0 {
             return Ok(());
         }
+        self.check_not_poisoned()?;
         let record_count = self.pending_tx_record_count;
         self.pending_tx_record_count = 0;
         let durability = if self.pending_tx_sync {
