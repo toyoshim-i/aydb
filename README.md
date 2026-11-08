@@ -2,6 +2,10 @@
 
 **Windows/SMB-Optimized Embedded Storage Engine & Lightweight SQL Runtime in Zero-Dependency Rust**
 
+[![CI](https://github.com/toyoshim-i/aydb/actions/workflows/ci.yml/badge.svg)](https://github.com/toyoshim-i/aydb/actions/workflows/ci.yml)
+
+Rendered documentation: <https://toyoshim-i.github.io/aydb/>. Latest CI test and benchmark results: <https://toyoshim-i.github.io/aydb/results.html>.
+
 `aydb` is an embedded storage engine designed from first principles to unify two workloads that traditionally conflict in desktop and edge applications:
 1. **High-Frequency ACID State & Configuration Updates:** Small records (tens to hundreds of bytes) requiring durability on commit return (`FILE_FLAG_WRITE_THROUGH`) without flushing multi-megabyte buffered cache pages or stalling on random B-Tree page writes.
 2. **Large-Scale Bounded Blob Caching (`MAX_BYTES` + LRU):** Multi-kilobyte to multi-megabyte payloads (such as HTTP caches or media assets) experiencing high churn, strict quota enforcement, and read-heavy access—where traditional B-Trees suffer from overflow-page fragmentation and classic LSM-Trees suffer from compaction write amplification.
@@ -52,6 +56,8 @@ flowchart TB
 ---
 
 ## Benchmark Highlights vs. Vanilla SQLite (`WAL` Mode)
+
+The table and charts below were measured on a single Windows NTFS host. The latest measurements taken by CI on Windows, Linux, and macOS runners (shared GitHub-hosted machines, so noisier and not comparable with this table) are published at <https://toyoshim-i.github.io/aydb/results.html>.
 
 All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same Windows NTFS host with **equivalent durability guarantees** (`WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` 2PC transactions):
 

@@ -132,3 +132,63 @@ jobs:
           name: bench-${{ matrix.os }}
           path: results/
           if-no-files-found: warn
+
+  # Publishes the report for pushes to main. "always()" makes the job run
+  # when a test or bench job failed, so a red state is published too. Pull
+  # requests and manual runs on other refs never deploy.
+  pages:
+    name: pages
+    needs: [test, bench]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # A newer push supersedes a deployment that is still waiting; a
+    # deployment already in progress is allowed to finish.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install site generator dependencies
+        run: python -m pip install "markdown==3.7"
+
+      # Without a name, every artifact lands in its own sub-directory.
+      # Missing artifacts (for example after a cancelled job) are fine.
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+        continue-on-error: true
+
+      - name: Build site
+        run: |
+          mkdir -p artifacts
+          python tools/build_site.py \
+            --artifacts artifacts \
+            --repo . \
+            --out site \
+            --sha "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --branch main
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
