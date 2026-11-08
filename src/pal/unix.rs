@@ -17,6 +17,17 @@ const LOCK_NB: c_int = 4;
 
 #[cfg(target_os = "macos")]
 const F_FULLFSYNC: c_int = 51;
+#[cfg(target_os = "macos")]
+const F_RDAHEAD: c_int = 45;
+#[cfg(target_os = "macos")]
+const F_NOCACHE: c_int = 48;
+
+#[cfg(target_os = "linux")]
+const POSIX_FADV_RANDOM: c_int = 1;
+#[cfg(target_os = "linux")]
+const POSIX_FADV_SEQUENTIAL: c_int = 2;
+#[cfg(target_os = "linux")]
+const POSIX_FADV_NOREUSE: c_int = 5;
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
@@ -24,7 +35,42 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     #[cfg(target_os = "linux")]
     fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
 }
+
+/// Tells the kernel how the file will be accessed. Advisory, so a failure is ignored. Blob files
+/// (`ImmutableSequential`) get no hint because they serve random point reads, as on Windows.
+#[cfg(target_os = "linux")]
+fn apply_open_hint(file: &File, hint: OpenHint) {
+    let advice = match hint {
+        OpenHint::MutableBufferedLog => POSIX_FADV_SEQUENTIAL,
+        OpenHint::ImmutableRandom => POSIX_FADV_RANDOM,
+        OpenHint::BackgroundBulk => POSIX_FADV_NOREUSE,
+        OpenHint::MutableSyncLog | OpenHint::ImmutableSequential => return,
+    };
+    unsafe {
+        posix_fadvise(file.as_raw_fd(), 0, 0, advice);
+    }
+}
+
+/// Tells the kernel how the file will be accessed. Advisory, so a failure is ignored. Blob files
+/// (`ImmutableSequential`) get no hint because they serve random point reads, as on Windows.
+#[cfg(target_os = "macos")]
+fn apply_open_hint(file: &File, hint: OpenHint) {
+    let (command, value) = match hint {
+        OpenHint::MutableBufferedLog => (F_RDAHEAD, 1),
+        OpenHint::ImmutableRandom => (F_RDAHEAD, 0),
+        OpenHint::BackgroundBulk => (F_NOCACHE, 1),
+        OpenHint::MutableSyncLog | OpenHint::ImmutableSequential => return,
+    };
+    unsafe {
+        fcntl(file.as_raw_fd(), command, value as c_int);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn apply_open_hint(_file: &File, _hint: OpenHint) {}
 
 /// Default maximum open file descriptors across idle segment handles in [`HandlePool`].
 pub const DEFAULT_HANDLE_POOL_CAP: usize = 128;
@@ -184,6 +230,7 @@ impl UnixPlatformFile {
             .create(create)
             .truncate(truncate)
             .open(full_path)?;
+        apply_open_hint(&file, hint);
         Ok(Self {
             path: full_path.to_path_buf(),
             writable,
@@ -213,6 +260,7 @@ impl UnixPlatformFile {
             .read(true)
             .write(self.writable)
             .open(&self.path)?;
+        apply_open_hint(&reopened, self.hint);
         let res = f(&reopened);
         *guard = Some(reopened);
         self.descriptor_open.store(true, Ordering::Release);
