@@ -135,7 +135,7 @@ sequenceDiagram
     end
 
     alt DurabilityMode == Sync (Critical Settings)
-        Eng->>WAL: Write 4 KB padded sector to wal_sync.db (WRITE_THROUGH + FlushFileBuffers)
+        Eng->>WAL: Write 4 KB padded sector to wal_sync.db (FlushFileBuffers)
     else DurabilityMode == Buffered (Cache / High-Freq State)
         Eng->>WAL: Write to wal_buf.db (Enters OS Page Cache immediately)
     end

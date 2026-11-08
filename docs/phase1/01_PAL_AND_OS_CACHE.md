@@ -125,7 +125,7 @@ flowchart TD
     end
 
     subgraph OptC["Option C: Physical Two-Stream WAL Separation (Selected)"]
-        C_Sync["wal_sync.db (e.g., 2 MB Fixed)<br/>dwShareMode = 0 | FILE_FLAG_WRITE_THROUGH"]
+        C_Sync["wal_sync.db (e.g., 8 MB Fixed)<br/>dwShareMode = 0, device flush per commit"]
         C_Buf["wal_buf.db (e.g., 16 MB Fixed)<br/>dwShareMode = 0 | Buffered Cache"]
         C_Rec["Crash Recovery:<br/>Scan both contiguous rings independently,<br/>then merge-sort valid records by 64-bit LSN!"]
         C_Sync --> C_Rec
@@ -141,7 +141,7 @@ flowchart TD
 
 ### 3.2 How Option C (`wal_sync.db` + `wal_buf.db`) Solves Everything
 
-By splitting the journal into two separate pre-allocated physical files—**`wal_sync.db`** (opened with `dwShareMode = 0` and `FILE_FLAG_WRITE_THROUGH`) and **`wal_buf.db`** (opened with `dwShareMode = 0` and standard buffered caching):
+By splitting the journal into two separate pre-allocated physical files—**`wal_sync.db`** (opened with `dwShareMode = 0` and flushed on every commit) and **`wal_buf.db`** (opened with `dwShareMode = 0` and standard buffered caching):
 
 1. **Full `dwShareMode = 0` Exclusivity:** Every file in the database directory is opened exactly once with `dwShareMode = 0`, preserving SMB RWH leases unconditionally.
 2. **Zero Flush Coupling:** `wal_sync.db` only ever contains `Sync` records. Flushing or writing through to `wal_sync.db` never touches the dirty OS cache pages of `wal_buf.db`.
@@ -193,7 +193,7 @@ Thanks to our two-stream WAL separation (Design Decision 3), we get the best of 
 
 | `OpenHint` Variant | Target Files | Windows Flags (`CreateFileW`) | Linux (`fcntl` / `fadvise`) | macOS (`fcntl`) | Kernel Behavior |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `MutableSyncLog` | `boot_meta.db`,<br/>`wal_sync.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_WRITE_THROUGH` | `fdatasync` after each append | `F_FULLFSYNC` after each append | Writes go through OS cache directly to non-volatile media; no stale cache views. |
+| `MutableSyncLog` | `boot_meta.db`,<br/>`wal_sync.db` | `FILE_FLAG_OVERLAPPED` | `fdatasync` after each append | `F_FULLFSYNC` after each append | Buffered write, then a device flush before the commit returns. No write-through, because NTFS holds such writes back while the file is being flushed. |
 | `MutableBufferedLog` | `wal_buf.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Fast buffered sequential appends in 256 KB VACB views; survives process crash. |
 | `ImmutableRandom` | `idx_<SeqID>.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_RANDOM_ACCESS` | `POSIX_FADV_RANDOM` | `F_RDAHEAD(0)` | Disables speculative read-ahead so 4 KB point lookups do not fetch 252 KB of unused neighbors. |
 | `ImmutableSequential` | `blob_std_<SeqID>.db`,<br/>`blob_lru_<TblID>_<SeqID>.db` | `FILE_FLAG_OVERLAPPED` only (`FILE_FLAG_SEQUENTIAL_SCAN` is deliberately omitted) | none | none | Blob files serve random point reads, so no platform requests sequential read-ahead on them. |
@@ -281,7 +281,7 @@ pub trait PlatformFile: Send + Sync + 'static {
 
     /// Issues an ordering barrier ensuring prior writes reach the storage controller
     /// before subsequent metadata updates.
-    /// - Windows: `FlushFileBuffers` (or no-op if opened with `MutableSyncLog` / `WRITE_THROUGH`)
+    /// - Windows: `FlushFileBuffers`
     /// - Linux: `fdatasync`
     /// - macOS: `F_FULLFSYNC` for `MutableSyncLog` handles, otherwise `fsync`
     ///   (`F_BARRIERFSYNC` is not used)
@@ -342,7 +342,7 @@ To validate the theoretical kernel analysis in Sections 2 and 4, we executed `ca
 
 ### 7.1 Benchmark 1: The NTFS Valid Data Length (VDL) Cliff on 4 KB WAL Writes
 
-> **Note.** The `wal_sync.db` rows below time write-through writes without a device flush. Sync commits now also call `FlushFileBuffers`, which dominates the latency on a consumer SSD, and `pal_bench` includes that flush.
+> **Note.** The `wal_sync.db` rows below time write-through writes without a device flush. `wal_sync.db` is no longer opened with `FILE_FLAG_WRITE_THROUGH`: each commit calls `FlushFileBuffers` instead (see `ARCHITECTURE.md` §4.5), and `pal_bench` includes that flush. The VDL analysis describes the earlier write-through behaviour.
 
 | Target File & Mode | `PreallocStrategy` | Prealloc Time | Epoch 1 Total | Epoch 1 P50 | Epoch 1 P99 | Epoch 2 Total | Epoch 2 P50 | Epoch 2 P99 |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

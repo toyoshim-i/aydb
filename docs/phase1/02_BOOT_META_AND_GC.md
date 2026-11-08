@@ -20,7 +20,7 @@ On Windows desktops and SMB/CIFS shares, this pattern suffers from three well-kn
 
 `aydb` eliminates file renaming completely:
 * Every segment file (`idx_<SeqID>.db`, `blob_std_<SeqID>.db`, `blob_lru_<TblID>_<SeqID>.db`, `manifest_<SeqID>.db`) is assigned a strictly monotonic 64-bit `SeqID` that is **never reused**.
-* The authoritative pointer to the active database state lives inside a fixed 8 KB file, **`boot_meta.db`**, pre-allocated at database creation with `PreallocStrategy::PhysicalZeroFill` and opened with `OpenHint::MutableSyncLog` (`dwShareMode = 0 | FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH`).
+* The authoritative pointer to the active database state lives inside a fixed 8 KB file, **`boot_meta.db`**, pre-allocated at database creation with `PreallocStrategy::PhysicalZeroFill` and opened with `OpenHint::MutableSyncLog` (`dwShareMode = 0 | FILE_FLAG_OVERLAPPED`, with a device flush after every write).
 * `boot_meta.db` is divided into two 4 KB sector-aligned slots: **Slot A (`0..4096`)** and **Slot B (`4096..8192`)**. Each checkpoint alternates between Slot A and Slot B ("ping-pong buffering").
 
 ```mermaid
@@ -34,7 +34,7 @@ sequenceDiagram
     Eng->>Seg: Write 4 KB blocks & sync_durable()
     Note over Eng,Meta: Slot A holds active Gen 41.<br/>Target the older slot (Slot B, offset 4096) for Gen 42.
     Eng->>Meta: Write 4096 bytes to Slot B (Gen 42, adds idx_0105, drops idx_0101)
-    Eng->>Meta: sync_durable() (WRITE_THROUGH + FlushFileBuffers)
+    Eng->>Meta: sync_durable() (FlushFileBuffers)
     Note over Meta: Atomic Commit Point!<br/>Even if power failed mid-write to Slot B,<br/>Slot A (Gen 41) remained 100% intact.
     Eng->>Old: Drop Arc<PlatformFile> (CloseHandle)
     Eng->>Old: fs.remove_file("idx_0101.db")

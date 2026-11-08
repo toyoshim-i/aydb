@@ -13,7 +13,7 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 * **Workload:** `300` individual synchronous transactions (`INSERT OR REPLACE INTO app_config VALUES (?1, ?2)`) updating 50 configuration keys with `128 B` values.
 * **Compared Configurations:**
   1. **Vanilla SQLite:** `PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`
-  2. **`aydb` Virtual Table:** `durability = 'sync'` (writes to `wal_sync.db` opened with `FILE_FLAG_WRITE_THROUGH` + `PhysicalZeroFill` pre-allocation, followed by `FlushFileBuffers` on every commit).
+  2. **`aydb` Virtual Table:** `durability = 'sync'` (writes to `wal_sync.db` with `PhysicalZeroFill` pre-allocation, followed by `FlushFileBuffers` on every commit).
 
 | Engine & Durability Mode | Throughput | P50 Latency | P99 Latency | Physical Bytes Written |
 | :--- | ---: | ---: | ---: | ---: |
@@ -24,7 +24,7 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 1. **Why Vanilla SQLite Takes `950 µs` per Sync Commit:**
    * Even for a `128 B` row, SQLite's B-Tree + WAL must write an entire 4 KB database page image + 24-byte WAL frame header to the `-wal` file, extend the `-wal` file's NTFS `ValidDataLength (VDL)` (triggering a synchronous NTFS `$LogFile` metadata transaction), and invoke `FlushFileBuffers()`, which stalls the calling thread until the full storage flush barrier completes.
 2. **Why `aydb` Is About Equal:**
-   * `aydb` pre-zeroes `wal_sync.db` (`8 MB`) at initialization so `VDL == EOF` permanently, and writes only a single 4 KB sector per transaction, so it writes about a third of the bytes. Both engines then wait for `FlushFileBuffers`, which dominates the commit on a consumer SSD, so throughput is about the same. `FILE_FLAG_WRITE_THROUGH` alone is not used as the durability point because it can complete in a drive's volatile cache.
+   * `aydb` pre-zeroes `wal_sync.db` (`8 MB`) at initialization so `VDL == EOF` permanently, and writes only a single 4 KB sector per transaction, so it writes about a third of the bytes. Both engines then wait for `FlushFileBuffers`, which dominates the commit on a consumer SSD, so throughput is about the same.
 
 ---
 

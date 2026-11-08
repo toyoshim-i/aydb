@@ -139,7 +139,7 @@ WalRecord :=
 | :--- | :--- | :--- |
 | **Default File Size** | `8 MB` (`2,048` sectors of 4 KB) | `16 MB` (`4,096` sectors of 4 KB) |
 | **Pre-allocation** | `PreallocStrategy::PhysicalZeroFill` (`VDL == EOF`) | `PreallocStrategy::LogicalExtendOnly` |
-| **OS Open Hint** | `OpenHint::MutableSyncLog` (`FILE_FLAG_WRITE_THROUGH`) | `OpenHint::MutableBufferedLog` (`FILE_FLAG_SEQUENTIAL_SCAN`) |
+| **OS Open Hint** | `OpenHint::MutableSyncLog` (device flush per commit) | `OpenHint::MutableBufferedLog` (`FILE_FLAG_SEQUENTIAL_SCAN`) |
 | **Sector Packing Policy** | **Sector-Isolated:** Every `append_batch` call starts at a fresh 4 KB sector boundary and advances the cursor to the next 4 KB boundary so committed sectors are never overwritten in place. | **Densely Packed:** Small batches are packed into the active 4 KB in-memory sector buffer (if remaining space `>= 3 + batch_bytes.len()`, or split across sectors) and immediately written to the OS Page Cache. |
 | **Crash Guarantee** | Durable when the commit returns (survives process crash, OS panic, and power loss, assuming the device honours write-through). | Survives process crash / `kill -9` / `TerminateProcess` (via OS Page Cache). Power loss / OS crash may roll back recent unsynced commits. |
 

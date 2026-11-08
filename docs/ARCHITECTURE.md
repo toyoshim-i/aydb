@@ -17,7 +17,7 @@
   * The data-holding components have fixed budgets: the MemTable (`memtable_capacity_bytes`), the verified block cache (`block_cache_bytes`, default 4 MB) and the verified blob cache (`blob_cache_bytes`, default 4 MB). Their sum is the deterministic part of the private heap.
   * Four further structures are bounded differently and are **not** included in that sum:
     * *Bloom filters and sparse fence pointers* are kept in memory for every `idx_*.db` segment. They are small relative to the data (about one fence pointer per 4 KB block and `bloom_bits_per_key` bits, default 10, per key) but grow in proportion to the size of the database.
-    * *The transaction overlay* holds the uncommitted writes of the open transaction. It is limited by `max_transaction_bytes` (default 64 MB; `0` means unlimited), and a write that would exceed the limit fails.
+    * *The transaction overlay* holds the uncommitted writes of the open transaction. It is limited by `max_transaction_bytes` (default 64 MB; `0` means unlimited), and a write that would exceed the limit fails. Commits waiting for a group flush (§4.5) are held in memory as well, at most one per connection.
     * *The `AccessTracker`* that coalesces read hits for LRU is capped by entry count (`max_in_memory_access_ticks`, default 65,536 keys), not by bytes.
     * *The SQLite adapter's rowid map* for non-integer primary keys retains at most 262,144 entries once all cursors are closed; while cursors are open it can hold more.
   * **Primary Storage Caching via OS Page Cache:** Raw file caching, OS-level write-behind, and sequential readahead are delegated to the host operating system's page cache (e.g., Windows Cache Manager VACBs).
@@ -47,8 +47,8 @@ To maximize the effectiveness of the Windows Cache Manager (which maps files in 
 
 | File Category | Naming Convention | OS Open Flags (Win / Unix) | Role & Lifecycle |
 | :--- | :--- | :--- | :--- |
-| **Boot Metadata** | `boot_meta.db` | Standard (`WRITE_THROUGH`, 4 KB-aligned) | Fixed 8 KB size (4 KB × 2 ping-pong buffer). Stores active segment ID lists, table statistics, and pending GC lists. |
-| **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` + `WRITE_THROUGH` | Default 8 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. Each commit ends with a device flush (`FlushFileBuffers`). |
+| **Boot Metadata** | `boot_meta.db` | Standard (4 KB-aligned, device flush after every write) | Fixed 8 KB size (4 KB × 2 ping-pong buffer). Stores active segment ID lists, table statistics, and pending GC lists. |
+| **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` (buffered, device flush per commit) | Default 8 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. See §4.5 for the commit path. |
 | **Buffered Journal (WAL)** | `wal_buf.db` | `OVERLAPPED` + `SEQUENTIAL_SCAN` | Fixed 16 MB size (pre-allocated). Sequentially logs high-frequency buffered updates in OS cache without disk stalls. |
 | **Index Layer** | `idx_<SeqID>.db` | `RANDOM_ACCESS` / `FADV_RANDOM` | Immutable sorted key-value file (SSTable format). Stores keys, small inline column values, and pointers to out-of-line blobs. |
 | **Standard Blob Layer** | `blob_std_<SeqID>.db` | Standard (`OVERLAPPED` / positional I/O) | Append-only immutable file storing values larger than the inline threshold (e.g., 1 KB). Opened without `SEQUENTIAL_SCAN` to avoid 256 KB read-ahead amplification on random point reads. |
@@ -102,7 +102,7 @@ To support both fast random updates of small configuration records and zero writ
 
 * **`SyncTransactional` commits** are durable when the call returns; before one is appended, all earlier buffered commits are made durable first (prefix durability).
 * **`BufferedFast` commits** survive process crashes (`kill -9` / `TerminateProcess`) because they reach the OS page cache, but an OS crash or power loss may roll back recent buffered commits that were not yet synced.
-* Consistency rests on CRC-verified WAL sectors, `boot_meta.db` slots, and blobs, and **assumes the storage honours flush / write-through semantics**. It is exercised by deterministic fault-injection simulation (`FaultInjectingFs`), not by physical power-cut testing.
+* Consistency rests on CRC-verified WAL sectors, `boot_meta.db` slots, and blobs, and **assumes the storage honours flush semantics**. It is exercised by deterministic fault-injection simulation (`FaultInjectingFs`), not by physical power-cut testing.
 
 ### 4.1 `boot_meta.db` Ping-Pong Buffer (Double Buffering)
 
@@ -118,7 +118,7 @@ To support both fast random updates of small configuration records and zero writ
   Both WAL files (`wal_sync.db` at 8 MB by default, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 3-byte fragment headers (`[FragType (1B) | FragLen (2B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented (and **both** epochs are rotated unconditionally on every `open`, even if recovery found nothing, so a stale same-epoch sector left behind by write-back reordering can never be replayed; this costs one `boot_meta.db` commit per open) and sectors are overwritten directly without zero-filling the file. Fragments carry no checksum of their own: the sector CRC32C covers the whole sector (header, fragments and padding), and each reassembled batch is additionally verified by its `BatchCRC32C`. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
-  1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written through the OS cache. `FlushFileBuffers` then flushes the device before the commit returns, because write-through alone can complete in a drive's volatile cache. SQL commits release the engine lock during the flush: readers keep seeing the pre-commit state, and the transaction becomes visible only after the flush succeeds.
+  1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries, written to the OS cache, and flushed to the device before the commit returns (§4.5).
   2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, so committed batches survive application crashes or `TerminateProcess` / `kill -9`. A full OS crash or power outage may roll back the most recent unflushed buffered writes. At every buffered-WAL sync point (prefix sync before a `wal_sync.db` append, transaction prepare, LRU segment reclaim) the open sector is **sealed**, so an already-synced sector is never rewritten in place by a later append (cost: at most one partly used 4 KB sector per sync point). During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
 
 ### 4.3 Consistency Protocol for KV Separation (`Write-Blob-Before-WAL`)
@@ -138,6 +138,23 @@ To prevent dangling pointers (where an index entry survives recovery but its tar
 
 * **`StorageEngine::checkpoint`:** Brings the persisted state up to date so that the next `open` has no replay work. A non-empty MemTable is flushed to a new `idx` segment, which also commits blob segment lengths, dead bytes and quota totals. With an empty MemTable, the lengths of blob segments that have grown since the last commit (for example through a rolled-back transaction) are committed instead. It fails with `InvalidInput` while a transaction is active. Dropping the engine does not run a checkpoint; a drop without one is treated as a crash by the next `open`.
 * **Post-commit maintenance failures do not fail the commit:** Once the WAL append of a write or transaction has succeeded, the commit is durable and the call returns `Ok`, even if the follow-up maintenance (blob segment reclaim, quota persistence, quota eviction, compaction, MemTable flush) fails. Such failures are counted in `StorageEngine::maintenance_failures()` and the text of the latest one is kept in `last_maintenance_error()`. The work is retried by later commits because the flush condition or the exceeded quota is still true. WAL append and sync failures are different: they poison the engine (item 3 above).
+
+### 4.5 Commit Path and Group Commit
+
+A synchronous SQL commit (`xCommit`) has three steps, and only the first and last hold the engine lock:
+
+1. Under the lock, the WAL batch is written to `wal_sync.db` without a device flush.
+2. Without the lock, the commit waits for a device flush that covers its batch.
+3. Under the lock, the batch moves to the MemTable, which makes it visible to readers.
+
+* **Readers are not held up by the flush.** They keep reading the committed state, and a transaction becomes visible only after a flush has made it durable.
+* **The writer slot is released after step 1.** The next writer starts at once. Its transaction overlay begins with the batches still waiting for durability, so it builds on them and no update is lost. Readers on other connections do not see those batches. These are bounded because each connection has at most one commit waiting.
+* **One flush covers a group.** The first waiting commit becomes the leader and flushes the file. The flush covers every batch written before it started. Commits that arrive during the flush are covered by the next leader.
+* **Waiting instead of `SQLITE_BUSY`.** `xBegin` waits up to `writer_wait_timeout_ms` (default 1 second) for another connection's transaction to end. The wait is bounded because that connection could be held open by the same thread, which could never end it. `0` restores immediate failure.
+* **Paths that bypass the group flush it first.** Rotating the WAL, flushing the MemTable, checkpointing, a commit that is not part of the group, and a non-transactional write all flush and publish the waiting batches first, so the MemTable holds every earlier commit before they proceed.
+* **A failed flush fails the whole group.** The engine is poisoned and every waiting commit returns an error, as with any WAL sync failure (§4.3 item 3).
+* **Commits outside the group.** A synchronous commit with post-commit maintenance (capped tables, dropped tables, quota persistence, a due MemTable flush) keeps the writer slot during its own flush, still without the engine lock. A transaction split across several WAL batches (over 512 KB) flushes under the lock.
+* **Why `wal_sync.db` is not write-through on Windows.** NTFS holds `FILE_FLAG_WRITE_THROUGH` writes back while the same file is being flushed, so such writes could not join a group flush in progress. Write-through alone also does not guarantee durability, because it can complete in a drive's volatile cache. Each commit relies on the device flush instead.
 
 ---
 
@@ -184,19 +201,18 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenHint {
     /// For boot_meta.db and wal_sync.db
-    /// - Win: FILE_FLAG_WRITE_THROUGH
-    /// - Unix: no open flag; the hint only selects the sync behaviour below
+    /// - Win: no extra open flag; durability comes from sync_barrier / sync_durable
+    /// - Unix: no access advice; the hint selects the sync behaviour below
     MutableSyncLog,
 
     /// For wal_buf.db
     /// - Win: FILE_FLAG_SEQUENTIAL_SCAN
-    /// - Unix: no open flag
+    /// - Linux: POSIX_FADV_SEQUENTIAL; macOS: F_RDAHEAD(1)
     MutableBufferedLog,
 
     /// For idx_<SeqID>.db
     /// - Win: FILE_FLAG_RANDOM_ACCESS
-    /// - Unix: no fadvise / fcntl call is issued (the design intent is
-    ///   POSIX_FADV_RANDOM on Linux and F_RDAHEAD(0) on macOS)
+    /// - Linux: POSIX_FADV_RANDOM; macOS: F_RDAHEAD(0)
     ImmutableRandom,
 
     /// For blob_*_<SeqID>.db (random point reads + buffered append writes)
@@ -207,8 +223,7 @@ pub enum OpenHint {
     /// For Compaction / GC bulk read/write. Defined, but not used by the
     /// engine: compaction does not open its files with this hint.
     /// - Win: FILE_FLAG_SEQUENTIAL_SCAN + SetFileInformationByHandle(IoPriorityHint = Low)
-    /// - Unix: no open flag (the design intent is POSIX_FADV_NOREUSE /
-    ///   DONTNEED on Linux and F_NOCACHE(1) on macOS)
+    /// - Linux: POSIX_FADV_NOREUSE; macOS: F_NOCACHE(1)
     BackgroundBulk,
 }
 
@@ -277,3 +292,33 @@ pub trait PlatformFile: Send + Sync {
   * Select `IndexScan` whenever an equality or range predicate matches an available index; otherwise fall back to `SeqScan`.
   * Restrict joins to declaration-order `Index Nested Loop Join` or in-memory `Hash Join` for small tables.
 * Implement the execution engine using Rust iterators (Volcano / Pipeline model), natively supporting the custom DDL extension `CREATE TABLE ... WITH (MAX_BYTES = ..., EVICTION = 'LRU')`.
+
+---
+
+## 8. Performance Characteristics and Open Items
+
+Current measurements are published with every CI run at <https://toyoshim-i.github.io/aydb/results.html>. This section records why the engine behaves as it does, not figures, which change with the code.
+
+### 8.1 Compared with SQLite in WAL Mode
+
+* **Point reads** served from the MemTable or the verified caches avoid a system call, and are where `aydb` is strongest. Reads also continue at nearly full speed during synchronous commits (§4.5).
+* **Buffered commits** are faster because each one coalesces into a single WAL batch in the OS cache.
+* **Concurrent synchronous writers** share device flushes (§4.5). A single synchronous writer is about level with SQLite, because the device flush dominates the commit once both engines flush the device.
+* **Bulk writes inside one transaction** are slower through the SQLite virtual table: each row crosses the `sqlite3_module` boundary and checks primary key uniqueness.
+* **Updates to values stored out of line** cost at least two writes per buffered commit (blob append and WAL sector).
+* **Short range scans** are slower: rows of a B-tree are clustered in leaf pages, while `aydb` needs a blob read per out-of-line row, and merges several sorted sources.
+* **SSTable mode with a small MemTable** pays LSM read amplification: several segments can be probed per lookup. The block cache reduces this but does not remove it.
+
+Windows-specific file handling is not the limit here. The remaining gaps come from the costs of system calls, CRC verification, and the virtual table boundary.
+
+### 8.2 Cache Verification Trade-off
+
+Only CRC-verified bytes enter the block and blob caches, so a hit skips re-verification. The cache is process-private memory, so this is safe against other processes, but a hit does not detect corruption that occurred on disk after the first read.
+
+### 8.3 Open Items
+
+* Issue the reads of `read_many_at` concurrently (OVERLAPPED on Windows, `io_uring` on Linux) instead of sequentially. This matters most on SMB.
+* Avoid per-entry key and value clones in `MemTable::write_to_segment`, and decode-before-filter in `scan_prefix_range`.
+* Read blobs directly into `Vec` spare capacity with a streaming CRC, avoiding the zeroed 16 KB stack buffer and the extra copy.
+* Combine the overlay and MemTable lookups of owner reads, or skip the overlay probe for untouched key ranges.
+* Use a cheaper coalescing path for buffered commits from several connections, without rewriting a synced sector in place.
