@@ -10,7 +10,7 @@ This document collects design changes aimed at the workloads where `aydb` still 
 
 `aydb` was designed from the start around the behaviour of Windows file systems. Its file layout, open flags, and durability protocol follow from NTFS, the Cache Manager, SMB leases, and antivirus filter drivers. The benchmark results in `README.md` show that this pays off exactly where those behaviours dominate:
 
-- **Synchronous commits:** TPC-B-style with `FULL` sync runs **`26.1×`** faster than SQLite (`13,817` vs `529` TPS), and synchronous `128 B` settings updates run **`15.0×`** faster (P50 `56.6 µs` vs `978.6 µs`). SQLite's `synchronous=FULL` calls `FlushFileBuffers` on every commit. On NTFS that call flushes all dirty pages and the metadata of the file, plus the device cache. `aydb` instead writes one 4 KB sector with `FILE_FLAG_WRITE_THROUGH` into a pre-zeroed `wal_sync.db`, whose `ValidDataLength` already equals EOF, so no metadata update is needed.
+- **Synchronous commits:** with `FlushFileBuffers` on every commit, as SQLite's `synchronous=FULL` does, TPC-B-style commits run at about the same speed as SQLite (`1.05×`, `1,087` vs `1,034` TPS in one run) because the device flush dominates the commit. Earlier figures of `15–26×` were measured without that flush and did not reflect equal durability.
 - **Point reads served from the MemTable:** Speedtest1 test 130 (`2.76×`) and YCSB C with `256 B` values (`3.98×`) hit the in-process `BTreeMap` and issue no system call.
 
 Despite this design work, several workloads still lose to SQLite, some by a wide margin:
@@ -42,7 +42,7 @@ The post-audit performance work on `main` confirms this direction. Moving compac
 | YCSB E (short ranges), `2 KB` values | `0.39×` | One random blob read per row; B-tree rows are clustered in leaf pages. |
 | Speedtest1-style, SSTable mode | `0.31×` | LSM read amplification: several segments probed per lookup, each probe a `ReadFile` + 4 KB CRC verification, no block reuse. |
 
-The wins (sync commits `15–26×`, MemTable point reads `2–4×`) come from Windows-specific choices: pre-zeroed `WRITE_THROUGH` WAL (no `ValidDataLength` metadata updates, no `FlushFileBuffers`) and an in-process MemTable.
+The wins (MemTable point reads `2–4×`, buffered commits) come from the in-process MemTable and the buffered WAL. Synchronous commits are on par with SQLite once both flush the device.
 
 The losses share one cause: **`aydb` deliberately keeps no user-space data cache** (`ARCHITECTURE.md` §3.2), so every non-MemTable access pays a user/kernel transition, a Cache Manager copy (`CcCopyRead`), and a full CRC check. On Windows this costs microseconds per access, whereas a user-space cache hit costs tens of nanoseconds. SQLite's advantage here is its generic page cache (`pcache`), not Windows-specific tuning; its `os_win.c` adaptations are mostly about robustness (antivirus retry loop, `LockFileEx`, mmap disabled by default).
 

@@ -197,7 +197,6 @@ where
 #[derive(Debug)]
 pub struct WinPlatformFile {
     handle: HANDLE,
-    hint: OpenHint,
 }
 
 // Safety: `WinPlatformFile` performs exclusively positional overlapped I/O with per-thread
@@ -293,7 +292,7 @@ impl WinPlatformFile {
             }
         }
 
-        Ok(Self { handle, hint })
+        Ok(Self { handle })
     }
 
     fn set_eof(&self, target_len: u64) -> io::Result<()> {
@@ -497,11 +496,8 @@ impl PlatformFile for WinPlatformFile {
     }
 
     fn sync_barrier(&self) -> io::Result<()> {
-        // When opened with MutableSyncLog (FILE_FLAG_WRITE_THROUGH), individual writes
-        // are already ordered through to storage. For buffered handles, flush buffers.
-        if self.hint == OpenHint::MutableSyncLog {
-            return Ok(());
-        }
+        // FILE_FLAG_WRITE_THROUGH alone can complete in a drive's volatile cache, so it does not
+        // make a write power-loss safe. Every barrier flushes the device, as on Unix.
         self.sync_durable()
     }
 

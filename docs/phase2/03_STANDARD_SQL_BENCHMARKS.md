@@ -1,5 +1,7 @@
 # Chapter 2.3: Selected Standard SQL Benchmark Workloads (`Speedtest1`-Style, `YCSB`-Style `A–F`, and `TPC-B`-Style)
 
+> **Note.** The synchronous-commit figures in this chapter were measured before `wal_sync.db` commits called `FlushFileBuffers`. They do not reflect equal durability with SQLite `synchronous=FULL`. See the README for current figures.
+
 To evaluate `aydb` objectively beyond custom cache/config microbenchmarks, this chapter presents results from three representative standard database workload styles (`examples/standard_sql_bench.rs`) executed via identical SQL statements against **Vanilla SQLite (`PRAGMA journal_mode = WAL`)** and **`aydb` Virtual Table (`USING aydb(...)`)** after passing a **pre-benchmark differential SQL equivalence verification suite (`verify_differential_sql_equivalence`)**:
 
 0. **Pre-Benchmark Differential SQL Equivalence Verification (`Suite 0`):** Asserts 100% identical query outputs and final table states between a native SQLite table and an `aydb` virtual table across mixed numeric sorting (`INTEGER` & `REAL` Unified Numeric `ORDER BY`), column affinity coercions (`WHERE id = 1.0`, `WHERE id = '1'`), `COLLATE NOCASE` / `COLLATE RTRIM` lookups, failed `UNIQUE` constraint statements, nested `SAVEPOINT` / `ROLLBACK TO`, cross-connection snapshot isolation (`SQLITE_BUSY`), and mixed native-SQLite + `aydb` virtual table two-phase transactions.

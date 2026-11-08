@@ -61,7 +61,7 @@ flowchart LR
 A critical part of understanding a storage engine is knowing **what lives where** across the three hardware/OS boundaries:
 1. **Process Private Heap (User Space RAM)** — The MemTable and the optional caches have fixed budgets (e.g., 8–16 MB in total). Bloom filters and fence pointers grow in proportion to the database size, the open transaction's overlay is limited by `max_transaction_bytes`, and the access tracker and rowid map are capped by entry count (see [ARCHITECTURE.md](../ARCHITECTURE.md) §1.1). Lost on process termination (`kill -9`).
 2. **OS Page Cache / System Cache (Kernel Space RAM)** — Managed by Windows Cache Manager (in 256 KB Virtual Address Control Block [VACB] views) or Linux/macOS page cache. Survives process termination; lost only on OS kernel panic or power outage.
-3. **Non-Volatile Storage (Physical Disk / Remote SMB Server)** — Survives power outages once flushed via `FILE_FLAG_WRITE_THROUGH` or `FlushFileBuffers` / `fdatasync`.
+3. **Non-Volatile Storage (Physical Disk / Remote SMB Server)** — Survives power outages once flushed via `FlushFileBuffers` / `fdatasync` (`FILE_FLAG_WRITE_THROUGH` alone can stop in a drive's volatile cache).
 
 ```mermaid
 flowchart TB
@@ -135,7 +135,7 @@ sequenceDiagram
     end
 
     alt DurabilityMode == Sync (Critical Settings)
-        Eng->>WAL: Write 4 KB padded sector to wal_sync.db (WRITE_THROUGH)
+        Eng->>WAL: Write 4 KB padded sector to wal_sync.db (WRITE_THROUGH + FlushFileBuffers)
     else DurabilityMode == Buffered (Cache / High-Freq State)
         Eng->>WAL: Write to wal_buf.db (Enters OS Page Cache immediately)
     end

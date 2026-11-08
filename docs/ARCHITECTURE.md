@@ -48,7 +48,7 @@ To maximize the effectiveness of the Windows Cache Manager (which maps files in 
 | File Category | Naming Convention | OS Open Flags (Win / Unix) | Role & Lifecycle |
 | :--- | :--- | :--- | :--- |
 | **Boot Metadata** | `boot_meta.db` | Standard (`WRITE_THROUGH`, 4 KB-aligned) | Fixed 8 KB size (4 KB × 2 ping-pong buffer). Stores active segment ID lists, table statistics, and pending GC lists. |
-| **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` + `WRITE_THROUGH` | Default 8 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. |
+| **Sync Journal (WAL)** | `wal_sync.db` | `OVERLAPPED` + `WRITE_THROUGH` | Default 8 MB size (physically pre-zeroed). Logs critical synchronous mutations without flushing buffered cache pages. Each commit ends with a device flush (`FlushFileBuffers`). |
 | **Buffered Journal (WAL)** | `wal_buf.db` | `OVERLAPPED` + `SEQUENTIAL_SCAN` | Fixed 16 MB size (pre-allocated). Sequentially logs high-frequency buffered updates in OS cache without disk stalls. |
 | **Index Layer** | `idx_<SeqID>.db` | `RANDOM_ACCESS` / `FADV_RANDOM` | Immutable sorted key-value file (SSTable format). Stores keys, small inline column values, and pointers to out-of-line blobs. |
 | **Standard Blob Layer** | `blob_std_<SeqID>.db` | Standard (`OVERLAPPED` / positional I/O) | Append-only immutable file storing values larger than the inline threshold (e.g., 1 KB). Opened without `SEQUENTIAL_SCAN` to avoid 256 KB read-ahead amplification on random point reads. |
@@ -118,7 +118,7 @@ To support both fast random updates of small configuration records and zero writ
   Both WAL files (`wal_sync.db` at 8 MB by default, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 3-byte fragment headers (`[FragType (1B) | FragLen (2B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented (and **both** epochs are rotated unconditionally on every `open`, even if recovery found nothing, so a stale same-epoch sector left behind by write-back reordering can never be replayed; this costs one `boot_meta.db` commit per open) and sectors are overwritten directly without zero-filling the file. Fragments carry no checksum of their own: the sector CRC32C covers the whole sector (header, fragments and padding), and each reassembled batch is additionally verified by its `BatchCRC32C`. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
-  1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written directly through to non-volatile storage.
+  1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written through the OS cache. `FlushFileBuffers` then flushes the device before the commit returns, because write-through alone can complete in a drive's volatile cache.
   2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, so committed batches survive application crashes or `TerminateProcess` / `kill -9`. A full OS crash or power outage may roll back the most recent unflushed buffered writes. At every buffered-WAL sync point (prefix sync before a `wal_sync.db` append, transaction prepare, LRU segment reclaim) the open sector is **sealed**, so an already-synced sector is never rewritten in place by a later append (cost: at most one partly used 4 KB sector per sync point). During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
 
 ### 4.3 Consistency Protocol for KV Separation (`Write-Blob-Before-WAL`)
@@ -232,7 +232,7 @@ pub trait PlatformFile: Send + Sync {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
 
     /// Write ordering barrier (guarantees ordering prior to metadata update)
-    /// - Win: no-op for WRITE_THROUGH handles (MutableSyncLog), otherwise FlushFileBuffers
+    /// - Win: FlushFileBuffers
     /// - Linux: fdatasync
     /// - macOS: same as sync_durable (F_FULLFSYNC) for MutableSyncLog
     ///   handles, otherwise fsync. F_BARRIERFSYNC is not used.

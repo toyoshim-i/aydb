@@ -8,7 +8,7 @@
 //!    `PreallocStrategy::LogicalExtendOnly` (`VDL = 0`)
 //!    vs. `PreallocStrategy::PhysicalZeroFill` (`VDL = EOF`)
 //!    for both `MutableSyncLog` and `MutableBufferedLog`. `MutableSyncLog` latency includes
-//!    `sync_barrier`, as the WAL does: write-through on Windows, a file sync on Unix.
+//!    `sync_barrier`, as the WAL does.
 
 #![allow(
     clippy::collapsible_if,

@@ -95,8 +95,8 @@ fn probe_raw_into_slab(raw: RawIdxEntry<'_>, slab: &mut Vec<u8>) -> io::Result<S
 /// after reopening the failed write may or may not be present (but never partially applied).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteDurability {
-    /// Logs to `wal_sync.db` (`FILE_FLAG_WRITE_THROUGH` on Windows, `fdatasync` on Linux,
-    /// `F_FULLFSYNC` on macOS), surviving immediate physical power loss upon return.
+    /// Logs to `wal_sync.db` and flushes the device (`FlushFileBuffers` on Windows, `fdatasync`
+    /// on Linux, `F_FULLFSYNC` on macOS), surviving immediate physical power loss upon return.
     SyncTransactional,
     /// Logs to `wal_buf.db` (OS Page Cache), surviving application crashes (`kill -9`)
     /// with microsecond latency.
