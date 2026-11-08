@@ -2517,7 +2517,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && self.last_buf_append_lsn > self.last_buf_synced_lsn
         {
             self.sync_active_blob_writers()?;
-            self.make_buf_wal_durable(false)?;
+            self.make_buf_wal_durable(true)?;
         }
 
         // A failed append/sync leaves the on-disk outcome of this batch unknown (it may or may not

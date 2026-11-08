@@ -319,7 +319,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if effective_durability == WriteDurability::SyncTransactional {
             self.sync_active_blob_writers()?;
             if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                self.make_buf_wal_durable(false)?;
+                self.make_buf_wal_durable(true)?;
             }
         }
 
