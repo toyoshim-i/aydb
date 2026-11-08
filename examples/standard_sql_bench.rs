@@ -1060,8 +1060,13 @@ fn bench_tpcb_suite(root: &PathBuf) {
         );
     }
 
-    // Mode 2: Full Sync Durability (150 multi-table transactions)
-    {
+    // Mode 2: Full Sync Durability. The short run stays inside the default WAL sizes. The
+    // sustained run wraps aydb's sync WAL several times and passes SQLite's autocheckpoint
+    // threshold, so it includes the forced flushes and the checkpoints.
+    for (label, n_tx) in [
+        ("Full Sync (sync=FULL / wal_sync)", 150),
+        ("Full Sync Sustained (8,000 Tx)", 8_000),
+    ] {
         let sq_tps = {
             let sub = root.join("tpcb_sq_full");
             let _ = std::fs::remove_dir_all(&sub);
@@ -1077,7 +1082,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
                  CREATE TABLE history (hid INTEGER PRIMARY KEY, tid INTEGER, bid INTEGER, aid INTEGER, delta INTEGER);",
             )
             .unwrap();
-            let tps = run_tpcb_transactions(&conn, 150);
+            let tps = run_tpcb_transactions(&conn, n_tx);
             drop(conn);
             let _ = std::fs::remove_dir_all(&sub);
             tps
@@ -1099,7 +1104,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
                  CREATE VIRTUAL TABLE history USING aydb(table_id=4, durability='sync', columns='hid INT PRIMARY KEY, tid INT, bid INT, aid INT, delta INT');",
             )
             .unwrap();
-            let tps = run_tpcb_transactions(&conn, 150);
+            let tps = run_tpcb_transactions(&conn, n_tx);
             drop(conn);
             drop(engine);
             let _ = std::fs::remove_dir_all(&sub);
@@ -1108,7 +1113,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
 
         println!(
             "{:<34} | {:>14.0} TPS | {:>14.0} TPS | {:>10.2}x",
-            "Full Sync (sync=FULL / wal_sync)",
+            label,
             sq_tps,
             ay_tps,
             ay_tps / sq_tps
