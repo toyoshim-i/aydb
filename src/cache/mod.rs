@@ -34,7 +34,10 @@ struct BlockCacheSlot {
     block_idx: u32,
     occupied: bool,
     ref_bit: bool,
-    data: Option<Box<[u8; IDX_BLOCK_SIZE]>>,
+    /// Shared so that a hit can copy or search the block after the shard lock is released. A
+    /// slot's block is never mutated in place: replacing the entry installs a new `Arc`, so a
+    /// reader that still holds the old one keeps seeing the block it was given.
+    data: Option<Arc<[u8; IDX_BLOCK_SIZE]>>,
 }
 
 struct BlockClockShard {
@@ -108,28 +111,47 @@ impl VerifiedBlockCache {
         ((h ^ (h >> 32)) as usize) & (NUM_SHARDS - 1)
     }
 
-    /// Attempts to read the verified block `(seq_id, block_idx)` into `out`.
-    /// Returns `true` on cache hit, `false` on miss.
-    pub fn get_into(&self, seq_id: u64, block_idx: u32, out: &mut [u8; IDX_BLOCK_SIZE]) -> bool {
+    /// Returns a shared handle to the verified block `(seq_id, block_idx)` on a hit.
+    /// The handle is cloned under the shard lock; the caller reads the block after it is released.
+    pub fn get_arc(&self, seq_id: u64, block_idx: u32) -> Option<Arc<[u8; IDX_BLOCK_SIZE]>> {
         if self.slots_per_shard == 0 {
-            return false;
+            return None;
         }
 
         let shard_idx = self.shard_index(seq_id, block_idx);
-        let mut shard = self.shards[shard_idx].lock().unwrap();
-        if let Some(&slot_idx) = shard.index.get(&(seq_id, block_idx)) {
-            let slot = &mut shard.slots[slot_idx];
-            if slot.occupied {
-                slot.ref_bit = true;
-                if let Some(data) = &slot.data {
-                    out.copy_from_slice(data.as_ref());
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    return true;
+        let found = {
+            let mut shard = self.shards[shard_idx].lock().unwrap();
+            match shard.index.get(&(seq_id, block_idx)).copied() {
+                Some(slot_idx) => {
+                    let slot = &mut shard.slots[slot_idx];
+                    if slot.occupied {
+                        slot.ref_bit = true;
+                        slot.data.clone()
+                    } else {
+                        None
+                    }
                 }
+                None => None,
             }
+        };
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        false
+        found
+    }
+
+    /// Attempts to read the verified block `(seq_id, block_idx)` into `out`.
+    /// Returns `true` on cache hit, `false` on miss.
+    pub fn get_into(&self, seq_id: u64, block_idx: u32, out: &mut [u8; IDX_BLOCK_SIZE]) -> bool {
+        match self.get_arc(seq_id, block_idx) {
+            Some(block) => {
+                out.copy_from_slice(block.as_ref());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Inserts a verified 4 KB block into the cache using CLOCK second-chance replacement.
@@ -138,18 +160,17 @@ impl VerifiedBlockCache {
             return;
         }
 
+        // Allocated and filled before taking the lock. A replaced slot gets a fresh allocation
+        // because readers may still hold the previous `Arc`.
+        let new_block = Arc::new(*block);
         let shard_idx = self.shard_index(seq_id, block_idx);
         let mut shard = self.shards[shard_idx].lock().unwrap();
 
-        // 1. If already resident, update in place and set reference bit
+        // 1. If already resident, replace the block and set the reference bit
         if let Some(&slot_idx) = shard.index.get(&(seq_id, block_idx)) {
             let slot = &mut shard.slots[slot_idx];
             slot.ref_bit = true;
-            if let Some(data) = &mut slot.data {
-                data.copy_from_slice(block);
-            } else {
-                slot.data = Some(Box::new(*block));
-            }
+            slot.data = Some(new_block);
             return;
         }
 
@@ -186,11 +207,7 @@ impl VerifiedBlockCache {
         slot.block_idx = block_idx;
         slot.occupied = true;
         slot.ref_bit = true;
-        if let Some(data) = &mut slot.data {
-            data.copy_from_slice(block);
-        } else {
-            slot.data = Some(Box::new(*block));
-        }
+        slot.data = Some(new_block);
         shard.index.insert((seq_id, block_idx), victim);
     }
 
@@ -496,6 +513,36 @@ mod tests {
         cache.invalidate_segment(1);
         assert!(!cache.get_into(1, 0, &mut out));
         assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn block_cache_get_arc_counts_hits_and_keeps_held_blocks_stable() {
+        // One slot per shard, so a second block hashed to the same shard replaces the first.
+        let cache = VerifiedBlockCache::new(NUM_SHARDS * IDX_BLOCK_SIZE);
+        assert!(cache.get_arc(1, 0).is_none());
+        assert_eq!((cache.hits(), cache.misses()), (0, 1));
+
+        cache.insert(1, 0, &[0x11u8; IDX_BLOCK_SIZE]);
+        let held = cache.get_arc(1, 0).expect("resident block");
+        assert_eq!(held[0], 0x11);
+        assert_eq!((cache.hits(), cache.misses()), (1, 1));
+
+        // Re-inserting the same key and evicting it by other keys must not change the block that
+        // a reader already holds.
+        cache.insert(1, 0, &[0x22u8; IDX_BLOCK_SIZE]);
+        assert_eq!(held[0], 0x11);
+        assert_eq!(cache.get_arc(1, 0).unwrap()[0], 0x22);
+        for blk in 1..(NUM_SHARDS as u32 * 8) {
+            cache.insert(1, blk, &[0x33u8; IDX_BLOCK_SIZE]);
+        }
+        assert!(cache.get_arc(1, 0).is_none());
+        assert_eq!(held[0], 0x11);
+        assert!(held.iter().all(|&b| b == 0x11));
+
+        let mut out = [0u8; IDX_BLOCK_SIZE];
+        let hits = cache.hits();
+        assert!(!cache.get_into(1, 0, &mut out));
+        assert_eq!(cache.hits(), hits);
     }
 
     #[test]

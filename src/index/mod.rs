@@ -1122,7 +1122,16 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
                 return IdxBlockReader::open_preverified(block_buf);
             }
         }
+        self.read_block_from_disk(block_idx, block_buf, populate_cache)
+    }
 
+    /// Reads and verifies block `block_idx` from the file, then optionally caches it.
+    fn read_block_from_disk<'b>(
+        &self,
+        block_idx: u32,
+        block_buf: &'b mut [u8; IDX_BLOCK_SIZE],
+        populate_cache: bool,
+    ) -> io::Result<IdxBlockReader<'b>> {
         self.file.read_exact_at(
             block_buf,
             (block_idx as u64) * (IDX_BLOCK_SIZE as u64),
@@ -1154,8 +1163,15 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         }
 
         let block_idx = self.fence_pointers[pos - 1].block_idx;
+        // On a hit the search runs directly on the shared cached block: no 4 KB stack buffer
+        // is zeroed and no block copy is made.
+        if let Some(cache) = &self.block_cache {
+            if let Some(block) = cache.get_arc(self.seq_id, block_idx) {
+                return IdxBlockReader::open_preverified(&block)?.lookup_binary_search(key);
+            }
+        }
         let mut block_buf = [0u8; IDX_BLOCK_SIZE];
-        let reader = self.read_block(block_idx, &mut block_buf, true)?;
+        let reader = self.read_block_from_disk(block_idx, &mut block_buf, true)?;
         reader.lookup_binary_search(key)
     }
 
@@ -1843,5 +1859,36 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn point_lookup_uses_cached_block_and_counts_hits_and_misses() {
+        let tmp = TempTestDir::new("idx_get_cache");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let mut mt = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
+        for i in 0..200u32 {
+            mt.put_inline(
+                format!("key_{i:05}").into_bytes(),
+                format!("val_{i}").into_bytes(),
+                (i + 1) as u64,
+            );
+        }
+        let mut seg = mt.flush_to_segment(&fs, 1, 10).expect("flush");
+        let cache = Arc::new(VerifiedBlockCache::new(1 << 20));
+        seg.set_block_cache(Some(Arc::clone(&cache)));
+
+        // The first lookup reads the block from disk and populates the cache; later lookups of
+        // keys in the same block are served from it. Each lookup counts exactly one hit or miss.
+        let expect = |i: u32| Some(((i + 1) as u64, IndexValue::Inline(format!("val_{i}").into_bytes())));
+        assert_eq!(seg.get(b"key_00007").unwrap(), expect(7));
+        assert_eq!((cache.hits(), cache.misses()), (0, 1));
+        assert_eq!(seg.get(b"key_00007").unwrap(), expect(7));
+        assert_eq!((cache.hits(), cache.misses()), (1, 1));
+        for i in 0..200u32 {
+            assert_eq!(seg.get(format!("key_{i:05}").as_bytes()).unwrap(), expect(i));
+        }
+        assert_eq!(cache.hits() + cache.misses(), 202);
+        assert!(cache.hits() > 190);
+        assert_eq!(seg.get(b"key_99999").unwrap(), None);
     }
 }
