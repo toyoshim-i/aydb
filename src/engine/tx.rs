@@ -434,7 +434,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_tx_buf`
     /// mutations and restoring `MemTable`, `capped_tables`, and blob `dead_bytes` in
     /// $O(\text{tx mutations})$ time via the in-memory undo log.
+    ///
+    /// SQLite invokes `xRollback` once per virtual table that took part in the transaction, so a
+    /// rollback with no active transaction is a no-op: there is no start snapshot to restore.
     pub fn rollback_transaction(&mut self) -> io::Result<()> {
+        if self.tx_depth == 0 {
+            return Ok(());
+        }
         self.tx_depth = 0;
         self.tx_owner_conn = None;
         self.deferred_flush_on_commit = false;

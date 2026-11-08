@@ -2752,3 +2752,36 @@ fn vtab_inline_max_ddl_option_inlines_large_rows() {
         assert!(eng.active_std_writer.is_some());
     }
 }
+
+#[test]
+fn rollback_across_two_vtabs_keeps_committed_rows_and_lsn() {
+    let tmp = TempTestDir::new("vtab_double_rollback");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.max_blob_segment_bytes = 32 * 1024;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE a USING aydb(columns='id INTEGER PRIMARY KEY, v BLOB');
+         CREATE VIRTUAL TABLE b USING aydb(columns='id INTEGER PRIMARY KEY, v BLOB');",
+    )
+    .unwrap();
+    let mut ins = conn.prepare("INSERT INTO a VALUES (?1, ?2)").unwrap();
+    for i in 0..20 {
+        ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![i as u8; 8192])])
+            .unwrap();
+    }
+    drop(ins);
+    let lsn_before = engine.read().unwrap().next_lsn();
+
+    conn.execute_batch("BEGIN; INSERT INTO a VALUES (1000, 'x'); INSERT INTO b VALUES (1, 'y'); ROLLBACK;")
+        .unwrap();
+
+    assert_eq!(engine.read().unwrap().next_lsn(), lsn_before);
+    engine.write().unwrap().flush_memtable().unwrap();
+    let rows = conn
+        .query_all("SELECT id, length(v) FROM a ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 20);
+}

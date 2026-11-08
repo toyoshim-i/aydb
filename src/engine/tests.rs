@@ -3753,3 +3753,22 @@ fn full_scan_bypasses_block_cache_insertion() {
         "Full unbounded scan must bypass cache insertion to avoid cache pollution"
     );
 }
+
+#[test]
+fn rollback_without_active_transaction_is_a_noop() {
+    let tmp = TempTestDir::new("rollback_noop");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine
+        .put_row(1, b"k", &[0x33u8; 8192], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    let lsn = engine.next_lsn();
+
+    engine.rollback_transaction().unwrap();
+    engine.rollback_transaction().unwrap();
+
+    assert_eq!(engine.next_lsn(), lsn);
+    engine.flush_memtable().unwrap();
+    assert_eq!(engine.get_row(1, b"k").unwrap(), Some(vec![0x33u8; 8192]));
+}
