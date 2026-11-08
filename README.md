@@ -57,34 +57,27 @@ flowchart TB
 
 ## Benchmark Highlights vs. Vanilla SQLite (`WAL` Mode)
 
-The table below reports the median of five runs at commit `6991aa5` on a single Windows NTFS host (Crucial P3 NVMe SSD). SQLite's full-sync throughput alternated between about 500 and 1,000 TPS from run to run. The latest measurements taken by CI on Windows, Linux, and macOS runners (shared GitHub-hosted machines, so noisier and not comparable with this table), with charts, are published at <https://toyoshim-i.github.io/aydb/results.html>.
+The charts below are regenerated from the CI results on every push to `main`: one run per operating system on shared GitHub-hosted runners, so they are noisy. Exact values, test status, and raw logs are published at <https://toyoshim-i.github.io/aydb/results.html>.
 
-All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same Windows NTFS host with **equivalent durability guarantees** (`WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` 2PC transactions):
+All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same machine with **equivalent durability guarantees** (`WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` 2PC transactions):
+
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/speedtest.svg" alt="Speedtest1-style workload, aydb relative to SQLite" width="100%"/></a></p>
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/tpcb.svg" alt="TPC-B-style workload, aydb relative to SQLite" width="100%"/></a></p>
+
+<details>
+<summary><b>More charts (YCSB-style A–F, SSTable mode, application scenarios)</b></summary>
+<br/>
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/ycsb-256.svg" alt="YCSB-style workloads with 256 B values, aydb relative to SQLite" width="100%"/></a></p>
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/ycsb-2048.svg" alt="YCSB-style workloads with 2 KB values, aydb relative to SQLite" width="100%"/></a></p>
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/sstable.svg" alt="On-disk SSTable evaluation, aydb relative to SQLite" width="100%"/></a></p>
+<p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/scenarios.svg" alt="Application scenarios, aydb relative to SQLite" width="100%"/></a></p>
+</details>
 
 > **Dataset Scale, Workload Scope, & Failure-Model Transparency:**
 > * **Workload Coverage:** `examples/standard_sql_bench.rs` implements selected **`Speedtest1`-style** (`Tests 100–240`), **`YCSB`-style** (`Workloads A–F`), and **`TPC-B`-style** (`pgbench`-like 4-table OLTP) workloads rather than full certified/official benchmark suites.
 > * **Warm OS Cache vs. Larger-Than-RAM Datasets:** With the default `memtable_capacity_bytes = 4 MB`, datasets whose index footprint is `< 4 MB` (`Speedtest1`-style `5,000` rows $\approx 600\text{ KB}$, `YCSB`-style `256 B` `4,000` rows $\approx 1.1\text{ MB}$, `TPC-B`-style `2,000` accounts $\approx 300\text{ KB}$) serve index lookups from the in-memory `MemTable` (`BTreeMap`) while logging every commit to the OS page cache (`wal_buf.db`) or non-volatile media (`wal_sync.db`). Lowering `memtable_capacity_bytes = 128 KB` forces `idx_*.db` SSTable flushes and size-tiered compactions ([Chapter 2.3 §4](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md)), exercising positional `ReadFile(OVERLAPPED)` calls against warm OS page cache; establishing cold-storage or larger-than-RAM behavior requires multi-gigabyte datasets beyond these quick-running examples.
 > * **Durability Contract:** `SyncTransactional` commits are durable on return (earlier buffered commits are made durable first); `BufferedFast` commits survive process crashes but an OS crash or power loss may roll back the most recent ones. Crash consistency relies on CRC-verified WAL/`boot_meta`/blobs and assumes the storage honours flush/write-through. A WAL write/sync failure poisons the engine (mutations fail until reopen, reads continue; the failed commit's outcome is then unknown, never partial), and both WAL epochs are rotated on every open.
-> * **Local Host & Simulated Fault Model:** Reported figures are single-host local Windows NTFS measurements. Power-loss and I/O fault tests in `examples/reliability_bench.rs` use deterministic in-memory simulation (`FaultInjectingFs`) and do not substitute for physical power-cut hardware testing or live SMB network-outage/reconnection testing.
-
-| Benchmark Workload | Workload & Durability / Scale Note | `aydb` (`4 MB` Default / `128 KB` SSTable) | Vanilla SQLite (`WAL`) | Speedup (`4 MB` / `SSTable`) |
-| :--- | :--- | ---: | ---: | ---: |
-| **`Speedtest1`-Style Suite** | Selected 5,000-row SQL workload (`Tests 100–240`, `BufferedImmediateOsCache` vs `NORMAL`, ~600 KB) | `63.84 ms` (`89.63 ms` SSTable) | `59.64 ms` (`58.85 ms`) | `0.94×` (`0.66×` SSTable) |
-| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s (`MemTable` `BTreeMap` vs SQLite `PCache`) | **`5.06 ms`** (`988K qps`) | `14.37 ms` (`348K qps`) | **`2.80×` faster** |
-| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE uval = ?`) | **`7.01 ms`** (`713K qps`) | `16.27 ms` (`307K qps`) | **`2.33×` faster** |
-| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | `5.20 ms` (`192K qps`) | `5.29 ms` (`189K qps`) | `1.02×` |
-| **YCSB-Style Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`299K`** / `98.4K ops/s` | `244K` / `174K ops/s` | **`1.23×`** / `0.57×` |
-| **YCSB-Style Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`728K`**] / `2 KB` WiscKey) | **`808K`** / **`289K ops/s`** | `304K` / `208K ops/s` | **`2.66×` [`2.42×` SST]** / **`1.42×`** |
-| **YCSB-Style Workload C** | 100% Point Read (`256 B` inline [SSTable: **`913K`**] / `2 KB` WiscKey) | **`1,017K`** / **`474K ops/s`** | `304K` / `213K ops/s` | **`3.34×` [`2.92×` SST]** / **`2.18×`** |
-| **YCSB-Style Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`786K` / `319K ops/s`** | `225K` / `116K ops/s` | **`3.53×` / `2.53×` faster** |
-| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey, prefetch) | `51.3K` / `37.6K ops/s` | `116K` / `53.6K ops/s` | `0.45×` / `0.70×` |
-| **YCSB-Style Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`265K`** / `99.1K ops/s` | `175K` / `135K ops/s` | **`1.51×`** / `0.73×` |
-| **TPC-B-Style (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` with `FlushFileBuffers` vs `synchronous=FULL`) | `1,093 TPS` (`1,064` SSTable) | `1,012 TPS` (`1,003` SST) | `1.06×` (`1.06×` SSTable) |
-| **TPC-B-Style (Sustained `FULL` Sync)** | 8,000 transactions, wrapping `wal_sync.db` and passing SQLite's autocheckpoint | `1,064 TPS` | `1,015 TPS` | `1.05×` |
-| **TPC-B-Style (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`106,604 TPS`** (**`79,582`** SSTable) | `22,971 TPS` (`18,805` SST) | **`4.76×` (`4.23×` SSTable)** |
-| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates (`wal_sync.db` vs `synchronous=FULL`) | `1,096 tx/s` (`899.5 µs` P50) | `1,047 tx/s` (`949.8 µs` P50) | `1.05×` |
-| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`32.0 MB` written, `4.0 MB` Quota Enforcement) | **`174.1 MB/s`** (`3.98 MB` disk) | `102.4 MB/s` (`8.15 MB` disk) | **`1.70×` faster (`0.49×` space)** |
-| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking (`4 KB` blobs in `blob_lru_*.db`) | **`645,014 ops/s`** (`0.00 MB` RAM) | `30,914 ops/s` (`0.03 MB` WAL) | **`20.86×` faster** |
+> * **Local Host & Simulated Fault Model:** The charts come from shared CI runners, not from dedicated hardware. Power-loss and I/O fault tests in `examples/reliability_bench.rs` use deterministic in-memory simulation (`FaultInjectingFs`) and do not substitute for physical power-cut hardware testing or live SMB network-outage/reconnection testing.
 
 ---
 
