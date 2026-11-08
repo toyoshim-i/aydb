@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::lru::CappedTableState;
-use crate::pal::{PlatformFile, PlatformFs};
+use crate::pal::PlatformFs;
 use crate::wal::WalBatch;
 
 use super::{StorageEngine, WriteDurability};
@@ -189,9 +189,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if effective_durability == WriteDurability::SyncTransactional {
             self.sync_active_blob_writers()?;
             if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                self.buf_wal.flush_buffered_to_os()?;
-                self.buf_wal.file().sync_barrier()?;
-                self.last_buf_synced_lsn = self.last_buf_append_lsn;
+                self.make_buf_wal_durable(false)?;
             }
         }
 

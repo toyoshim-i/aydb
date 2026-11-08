@@ -1726,6 +1726,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(lsn)
     }
 
+    /// Makes everything appended to `wal_buf.db` so far durable (flush, seal the open sector so it
+    /// is never rewritten in place after being synced, then sync) and advances
+    /// `last_buf_synced_lsn`. A failure leaves the durability outcome unknown and poisons the engine.
+    pub(super) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
+        self.buf_wal
+            .make_durable_and_seal(durable)
+            .map_err(|e| self.poison(e))?;
+        self.last_buf_synced_lsn = self.last_buf_append_lsn;
+        Ok(())
+    }
+
     pub(super) fn append_raw_wal_batch_with_rotation(
         &mut self,
         encoded: &[u8],
@@ -1745,12 +1756,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && self.last_buf_append_lsn > self.last_buf_synced_lsn
         {
             self.sync_active_blob_writers()?;
-            let r = self
-                .buf_wal
-                .flush_buffered_to_os()
-                .and_then(|()| self.buf_wal.file().sync_barrier());
-            r.map_err(|e| self.poison(e))?;
-            self.last_buf_synced_lsn = self.last_buf_append_lsn;
+            self.make_buf_wal_durable(false)?;
         }
 
         // A failed append/sync leaves the on-disk outcome of this batch unknown (it may or may not

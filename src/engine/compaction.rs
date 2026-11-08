@@ -9,7 +9,7 @@ use crate::meta::{
     IdxSegmentMeta, LruBlobSegmentMeta, StdBlobSegmentMeta, format_idx_file_name,
     format_lru_blob_file_name, format_std_blob_file_name,
 };
-use crate::pal::{PlatformFile, PlatformFs};
+use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, WalRecord};
 
 use super::{StorageEngine, WriteDurability};
@@ -549,9 +549,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // Ensure all buffered eviction `Delete` WAL records that killed these LRU blob segments
         // are durable on disk before removing the segments from `boot_meta.db` and unlinking them.
-        self.buf_wal.flush_buffered_to_os()?;
-        self.buf_wal.file().sync_durable()?;
-        self.last_buf_synced_lsn = self.last_buf_append_lsn;
+        self.make_buf_wal_durable(true)?;
 
         let mut deleted_files = Vec::with_capacity(dead_lru.len());
         for &(tid, seq) in &dead_lru {

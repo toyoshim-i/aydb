@@ -620,6 +620,45 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         Ok(())
     }
 
+    /// Closes the currently open partially-filled sector (if any) so that no later append ever
+    /// rewrites it in place.
+    ///
+    /// Buffered modes pack batches densely and rewrite the open 4 KB sector on every append. Once
+    /// that sector has been (or is about to be) made durable by a sync, an in-place rewrite that is
+    /// torn by power loss would invalidate the sector CRC and destroy already-synced batches. Call
+    /// this *before* the sync: the sealed sector is what gets synced, and subsequent appends start
+    /// in the next, empty sector. Cost: at most one partially wasted sector per sync point. If the
+    /// cursor reaches `total_sectors`, the next append returns `RingFull` and the caller rotates.
+    ///
+    /// Failure-atomic: the cursor only advances after the sector write succeeded.
+    pub fn seal_open_sector_for_durability(&mut self) -> io::Result<()> {
+        if self.current_valid_bytes == 0 {
+            return Ok(());
+        }
+        if self.dirty_in_user_space || self.mode == WalStreamMode::BufferedUserSpaceCoalesced {
+            self.seal_and_write_current_sector()?;
+        }
+        // In `BufferedImmediateOsCache` mode the open sector was already written by the append.
+        self.current_sector_idx += 1;
+        self.current_valid_bytes = 0;
+        self.dirty_in_user_space = false;
+        self.sector_buf.fill(0);
+        Ok(())
+    }
+
+    /// Flushes pending bytes to the OS, seals the open sector (see
+    /// [`Self::seal_open_sector_for_durability`]) and then syncs the file: with `sync_durable`
+    /// when `durable` is true, otherwise with `sync_barrier`.
+    pub fn make_durable_and_seal(&mut self, durable: bool) -> io::Result<()> {
+        self.flush_buffered_to_os()?;
+        self.seal_open_sector_for_durability()?;
+        if durable {
+            self.file.sync_durable()
+        } else {
+            self.file.sync_barrier()
+        }
+    }
+
     fn preview_end_sector(&self, mut rem_len: usize) -> usize {
         let mut sec_idx = self.current_sector_idx;
         let mut valid = self.current_valid_bytes;
@@ -1638,6 +1677,90 @@ mod tests {
         w.append_batch(&put_batch(3, b"c", 10)).unwrap();
         drop(w);
         assert_eq!(recover_lsns(&fs, WAL_SYNC_FILE_NAME, 1), vec![1, 3]);
+    }
+
+    #[test]
+    fn sealed_sector_survives_torn_rewrite_of_following_batch() {
+        for mode in [
+            WalStreamMode::BufferedImmediateOsCache,
+            WalStreamMode::BufferedUserSpaceCoalesced,
+        ] {
+            let (_tmp, fs, _, _) = fail_fs("wal_seal_torn");
+            let mut w =
+                WalStreamWriter::open(&fs, WAL_BUF_FILE_NAME, 64 * 1024, 1, mode).unwrap();
+            w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+            w.make_durable_and_seal(false).unwrap();
+            assert_eq!(w.current_sector_idx(), 1);
+            let out = w.append_batch(&put_batch(2, b"b", 10)).unwrap();
+            assert_eq!(
+                out,
+                WalAppendOutcome::Appended {
+                    first_sector_idx: 1,
+                    sectors_touched: 1
+                }
+            );
+            w.flush_buffered_to_os().unwrap();
+            drop(w);
+            assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 2]);
+
+            // Tear the sector holding B: only A (sealed in sector 0) must remain.
+            let f = fs
+                .open_file(WAL_BUF_FILE_NAME, false, true, OpenHint::MutableBufferedLog)
+                .unwrap();
+            f.write_all_at(&[0xFFu8; 64], WAL_SECTOR_SIZE as u64 + 100)
+                .unwrap();
+            drop(f);
+            assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1]);
+        }
+    }
+
+    #[test]
+    fn unsealed_buffered_sector_is_shared_between_batches() {
+        let (_tmp, fs, _, _) = fail_fs("wal_unsealed_shared");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        w.append_batch(&put_batch(2, b"b", 10)).unwrap();
+        assert_eq!(w.current_sector_idx(), 0);
+        // Sealing an empty open sector is a no-op.
+        let mut w2 = WalStreamWriter::open(
+            &fs,
+            "wal_buf_other.db",
+            64 * 1024,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        w2.seal_open_sector_for_durability().unwrap();
+        assert_eq!(w2.current_sector_idx(), 0);
+    }
+
+    #[test]
+    fn seal_at_end_of_ring_yields_ring_full() {
+        let (_tmp, fs, _, _) = fail_fs("wal_seal_ring_end");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            WAL_SECTOR_SIZE as u64,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        w.make_durable_and_seal(true).unwrap();
+        assert_eq!(w.current_sector_idx(), w.total_sectors());
+        assert_eq!(
+            w.append_batch(&put_batch(2, b"b", 10)).unwrap(),
+            WalAppendOutcome::RingFull
+        );
+        drop(w);
+        assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1]);
     }
 
     #[test]

@@ -2436,3 +2436,38 @@ fn lazy_blob_survives_segment_reclaim_via_pinned_handle() {
     // And the live rows read the new generation.
     assert_eq!(engine.get_row(1, b"k\x00").unwrap(), Some(val(0, 0xB2)));
 }
+
+#[test]
+fn sync_point_seals_buf_wal_sector_so_it_is_never_rewritten() {
+    for mode in [
+        WalStreamMode::BufferedImmediateOsCache,
+        WalStreamMode::BufferedUserSpaceCoalesced,
+    ] {
+        let tmp = TempTestDir::new("seal_buf_sector");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.buf_wal_mode = mode;
+
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine
+            .put_row(1, b"k1", b"v1", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let before_sync = engine.buf_wal.current_sector_idx();
+        engine
+            .put_row(1, b"k2", b"v2", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        // The sector holding k1 was synced and sealed: the cursor moved past it.
+        assert!(engine.buf_wal.current_sector_idx() > before_sync);
+        let after_sync = engine.buf_wal.current_sector_idx();
+        engine
+            .put_row(1, b"k3", b"v3", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        assert!(engine.buf_wal.current_sector_idx() >= after_sync);
+        drop(engine);
+
+        let mut engine = StorageEngine::open(fs, cfg).unwrap();
+        for (k, v) in [(&b"k1"[..], &b"v1"[..]), (b"k2", b"v2"), (b"k3", b"v3")] {
+            assert_eq!(engine.get_row(1, k).unwrap(), Some(v.to_vec()));
+        }
+    }
+}
