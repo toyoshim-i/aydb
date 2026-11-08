@@ -216,6 +216,7 @@ pub(crate) fn list_dir_files(root: &Path) -> io::Result<Vec<String>> {
 mod tests {
     use super::*;
     use crate::util::test_util::TempTestDir;
+    #[cfg(windows)]
     use std::path::PathBuf;
     use std::thread;
 
