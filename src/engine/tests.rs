@@ -2529,3 +2529,164 @@ fn stale_same_epoch_wal_sectors_are_not_replayed_after_halt_at_sector_zero() {
         }
     }
 }
+
+#[test]
+fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicI64;
+
+    // `mode`: 0 = normal, 1 = silently drop boot_meta writes (lost-write crash simulation),
+    // 2 = allow `budget` more boot_meta writes, then fail them.
+    struct Ctl {
+        mode: AtomicI64,
+        budget: AtomicI64,
+    }
+    struct FaultFile<F> {
+        inner: Arc<F>,
+        name: String,
+        ctl: Arc<Ctl>,
+    }
+    impl<F: PlatformFile> PlatformFile for FaultFile<F> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            if self.name == "boot_meta.db" {
+                match self.ctl.mode.load(Ordering::SeqCst) {
+                    1 => return Ok(()),
+                    2 if self.ctl.budget.fetch_sub(1, Ordering::SeqCst) <= 0 => {
+                        return Err(io::Error::other("simulated crash before checkpoint"));
+                    }
+                    _ => {}
+                }
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+    struct FaultFs {
+        inner: OsFs,
+        ctl: Arc<Ctl>,
+    }
+    impl PlatformFs for FaultFs {
+        type File = FaultFile<<OsFs as PlatformFs>::File>;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+            Ok(Arc::new(FaultFile {
+                inner,
+                name: rel_name.to_string(),
+                ctl: Arc::clone(&self.ctl),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("open_commit_dead_bytes");
+    let ctl = Arc::new(Ctl {
+        mode: AtomicI64::new(0),
+        budget: AtomicI64::new(0),
+    });
+    let fs = Arc::new(FaultFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        ctl: Arc::clone(&ctl),
+    });
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 128;
+    cfg.max_blob_segment_bytes = 16 * 1024;
+    let key = |i: u32| format!("blob_key_{i:03}").into_bytes();
+    let blob = |i: u32| vec![i as u8 + 1; 3000];
+
+    // Segment A: four live blobs, checkpointed.
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for i in 0..4u32 {
+            engine
+                .put_row(1, &key(i), &blob(i), &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        engine.flush_memtable().unwrap();
+    }
+    let seg_a = {
+        let engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let segs = &engine.meta_mgr.state().std_blob_segments;
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].dead_bytes, 0);
+        segs[0].seq_id
+    };
+
+    // Overwrite 3 of the 4 blobs; the new segment B's catalog commit is lost (crash), so B is an
+    // uncataloged live segment referenced only by the WAL. Dead bytes of A exist only in the WAL.
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        ctl.mode.store(1, Ordering::SeqCst);
+        for i in 0..3u32 {
+            engine
+                .put_row(1, &key(i), &blob(i + 10), &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+    }
+    ctl.mode.store(0, Ordering::SeqCst);
+
+    // Open: the uncataloged-blob catalog commit succeeds, then the post-recovery checkpoint
+    // fails (crash before the checkpoint_lsn advances).
+    ctl.budget.store(1, Ordering::SeqCst);
+    ctl.mode.store(2, Ordering::SeqCst);
+    assert!(StorageEngine::open(Arc::clone(&fs), cfg.clone()).is_err());
+    ctl.mode.store(0, Ordering::SeqCst);
+
+    // The persisted dead_bytes must not include the (not yet checkpointed) replay increments.
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let a = engine
+            .meta_mgr
+            .state()
+            .std_blob_segments
+            .iter()
+            .find(|s| s.seq_id == seg_a)
+            .cloned()
+            .expect("segment A with a live blob must not be reclaimed");
+        // Exactly 3 of 4 equal blobs are dead; a double count would be ~6/4 of the file.
+        assert!(a.dead_bytes > 0 && a.dead_bytes * 4 <= a.file_len * 3, "{a:?}");
+        assert!(
+            fs.list_files()
+                .unwrap()
+                .contains(&format_std_blob_file_name(seg_a))
+        );
+        for i in 0..3u32 {
+            assert_eq!(engine.get_row(1, &key(i)).unwrap(), Some(blob(i + 10)));
+        }
+        assert_eq!(engine.get_row(1, &key(3)).unwrap(), Some(blob(3)));
+    }
+}

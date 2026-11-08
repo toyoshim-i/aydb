@@ -362,6 +362,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        // Snapshot the persisted (checkpointed) dead_bytes before WAL replay mutates the in-memory
+        // values. Uncataloged segments have no persisted value (0).
+        let std_base_dead: BTreeMap<u64, u64> =
+            std_blobs.iter().map(|(&k, b)| (k, b.dead_bytes)).collect();
+        let lru_base_dead: BTreeMap<(u16, u64), u64> =
+            lru_blobs.iter().map(|(&k, b)| (k, b.dead_bytes)).collect();
+
         // 4. Open `wal_sync.db` and `wal_buf.db` and run Two-Stream Recovery
         let mut sync_wal = WalStreamWriter::open(
             &*fs,
@@ -476,6 +483,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .map(|s| (s.table_id, s.seq_id))
             .collect();
 
+        // Invariant: persisted dead_bytes must only reflect mutations at or below checkpoint_lsn
+        // (plus idempotent tail garbage). The open-time commit below does not advance
+        // checkpoint_lsn, so it must NOT persist the WAL-replay increments: a crash before the
+        // post-recovery checkpoint would replay the same batches and double-count, eventually
+        // deleting segments that still hold live blobs. Tail garbage is idempotent because the
+        // committed file_len becomes the physical length, so a re-open computes no new garbage.
+        // The in-memory values (with replay increments) are persisted by the post-recovery
+        // flush together with the new checkpoint_lsn.
+        let mut std_persist_dead: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut lru_persist_dead: BTreeMap<(u16, u64), u64> = BTreeMap::new();
         let mut had_uncataloged_live_blobs = false;
         std_blobs.retain(|&seq_id, b| {
             let valid_end = std_valid_end.get(&seq_id).copied().unwrap_or(0);
@@ -485,10 +502,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !cataloged_std_seqs.contains(&seq_id) {
                 had_uncataloged_live_blobs = true;
             }
+            let mut persisted = std_base_dead.get(&seq_id).copied().unwrap_or(0);
             if b.file_len > valid_end {
                 let tail_garbage = b.file_len - valid_end;
                 b.dead_bytes = b.dead_bytes.saturating_add(tail_garbage).min(b.file_len);
+                persisted = persisted.saturating_add(tail_garbage).min(b.file_len);
             }
+            std_persist_dead.insert(seq_id, persisted);
             true
         });
         lru_blobs.retain(|&(tid, seq_id), b| {
@@ -499,10 +519,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !cataloged_lru_keys.contains(&(tid, seq_id)) {
                 had_uncataloged_live_blobs = true;
             }
+            let mut persisted = lru_base_dead.get(&(tid, seq_id)).copied().unwrap_or(0);
             if b.file_len > valid_end {
                 let tail_garbage = b.file_len - valid_end;
                 b.dead_bytes = b.dead_bytes.saturating_add(tail_garbage).min(b.file_len);
+                persisted = persisted.saturating_add(tail_garbage).min(b.file_len);
             }
+            lru_persist_dead.insert((tid, seq_id), persisted);
             true
         });
 
@@ -519,15 +542,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .map(|(&seq_id, b)| StdBlobSegmentMeta {
                     seq_id,
                     file_len: b.file_len,
-                    dead_bytes: b.dead_bytes,
+                    dead_bytes: std_persist_dead.get(&seq_id).copied().unwrap_or(0),
                 })
                 .collect();
             let lru_metas: Vec<LruBlobSegmentMeta> = lru_blobs
                 .iter()
-                .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
+                .map(|(&(tid, seq_id), b)| LruBlobSegmentMeta {
                     seq_id,
                     file_len: b.file_len,
-                    dead_bytes: b.dead_bytes,
+                    dead_bytes: lru_persist_dead.get(&(tid, seq_id)).copied().unwrap_or(0),
                     table_id: b.table_id,
                 })
                 .collect();
