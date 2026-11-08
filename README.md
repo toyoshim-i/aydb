@@ -7,7 +7,7 @@
 Rendered documentation: <https://toyoshim-i.github.io/aydb/>. Latest CI test and benchmark results: <https://toyoshim-i.github.io/aydb/results.html>.
 
 `aydb` is an embedded storage engine designed from first principles to unify two workloads that traditionally conflict in desktop and edge applications:
-1. **High-Frequency ACID State & Configuration Updates:** Small records (tens to hundreds of bytes) requiring durability on commit return (write-through plus a device flush) without flushing multi-megabyte buffered cache pages or stalling on random B-Tree page writes.
+1. **High-Frequency ACID State & Configuration Updates:** Small records (tens to hundreds of bytes) requiring durability on commit return (a device flush shared by concurrent commits) without flushing multi-megabyte buffered cache pages or stalling on random B-Tree page writes.
 2. **Large-Scale Bounded Blob Caching (`MAX_BYTES` + LRU):** Multi-kilobyte to multi-megabyte payloads (such as HTTP caches or media assets) experiencing high churn, strict quota enforcement, and read-heavy access—where traditional B-Trees suffer from overflow-page fragmentation and classic LSM-Trees suffer from compaction write amplification.
 
 Built with **zero external runtime crate dependencies**, `aydb` is engineered specifically for the realities of **Windows NTFS, SMB/CIFS network shares (roaming profiles / folder redirection), and enterprise antivirus minifilter drivers**, while providing clean cross-platform portability to Linux and macOS.
@@ -23,16 +23,17 @@ flowchart TB
         KVAPI["Native Ordered KV & Table API (src/engine/)<br/>get_row / put_row / scan_table / lookup_by_secondary_index"]
     end
 
-    subgraph Memory["Bounded Process Heap (~4-8 MB Budget)"]
+    subgraph Memory["Bounded Process Heap"]
         MT["Writable MemTable (src/memtable/)<br/>Inline Values (< 1 KB) + 23-Byte BlobPtrs (>= 1 KB)"]
         FENCE["Sparse Fence Pointers & Bloom Filters (src/index/)<br/>1st Key per 4 KB Block + 10 bits/key Filter"]
+        VCACHE["Verified Block & Blob Caches (src/cache/)<br/>Default 4 MB Each, Avoids Repeated Syscalls & CRC"]
         LRU["Zero-I/O LRU AccessTracker (src/lru/)<br/>Coalesces SELECT Timestamp Hits in RAM"]
     end
 
     subgraph Disk["OS Cache Manager & Non-Volatile Storage (dwShareMode = 0)"]
         META["boot_meta.db (8 KB Ping-Pong)<br/>Rename-Free Atomic Manifest + Deferred GC"]
         WAL["Dual-Stream Epoch WAL (src/wal/)<br/>wal_sync.db (8 MB, flushed per commit) & wal_buf.db (16 MB Buffered)"]
-        IDX["idx_<SeqID>.db (RANDOM_ACCESS; SEQUENTIAL_SCAN in Compaction)<br/>Immutable 4 KB Offset-Indexed SSTables"]
+        IDX["idx_<SeqID>.db (RANDOM_ACCESS)<br/>Immutable 4 KB Offset-Indexed SSTables"]
         BLOB["blob_std_<SeqID>.db & blob_lru_<TblID>_<SeqID>.db<br/>Append-Only Blobs (Random Point Read + Buffered Append)"]
     end
 
@@ -48,8 +49,8 @@ flowchart TB
 ```
 
 * **WiscKey-Style Key-Value Separation:** Values `< 1 KB` are stored inline inside the sorted index so point lookups finish in a single read. Values `>= 1 KB` are appended directly to immutable `blob_*.db` files using a **`Write-Blob-Before-WAL`** protocol protected by end-to-end `CRC32C`, while the WAL and `idx_*.db` store only a **23-byte `BlobPtr`**. Index compaction never copies large blobs.
-* **Strict Heap Budget via OS Page Cache Delegation:** Instead of duplicating kernel page cache memory inside a custom user-space buffer pool, `aydb` retains only **Sparse Fence Pointers** (the first key of each 4 KB block) and **10-bit/key Bloom Filters** in heap memory (~0.75% of index size), issuing direct positional `ReadFile` (`OVERLAPPED`) / `pread` calls backed by the Windows Cache Manager.
-* **Dual-Stream Fixed-Size Epoch WAL (`wal_sync.db` & `wal_buf.db`):** Pre-allocated fixed-size ring buffers recycled via monotonically increasing `WalEpoch` headers without file truncation or zero-fill stalls. Separating `wal_sync.db` (write-through plus `FlushFileBuffers` on every commit) from `wal_buf.db` allows synchronous configuration commits to complete without inadvertently flushing megabytes of dirty buffered cache pages.
+* **Bounded Heap with the OS Page Cache as the Primary Cache:** Instead of a large user-space buffer pool, `aydb` retains **Sparse Fence Pointers** (the first key of each 4 KB block) and **10-bit/key Bloom Filters** in heap memory, issuing direct positional `ReadFile` (`OVERLAPPED`) / `pread` calls backed by the Windows Cache Manager. Small, strictly bounded verified caches keep the hottest index blocks and blobs in user space.
+* **Dual-Stream Fixed-Size Epoch WAL (`wal_sync.db` & `wal_buf.db`):** Pre-allocated fixed-size ring buffers recycled via monotonically increasing `WalEpoch` headers without file truncation or zero-fill stalls. Separating `wal_sync.db` (flushed on every commit, with concurrent commits sharing a flush) from `wal_buf.db` allows synchronous configuration commits to complete without inadvertently flushing megabytes of dirty buffered cache pages.
 * **Rename-Free Atomic Metadata & Antivirus Resilience:** Never invokes `MoveFileEx` (atomic rename), which frequently triggers `ERROR_SHARING_VIOLATION` under Windows Defender or Samba shares. Segment switches are committed atomically via an 8 KB double-buffered (`Slot A` / `Slot B`) `boot_meta.db` with a persistent `PendingDeleteList` for deferred garbage collection.
 * **Copy-Less Per-Table LRU Eviction & Zero-Write `SELECT` Tracking:** Tables configured with `max_bytes` isolate their blobs into per-table generational files (`blob_lru_<TblID>_<SeqID>.db`). Read hits coalesce access timestamps in RAM (`AccessTracker`) with **zero disk writes**, and when an older blob generation becomes 100% evicted, the entire file is unlinked in $O(1)$ without copying a single live byte.
 
@@ -114,8 +115,10 @@ aydb/
 │   ├── ARCHITECTURE.md                       # Master architecture specification
 │   ├── phase1/                               # Phase 1: Storage Engine textbook (Chapters 1.0 - 1.5)
 │   └── phase2/                               # Phase 2: SQLite VTab & Benchmarks (Chapters 2.0 - 2.3)
+├── tools/build_site.py                       # GitHub Pages Site & Chart Generator
 ├── src/
 │   ├── lib.rs                                # Crate root & module exports
+│   ├── cache/mod.rs                          # Bounded Verified Block & Blob Caches
 │   ├── util/                                 # Shared utilities (CRC32C, ByteReader, test helpers)
 │   │   ├── mod.rs
 │   │   ├── crc32c.rs
@@ -134,6 +137,7 @@ aydb/
 │   ├── engine/                               # StorageEngine Coordinator, Transactions, Scans, Compaction & Eviction
 │   │   ├── mod.rs
 │   │   ├── tx.rs
+│   │   ├── reader.rs
 │   │   ├── scan.rs
 │   │   ├── compaction.rs
 │   │   ├── eviction.rs
@@ -141,6 +145,7 @@ aydb/
 │   └── vtab/                                 # SQLite Virtual Table Adapter
 │       ├── mod.rs
 │       ├── ddl.rs
+│       ├── compaction_worker.rs
 │       ├── rowid_map.rs
 │       ├── connection.rs
 │       ├── row_codec.rs
@@ -151,6 +156,9 @@ aydb/
     ├── meta_wal_bench.rs                     # Step 1-2/1-3: Ping-Pong Meta & Dual-Stream WAL benchmarks
     ├── wisckey_bench.rs                      # Step 1-4: WiscKey vs. Inline LSM Compaction benchmarks
     ├── lru_engine_bench.rs                   # Step 1-5: Zero-I/O LRU & Quota Eviction benchmarks
+    ├── concurrent_read_bench.rs              # Read Scaling Across Threads
+    ├── tx_isolation_read_bench.rs            # Non-Owner Read Cost During Transactions
+    ├── compaction_latency_bench.rs           # Commit Latency: Inline vs. Background Compaction
     ├── reliability_bench.rs                  # Crash-Consistency, Fault-Injection, & Audit Regression Suite
     ├── sqlite_vs_aydb_bench.rs               # Step 2-2: Hybrid Workload SQLite vs. aydb benchmarks
     └── standard_sql_bench.rs                 # Step 2-3: Differential SQL check & Speedtest1/YCSB/TPC-B-style benchmarks

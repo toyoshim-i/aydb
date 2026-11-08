@@ -39,9 +39,9 @@ To eliminate this repeated overhead without violating bounded-memory requirement
   * **User-Space Verified Block/Blob Cache (Hot-Tier Acceleration):** Keeps hot, already-verified 4 KB index blocks and small blobs ($\le 16\text{ KB}$) in process heap memory.
 * **Key Invariants and Performance Advantages:**
   * **Zero Syscall & Zero CRC Recalculation:** Cache hits bypass `ReadFile`/`pread` entirely and serve data in tens of nanoseconds. Because blocks were already verified when inserted into the cache, repeated CRC32C calculations are eliminated on hot internal and leaf index blocks.
-  * **Strict Deterministic Bounds:** Total private heap consumption is strictly capped at `memtable_capacity_bytes + block_cache_bytes + blob_cache_bytes + sparse_fence_metadata`. Setting both cache budgets to `0` reverts cleanly to the pure OS-cache-only model for ultra-constrained environments.
+  * **Bounded Budgets:** The MemTable and both caches have fixed budgets (`memtable_capacity_bytes + block_cache_bytes + blob_cache_bytes`). Other in-memory structures are bounded separately, as listed in `ARCHITECTURE.md` §1.1. Setting both cache budgets to `0` reverts cleanly to the pure OS-cache-only model for ultra-constrained environments.
   * **Immutability & Zero Cache Invalidation Complexity:** SSTable segments and blob files are immutable with strictly monotonic `SeqID`s. Cached entries never become stale while the segment is active. When compaction or LRU reclamation retires a segment, all cache entries for that `SeqID` are discarded wholesale.
-  * **Scan Resistance:** Compaction bulk inputs (`BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table scans bypass cache insertion to avoid displacing hot point-lookup data.
+  * **Scan Resistance:** Compaction reads and unbounded full-table scans bypass cache insertion to avoid displacing hot point-lookup data.
 
 ---
 
@@ -91,7 +91,7 @@ To achieve true lock-free parallel `pread`/`pwrite` semantics on Windows equival
 3. **Thread-Local Manual-Reset Event for Cache Misses:** Only when `ReadFile` returns `FALSE` with `GetLastError() == ERROR_IO_PENDING` (meaning a physical disk or SMB request was queued) does the calling thread wait. To avoid calling `CreateEventW` on every I/O, each thread caches a reusable manual-reset event handle in `thread_local!` storage and passes `(hEvent as usize | 1) as HANDLE` in `OVERLAPPED.hEvent` (setting the low bit `1` instructs the Windows kernel not to post completion packets to any I/O Completion Port if one is ever associated).
 
 ```rust
-// Conceptual execution flow inside WindowsPlatformFile::read_exact_at
+// Conceptual execution flow inside WinPlatformFile::read_exact_at
 // 1. Borrow reusable manual-reset Event from thread_local!
 // 2. Populate OVERLAPPED { Offset, OffsetHigh, hEvent: h_event | 1 }
 // 3. Call ReadFile(...)
@@ -105,7 +105,7 @@ To achieve true lock-free parallel `pread`/`pwrite` semantics on Windows equival
 ## 3. Design Decision 3: Physical Two-Stream WAL Separation (`wal_sync.db` vs. `wal_buf.db`)
 
 `aydb` supports two durability tiers for mutations:
-* **`Durability::Sync`:** For critical settings and catalog changes; durable when the commit returns (survives power loss and OS panics, assuming the device honours write-through), with earlier buffered commits made durable first.
+* **`Durability::Sync`:** For critical settings and catalog changes; durable when the commit returns (survives power loss and OS panics, assuming the device honours flush requests), with earlier buffered commits made durable first.
 * **`Durability::Buffered`:** For high-churn HTTP cache insertions and transient state; enters the OS page cache immediately (surviving application crashes or `TerminateProcess` / `kill -9`; an OS crash or power loss may roll back the most recent ones), without stalling on physical disk flushes.
 
 ### 3.1 Why Single-File WAL Designs Fail Under Dual Durability
@@ -144,8 +144,8 @@ flowchart TD
 By splitting the journal into two separate pre-allocated physical files—**`wal_sync.db`** (opened with `dwShareMode = 0` and flushed on every commit) and **`wal_buf.db`** (opened with `dwShareMode = 0` and standard buffered caching):
 
 1. **Full `dwShareMode = 0` Exclusivity:** Every file in the database directory is opened exactly once with `dwShareMode = 0`, preserving SMB RWH leases unconditionally.
-2. **Zero Flush Coupling:** `wal_sync.db` only ever contains `Sync` records. Flushing or writing through to `wal_sync.db` never touches the dirty OS cache pages of `wal_buf.db`.
-3. **Contiguous Prefix Invariant per File:** Within `wal_sync.db`, every sector is written synchronously in strict sequential order; there is never an unflushed gap. Within `wal_buf.db`, sectors are flushed sequentially by the OS; any power-loss truncation only affects the tail of `wal_buf.db`.
+2. **Zero Flush Coupling:** `wal_sync.db` only ever contains `Sync` records. Flushing `wal_sync.db` never touches the dirty OS cache pages of `wal_buf.db`.
+3. **Contiguous Prefix Invariant per File:** Within `wal_sync.db`, sectors are written in strict sequential order and a commit returns only after a device flush that covers its sector, so there is never a gap below an acknowledged commit. Within `wal_buf.db`, sectors are flushed sequentially by the OS; any power-loss truncation only affects the tail of `wal_buf.db`.
 4. **Mathematical Soundness of Two-Stream `LSN` Merge Recovery:**
    Because `aydb` logs **idempotent state-replacement records** (`Put(Key, InlineValue | BlobPtr)` or `Delete(Key)`) tagged with a global monotonically increasing 64-bit `LSN`—rather than byte-offset page diffs—recovery simply scans valid sectors from `wal_sync.db` and `wal_buf.db` independently and performs a two-way merge sort by `LSN`:
    * If `Key_A` was written as `Buffered` (`LSN = 10`) and then overwritten as `Sync` (`LSN = 11`), and `LSN = 10` is lost in a power outage, replaying `LSN = 11` from `wal_sync.db` still produces the exact final state for `Key_A`.
@@ -155,7 +155,7 @@ By splitting the journal into two separate pre-allocated physical files—**`wal
 
 ## 4. Design Decision 4: Pre-Allocation and the NTFS Valid Data Length (VDL) Cliff
 
-To avoid file fragmentation and NTFS Master File Table (MFT) size-extension locks on every write, both `wal_sync.db` and `wal_buf.db` have fixed file sizes (`2 MB` for `wal_sync.db`, `16 MB` for `wal_buf.db`). However, *how* those files are pre-allocated on Windows NTFS has a dramatic impact on first-epoch write latency.
+To avoid file fragmentation and NTFS Master File Table (MFT) size-extension locks on every write, both `wal_sync.db` and `wal_buf.db` have fixed file sizes (by default `8 MB` for `wal_sync.db` and `16 MB` for `wal_buf.db`). However, *how* those files are pre-allocated on Windows NTFS has a dramatic impact on first-epoch write latency.
 
 ### 4.1 Understanding `AllocationSize`, `EOF`, and `VDL` in NTFS
 
@@ -173,17 +173,17 @@ Every file stream on NTFS maintains three distinct 64-bit length pointers:
 +-----------------------------------+-----------------------------------+-----------+
 ```
 
-1. **What Happens with `SetEndOfFile` Only (`VDL = 0`, `EOF = 2 MB`):**
-   If we pre-allocate `wal_sync.db` solely by calling `SetFilePointerEx(2 MB)` + `SetEndOfFile()`, NTFS reserves the clusters and sets `EOF = 2 MB`, but leaves **`ValidDataLength (VDL) = 0`** (so an unprivileged user cannot read leftover disk sectors from previously deleted files).
-   During the first pass through `wal_sync.db` (opened with `FILE_FLAG_WRITE_THROUGH`), every single 4 KB sector write advances `VDL` by 4 KB. Because `FILE_FLAG_WRITE_THROUGH` guarantees that the written data is readable after a power outage, **NTFS is forced to commit an internal metadata transaction to `$LogFile` and update the MFT record on every single 4 KB write**—turning 1 write into 2–3 physical disk I/Os!
-2. **What Happens with Physical Zero-Initialization (`VDL = EOF = 2 MB`):**
-   If we write 2 MB of zeros sequentially in 256 KB chunks when `wal_sync.db` is first created and flush once, **`VDL` reaches `2 MB` immediately**. From the very first transaction of Epoch 1 onward, every 4 KB `WRITE_THROUGH` write occurs strictly at `Offset < VDL` (a pure in-place sector overwrite), completely bypassing NTFS MFT/VDL extension logging!
+1. **What Happens with `SetEndOfFile` Only (`VDL = 0`, `EOF` = file size):**
+   If we pre-allocate `wal_sync.db` solely by calling `SetFilePointerEx` + `SetEndOfFile()`, NTFS reserves the clusters and sets `EOF`, but leaves **`ValidDataLength (VDL) = 0`** (so an unprivileged user cannot read leftover disk sectors from previously deleted files).
+   During the first pass through `wal_sync.db`, every 4 KB sector write advances `VDL` by 4 KB, and the device flush that follows must also persist that metadata change: **NTFS commits an internal metadata transaction to `$LogFile` and updates the MFT record for each sector**. On a consumer NVMe SSD the flush itself dominates and hides much of this difference.
+2. **What Happens with Physical Zero-Initialization (`VDL = EOF`):**
+   If we write zeros sequentially in 256 KB chunks when `wal_sync.db` is first created and flush once, **`VDL` reaches `EOF` immediately**. From the very first transaction of Epoch 1 onward, every 4 KB write occurs strictly at `Offset < VDL` (a pure in-place sector overwrite), avoiding NTFS MFT/VDL extension logging.
 
 ### 4.2 Tailored Pre-Allocation Strategy
 
 Thanks to our two-stream WAL separation (Design Decision 3), we get the best of both worlds:
-* **`boot_meta.db` (8 KB) & `wal_sync.db` (8 MB by default):** Physically zero-initialized upon creation (`PreallocStrategy::PhysicalZeroFill`) so `VDL == EOF` before the first transaction runs. Writing 2 MB of zeros takes `< 1 ms` on a local NVMe SSD and `~15 ms` over 1 Gbps SMB.
-* **`wal_buf.db` (16 MB):** Because `wal_buf.db` uses buffered writes (not `FILE_FLAG_WRITE_THROUGH`), NTFS coalesces VDL updates lazily in memory during background flushing. We expose both `PhysicalZeroFill` and `LogicalExtendOnly` (`SetEndOfFile` / `posix_fallocate`) in the PAL so we can benchmark both strategies on local NTFS and SMB.
+* **`boot_meta.db` (8 KB) & `wal_sync.db` (8 MB by default):** Physically zero-initialized upon creation (`PreallocStrategy::PhysicalZeroFill`) so `VDL == EOF` before the first transaction runs.
+* **`wal_buf.db` (16 MB):** Because `wal_buf.db` uses buffered writes without a per-commit flush, NTFS coalesces VDL updates lazily in memory during background flushing. We expose both `PhysicalZeroFill` and `LogicalExtendOnly` (`SetEndOfFile` / `posix_fallocate`) in the PAL so we can benchmark both strategies on local NTFS and SMB.
 
 ---
 
@@ -209,8 +209,8 @@ Standard Win32 file paths are limited to `MAX_PATH = 260` characters unless pref
 
 ### 5.3 Cross-Platform Handle Pool & Descriptor Limits
 
-* **On Windows (Local NTFS & SMB):** Every open segment handle holds an SMB `Read-Write-Handle (RWH) Lease`. Closing a handle immediately revokes or downgrades the lease and forces an SMB2 `CREATE` / `CLOSE` network round-trip on the next access. Because Windows supports millions of handles per process, the PAL's `HandlePool` sets the default open-handle cap on Windows to `usize::MAX` (keeping all active segments open until retired by compaction/eviction).
-* **On POSIX (macOS / Linux):** macOS defaults to a strict soft limit of `RLIMIT_NOFILE = 256` file descriptors per process. On POSIX targets, `HandlePool` (`src/pal/unix.rs`) pins critical files (`boot_meta.db`, `wal_sync.db`, `wal_buf.db`, and hot `idx` segments) and maintains a **reference-aware LRU descriptor cache** (default cap: `128`) across idle segment handles. The pool bounds the number of simultaneously open OS file descriptors without evicting handles that are currently pinned by an active `Arc` reference, an open `LazyBlob` cursor, or an in-flight `pread`. Cold unpinned handles are transparently closed and reopened on demand while holding an advisory `flock(LOCK_EX | LOCK_NB)` on a dedicated `db.lock` file to match Windows's `dwShareMode = 0` single-host guarantee.
+* **On Windows (Local NTFS & SMB):** Every open segment handle holds an SMB `Read-Write-Handle (RWH) Lease`. Closing a handle immediately revokes or downgrades the lease and forces an SMB2 `CREATE` / `CLOSE` network round-trip on the next access. Because Windows supports millions of handles per process, the Windows PAL has no handle pool: all active segments stay open until retired by compaction or eviction.
+* **On POSIX (macOS / Linux):** macOS defaults to a strict soft limit of `RLIMIT_NOFILE = 256` file descriptors per process. `HandlePool` (`src/pal/unix.rs`) bounds the descriptors of idx and blob handles (default cap: `128`). The WAL files and `boot_meta.db` are not pooled, so they stay open. When the cap is reached, the oldest handle without other references is closed and reopened on demand. Handles that are in use, or whose file has been unlinked, are not closed. An advisory `flock(LOCK_EX | LOCK_NB)` on a dedicated `db.lock` file provides the single-host guarantee that `dwShareMode = 0` provides on Windows.
 
 ---
 
@@ -224,13 +224,13 @@ use std::sync::Arc;
 /// Access pattern and durability hints passed to the OS kernel when opening a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenHint {
-    /// For boot_meta.db and wal_sync.db (Write-Through / Synchronous durability).
+    /// For boot_meta.db and wal_sync.db (durability through an explicit device flush).
     MutableSyncLog,
     /// For wal_buf.db (Buffered sequential journal).
     MutableBufferedLog,
     /// For idx_<SeqID>.db (4 KB random block lookups).
     ImmutableRandom,
-    /// For blob_*_<SeqID>.db (Sequential large payload reads & appends).
+    /// For blob_*_<SeqID>.db (random point reads and buffered appends).
     ImmutableSequential,
     /// For background compaction and GC bulk scans.
     BackgroundBulk,

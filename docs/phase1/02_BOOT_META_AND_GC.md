@@ -61,7 +61,7 @@ Each of the two slots (`Slot A` at offset `0`, `Slot B` at offset `4096`) is exa
 |                        NextSeqId (u64)                        | 16..24
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         NextLsn (u64)                         | 24..32
+|                      CheckpointLsn (u64)                      | 24..32
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                    ActiveSyncWalEpoch (u64)                   | 32..40
@@ -120,7 +120,7 @@ A 4028-byte inline payload area comfortably holds over **120 segment descriptors
    * The engine allocates a new `manifest_seq_id` from `next_seq_id` and writes `[Magic "AYMF" (4B) | Version (2B) | Reserved (2B) | PayloadLen (4B) | PayloadCRC32C (4B) | PayloadBytes...]` to an immutable file `manifest_<SeqID>.db`, followed by `sync_durable()`.
    * Inside the `boot_meta.db` slot's payload area (`64..84`, `payload_len = 20`), the engine stores a 20-byte external pointer:
      `[manifest_seq_id: u64 | manifest_file_len: u64 | manifest_payload_crc32c: u32]`.
-   * The previous generation's `manifest_<OldSeqID>.db` (if any) is added to `pending_delete_files` so it is automatically garbage-collected once the new slot commits!
+   * After a commit, the previous generation's manifest stays on disk while its slot is the standby fallback. A manifest that neither slot references is added to `pending_delete_files`.
 
 ### 3.1 Catalog Payload Binary Format
 
@@ -207,6 +207,8 @@ File deletion in `aydb` operates via two complementary mechanisms so that neithe
 2. **Startup Orphan Sweep:**
    * Suppose power fails while the engine is halfway through writing a new `idx_0009.db` during a MemTable flush, *before* `boot_meta.db` is updated to reference `idx_0009.db`.
    * Upon recovery, after selecting the winning `BootMetaState`, the engine enumerates the directory via `fs.list_files()`. Any segment or manifest file (`idx_*.db`, `blob_std_*.db`, `blob_lru_*.db`, `manifest_*.db`) that is **not** referenced by the winning `BootMetaState` (and not referenced by the standby slot's external manifest, to protect rollback safety until the next commit) is identified as an uncommitted orphan and immediately deleted (or queued in `pending_delete_files` if locked by antivirus).
+3. **SeqID Reservation:**
+   * A crashed flush or compaction can leave a file whose `SeqID` was never persisted. Before anything allocates a new `SeqID`, `reserve_seq_ids_above_existing_files` durably advances `next_seq_id` past every managed file on disk, so a file name is never reused.
 
 ---
 
@@ -215,9 +217,9 @@ File deletion in `aydb` operates via two complementary mechanisms so that neithe
 Every storage layer in `aydb` (`boot_meta.db`, `wal_sync.db`, `wal_buf.db`, `idx_<SeqID>.db`, and `blob_*_<SeqID>.db`) relies on **CRC32C** (the Castagnoli polynomial `0x1EDC6F41`, bit-reflected `0x82F63B78`) for end-to-end data integrity and torn-write detection.
 
 To maintain zero external crate dependencies while achieving hardware-line-rate checksumming:
-* **x86 / x86_64 Hardware Acceleration (`SSE4.2`):** Uses `std::arch::is_x86_feature_detected!("sse4.2")` to dispatch to `_mm_crc32_u64` (processing 8 bytes per instruction cycle at **~12–21 GB/s**) and `_mm_crc32_u8` for tail bytes.
-* **ARM64 Hardware Acceleration (`crc` target feature):** Uses `std::arch::is_aarch64_feature_detected!("crc")` with `__crc32cd` / `__crc32cb`.
-* **Portable Slice-by-8 Software Fallback:** Provides a `const`-generated $8 \times 256$ lookup table (`CRC32C_TABLE: [[u32; 256]; 8]`) processing 8 bytes per loop iteration in pure safe Rust (~2.3–3.2 GB/s), which also serves as the ground-truth oracle in unit tests to verify the hardware-accelerated path!
+* **x86 / x86_64 Hardware Acceleration (`SSE4.2`):** Uses `std::arch::is_x86_feature_detected!("sse4.2")` to dispatch to `_mm_crc32_u64`, running three interleaved streams over larger inputs and recombining them, with `_mm_crc32_u8` for tail bytes.
+* **ARM64 Hardware Acceleration (`crc` target feature):** Uses `std::arch::is_aarch64_feature_detected!("crc")` with `__crc32cd` / `__crc32cb`, also using three interleaved streams.
+* **Portable Slice-by-8 Software Fallback:** Provides a `const`-generated $8 \times 256$ lookup table (`CRC32C_TABLE: [[u32; 256]; 8]`) processing 8 bytes per loop iteration in pure safe Rust, which also serves as the ground-truth oracle in unit tests to verify the hardware-accelerated path!
 
 ---
 

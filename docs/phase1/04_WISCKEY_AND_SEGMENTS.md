@@ -12,7 +12,7 @@ In a classic LSM-Tree (such as LevelDB or RocksDB), keys and values are stored t
 
 ```mermaid
 flowchart TB
-    subgraph Write["Mutation Arrival (put / batch_write)"]
+    subgraph Write["Mutation Arrival (put_row)"]
         KV["(Key, Value)"] --> SizeCheck{"Value.len() >= inline_threshold<br/>(or Key+Val > MaxInline)?"}
     end
 
@@ -57,7 +57,7 @@ Selecting the appropriate inline threshold balances write amplification against 
 
 ## 2. Out-of-Line Blob Segment Format (`blob_std_<SeqID>.db` & `blob_lru_<TblID>_<SeqID>.db`)
 
-Blob segments are append-only files opened with `OpenHint::ImmutableSequential` (`FILE_FLAG_SEQUENTIAL_SCAN`), enabling the Windows Cache Manager to prefetch 256 KB VACB windows during sequential reads and automatically release pages behind the cursor.
+Blob segments are append-only files opened with `OpenHint::ImmutableSequential`. Despite the name, no sequential read-ahead is requested: blob files mostly serve random point reads, so `FILE_FLAG_SEQUENTIAL_SCAN` would only fetch unused 256 KB windows. Appends are staged in a 256 KB buffer and written before the WAL record. A `SyncTransactional` commit also syncs the blob writers first, so a durable commit never refers to a blob that could be lost.
 
 ### 2.1 Framed Blob Record Binary Layout
 
@@ -88,8 +88,9 @@ Every blob appended to a blob segment is framed with a 16-byte header followed b
 
 When reading a blob referenced by `BlobPtr { kind, table_id, seg_id, offset, len, crc32c }`:
 1. The reader issues a single positional `read_exact_at` of `len` bytes at `offset`.
-2. If the file is shorter than `offset + len` (`UnexpectedEof`), or if `magic != b"AYBL"`, or if the computed `crc32c` does not equal `ptr.crc32c`:
-   * Rather than raising a fatal corruption error, the reader returns `Ok(None)` (treating the record as an uncommitted write from a prior power outage or an already-evicted cache entry).
+2. A failure (`UnexpectedEof`, a wrong magic, a CRC or key mismatch, or a missing segment) has two meanings, depending on when it happens:
+   * **During recovery**, for a pointer replayed from the WAL, it means the blob never reached disk, and the record is treated as an uncommitted write. A real I/O error fails the open instead.
+   * **After the open**, it is genuine corruption and is never reported as absence. The per-table `on_corrupt` policy either returns an error or hides the row and queues it for deletion.
 
 ---
 
@@ -199,6 +200,12 @@ While sparse fence pointers and Bloom filters in heap memory keep default memory
   * When multiple segments contain the same key, only the entry with the highest `lsn` is retained; older versions are discarded.
   * If `drop_tombstones = true` (when compacting all existing segments into a single base segment), `IndexValue::Tombstone` entries are stripped completely, reclaiming deleted key space.
   * When an overwritten or deleted entry was a `BlobPtr` pointing to `blob_std_<SeqID>.db` (or `blob_lru`), compaction reports the reclaimed `dead_bytes` per `(BlobKind, table_id, seg_id)` so `BootMetaState` can track dead blob ratios and unlink 100%-dead blob segments without copying a single blob byte!
+
+### 4.3 Compaction Scheduling
+
+* **Trigger:** A merge is due when the segment count reaches `auto_compact_segment_threshold` (default `8`). The trigger counts segments, not bytes.
+* **Selection:** `compact_auto_tiered` picks a contiguous suffix of newer segments of comparable size. Merging only a suffix keeps tombstones, because they may shadow keys in older segments.
+* **Inline or background:** By default the merge runs inline after a flush. Registering the SQLite module starts a background worker that runs `prepare_compaction`, the merge without the engine lock, and `install_compaction`. If the worker falls behind, a flush falls back to an inline merge once the segment count reaches `max_segments_before_inline_compaction`.
 
 ---
 

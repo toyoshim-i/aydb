@@ -31,7 +31,7 @@ CREATE VIRTUAL TABLE http_cache USING aydb(
 
 ## 2. Multi-Column Binary Row Codec (`src/vtab/row_codec.rs`)
 
-While the primary key column is encoded using `src/lru/key_codec.rs` (memcomparable format) to serve as the `StorageEngine` row key (`[TableID | 'r' | EncodedPK]`), the non-PK columns of a row are packed into a compact binary row payload with an $O(1)$ column-offset header so `xColumn` can project individual columns without decoding preceding variable-length blobs:
+While the primary key column is encoded using `src/index/key_codec.rs` (memcomparable format) to serve as the `StorageEngine` row key (`[TableID | 'r' | EncodedPK]`), the non-PK columns of a row are packed into a compact binary row payload with an $O(1)$ column-offset header so `xColumn` can project individual columns without decoding preceding variable-length blobs:
 
 ```text
  0                   1                   2                   3
@@ -81,13 +81,13 @@ flowchart TD
 To avoid allocating a new `Vec<(Vec<u8>, Vec<u8>)>` of heap-allocated rows on every `SELECT` or range scan, each `AydbCursor` owns a reusable contiguous byte slab (`slab: Vec<u8>`) and a lightweight offset span index (`spans: Vec<(u32, u32, u32, u32)>`). On each `xFilter` call, `slab.clear()` and `spans.clear()` reset the cursor in $O(1)$ without freeing capacity:
 
 * **Plan 1 (`PK Point Lookup`, `idxNum == 1`):**
-  Encodes `argv[0]` into stack-buffered `EncodedPK` (`[u8; 64]` fast path for `INT`/`REAL`), calls `engine.get_row_into(table_id, &encoded_pk, &mut cursor.slab)` directly (which hits the `MemTable` or a single Bloom-filtered `idx` 4 KB block + optional `blob` dereference, and updates the in-memory `AccessTracker` in $O(1)$), and pushes a single `(pk_start, pk_end, val_start, val_end)` span.
+  Encodes `argv[0]` into stack-buffered `EncodedPK` (`[u8; 64]` fast path for `INT`/`REAL`), calls `engine.get_row_into(table_id, &encoded_pk, &mut cursor.slab, &mut cursor.spans)` directly (which hits the `MemTable` or a single Bloom-filtered `idx` 4 KB block + optional `blob` dereference, and updates the in-memory `AccessTracker` in $O(1)$), and pushes a single `(pk_start, pk_end, val_start, val_end)` span.
 * **Plan 2 (`Secondary Index Lookup`, `idxNum & 0xFF == 2`):**
-  Extracts `index_id = ((idxNum >> 8) & 0x0F) as u16`, encodes `argv[0]` into `col_bytes`, calls `engine.lookup_by_secondary_index(table_id, index_id, &col_bytes)` to obtain matching primary keys, and appends the matching rows into `cursor.slab`.
+  Extracts `index_id = ((idxNum >> 8) & 0x0F) as u16`, encodes `argv[0]`, and streams matching rows into `cursor.slab` in bounded chunks with `scan_secondary_index_into_slab`.
 * **Plan 3 (`PK Range Scan`, `idxNum & 0xFF == 3`):**
-  Extracts the lower/upper memcomparable key bounds (`GT`/`GE`/`LT`/`LE`) and optional pushed-down `LIMIT` (`(idxNum & 0x1000) != 0`), then calls `engine.scan_table_values_into(table_id, lower_bound, upper_bound, limit, &mut cursor.slab, &mut cursor.spans)`. Because `[TableID | 'r' | EncodedPK]` is stored in memcomparable order, `scan_range_values_into` seeks directly to the lower bound in both the `MemTable` (`BTreeMap::range`) and on-disk `idx_<SeqID>.db` segments (via Sparse Fence Pointers), stopping immediately at `upper_bound` or `limit` without scanning unrelated keys. Furthermore, if the query specifies `ORDER BY pk ASC`, `xBestIndex` sets `orderByConsumed = 1` so SQLite skips its ephemeral B-Tree sorter (`USE TEMP B-TREE FOR ORDER BY`).
+  Extracts the lower/upper memcomparable key bounds (`GT`/`GE`/`LT`/`LE`) and optional pushed-down `LIMIT` (`(idxNum & 0x1000) != 0`), then calls `scan_range_into_slab`. Because `[TableID | 'r' | EncodedPK]` is stored in memcomparable order, the scan seeks directly to the lower bound in both the `MemTable` (`BTreeMap::range`) and on-disk `idx_<SeqID>.db` segments (via Sparse Fence Pointers), stopping at the upper bound or `LIMIT`. If the query specifies `ORDER BY pk`, ascending or descending, `xBestIndex` sets `orderByConsumed = 1` so SQLite skips its sorter.
 * **Plan 0 (`Full Table Scan`, `idxNum & 0xFF == 0`):**
-  Calls `engine.scan_table_values_into(table_id, None, None, limit, &mut cursor.slab, &mut cursor.spans)` to stream live rows directly into the cursor's contiguous byte slab.
+  Calls `scan_range_into_slab` without key bounds, streaming live rows directly into the cursor's contiguous byte slab.
 
 ### 3.2 Chunked 256-Row Streaming & Lazy Per-Row Blob Dereference
 To prevent allocating unbounded memory when scanning large tables while keeping SQLite VDBE query plans fully expressive (e.g. queries with residual `WHERE` filters, `LIMIT`, or `ORDER BY`), `AydbCursor` streams records in bounded chunks of `CURSOR_STREAM_CHUNK_ROWS = 256` rows.
@@ -108,17 +108,28 @@ SQLite routes `INSERT`, `UPDATE`, and `DELETE` statements on a virtual table to 
 | Operation | `argc` & `argv` Condition | `aydb` Execution Path |
 | :--- | :--- | :--- |
 | **`DELETE`** | `argc == 1` (`argv[0]` is old PK / rowid) | Extracts `old_pk` from `argv[0]` (via reversible 8-byte `i64` decoding or fallback `rowid_to_pk` map) and calls `engine.delete_row(table_id, &old_pk, durability)`. |
-| **`INSERT` / `REPLACE`** | `argc > 1` and `sqlite3_value_type(argv[0]) == SQLITE_NULL` | Extracts `new_pk` from `argv[2 + pk_col_idx]`, encodes all columns directly via `encode_sqlite_values_direct`, builds secondary index pairs `(index_id, col_bytes)`, and calls `engine.put_row_owned(table_id, &new_pk, row_bytes, &sec_keys, durability)`. Because `put_row_owned` natively overwrites existing keys and cleans up old blobs/LRU entries, `INSERT OR REPLACE` works in a single pass! |
+| **`INSERT` / `REPLACE`** | `argc > 1` and `sqlite3_value_type(argv[0]) == SQLITE_NULL` | Extracts `new_pk` from `argv[2 + pk_col_idx]`, encodes all columns directly via `encode_sqlite_values_direct`, builds secondary index pairs `(index_id, col_bytes)`, and calls `engine.put_row_owned(table_id, &new_pk, row_bytes, &sec_keys, durability)`. A duplicate primary key is first resolved against `ON CONFLICT` (`sqlite3_vtab_on_conflict`), failing with `SQLITE_CONSTRAINT` by default. `put_row_owned` overwrites existing keys and cleans up old blobs and LRU entries, so `INSERT OR REPLACE` works in a single pass. |
 | **`UPDATE`** | `argc > 1` and `sqlite3_value_type(argv[0]) != SQLITE_NULL` | Resolves `old_pk` from `argv[0]`. If `old_pk != new_pk`, deletes `old_pk` first, then upserts `new_pk` via `engine.put_row_owned(...)`. |
 
-### 4.2 Lock-Free Reversible 8-Byte `ROWID` Mapping
+### 4.2 Lock-Free Reversible Integer `ROWID` Mapping
 SQLite's Virtual Table bytecode sequences two-phase mutations (`DELETE` and `UPDATE`) by reading a 64-bit integer `rowid` via `xRowid` during cursor scan and passing that `rowid` back as `argv[0]` in `xUpdate`.
-* For any 8-byte memcomparable primary key (`INT` or `REAL` PKs), `aydb` decodes the 8-byte key directly into its exact `i64` bit pattern (`decode_i64_memcomparable`) in `xRowid` without acquiring any mutex or inserting into a hash map. When `xUpdate` receives `argv[0]` and `has_non_int_pks` is `false`, it reverses the bijection (`encode_i64_memcomparable(rid)`) in $O(1)$ on the stack.
-* Only when a variable-length `TEXT` or `BLOB` primary key (`pk.len() != 8`) is stored does `aydb` set `has_non_int_pks = true` and record the FNV-1a 64-bit hash in `rowid_to_pk`, falling back gracefully to `encode_i64_memcomparable(rid)` whenever an 8-byte key is not in the map.
+* An integer primary key is stored as a 9-byte tagged key, which maps bijectively to its `i64` value (`decode_i64_tagged_key` / `encode_i64_tagged_key`). `xRowid` and `xUpdate` use this mapping on the stack without taking a mutex or touching a hash map, as long as `has_non_int_pks` is `false`.
+* For other primary keys, `aydb` sets `has_non_int_pks = true`, derives the rowid with a CRC32C + SplitMix64 hash (`hash_pk_to_rowid`), and records it in the bounded `rowid_to_pk` map.
 
-### 4.3 Transaction Lifecycle Callbacks (`xBegin`, `xCommit`, `xRollback`) & Multi-Sector WAL Coalescing
+### 4.3 Transaction Lifecycle Callbacks (`xBegin`, `xSync`, `xCommit`, `xRollback`) & Multi-Sector WAL Coalescing
 To eliminate per-row 4 KB WAL sector padding on multi-row `BEGIN ... COMMIT` transactions and multi-table OLTP workloads (such as TPC-B):
-1. **`xBegin` (`engine.begin_transaction()`):** Activates in-memory WAL batch buffering (`in_transaction = true`).
-2. **Row Mutations inside a Transaction:** Each `put_row_owned` / `delete_row` serializes its WAL records (`PutInline`, `PutBlobPtr`, `Delete`) directly into `pending_tx_buf` and transfers ownership of the row buffer into the `MemTable` (`apply_wal_batch_owned`) with **zero heap clones**, so subsequent reads inside the same transaction immediately observe the uncommitted changes (read-your-own-writes).
-3. **`xCommit` (`engine.commit_transaction()`):** Packs all accumulated records in `pending_tx_buf` tightly across contiguous 4 KB sectors inside `WalStreamWriter::multi_sector_buf` and issues a **single coalesced `write_all_at` I/O call** to `wal_buf.db` or `wal_sync.db`.
-4. **`xRollback` (`engine.rollback_transaction()`):** Discards `pending_tx_buf` without touching disk and reconstructs the `MemTable` from the committed WAL streams (`wal_sync.db` + `wal_buf.db`), strictly preserving ACID atomicity and rollback semantics.
+1. **`xBegin` (`begin_transaction_for_conn`):** Makes the connection the owner of the single writer slot. If another connection owns it, `xBegin` waits up to `writer_wait_timeout_ms` before failing with `SQLITE_BUSY`. A transaction spanning several virtual tables increments the nesting depth once per table.
+2. **Row Mutations inside a Transaction:** Each `put_row_owned` / `delete_row` serializes its WAL records into `pending_tx_buf` and applies the mutation to a private `TxOverlay`. The owner reads its own writes through the overlay. Other connections read only committed data, so the cost of hiding a transaction does not depend on its size.
+3. **`xSync` (`prepare_commit_transaction`):** Runs capped-table quota evictions inside the transaction, flushes or syncs the blob writers, and checks WAL capacity, so that fallible work surfaces while `xRollback` can still undo everything.
+4. **`xCommit` (`begin_commit_for_conn`):** Packs the records of `pending_tx_buf` across contiguous 4 KB sectors and issues a **single coalesced `write_all_at` call** to `wal_buf.db` or `wal_sync.db`. For a synchronous commit, the device flush runs outside the engine lock and is shared with other commits, as described in `ARCHITECTURE.md` §4.5. The overlay moves into the `MemTable` once the commit is durable.
+5. **`xRollback` (`rollback_transaction_for_conn`):** Discards `pending_tx_buf` and the overlay without touching disk, and restores in-memory table metadata from the snapshot taken at `xBegin`. `xSavepoint` and `xRollbackTo` use an undo log inside the overlay.
+
+---
+
+## 5. Concurrency Model
+
+* **Shared engine, per-connection state:** All connections to a database share one `Arc<RwLock<StorageEngine<OsFs>>>`. Cursors and statements belong to a connection.
+* **Reads:** Most reads run under the shared lock through `reader_for_conn`. A read takes the exclusive lock only when it may touch the owner's unflushed blobs or when `EagerWriteOnRead` tracking applies.
+* **Writes:** One transaction owns the writer slot at a time. The slot is released as soon as a group-committed batch is written, so transactions overlap only while earlier commits wait for their flush.
+* **Compaction:** The first registration of the module starts one background worker per engine (`src/vtab/compaction_worker.rs`), which merges segments without holding the engine lock. Registrations are reference-counted, and the last one stops the worker.
+* **Lock scope:** Virtual table callbacks take the engine lock for the duration of the callback only, never across a SQLite callback boundary.

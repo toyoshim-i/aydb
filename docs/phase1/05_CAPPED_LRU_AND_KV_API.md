@@ -1,10 +1,10 @@
 # Chapter 1.5: Capped Tables (`MAX_BYTES`), Delayed LRU Eviction, Memcomparable Keys, and Unified Engine API
 
-This chapter defines the detailed architecture of **Step 1-5: Memcomparable Key Encoding (`src/lru/key_codec.rs`), Coalesced In-Memory `AccessTick` & Lazy LRU Promotion (`src/lru/mod.rs`), Copy-less Per-Table Blob Eviction, and the Unified Phase 1 `StorageEngine` Coordinator (`src/engine/mod.rs`)**.
+This chapter defines the detailed architecture of **Step 1-5: Memcomparable Key Encoding (`src/index/key_codec.rs`), Coalesced In-Memory `AccessTick` & Lazy LRU Promotion (`src/lru/mod.rs`), Copy-less Per-Table Blob Eviction, and the Unified Phase 1 `StorageEngine` Coordinator (`src/engine/mod.rs`)**.
 
 ---
 
-## 1. Memcomparable Binary Key Encoding (`src/lru/key_codec.rs`)
+## 1. Memcomparable Binary Key Encoding (`src/index/key_codec.rs`)
 
 Because `aydb` stores all tables, secondary indexes, and LRU eviction queues inside a unified sorted key space (`MemTable` and `idx_<SeqID>.db`), every logical record key must serialize into a byte sequence whose **unsigned lexicographical byte order (`memcmp`) matches its logical sort order**.
 
@@ -25,7 +25,7 @@ Every internal key begins with a 2-byte big-endian `TableID` (`u16::to_be_bytes(
 | **Primary Row Key** | `'r'` (`0x72`) | `[TableID: u16 BE \| 'r' \| EncodedPK]` | Maps primary key to row payload (inline bytes or 23-byte `BlobPtr`) |
 | **Secondary Index Key** | `'i'` (`0x69`) | `[TableID: u16 BE \| 'i' \| IndexID: u16 BE \| EncodedCol \| EncodedPK]` | Maps indexed column value + primary key to empty value (`[]`) |
 | **LRU Queue Key** | `'l'` (`0x6C`) | `[TableID: u16 BE \| 'l' \| AccessTick: u64 BE \| EncodedPK]` | Orders rows of a capped table from oldest `AccessTick` to newest |
-| **Reverse Tick Lookup** | `'t'` (`0x74`) | `[TableID: u16 BE \| 't' \| EncodedPK]` | Stores `[RecordedTick: u64 BE \| LogicalSize: u32 BE]` (12 B inline) for exact quota accounting & lazy LRU verification |
+| **Reverse Tick Lookup** | `'t'` (`0x74`) | `[TableID: u16 BE \| 't' \| EncodedPK]` | Stores a `RowMetaRecord` (recorded tick, logical size, and secondary index values) for exact quota accounting, lazy LRU verification, and index cleanup |
 
 ### 1.2 Order-Preserving Primitive Encodings
 
@@ -68,39 +68,41 @@ flowchart TB
 
 ### 2.1 Why Lazy Promotion Beats Eager LRU Index Maintenance
 * **Zero Index Churn While Below Quota:** As long as `CurrentLogicalBytes <= MAX_BYTES`, reading hot cache keys thousands of times per second mutates only a single `u64` entry in the in-memory `AccessTracker` hash map (`~25 nanoseconds`, zero WAL records, zero MemTable insertions).
-* **Coalesced Batch Flush on MemTable Spill / Checkpoint:** If the in-memory `AccessTracker` reaches its entry cap (default: `65,536` distinct keys) or when an explicit checkpoint is requested, dirty `AccessTick` updates can either be retained for lazy promotion or flushed in a single batch.
+* **Bounded Tracker:** When the in-memory `AccessTracker` reaches its entry cap (default: `65,536` distinct keys), the older half of its ticks is dropped, and those keys fall back to their recorded tick. Ticks are not written back at a flush or checkpoint; they take effect through lazy promotion during eviction.
 * **Exact $O(1)$ Quota Accounting via `'t'` Metadata Key:** Because `[TableID | 't' | EncodedPK]` stores both the currently indexed `RecordedTick: u64` and `LogicalSize: u32`, overwriting or explicitly deleting a key `PK` immediately knows the exact `OldTick` to tombstone (`[TableID | 'l' | OldTick | PK]`) and the exact `LogicalSize` to subtract from `CurrentLogicalBytes` without having to read the old multi-megabyte blob from disk!
 
 ---
 
 ## 3. Per-Table Physical Isolation & $O(1)$ Copy-less Blob Segment Eviction
 
-When a Capped Table (e.g., `CREATE TABLE http_cache (...) MAX_BYTES = 1073741824`) stores out-of-line blobs (`>= 1024 B`), `aydb` routes those blobs to **per-table LRU blob segments** (`blob_lru_<TblID>_<SeqID>.db`) rather than mixing them into `blob_std_<SeqID>.db`:
+When a Capped Table (e.g., a virtual table declared with `max_bytes = 1073741824`) stores out-of-line blobs (`>= 1024 B`), `aydb` routes those blobs to **per-table LRU blob segments** (`blob_lru_<TblID>_<SeqID>.db`) rather than mixing them into `blob_std_<SeqID>.db`:
 
 1. **No Cross-Table Fragmentation:** Permanent user tables (`blob_std_<SeqID>.db`) never share physical files with high-churn cache tables (`blob_lru_0001_<SeqID>.db`).
 2. **Segment Rolling & Dead-Byte Accounting:**
    * Each `blob_lru_<TblID>_<SeqID>.db` rolls to a new `SeqID` once its size reaches `max_blob_segment_bytes` (default: `64 MB`, configurable down to `64 KB` for testing/small caches).
-   * The engine tracks `{ total_live_bytes, dead_bytes }` per blob segment. Whenever a row referencing `blob_lru_<TblID>_<SeqID>.db` is overwritten, deleted, or LRU-evicted, its framed blob length is added to `dead_bytes` (decrementing `total_live_bytes`).
+   * The engine tracks `{ file_len, dead_bytes }` per blob segment. Whenever a row referencing `blob_lru_<TblID>_<SeqID>.db` is overwritten, deleted, or LRU-evicted, its framed blob length is added to `dead_bytes`.
 3. **$O(1)$ Copy-less Segment Deletion:**
-   * Because LRU eviction retires entries in chronological `AccessTick` order, older `blob_lru_<TblID>_<SeqID>.db` segments naturally drain to `total_live_bytes == 0`.
-   * The moment a sealed `blob_lru_<TblID>_<SeqID>.db` segment reaches `0` live bytes, the engine drops its reader handle and **deletes the entire physical file via `remove_file`** (or queues it in `BootMetaState.obsolete_files` if a concurrent reader still holds an `Arc` clone)—reclaiming tens of megabytes of disk space in $O(1)$ time with **zero blob-to-blob copying**!
+   * Because LRU eviction retires entries in chronological `AccessTick` order, older `blob_lru_<TblID>_<SeqID>.db` segments naturally become fully dead.
+   * The moment a sealed `blob_lru_<TblID>_<SeqID>.db` segment is fully dead, the engine drops its reader handle and **deletes the entire physical file via `remove_file`** (or leaves it in `pending_delete_files` if it cannot be removed yet)—reclaiming tens of megabytes of disk space in $O(1)$ time with **zero blob-to-blob copying**!
 
 ---
 
 ## 4. Unified Phase 1 `StorageEngine` API (`src/engine/mod.rs`)
 
-`StorageEngine<F: PalFile>` integrates all five Phase 1 subsystems behind a clean, thread-safe coordinator API:
+`StorageEngine<FS: PlatformFs>` integrates all five Phase 1 subsystems behind one coordinator API. Callers that share it between threads wrap it in `Arc<RwLock<_>>`:
 
 | Method | Description |
 | :--- | :--- |
-| `StorageEngine::open(root_dir, config)` | Opens/locks `boot_meta.db`, sweeps orphaned/obsolete files, loads active `idx_<SeqID>.db` & `blob_*.db` segments, replays two-stream WAL (`wal_sync.db` + `wal_buf.db`), and rebuilds in-memory quota/LRU state. |
+| `StorageEngine::open(fs, config)` | Recovers `boot_meta.db`, reserves `SeqID`s above existing files, loads active `idx_<SeqID>.db` & `blob_*.db` segments, replays the two-stream WAL (`wal_sync.db` + `wal_buf.db`), rebuilds in-memory quota/LRU state, rotates both WAL epochs, and sweeps orphaned files. |
 | `register_capped_table(table_id, max_bytes)` | Configures a `TableID` as a Capped Table with automatic `MAX_BYTES` LRU eviction and dedicated `blob_lru_<TblID>_<SeqID>.db` storage. |
 | `put_row(table_id, pk, value, secondary_keys, durability)` | Writes a row (plus optional secondary index entries), routes payloads `>= inline_threshold` to `blob_std` or `blob_lru`, logs to the Epoch WAL, updates `MemTable`, and enforces `MAX_BYTES` quota via lazy-promoted LRU eviction. |
 | `get_row(table_id, pk)` | Looks up `[TableID \| 'r' \| pk]` across `MemTable` and active `idx_<SeqID>.db` segments (protected by Bloom filters & sparse fence pointers), dereferences `BlobPtr` if out-of-line, and updates the in-memory `AccessTracker` in $O(1)$ with zero disk writes. |
-| `delete_row(table_id, pk, secondary_keys, durability)` | Tombstones the primary row, secondary indexes, and LRU queue entry, decrements `CurrentLogicalBytes`, and reclaims dead blob segments when `live_bytes == 0`. |
+| `delete_row(table_id, pk, durability)` | Tombstones the primary row, secondary indexes, and LRU queue entry, decrements `CurrentLogicalBytes`, and reclaims fully dead blob segments. Returns whether a row was deleted. |
 | `scan_table(table_id)` / `lookup_by_secondary_index(table_id, index_id, col_val)` | Performs a merged forward range scan across `MemTable` and all `idx_<SeqID>.db` segments in memcomparable key order. |
-| `flush_memtable()` | Flushes the active `MemTable` to a new `idx_<SeqID>.db` segment, rotates the WAL epoch (`active_wal_epoch` + `checkpoint_lsn`), and commits `boot_meta.db`. |
+| `flush_memtable()` | Flushes the active `MemTable` to a new `idx_<SeqID>.db` segment, rotates both WAL epochs (`sync_wal_epoch`, `buf_wal_epoch`, and `checkpoint_lsn`), and commits `boot_meta.db`. |
 | `compact()` | Runs multi-way merge compaction across active `idx_<SeqID>.db` segments, commits the new segment list to `boot_meta.db`, and unlinks superseded segments via Deferred GC. |
+| `checkpoint()` | Brings persisted state up to date so that the next `open` has no replay work. Dropping the engine does not do this. |
+| `begin_transaction()` / `commit_transaction()` / `rollback_transaction()` | Groups mutations into one atomic WAL batch. Uncommitted writes live in a private overlay until the commit. The `*_for_conn` variants add connection ownership for SQL. |
 
 ---
 

@@ -127,7 +127,7 @@ To prevent dangling pointers (where an index entry survives recovery but its tar
 
 1. **Write Ordering:** Always write `[Magic | BlobCRC32C | Key | Value]` to `blob_<SeqID>.db` first, and only then append the pointer record `[Key | BlobSegID | Offset | Len | BlobCRC32C]` to the WAL (`wal_sync.db` or `wal_buf.db`).
 2. **CRC Verification on Recovery and Read:**
-   Expensive `FlushFileBuffers` calls on `blob` files are omitted on every write. Instead, during WAL replay after a power failure (or during normal reads), the engine verifies the `BlobCRC32C` stored in the WAL/index against the actual bytes in the `blob` file. If a power outage prevented the blob write from reaching disk (file truncated or CRC mismatch), the engine does **not** treat the database as corrupted; instead, it safely discards the uncommitted record. This validation happens only at startup (`recover_two_streams` + `validate_blob_ptr` for WAL-replayed pointers; blobs referenced from `idx` segments were synced before their checkpoint). After open, a blob that fails verification (CRC/magic/key mismatch, short read, missing segment) is genuine corruption and is **never** silently reported as absence: per-table `on_corrupt` policy either returns `InvalidData` / `SQLITE_CORRUPT` naming the table and primary key (`error`, default for uncapped tables; explicit deletes still succeed and clean up) or hides the row and queues it for automatic deletion at the next safe write (`evict`, default for capped tables). Both modes bump `StorageEngine::corrupt_blob_detections()`.
+   For `BufferedFast` commits, expensive `FlushFileBuffers` calls on `blob` files are omitted. (`SyncTransactional` commits sync the blob writers before the WAL record.) Instead, during WAL replay after a power failure (or during normal reads), the engine verifies the `BlobCRC32C` stored in the WAL/index against the actual bytes in the `blob` file. If a power outage prevented the blob write from reaching disk (file truncated or CRC mismatch), the engine does **not** treat the database as corrupted; instead, it safely discards the uncommitted record. This validation happens only at startup (`recover_two_streams` + `validate_blob_ptr` for WAL-replayed pointers; blobs referenced from `idx` segments were synced before their checkpoint). After open, a blob that fails verification (CRC/magic/key mismatch, short read, missing segment) is genuine corruption and is **never** silently reported as absence: per-table `on_corrupt` policy either returns `InvalidData` / `SQLITE_CORRUPT` naming the table and primary key (`error`, default for uncapped tables; explicit deletes still succeed and clean up) or hides the row and queues it for automatic deletion at the next safe write (`evict`, default for capped tables). Both modes bump `StorageEngine::corrupt_blob_detections()`.
    Recovery applies the startup validation per stream. In `wal_sync.db` a batch whose blob cannot be verified is dropped on its own, because the blob is synced before the WAL record is written. In `wal_buf.db` blobs and WAL records are flushed independently, so a power loss can persist a later commit while losing an earlier one. Recovery of the buffered stream therefore has **prefix semantics**: it stops at the first batch (or transaction group) with an unverifiable blob and discards everything after it in that stream, so that replay never exposes a hole in the commit order. Only a blob that was never durably written counts as unverifiable. A real I/O error while reading a blob during validation is not treated as absence; it aborts recovery and fails the open, so that a transient error cannot cause a committed batch to be dropped.
 3. **WAL Failure Poisons the Engine:**
    If a WAL write or sync fails, the engine is poisoned: further mutations return errors until the database is reopened, while reads keep working. After reopen, the failed commit's outcome is unknown (it may or may not be present, but it is never partially applied).
@@ -166,23 +166,26 @@ SQL tables, primary rows, and secondary indexes are mapped into a single ordered
 
 * **Primary Row Data:**
   * Key: `[TableID (2B) | 'r' (1B) | EncodedPrimaryKey]`
-  * Value: `[RowByteSize (4B) | LastAccessTick (8B) | ColBitmask | InlineColumnValues... | LargeColumnBlobPointers...]`
+  * Value: The row payload (inline bytes), or a `BlobPtr` when it is stored out of line.
 * **Secondary Index:**
   * Key: `[TableID (2B) | 'i' (1B) | IndexID (2B) | EncodedIndexColumns | EncodedPrimaryKey]`
   * Value: `Empty`
 * **System-Managed LRU Tracking Index:**
   * Key: `[TableID (2B) | 'l' (1B) | AccessTick (8B, Big-Endian) | EncodedPrimaryKey]`
-  * Value: `[RowByteSize (4B)]`
+  * Value: `Empty`
+* **Row Metadata (capped tables and tables with secondary indexes):**
+  * Key: `[TableID (2B) | 't' (1B) | EncodedPrimaryKey]`
+  * Value: `RowMetaRecord`: the recorded `AccessTick`, the logical size, and the secondary index values of the row.
 
 ### 5.2 Per-Table Size Caps (`MAX_BYTES`) and Zero-Write-Amplification Approximate LRU
 
-Automatic eviction mechanism for tables declared with size bounds (e.g., `CREATE TABLE http_cache (...) WITH (MAX_BYTES = 104857600, EVICTION = 'LRU')`):
+Automatic eviction mechanism for tables declared with size bounds (e.g., a virtual table declared with `max_bytes = 104857600`):
 
 1. **Logical Size Counter (`CurrentLogicalBytes`):**
    Each table maintains an atomic counter tracking the total logical bytes of all live rows (key length + inline column bytes + referenced blob lengths).
 2. **Deferred Access Timestamp Updates on `SELECT` (In-Memory Access Coalescing):**
-   Writing a new `AccessTick` to disk on every `SELECT` would turn reads into writes and degrade performance. Instead, a read hit updates `[TableID, PK] -> LatestTick` inside a **small bounded in-memory ring buffer / hash table (capped at a few hundred KB)** with zero disk I/O.
-   Once a configurable time window elapses (e.g., several minutes) or when the MemTable flushes, accumulated access timestamp updates are batch-applied to the system LRU index (`[TableID | 'l' | ...]`).
+   Writing a new `AccessTick` to disk on every `SELECT` would turn reads into writes and degrade performance. Instead, a read hit updates `[TableID, PK] -> LatestTick` inside a **bounded in-memory map** (`max_in_memory_access_ticks` keys, default 65,536; the older half is dropped when full) with zero disk I/O.
+   Ticks are not written back on a timer or at a flush. During quota enforcement (below), a row whose in-memory tick is newer than its queue entry is promoted in the LRU index instead of being evicted.
 3. **Automatic Eviction Sequence on Quota Overflow:**
    When an `INSERT` or `UPDATE` causes `CurrentLogicalBytes > MAX_BYTES`, the engine iterates from the beginning of `[TableID | 'l' | ...]` (smallest `AccessTick` = oldest accessed rows) and executes cascading eviction:
    * Fetches the primary row `[TableID | 'r' | PK]` and deletes the primary row, all associated secondary index entries `[TableID | 'i' | ...]`, and the system LRU entry.
@@ -279,7 +282,7 @@ pub trait PlatformFile: Send + Sync {
 * Implement the `PlatformFile` trait (Windows / Unix) and extended-length path normalization (`\\?\` prefix on Windows to bypass `MAX_PATH` limits).
 * Implement `boot_meta.db` (ping-pong buffer), pre-allocated fixed-size `wal_sync.db` / `wal_buf.db` (Epoch + CRC recovery), and the KV-separated `idx` / `blob` segment engine.
 * Implement per-table `MAX_BYTES` accounting, the in-memory `AccessTick` coalescing buffer, and automatic LRU eviction.
-* Expose a low-level Rust-native Ordered KV API (`get`, `put`, `delete`, `scan_prefix`, `batch_write`).
+* Expose a low-level Rust-native Ordered KV API (`get_row`, `put_row`, `delete_row`, `scan_table`, transactions).
 
 ### Phase 2: SQLite Virtual Table Adapter & Benchmark Verification
 * Implement a SQLite `sqlite3_module` (`xBestIndex`, `xFilter`, `xUpdate`) backed by the Phase 1 storage engine.

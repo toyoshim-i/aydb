@@ -18,12 +18,12 @@ A conventional rolling WAL (creating a new log file per MemTable flush, appendin
 ### How `aydb` Solves All Four Challenges
 
 1. **Pre-Allocated Fixed-Size Sector Rings (`WalEpoch` Reuse):**
-   `wal_sync.db` (default `8 MB` = 2,048 sectors of 4 KB, `PhysicalZeroFill`) and `wal_buf.db` (default `16 MB` = 4,096 sectors of 4 KB, `LogicalExtendOnly`) are pre-allocated once and never resized or deleted. When a `MemTable` flushes, the engine increments `sync_wal_epoch` and `buf_wal_epoch` in `boot_meta.db` and wraps the write cursor back to Sector 0 with **zero file truncation and zero disk clearing**.
+   `wal_sync.db` (default `8 MB` = 2,048 sectors of 4 KB, `PhysicalZeroFill`) and `wal_buf.db` (default `16 MB` = 4,096 sectors of 4 KB, `LogicalExtendOnly`) are pre-allocated once and never deleted. They grow only when a single transaction would not otherwise fit (`ensure_min_size`). When a `MemTable` flushes, the engine increments `sync_wal_epoch` and `buf_wal_epoch` in `boot_meta.db` and wraps the write cursor back to Sector 0 with **zero file truncation and zero disk clearing**.
 2. **Strict Sector Isolation for `wal_sync.db` vs. Dense Sector Packing for `wal_buf.db`:**
    * **`wal_sync.db` (`Durability::Sync`):** Every synchronous commit batch advances to a fresh 4 KB sector boundary. Once a 4 KB sector in `wal_sync.db` is written and acknowledged, it is **never overwritten again during the same `WalEpoch`**, making torn-overwrite corruption of committed data mathematically impossible.
    * **`wal_buf.db` (`Durability::Buffered`):** Multiple buffered commits are packed back-to-back inside the current 4 KB sector buffer and written through to the OS Page Cache (`CcCopyWrite`), surviving `kill -9` / `TerminateProcess` while achieving high storage density.
 3. **Two-Stream `LSN` Merge Recovery + `Write-Blob-Before-WAL` Verification:**
-   Upon recovery, valid batches from `wal_sync.db` and `wal_buf.db` are extracted independently, filtered by `lsn > checkpoint_lsn`, and merge-sorted in ascending `LSN` order. Any `PutBlobPtr` record whose target blob range fails CRC32C verification (because a power outage occurred before the buffered blob write reached disk) is safely skipped as an incomplete write rather than corrupting the database.
+   Upon recovery, valid batches from `wal_sync.db` and `wal_buf.db` are extracted independently, filtered by `lsn > checkpoint_lsn`, and merge-sorted in ascending `LSN` order. Any `PutBlobPtr` record whose target blob range fails CRC32C verification (because a power outage occurred before the buffered blob write reached disk) is treated as an incomplete write rather than corruption. How much is discarded depends on the stream (§4).
 
 ---
 
@@ -141,7 +141,9 @@ WalRecord :=
 | **Pre-allocation** | `PreallocStrategy::PhysicalZeroFill` (`VDL == EOF`) | `PreallocStrategy::LogicalExtendOnly` |
 | **OS Open Hint** | `OpenHint::MutableSyncLog` (device flush per commit) | `OpenHint::MutableBufferedLog` (`FILE_FLAG_SEQUENTIAL_SCAN`) |
 | **Sector Packing Policy** | **Sector-Isolated:** Every `append_batch` call starts at a fresh 4 KB sector boundary and advances the cursor to the next 4 KB boundary so committed sectors are never overwritten in place. | **Densely Packed:** Small batches are packed into the active 4 KB in-memory sector buffer (if remaining space `>= 3 + batch_bytes.len()`, or split across sectors) and immediately written to the OS Page Cache. |
-| **Crash Guarantee** | Durable when the commit returns (survives process crash, OS panic, and power loss, assuming the device honours write-through). | Survives process crash / `kill -9` / `TerminateProcess` (via OS Page Cache). Power loss / OS crash may roll back recent unsynced commits. |
+| **Crash Guarantee** | Durable when the commit returns (survives process crash, OS panic, and power loss, assuming the device honours flush requests). | Survives process crash / `kill -9` / `TerminateProcess` (via OS Page Cache). Power loss / OS crash may roll back recent unsynced commits. |
+
+A synchronous append normally ends with a device flush. SQL commits write the sector first and wait for a flush outside the engine lock, so that one flush can cover several commits (`ARCHITECTURE.md` §4.5).
 
 #### Subtlety in `wal_buf.db` In-Place Sector Packing and Power Loss
 In `wal_buf.db`, suppose a 4 KB sector buffer in memory receives Batch 1 (`100 B`), which is written to `Sector k` in the OS Page Cache (`write_all_at`), and then receives Batch 2 (`100 B`), updating `Sector k` in the OS Page Cache with both Batch 1 and Batch 2.
@@ -149,8 +151,8 @@ In `wal_buf.db`, suppose a 4 KB sector buffer in memory receives Batch 1 (`100 B
 * If the process is killed via `TerminateProcess`, the intact 4 KB sector containing both Batch 1 and Batch 2 sits in kernel RAM and flushes cleanly to disk.
 * If a full power outage occurs while the OS Lazy Writer is flushing `Sector k` to disk, `Durability::Buffered` explicitly permits rolling back recent unflushed seconds of cache mutations; even if `Sector k` tears on power loss, `SectorCrc32c` catches it and truncates the buffered stream cleanly at `Sector k`.
 
-### 3.2 Handling Ring Full (`ErrorKind::StorageFull` $\rightarrow$ Trigger MemTable Flush)
-Because a fixed-size WAL ring holds a single active `WalEpoch` at a time, if an incoming batch requires $M$ sectors and `current_sector_idx + M > total_sectors`, the writer returns `WalAppendResult::RingFull`. The coordinator (`StorageEngine`) responds by flushing the active `MemTable` to a new `idx_<SeqID>.db`, advancing `sync_wal_epoch` / `buf_wal_epoch` in `boot_meta.db`, calling `wal.reset_for_new_epoch(new_epoch)` (which resets `current_sector_idx = 0` in $O(1)$ without touching the disk), and retrying the append.
+### 3.2 Handling Ring Full (`WalAppendOutcome::RingFull` $\rightarrow$ Trigger MemTable Flush)
+Because a fixed-size WAL ring holds a single active `WalEpoch` at a time, if an incoming batch requires $M$ sectors and `current_sector_idx + M > total_sectors`, the writer returns `WalAppendOutcome::RingFull`. The coordinator (`StorageEngine`) first makes any commits waiting for a group flush durable, then responds by flushing the active `MemTable` to a new `idx_<SeqID>.db`, advancing `sync_wal_epoch` / `buf_wal_epoch` in `boot_meta.db`, calling `wal.reset_for_new_epoch(new_epoch)` (which resets `current_sector_idx = 0` in $O(1)$ without touching the disk), and retrying the append.
 
 ---
 
@@ -183,7 +185,7 @@ If a WAL write or sync fails at runtime, the engine is poisoned: mutations fail 
 Once both `sync_batches` and `buf_batches` have been recovered:
 1. Any batch with `batch.lsn <= boot_meta.checkpoint_lsn` is filtered out (already persisted in an `idx_<SeqID>.db` segment).
 2. The two sorted slices (`sync_batches` and `buf_batches`) are merged in $O(N)$ by ascending `batch.lsn`.
-3. For each `WalRecord::PutBlobPtr`, the recovery coordinator invokes a caller-supplied `BlobValidator` callback (`Fn(&BlobPtr) -> bool`). Following the **`Write-Blob-Before-WAL`** protocol, if a power outage prevented an un-fsynced blob payload from reaching disk, `BlobValidator` returns `false` and that uncommitted record is safely skipped without aborting recovery!
+3. For each `WalRecord::PutBlobPtr`, the recovery coordinator invokes a caller-supplied validator (`FnMut(&BlobPtr) -> io::Result<bool>`). Following the **`Write-Blob-Before-WAL`** protocol, `Ok(false)` means the blob never reached disk. In `wal_sync.db` only that batch is dropped, because blobs are synced before the WAL record is written. In `wal_buf.db` recovery stops at the first such batch and discards the rest of that stream, so replay never exposes a hole in the commit order. `Err` is a real I/O error and fails the open, so a transient error cannot drop a committed batch.
 
 ---
 
