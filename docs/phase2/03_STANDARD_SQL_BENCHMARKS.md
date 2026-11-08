@@ -91,7 +91,7 @@ Each `TPC-B`-style transaction executes `BEGIN` + 5 parameterized SQL statements
 | **Sustained Full Sync (8,000 transactions)** | `817 TPS` | `1,088 TPS` | `1.07×` |
 
 * **Why Transaction Coalescing (`xBegin` $\rightarrow$ `xSync` $\rightarrow$ `xCommit`) & Row-Metadata Skip Shine in `TPC-B`-Style OLTP:**
-  `aydb` coalesces the 4 table mutations into a **single atomic `WalBatch`** written to a pre-zeroed 4 KB sector in `wal_sync.db`, and skips negative `'t'` metadata probes on uncapped tables without secondary indexes. In buffered mode, where no commit waits for the device, this gives `4.85×` the throughput of SQLite. With full sync both engines wait for one `FlushFileBuffers` per commit, which dominates, so the throughput is about equal (`1.04×`). These runs use a single writer. Group commit raises the throughput of concurrent synchronous writers, which this suite does not measure.
+  `aydb` coalesces the 4 table mutations into a **single atomic `WalBatch`** written to a pre-zeroed 4 KB sector in `wal_sync.db`, and skips negative `'t'` metadata probes on uncapped tables without secondary indexes. In buffered mode, where no commit waits for the device, this gives `4.85×` the throughput of SQLite. With full sync both engines wait for one `FlushFileBuffers` per commit, which dominates, so the throughput is about equal (`1.04×`). These runs use a single writer. Concurrent synchronous writers, which benefit from group commit, are measured in Chapter 2.2 §4.
 
 ---
 

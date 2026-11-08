@@ -157,6 +157,7 @@ aydb/
     ├── wisckey_bench.rs                      # Step 1-4: WiscKey vs. Inline LSM Compaction benchmarks
     ├── lru_engine_bench.rs                   # Step 1-5: Zero-I/O LRU & Quota Eviction benchmarks
     ├── concurrent_read_bench.rs              # Read Scaling Across Threads
+    ├── concurrent_write_bench.rs             # Group Commit & Reads During Synchronous Writes
     ├── tx_isolation_read_bench.rs            # Non-Owner Read Cost During Transactions
     ├── compaction_latency_bench.rs           # Commit Latency: Inline vs. Background Compaction
     ├── reliability_bench.rs                  # Crash-Consistency, Fault-Injection, & Audit Regression Suite

@@ -58,3 +58,31 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 | :--- | ---: | ---: | ---: |
 | **Vanilla SQLite (`SELECT` + `UPDATE access_tick`)** | `30,783 ops/s` | `32.49 µs` | `0.03 MB` WAL + B-Tree Page Dirtying |
 | **`aydb` Virtual Table (`SELECT` w/ Lazy `AccessTracker`)** | **`653,932 ops/s` (`21.24×` faster)** | **`1.53 µs` (`21.2×` lower)** | **`0.00 MB` (Pure In-Memory Update)** |
+
+---
+
+## 4. Benchmark 4: Concurrent Synchronous Commits (`examples/concurrent_write_bench.rs`)
+
+Figures are medians of five runs at commit `ffdb0de` on the same host. Both engines use a full device flush per durable commit (`synchronous = FULL` with `fullfsync` on SQLite, `durability = 'sync'` on `aydb`). The flush time on this SSD alternated between runs, so absolute figures vary by about a factor of two. Ratios are the median of the per-run ratios and are more stable.
+
+### 4.1 Concurrent Writers (Autocommit `UPDATE`, `100 B` Values)
+
+| Writer Connections | Vanilla SQLite | `aydb` Virtual Table | `aydb` `SQLITE_BUSY` | `aydb` / SQLite |
+| ---: | ---: | ---: | ---: | ---: |
+| **1** | `524 tx/s` | `547 tx/s` | `0` | `0.96×` |
+| **2** | `1,070 tx/s` | **`1,522 tx/s`** | `0` | **`1.74×`** |
+| **4** | `490 tx/s` | **`1,437 tx/s`** | `0` | **`2.93×`** |
+| **8** | `413 tx/s` | **`2,110 tx/s`** | `0` | **`5.20×`** |
+
+A single writer is about level with SQLite, because each commit still waits for one device flush. With more writers, SQLite performs one flush per commit, so its throughput does not rise. `aydb` covers every commit written before a flush starts with that one flush (`ARCHITECTURE.md` §4.5), so throughput rises with concurrency.
+
+### 4.2 Point Reads From 4 Connections During Synchronous Commits
+
+| Engine & Writer | Commits/s | Reads/s | P50 | P99 | P99.9 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **Vanilla SQLite**, no writer | `0` | `661,837` | `5.2 µs` | `18.1 µs` | `41.0 µs` |
+| **`aydb`**, no writer | `0` | **`2,001,071`** | **`1.8 µs`** | **`2.8 µs`** | **`8.6 µs`** |
+| **Vanilla SQLite**, 1 synchronous writer | `538` | `339,521` | `9.1 µs` | `50.7 µs` | `138.1 µs` |
+| **`aydb`**, 1 synchronous writer | `516` | **`2,217,183`** | **`1.6 µs`** | **`3.1 µs`** | **`28.6 µs`** |
+
+`aydb` waits for the device flush without the engine lock, and readers keep using the committed state, so a synchronous writer leaves read throughput nearly unchanged.

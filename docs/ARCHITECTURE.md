@@ -306,7 +306,7 @@ Measured figures are in the phase chapters, each labelled with the commit it was
 
 * **Point reads** served from the MemTable or the verified caches avoid a system call, and are where `aydb` is strongest. Reads also continue at nearly full speed during synchronous commits (§4.5).
 * **Buffered commits** are faster because each one coalesces into a single WAL batch in the OS cache.
-* **Concurrent synchronous writers** share device flushes (§4.5). A single synchronous writer is about level with SQLite, because the device flush dominates the commit once both engines flush the device.
+* **Concurrent synchronous writers** share device flushes (§4.5; measured in phase 2, Chapter 2.2 §4). A single synchronous writer is about level with SQLite, because the device flush dominates the commit once both engines flush the device.
 * **Bulk writes inside one transaction** are slower through the SQLite virtual table: each row crosses the `sqlite3_module` boundary and checks primary key uniqueness.
 * **Updates to values stored out of line** cost at least two writes per buffered commit (blob append and WAL sector).
 * **Short range scans** are slower: rows of a B-tree are clustered in leaf pages, while `aydb` needs a blob read per out-of-line row, and merges several sorted sources.
