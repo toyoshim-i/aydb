@@ -6,7 +6,8 @@ The site has three parts:
 * index.html: the repository README rendered to HTML.
 * docs/: the Markdown files under docs/ rendered to HTML, with the
   figures from docs/assets copied next to them.
-* results.html: test and benchmark results collected by the CI workflow.
+* results.html: test and benchmark results collected by the CI workflow,
+  with bar charts rendered as plain HTML and CSS.
 
 Dependencies: Python 3 and the "markdown" package (pip install markdown).
 
@@ -22,6 +23,7 @@ Missing files are reported as "no result"; they never abort the build.
 
 import argparse
 import html
+import math
 import posixpath
 import re
 import shutil
@@ -111,6 +113,84 @@ details > summary { cursor: pointer; font-weight: 600; }
 details details { margin-left: 1em; }
 pre.raw { max-height: 32em; overflow: auto; }
 """
+
+CHART_CSS = """
+:root { --s0: #2a78d6; --s1: #eb6834; --s2: #1baf7a; }
+@media (prefers-color-scheme: dark) {
+  :root { --s0: #3987e5; --s1: #d95926; --s2: #199e70; }
+}
+figure.chart { margin: 1.5em 0 2em; }
+figure.chart figcaption { font-weight: 600; line-height: 1.35; }
+figure.chart figcaption span { display: block; font-weight: 400;
+                               font-size: 0.875em; color: var(--muted); }
+.c-legend { display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 8px 0;
+            font-size: 0.875em; color: var(--muted); }
+.c-legend i { display: inline-block; width: 10px; height: 10px;
+              border-radius: 2px; margin-right: 6px; }
+.c-row, .c-axis { display: grid; column-gap: 12px;
+                  grid-template-columns: minmax(0, 36%) minmax(0, 1fr); }
+.c-row { border-radius: 4px; }
+.c-row:hover, .c-row:focus-visible { background: var(--row); }
+.c-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.c-label { align-self: center; font-size: 0.875em; line-height: 1.3;
+           padding: 4px 0 4px 4px; }
+.c-plot { position: relative; padding: 5px 0; }
+.c-grid { position: absolute; top: 0; bottom: 0; width: 1px;
+          background: var(--border); }
+.c-grid.base { background: var(--muted); }
+.c-track { position: relative; height: 10px; margin-top: 2px; }
+.c-track:first-of-type { margin-top: 0; }
+.c-bar { position: absolute; top: 0; bottom: 0; min-width: 2px; }
+.c-bar.up { border-radius: 0 4px 4px 0; }
+.c-bar.down { border-radius: 4px 0 0 4px; }
+.c-bar.s0, .c-legend i.s0 { background: var(--s0); }
+.c-bar.s1, .c-legend i.s1 { background: var(--s1); }
+.c-bar.s2, .c-legend i.s2 { background: var(--s2); }
+.c-ticks { position: relative; height: 1.6em; font-size: 0.75em;
+           color: var(--muted); font-variant-numeric: tabular-nums; }
+.c-ticks span { position: absolute; top: 2px; transform: translateX(-50%);
+                white-space: nowrap; }
+.c-ticks span.first { transform: none; }
+.c-ticks span.last { transform: translateX(-100%); }
+.c-tip { position: fixed; z-index: 10; max-width: min(420px, 92vw);
+         padding: 6px 10px; border-radius: 6px; pointer-events: none;
+         background: var(--bg); color: var(--fg);
+         border: 1px solid var(--border); font-size: 0.8125em;
+         white-space: pre-line; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+@media (max-width: 640px) {
+  .c-row, .c-axis { grid-template-columns: minmax(0, 1fr); }
+  .c-axis .c-label { display: none; }
+  .c-label { padding-bottom: 0; }
+}
+"""
+
+CHART_SCRIPT = """<script>
+(() => {
+  const tip = document.createElement("div");
+  tip.className = "c-tip";
+  tip.hidden = true;
+  document.body.append(tip);
+  const hide = () => { tip.hidden = true; };
+  const show = (event) => {
+    const row = event.target.closest(".c-row[data-tip]");
+    if (!row) { hide(); return; }
+    tip.textContent = row.dataset.tip;
+    tip.hidden = false;
+    const box = row.getBoundingClientRect();
+    const size = tip.getBoundingClientRect();
+    const left = Math.max(8, Math.min(box.right - size.width,
+                                      innerWidth - size.width - 8));
+    const above = box.top - size.height - 6;
+    const top = above >= 8 ? above : box.bottom + 6;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  };
+  document.addEventListener("pointerover", show);
+  document.addEventListener("focusin", show);
+  document.addEventListener("focusout", hide);
+  document.addEventListener("scroll", hide, true);
+})();
+</script>"""
 
 NAV_ITEMS = [
     ("overview", "Overview", "index.html"),
@@ -486,36 +566,42 @@ def os_summary_table(os_name, entry):
     return "\n".join(out)
 
 
+def merged_tables(data, bench):
+    """Merge one benchmark's tables across operating systems.
+
+    Tables are matched by (section, index within section) and kept in the
+    order in which they first appear. Returns (order, merged), where
+    merged[key]["rows"][label][os_name] holds the cells after the label.
+    """
+    order = []
+    merged = {}
+    for os_name in OS_NAMES:
+        text = data[os_name]["bench"][bench]
+        seen = {}
+        for section, header, rows in (parse_tables(text) if text else []):
+            index = seen.get(section, 0)
+            seen[section] = index + 1
+            key = (section, index)
+            if key not in merged:
+                merged[key] = {"header": header, "rows": {}, "labels": []}
+                order.append(key)
+            table = merged[key]
+            for cells in rows:
+                if not cells:
+                    continue
+                label = cells[0]
+                if label not in table["rows"]:
+                    table["rows"][label] = {}
+                    table["labels"].append(label)
+                table["rows"][label][os_name] = cells[1:]
+    return order, merged
+
+
 def comparison_tables(data):
     """Cross-OS tables for the SQLite-vs-aydb benchmarks."""
     out = []
     for bench in COMPARED:
-        per_os = {}
-        for os_name in OS_NAMES:
-            text = data[os_name]["bench"][bench]
-            per_os[os_name] = parse_tables(text) if text else []
-        # Merge by (section, table index within section), keeping the order
-        # in which tables first appear.
-        order = []
-        merged = {}
-        for os_name in OS_NAMES:
-            seen = {}
-            for section, header, rows in per_os[os_name]:
-                index = seen.get(section, 0)
-                seen[section] = index + 1
-                key = (section, index)
-                if key not in merged:
-                    merged[key] = {"header": header, "rows": {}, "labels": []}
-                    order.append(key)
-                table = merged[key]
-                for cells in rows:
-                    if not cells:
-                        continue
-                    label = cells[0]
-                    if label not in table["rows"]:
-                        table["rows"][label] = {}
-                        table["labels"].append(label)
-                    table["rows"][label][os_name] = cells[1:]
+        order, merged = merged_tables(data, bench)
         out.append("<h3><code>{}</code></h3>".format(esc(bench)))
         if not order:
             out.append('<p class="none">No parsable table rows (no result).</p>')
@@ -542,6 +628,229 @@ def comparison_tables(data):
                 out.append("</tr>")
             out.append("</tbody></table></div>")
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# Charts
+# --------------------------------------------------------------------------
+
+def first_number(cell):
+    """Return the first number in a table cell, or None."""
+    match = re.search(r"\d+(?:\.\d+)?", cell or "")
+    return float(match.group()) if match else None
+
+
+def ratio_scale(values):
+    """Log2 axis around 1x. Returns (position, base, ticks, tick_label)."""
+    lo_exp = min(-1, math.floor(math.log2(min(values))))
+    hi_exp = max(1, math.ceil(math.log2(max(values))))
+    span = hi_exp - lo_exp
+    step = max(1, math.ceil(span / 6))
+
+    def position(value):
+        return (math.log2(value) - lo_exp) / span * 100
+
+    ticks = [2.0 ** e for e in range(lo_exp, hi_exp + 1) if e % step == 0]
+    return position, 1.0, ticks, lambda value: "{:g}x".format(value)
+
+
+def compact_number(value):
+    for limit, suffix in ((1e6, "M"), (1e3, "K")):
+        if value >= limit:
+            return "{:g}{}".format(value / limit, suffix)
+    return "{:g}".format(value)
+
+
+def linear_scale(high):
+    """Zero-based axis up to a rounded maximum of at least `high`."""
+    magnitude = 10.0 ** math.floor(math.log10(high))
+    step = next(m * magnitude for m in (0.2, 0.5, 1, 2, 5, 10)
+                if high / (m * magnitude) <= 5)
+    top = math.ceil(high / step) * step
+
+    def position(value):
+        return value / top * 100
+
+    ticks = [i * step for i in range(int(round(top / step)) + 1)]
+    return position, 0.0, ticks, compact_number
+
+
+def render_chart(title, note, rows, scale):
+    """Render grouped horizontal bars, one track per operating system.
+
+    `rows` is a list of (label, {os_name: (value, detail)}); `scale` is the
+    result of ratio_scale or linear_scale.
+    """
+    out = ['<figure class="chart"><figcaption>{}<span>{}</span></figcaption>'
+           .format(esc(title), esc(note))]
+    out.append('<div class="c-legend">{}</div>'.format("".join(
+        '<span><i class="s{}"></i>{}</span>'.format(i, esc(os_name))
+        for i, os_name in enumerate(OS_NAMES))))
+    position, base, ticks, tick_label = scale
+    grid = "".join(
+        '<div class="c-grid{}" style="left:{:.3f}%"></div>'.format(
+            " base" if tick == base else "", position(tick))
+        for tick in ticks)
+    for label, values in rows:
+        lines = [label]
+        tracks = []
+        for i, os_name in enumerate(OS_NAMES):
+            if os_name not in values:
+                lines.append("{}: no result".format(os_name))
+                tracks.append('<div class="c-track"></div>')
+                continue
+            value, detail = values[os_name]
+            lines.append("{}: {}".format(os_name, detail))
+            start, end = sorted((position(base), position(value)))
+            tracks.append(
+                '<div class="c-track"><div class="c-bar s{} {}" '
+                'style="left:{:.3f}%;width:{:.3f}%"></div></div>'.format(
+                    i, "up" if value >= base else "down", start, end - start))
+        tip = esc("\n".join(lines))
+        out.append(
+            '<div class="c-row" tabindex="0" role="img" aria-label="{0}" '
+            'data-tip="{0}"><div class="c-label">{1}</div>'
+            '<div class="c-plot">{2}{3}</div></div>'.format(
+                tip, esc(label), grid, "".join(tracks)))
+    tick_spans = []
+    for tick in ticks:
+        edge = (' class="first"' if position(tick) < 0.5 else
+                ' class="last"' if position(tick) > 99.5 else "")
+        tick_spans.append('<span{} style="left:{:.3f}%">{}</span>'.format(
+            edge, position(tick), esc(tick_label(tick))))
+    out.append('<div class="c-axis"><div class="c-label"></div>'
+               '<div class="c-ticks">{}</div></div></figure>'.format(
+                   "".join(tick_spans)))
+    return "".join(out)
+
+
+def ratio_chart(title, note, rows):
+    """Render a ratio chart, or a "no result" line when `rows` has no data."""
+    rows = [(label, values) for label, values in rows if values]
+    if not rows:
+        return '<p class="none">{}: no result</p>'.format(esc(title))
+    values = [value for _, per_os in rows for value, _ in per_os.values()]
+    return render_chart(title, note, rows, ratio_scale(values))
+
+
+def reported_ratio_rows(table):
+    """Rows of a table whose last column is a reported ratio such as 0.83x."""
+    rows = []
+    for label in table["labels"]:
+        values = {}
+        for os_name, cells in table["rows"][label].items():
+            ratio = first_number(cells[-1]) if len(cells) >= 2 else None
+            if ratio:
+                values[os_name] = (ratio, "{:.2f}x ({})".format(
+                    ratio, " vs ".join(cells[:-1])))
+        rows.append((label, values))
+    return rows
+
+
+def computed_ratio(table, base_prefix, other_prefix):
+    """{os_name: (ratio, detail)} from the first column of two table rows.
+
+    The rows are found by label prefix; the ratio is other / base.
+    """
+    def find(prefix, os_name):
+        for label in table["labels"]:
+            cells = table["rows"][label].get(os_name)
+            if label.startswith(prefix) and cells:
+                return cells[0]
+        return None
+
+    values = {}
+    for os_name in OS_NAMES:
+        base_cell = find(base_prefix, os_name)
+        other_cell = find(other_prefix, os_name)
+        base, other = first_number(base_cell), first_number(other_cell)
+        if base and other:
+            values[os_name] = (other / base, "{:.2f}x ({} vs {})".format(
+                other / base, base_cell, other_cell))
+    return values
+
+
+def sqlite_charts(data):
+    out = []
+    order, merged = merged_tables(data, "standard_sql_bench")
+    note = ("aydb relative to SQLite, log scale. Right of 1x: aydb is faster. "
+            "Left of 1x: SQLite is faster.")
+    for key in order:
+        table = merged[key]
+        if re.search(r"ratio|speedup", table["header"][-1], re.I):
+            out.append(ratio_chart(key[0], note, reported_ratio_rows(table)))
+    order, merged = merged_tables(data, "sqlite_vs_aydb_bench")
+    rows = []
+    for key in order:
+        label = re.sub(r"^BENCHMARK \d+ \(Phase 2\):\s*", "", key[0])
+        rows.append((label, computed_ratio(merged[key], "Vanilla", "aydb")))
+    out.append(ratio_chart("Application scenarios (sqlite_vs_aydb_bench)",
+                           note, rows))
+    return "\n".join(out)
+
+
+def concurrent_read_charts(data):
+    """One chart per workload: reads/s at each thread count."""
+    workloads = {}
+    for os_name in OS_NAMES:
+        text = data[os_name]["bench"]["concurrent_read_bench"]
+        for _section, header, rows in (parse_tables(text) if text else []):
+            if len(header) < 3 or header[1] != "threads":
+                continue
+            for cells in rows:
+                reads = first_number(cells[2]) if len(cells) >= 3 else None
+                if reads:
+                    per_thread = workloads.setdefault(cells[0], {})
+                    per_thread.setdefault(cells[1], {})[os_name] = (
+                        reads, "{:,.0f} reads/s".format(reads))
+    title = "Concurrent reads: {}"
+    if not workloads:
+        return '<p class="none">{}: no result</p>'.format(esc(title.format("all")))
+    high = max(value for rows in workloads.values() for per_os in rows.values()
+               for value, _ in per_os.values())
+    scale = linear_scale(high)
+    out = []
+    for workload, rows in workloads.items():
+        out.append(render_chart(
+            title.format(workload), "Reads per second by thread count.",
+            [("{} thread{}".format(t, "" if t == "1" else "s"), values)
+             for t, values in rows.items()], scale))
+    return "\n".join(out)
+
+
+def pal_charts(data):
+    """aydb OsFile against std::fs::File in pal_bench benchmark 2."""
+    order, merged = merged_tables(data, "pal_bench")
+    tables = [merged[key] for key in order if key[0].startswith("BENCHMARK 2")]
+    note = ("aydb OsFile relative to std::fs::File, log scale. "
+            "Right of 1x: OsFile is faster.")
+    out = []
+    if tables:
+        rows = [("{} thread{}".format(label, "" if label == "1" else "s"), values)
+                for label, values in reported_ratio_rows(tables[0])]
+        out.append(ratio_chart("Hot-cache 4 KB reads", note, rows))
+    if len(tables) > 1:
+        out.append(ratio_chart(
+            "4 KB reads while another thread writes and flushes", note,
+            [("8 readers", computed_ratio(tables[1], "std::fs::File", "aydb"))]))
+    if not out:
+        out.append('<p class="none">pal_bench: no result</p>')
+    return "\n".join(out)
+
+
+def charts_section(data):
+    return "\n".join([
+        "<h2>Benchmark charts</h2>",
+        '<p class="meta">Each chart shows one run per operating system. Hover '
+        "or focus a row for its values. The tables and raw output below hold "
+        "every number.</p>",
+        "<h3>aydb compared with SQLite</h3>",
+        sqlite_charts(data),
+        "<h3>Read scaling</h3>",
+        concurrent_read_charts(data),
+        "<h3>Positional reads: aydb OsFile compared with std::fs::File</h3>",
+        pal_charts(data),
+    ])
 
 
 def raw_outputs(data):
@@ -588,12 +897,14 @@ def build_results(artifacts, out, meta, repo_url):
     ]
     for os_name in OS_NAMES:
         body.append(os_summary_table(os_name, data[os_name]))
+    body.append(charts_section(data))
     body.append("<h2>Benchmark comparison across operating systems</h2>")
     body.append(comparison_tables(data))
     body.append("<h2>Raw output</h2>")
     body.append(raw_outputs(data))
+    body.append(CHART_SCRIPT)
     html_text = page("Test and benchmark results", "\n".join(body), "",
-                     "results")
+                     "results", "<style>{}</style>\n".format(CHART_CSS))
     (out / "results.html").write_text(html_text, encoding="utf-8")
 
 
