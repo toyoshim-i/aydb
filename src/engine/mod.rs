@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use crate::blob::{
     BLOB_RECORD_HEADER_LEN, BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_BLOB_SEGMENT_SIZE,
 };
+use crate::cache::{BlobCacheKey, VerifiedBlobCache, VerifiedBlockCache};
 use crate::index::{
     DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, decode_lru_queue_key,
     decode_secondary_index_pk_slice,
@@ -120,6 +121,12 @@ pub const DEFAULT_AUTO_COMPACT_SEGMENT_THRESHOLD: usize = 8;
 /// Default maximum in-memory transaction footprint (`64 MB`). `0` disables the limit.
 pub const DEFAULT_MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default block cache capacity in bytes (`4 MB`). `0` disables the cache.
+pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default small blob cache capacity in bytes (`4 MB`). `0` disables the cache.
+pub const DEFAULT_BLOB_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Configuration parameters for [`StorageEngine`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -145,6 +152,10 @@ pub struct EngineConfig {
     pub max_segments_before_inline_compaction: usize,
     /// Maximum uncommitted transaction payload + WAL record budget in bytes (`0` = unlimited).
     pub max_transaction_bytes: usize,
+    /// Total capacity for in-process verified 4 KB index block cache (`0` disables block cache).
+    pub block_cache_bytes: usize,
+    /// Total capacity for in-process verified small blob payload cache (`0` disables blob cache).
+    pub blob_cache_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -163,6 +174,8 @@ impl Default for EngineConfig {
             background_compaction: false,
             max_segments_before_inline_compaction: 0,
             max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
+            block_cache_bytes: DEFAULT_BLOCK_CACHE_BYTES,
+            blob_cache_bytes: DEFAULT_BLOB_CACHE_BYTES,
         }
     }
 }
@@ -271,6 +284,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Explicit per-table corruption policies (absent -> derived default, see
     /// [`Self::corrupt_policy`]).
     corrupt_policies: HashMap<u16, CorruptPolicy>,
+    /// Explicit per-table inline threshold overrides in bytes (see [`Self::set_table_inline_threshold`]).
+    table_inline_thresholds: BTreeMap<u16, usize>,
+    /// In-process verified 4 KB index block cache.
+    pub(crate) block_cache: Arc<VerifiedBlockCache>,
+    /// In-process small verified blob payload cache.
+    pub(crate) blob_cache: Arc<VerifiedBlobCache>,
     /// Engine-wide count of blob verification failures observed by reads/cleanup paths.
     corrupt_blob_detections: AtomicU64,
     /// Rows awaiting automatic deletion under [`CorruptPolicy::Evict`]. Filled from `&self` read
@@ -284,10 +303,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut meta_mgr = BootMetaManager::open_or_recover_deferred_sweep(fs.clone())?;
         let state_snapshot = meta_mgr.state().clone();
 
+        let block_cache = Arc::new(VerifiedBlockCache::new(config.block_cache_bytes));
+        let blob_cache = Arc::new(VerifiedBlobCache::new(config.blob_cache_bytes));
+
         // 1. Open active `idx_<SeqID>.db` segments
         let mut idx_segments = Vec::with_capacity(state_snapshot.idx_segments.len());
         for seg_meta in &state_snapshot.idx_segments {
-            let reader = IdxSegmentReader::open(&*fs, seg_meta.seq_id)?;
+            let mut reader = IdxSegmentReader::open(&*fs, seg_meta.seq_id)?;
+            reader.set_block_cache(Some(Arc::clone(&block_cache)));
             idx_segments.push(Arc::new(reader));
         }
 
@@ -671,6 +694,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             last_buf_synced_lsn: 0,
             poisoned: None,
             corrupt_policies: HashMap::new(),
+            table_inline_thresholds: BTreeMap::new(),
+            block_cache,
+            blob_cache,
             corrupt_blob_detections: AtomicU64::new(0),
             pending_corrupt_evictions: Mutex::new(HashMap::new()),
         };
@@ -888,6 +914,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.corrupt_policies.remove(&table_id);
+        self.table_inline_thresholds.remove(&table_id);
+        self.blob_cache.invalidate_table_blobs(table_id);
         if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
             q.retain(|(tid, _), _| *tid != table_id);
         }
@@ -1087,8 +1115,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // 2. Write out-of-line blob FIRST if `value.len() >= inline_threshold_bytes` or if inline entry exceeds 4 KB block
-        let store_as_blob = value.len() >= self.config.inline_threshold_bytes
+        // 2. Write out-of-line blob FIRST if `value.len() >= effective_inline_threshold` or if inline entry exceeds 4 KB block
+        let inline_thresh = self.effective_inline_threshold(table_id);
+        let store_as_blob = value.len() >= inline_thresh
             || !IndexEntry::inline_fits_in_block(row_key.len(), value.len());
         if self.tx_depth > 0
             && !self.tx_preparing
@@ -1721,6 +1750,42 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    /// Sets the per-table inline threshold override in bytes.
+    pub fn set_table_inline_threshold(&mut self, table_id: u16, bytes: usize) {
+        self.table_inline_thresholds.insert(table_id, bytes);
+    }
+
+    /// Removes any per-table inline threshold override for `table_id`, restoring default.
+    pub fn reset_table_inline_threshold(&mut self, table_id: u16) {
+        self.table_inline_thresholds.remove(&table_id);
+    }
+
+    /// Effective inline payload threshold for `table_id`.
+    /// - If explicitly configured via `inline_max` / `set_table_inline_threshold`, returns that value.
+    /// - Else if `table_id` is a capped table, returns `self.config.inline_threshold_bytes.min(DEFAULT_INLINE_THRESHOLD)` (1024),
+    ///   preserving O(1) copyless LRU segment eviction.
+    /// - Else returns `self.config.inline_threshold_bytes`.
+    pub fn effective_inline_threshold(&self, table_id: u16) -> usize {
+        if let Some(&thresh) = self.table_inline_thresholds.get(&table_id) {
+            return thresh;
+        }
+        if self.capped_tables.contains_key(&table_id) {
+            self.config.inline_threshold_bytes.min(DEFAULT_INLINE_THRESHOLD)
+        } else {
+            self.config.inline_threshold_bytes
+        }
+    }
+
+    /// Reference to the engine's in-process verified block cache.
+    pub fn block_cache(&self) -> &Arc<VerifiedBlockCache> {
+        &self.block_cache
+    }
+
+    /// Reference to the engine's in-process small blob cache.
+    pub fn blob_cache(&self) -> &Arc<VerifiedBlobCache> {
+        &self.blob_cache
+    }
+
     /// Number of blob verification failures (or dangling blob pointers) detected since open.
     pub fn corrupt_blob_detections(&self) -> u64 {
         self.corrupt_blob_detections.load(Ordering::Relaxed)
@@ -1847,18 +1912,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // The pinned handle must see the blob bytes: committed blobs are always flushed; the
         // owner view may need its writer buffer flushed first (exclusive caller retries).
         self.ensure_flushed_cx(cx, ptr)?;
+
+        let cache_key = BlobCacheKey {
+            kind: ptr.kind as u8,
+            table_id: ptr.table_id,
+            seg_id: ptr.seg_id,
+            offset: ptr.offset,
+        };
+        let start = slab.len();
+        if self.blob_cache.get_append_into(&cache_key, slab) {
+            let end = slab.len();
+            self.track_read_hit(cx, table_id, pk);
+            return Ok(Some((start, end)));
+        }
+
         let Some(reader) = &lazy.reader else {
             // Segment was already absent when the pointer was captured: dangling pointer.
             self.note_corrupt_blob(row_key, ptr)?;
             return Ok(None);
         };
-        let start = slab.len();
         if !reader.append_blob_into(ptr, Some(row_key), slab)? {
             slab.truncate(start);
             self.note_corrupt_blob(row_key, ptr)?;
             return Ok(None);
         }
         let end = slab.len();
+
+        if self.is_blob_eligible_for_cache(ptr) {
+            self.blob_cache.insert(cache_key, &slab[start..end]);
+        }
 
         self.track_read_hit(cx, table_id, pk);
 
@@ -2081,26 +2163,68 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.read_blob_ref(ptr, expected_key)
     }
 
+    fn is_blob_eligible_for_cache(&self, ptr: &BlobPtr) -> bool {
+        if self.config.blob_cache_bytes == 0 || (ptr.len as usize) > 16 * 1024 {
+            return false;
+        }
+        match ptr.kind {
+            BlobKind::Standard => {
+                if let Some(w) = &self.active_std_writer {
+                    if w.seq_id() == ptr.seg_id {
+                        return (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset();
+                    }
+                }
+                true
+            }
+            BlobKind::Lru => {
+                if let Some(w) = self.active_lru_writers.get(&ptr.table_id) {
+                    if w.seq_id() == ptr.seg_id {
+                        return (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset();
+                    }
+                }
+                true
+            }
+        }
+    }
+
     /// Reads and verifies a blob that is already flushed (no policy applied).
     pub(super) fn read_blob_ref(
         &self,
         ptr: &BlobPtr,
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
-        match ptr.kind {
+        let mut out = Vec::new();
+        let cache_key = BlobCacheKey {
+            kind: ptr.kind as u8,
+            table_id: ptr.table_id,
+            seg_id: ptr.seg_id,
+            offset: ptr.offset,
+        };
+        if self.blob_cache.get_append_into(&cache_key, &mut out) {
+            return Ok(Some(out));
+        }
+
+        let res = match ptr.kind {
             BlobKind::Standard => {
                 let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
                     return Ok(None);
                 };
-                b.reader.read_blob(ptr, Some(expected_key))
+                b.reader.read_blob(ptr, Some(expected_key))?
             }
             BlobKind::Lru => {
                 let Some(b) = self.lru_blobs.get(&(ptr.table_id, ptr.seg_id)) else {
                     return Ok(None);
                 };
-                b.reader.read_blob(ptr, Some(expected_key))
+                b.reader.read_blob(ptr, Some(expected_key))?
+            }
+        };
+
+        if let Some(payload) = &res {
+            if self.is_blob_eligible_for_cache(ptr) {
+                self.blob_cache.insert(cache_key, payload);
             }
         }
+        Ok(res)
     }
 
     pub(super) fn dereference_blob_append_into_cx(
@@ -2120,6 +2244,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         expected_key: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
+        let cache_key = BlobCacheKey {
+            kind: ptr.kind as u8,
+            table_id: ptr.table_id,
+            seg_id: ptr.seg_id,
+            offset: ptr.offset,
+        };
+
+        let orig_len = out.len();
+        if self.blob_cache.get_append_into(&cache_key, out) {
+            return Ok(true);
+        }
+
         let reader = match ptr.kind {
             BlobKind::Standard => self.std_blobs.get(&ptr.seg_id).map(|b| &b.reader),
             BlobKind::Lru => self
@@ -2135,6 +2271,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !ok {
             // Corruption or dangling pointer: apply the table's policy (Err for `Error`).
             self.note_corrupt_blob(expected_key, ptr)?;
+        } else if self.is_blob_eligible_for_cache(ptr) {
+            self.blob_cache.insert(cache_key, &out[orig_len..]);
         }
         Ok(ok)
     }

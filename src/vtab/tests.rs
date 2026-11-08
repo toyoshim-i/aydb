@@ -2684,3 +2684,71 @@ fn owner_reads_own_uncommitted_blob_while_other_connection_reads_committed() {
         assert_eq!(rows[0][0], SqlValue::Text(new));
     });
 }
+
+#[test]
+fn vtab_inline_max_ddl_option_inlines_large_rows() {
+    let tmp = TempTestDir::new("vtab_inline_max_test");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 1024;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+
+    // 1. Table with inline_max = 2500
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_inline USING aydb(
+            table_id = 1,
+            inline_max = 2500,
+            columns = 'id INT PRIMARY KEY, val BLOB'
+        );",
+    )
+    .unwrap();
+
+    conn.execute_batch("INSERT INTO t_inline(id, val) VALUES (1, zeroblob(2000));")
+        .unwrap();
+
+    let rows = conn
+        .query_all("SELECT id, length(val) FROM t_inline WHERE id = 1", &[])
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Integer(1), SqlValue::Integer(2000)]]
+    );
+
+    // Verify engine stored it inline (no blob segment written)
+    {
+        let eng = engine.read().unwrap();
+        assert_eq!(eng.effective_inline_threshold(1), 2500);
+        assert_eq!(eng.std_blobs.len(), 0);
+    }
+
+    // 2. Table with inline_max = 256
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_blob USING aydb(
+            table_id = 2,
+            inline_max = 256,
+            columns = 'id INT PRIMARY KEY, val BLOB'
+        );",
+    )
+    .unwrap();
+
+    conn.execute_batch("INSERT INTO t_blob(id, val) VALUES (1, zeroblob(500));")
+        .unwrap();
+
+    let rows = conn
+        .query_all("SELECT id, length(val) FROM t_blob WHERE id = 1", &[])
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Integer(1), SqlValue::Integer(500)]]
+    );
+
+    // Verify engine stored it as out-of-line blob
+    {
+        let eng = engine.read().unwrap();
+        assert_eq!(eng.effective_inline_threshold(2), 256);
+        assert!(eng.active_std_writer.is_some());
+    }
+}

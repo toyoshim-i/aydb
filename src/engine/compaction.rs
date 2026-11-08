@@ -135,7 +135,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let new_seq_id = self.meta_mgr.state().next_seq_id;
 
-        let new_reader = match self.memtable.write_to_segment(
+        let mut new_reader = match self.memtable.write_to_segment(
             &*self.fs,
             new_seq_id,
             self.config.bloom_bits_per_key,
@@ -146,6 +146,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Err(e);
             }
         };
+        new_reader.set_block_cache(Some(Arc::clone(&self.block_cache)));
         let idx_meta = IdxSegmentMeta {
             seq_id: new_reader.seq_id(),
             file_len: new_reader.file_len(),
@@ -202,9 +203,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std_seqs {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
         if !dead_blob_files.is_empty() {
@@ -567,15 +570,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std_seqs {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
 
         let CompactionOutput {
-            new_segment, inputs, ..
+            mut new_segment, inputs, ..
         } = out;
+        if let Some(r) = Arc::get_mut(&mut new_segment) {
+            r.set_block_cache(Some(Arc::clone(&self.block_cache)));
+        }
+        for inp in &inputs {
+            self.block_cache.invalidate_segment(inp.seq_id());
+        }
         let removed: Vec<_> = self
             .idx_segments
             .splice(start..start + k, std::iter::once(new_segment))
@@ -656,6 +667,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut deleted_files = Vec::with_capacity(dead_lru.len());
         for &(tid, seq) in &dead_lru {
             deleted_files.push(format_lru_blob_file_name(tid, seq));
+            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
             self.lru_blobs.remove(&(tid, seq));
         }
 
@@ -679,9 +691,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru {
+            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
 

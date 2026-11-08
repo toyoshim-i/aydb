@@ -15,6 +15,8 @@ pub(super) struct ParsedVtabDdl {
     pub(super) durability: WriteDurability,
     /// Explicit `on_corrupt=error|evict`; `None` keeps the engine default (capped -> evict).
     pub(super) on_corrupt: Option<CorruptPolicy>,
+    /// Explicit per-table inline threshold override in bytes; `None` keeps engine default.
+    pub(super) inline_max: Option<usize>,
     pub(super) columns_spec: String,
     pub(super) col_names: Vec<String>,
     pub(super) col_affinities: Vec<ColumnAffinity>,
@@ -74,6 +76,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut max_bytes: u64 = 0;
         let mut durability = WriteDurability::BufferedFast;
         let mut on_corrupt: Option<CorruptPolicy> = None;
+        let mut inline_max: Option<usize> = None;
         let mut columns_spec = String::from("key TEXT PRIMARY KEY, value BLOB");
         let mut indexes_spec = String::new();
 
@@ -112,6 +115,10 @@ pub(super) unsafe fn parse_vtab_ddl(
                             return Err(SQLITE_ERROR);
                         }
                     }
+                    "inline_max" => match val.parse::<usize>() {
+                        Ok(thresh) if thresh <= 4096 => inline_max = Some(thresh),
+                        _ => return Err(SQLITE_ERROR),
+                    },
                     "columns" => {
                         columns_spec = val.to_string();
                     }
@@ -215,6 +222,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             max_bytes,
             durability,
             on_corrupt,
+            inline_max,
             columns_spec,
             col_names,
             col_affinities,
@@ -259,5 +267,30 @@ mod tests {
         );
         assert_eq!(parse(&["on_corrupt=ignore"]).err(), Some(SQLITE_ERROR));
         assert_eq!(parse(&["on_corrupt="]).err(), Some(SQLITE_ERROR));
+    }
+
+    #[test]
+    fn inline_max_option_parsing() {
+        assert_eq!(parse(&[]).unwrap().inline_max, None);
+        assert_eq!(
+            parse(&["inline_max=2048"]).unwrap().inline_max,
+            Some(2048)
+        );
+        assert_eq!(
+            parse(&["inline_max=0"]).unwrap().inline_max,
+            Some(0)
+        );
+        assert_eq!(
+            parse(&["INLINE_MAX=4096"]).unwrap().inline_max,
+            Some(4096)
+        );
+        assert_eq!(
+            parse(&["inline_max = '3500'"]).unwrap().inline_max,
+            Some(3500)
+        );
+        assert_eq!(parse(&["inline_max=4097"]).err(), Some(SQLITE_ERROR));
+        assert_eq!(parse(&["inline_max=-1"]).err(), Some(SQLITE_ERROR));
+        assert_eq!(parse(&["inline_max=abc"]).err(), Some(SQLITE_ERROR));
+        assert_eq!(parse(&["inline_max="]).err(), Some(SQLITE_ERROR));
     }
 }

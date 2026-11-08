@@ -3561,3 +3561,195 @@ fn concurrent_shared_readers_never_see_torn_or_uncommitted_pairs() {
         assert!(total > 0);
     });
 }
+
+#[test]
+fn table_inline_threshold_override_and_effective_default_for_capped_tables() {
+    let tmp = TempTestDir::new("inline_threshold_test");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 1024;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    // 1. Table 1 (uncapped): default effective threshold = 1024
+    assert_eq!(engine.effective_inline_threshold(1), 1024);
+    let val_2048 = vec![0x44u8; 2048];
+    engine
+        .put_row(1, b"key1", &val_2048, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    // Default spills to standard blob segment
+    assert_eq!(engine.std_blobs.len(), 1);
+
+    // Override inline threshold for Table 1 to 2500 bytes
+    engine.set_table_inline_threshold(1, 2500);
+    assert_eq!(engine.effective_inline_threshold(1), 2500);
+    let initial_blob_len = engine.active_std_writer.as_ref().unwrap().current_len();
+    engine
+        .put_row(1, b"key2", &val_2048, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    // Inlined into MemTable! No bytes appended to blob segment!
+    assert_eq!(
+        engine.active_std_writer.as_ref().unwrap().current_len(),
+        initial_blob_len
+    );
+    assert_eq!(engine.get_row(1, b"key2").unwrap(), Some(val_2048.clone()));
+
+    // 2. Table 2: Capped LRU Table
+    engine.register_capped_table(2, 50_000).unwrap();
+    // Globally raise inline_threshold_bytes to 3584
+    engine.config.inline_threshold_bytes = 3584;
+    // Uncapped table 1 (with reset override) would get 3584:
+    engine.reset_table_inline_threshold(1);
+    assert_eq!(engine.effective_inline_threshold(1), 3584);
+    // BUT capped table 2 must remain at 1024 by default to preserve O(1) LRU blob segment eviction!
+    assert_eq!(engine.effective_inline_threshold(2), 1024);
+
+    let val_1500 = vec![0x66u8; 1500];
+    engine
+        .put_row(2, b"cap1", &val_1500, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    // Spilled to LRU blob segment because 1500 >= 1024
+    assert!(engine.active_lru_writers.contains_key(&2));
+
+    // Explicit override on capped table is honored:
+    engine.set_table_inline_threshold(2, 2048);
+    assert_eq!(engine.effective_inline_threshold(2), 2048);
+
+    // 3. Table 3: Low override spills small rows
+    engine.set_table_inline_threshold(3, 256);
+    assert_eq!(engine.effective_inline_threshold(3), 256);
+    let val_500 = vec![0x77u8; 500];
+    let prev_blob_len = engine.active_std_writer.as_ref().unwrap().current_len();
+    engine
+        .put_row(3, b"k3", &val_500, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(engine.active_std_writer.as_ref().unwrap().current_len() > prev_blob_len);
+
+    // 4. Dropping table cleans up threshold
+    engine.drop_table(3, None).unwrap();
+    assert_eq!(engine.effective_inline_threshold(3), 3584);
+}
+
+#[test]
+fn block_cache_and_blob_cache_hits_and_segment_invalidation_lifecycle() {
+    let tmp = TempTestDir::new("cache_lifecycle_test");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.block_cache_bytes = 64 * 1024;
+    cfg.blob_cache_bytes = 64 * 1024;
+    cfg.inline_threshold_bytes = 1024;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    assert!(engine.block_cache().is_enabled());
+    assert!(engine.blob_cache().is_enabled());
+
+    // 1. Populate 100 inline rows
+    for i in 0..100u32 {
+        let k = format!("k_{i:04}").into_bytes();
+        let v = format!("val_{i:04}").into_bytes();
+        engine
+            .put_row(1, &k, &v, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    // Also write a 2048 B blob
+    let blob_val = vec![0xBBu8; 2048];
+    engine
+        .put_row(1, b"blob_row", &blob_val, &[], WriteDurability::BufferedFast)
+        .unwrap();
+
+    // Flush to create segment 1 and sealed blob segment
+    engine.flush_memtable().unwrap();
+    assert_eq!(engine.idx_segments.len(), 1);
+
+    let _initial_block_hits = engine.block_cache().hits();
+    let _initial_blob_hits = engine.blob_cache().hits();
+
+    // Pass 1: read all rows -> cache misses on initial block load, populated into cache
+    for i in 0..100u32 {
+        let k = format!("k_{i:04}").into_bytes();
+        assert!(engine.get_row(1, &k).unwrap().is_some());
+    }
+    assert_eq!(engine.get_row(1, b"blob_row").unwrap(), Some(blob_val.clone()));
+
+    // Pass 2: read all rows again -> must HIT verified block cache and blob cache!
+    let block_hits_after_p1 = engine.block_cache().hits();
+    for i in 0..100u32 {
+        let k = format!("k_{i:04}").into_bytes();
+        assert!(engine.get_row(1, &k).unwrap().is_some());
+    }
+    assert!(
+        engine.block_cache().hits() > block_hits_after_p1,
+        "Pass 2 point reads must hit VerifiedBlockCache"
+    );
+
+    let blob_hits_after_p1 = engine.blob_cache().hits();
+    assert_eq!(engine.get_row(1, b"blob_row").unwrap(), Some(blob_val));
+    assert!(
+        engine.blob_cache().hits() > blob_hits_after_p1,
+        "Pass 2 blob read must hit VerifiedBlobCache"
+    );
+
+    // Compacting segments invalidates retired segment 1
+    // Write another batch and flush so there are 2 segments for compact() to merge!
+    engine
+        .put_row(1, b"another_row", b"val", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    assert_eq!(engine.idx_segments.len(), 2);
+
+    let seg1_id = engine.idx_segments[0].seq_id();
+    // Verify block was resident in cache before compaction
+    let mut out_block = [0u8; 4096];
+    assert!(engine.block_cache().get_into(seg1_id, 0, &mut out_block));
+
+    engine.compact().unwrap();
+    // Segment 1 blocks are purged from cache upon retirement!
+    assert!(!engine.block_cache().get_into(seg1_id, 0, &mut out_block));
+}
+
+#[test]
+fn full_scan_bypasses_block_cache_insertion() {
+    let tmp = TempTestDir::new("scan_resistance_test");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.block_cache_bytes = 64 * 1024;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    for i in 0..50u32 {
+        let k = format!("s_{i:04}").into_bytes();
+        engine
+            .put_row(1, &k, b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    let seg_id = engine.idx_segments[0].seq_id();
+
+    // Verify cache has no blocks for this segment yet
+    let mut block_buf = [0u8; 4096];
+    assert!(!engine.block_cache().get_into(seg_id, 0, &mut block_buf));
+
+    // Full unbounded table scan (lower: None, upper: None, limit: usize::MAX, keys_only: true)
+    let mut pks = Vec::new();
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    engine
+        .scan_range_into_slab(
+            1,
+            None,
+            None,
+            false,
+            usize::MAX,
+            true,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+            None,
+        )
+        .unwrap();
+    assert_eq!(pks.len(), 50);
+
+    // Full table scan must NOT have inserted the blocks into VerifiedBlockCache!
+    assert!(
+        !engine.block_cache().get_into(seg_id, 0, &mut block_buf),
+        "Full unbounded scan must bypass cache insertion to avoid cache pollution"
+    );
+}

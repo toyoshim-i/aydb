@@ -911,6 +911,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         );
         let mut mem_exhausted = false;
 
+        let is_unbounded_full_scan =
+            seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
+        let populate_cache = !is_unbounded_full_scan;
+
         let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
         let upper_for_overlap = range.upper_for_overlap();
         for seg in &self.idx_segments {
@@ -923,7 +927,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             {
                 continue;
             }
-            seg_cursors.push(seg.cursor_from(range.eff_lo_key, range.eff_lo_inc)?);
+            seg_cursors.push(seg.cursor_from_with_cache(
+                range.eff_lo_key,
+                range.eff_lo_inc,
+                populate_cache,
+            )?);
         }
 
         let mut emitted = 0usize;
@@ -1063,6 +1071,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         );
         let mut mem_exhausted = false;
 
+        let is_unbounded_full_scan =
+            seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
+        let populate_cache = !is_unbounded_full_scan;
+
         let seg_upper_arg = range.seg_upper_arg();
         let upper_for_overlap = range.upper_for_overlap();
         let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
@@ -1076,7 +1088,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             {
                 continue;
             }
-            seg_cursors.push(seg.cursor_reverse_from(seg_upper_arg)?);
+            seg_cursors.push(seg.cursor_reverse_from_with_cache(seg_upper_arg, populate_cache)?);
         }
 
         let mut emitted = 0usize;

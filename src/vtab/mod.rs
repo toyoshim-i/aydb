@@ -517,6 +517,10 @@ unsafe extern "system" fn vtab_create_or_connect(
                 Some(policy) => eng.set_table_corrupt_policy(resolved_id, policy),
                 None => eng.reset_table_corrupt_policy(resolved_id),
             }
+            match ddl.inline_max {
+                Some(max_bytes) => eng.set_table_inline_threshold(resolved_id, max_bytes),
+                None => eng.reset_table_inline_threshold(resolved_id),
+            }
             resolved_id
         };
 

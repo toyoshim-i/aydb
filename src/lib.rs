@@ -18,6 +18,7 @@
 )]
 
 pub mod blob;
+pub mod cache;
 pub mod engine;
 pub mod index;
 pub mod lru;
