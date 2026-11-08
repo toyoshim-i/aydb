@@ -917,9 +917,29 @@ pub struct TwoStreamRecoveryResult {
     pub next_buf_sector_idx: usize,
 }
 
+/// Returns whether every `PutBlobPtr` in `batches` passes `validate_blob`. An `Err` from the
+/// validator is a real I/O failure and is propagated instead of being read as "blob absent".
+fn batches_blobs_valid<V>(batches: &[WalBatch], validate_blob: &mut V) -> io::Result<bool>
+where
+    V: FnMut(&BlobPtr) -> io::Result<bool>,
+{
+    for b in batches {
+        for rec in &b.records {
+            if let WalRecord::PutBlobPtr { blob_ptr, .. } = rec {
+                if !validate_blob(blob_ptr)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Recovers both `wal_sync.db` and `wal_buf.db`, filters out batches with `lsn <= checkpoint_lsn`,
 /// merges them in $O(N)$ by ascending `lsn`, and validates `PutBlobPtr` records via `validate_blob`
-/// (enforcing the `Write-Blob-Before-WAL` crash-consistency protocol).
+/// (enforcing the `Write-Blob-Before-WAL` crash-consistency protocol). `validate_blob` returns
+/// `Ok(false)` for a blob that was never durably written and `Err` for a genuine I/O error, which
+/// aborts recovery so that no committed batch is dropped because of a transient failure.
 pub fn recover_two_streams<F, V>(
     sync_file: &F,
     sync_epoch: u64,
@@ -930,7 +950,7 @@ pub fn recover_two_streams<F, V>(
 ) -> io::Result<TwoStreamRecoveryResult>
 where
     F: PlatformFile,
-    V: FnMut(&BlobPtr) -> bool,
+    V: FnMut(&BlobPtr) -> io::Result<bool>,
 {
     let sync_rec = recover_single_wal_stream(sync_file, sync_epoch)?;
     let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
@@ -941,15 +961,9 @@ where
     // all recovered batches.
     let mut max_lsn = checkpoint_lsn;
     let mut filter_committed_stream =
-        |batches: Vec<WalBatch>, validate_blob: &mut V| -> Vec<WalBatch> {
+        |batches: Vec<WalBatch>, validate_blob: &mut V| -> io::Result<Vec<WalBatch>> {
             let mut out = Vec::with_capacity(batches.len());
             let mut pending_tx: Option<Vec<WalBatch>> = None;
-            let batch_blobs_valid = |b: &WalBatch, validate_blob: &mut V| -> bool {
-                b.records.iter().all(|rec| match rec {
-                    WalRecord::PutBlobPtr { blob_ptr, .. } => validate_blob(blob_ptr),
-                    _ => true,
-                })
-            };
 
             for mut b in batches {
                 if b.lsn > max_lsn {
@@ -970,10 +984,7 @@ where
                         tx_vec.push(b);
                     }
                     if has_commit {
-                        if tx_vec
-                            .iter()
-                            .all(|chunk| batch_blobs_valid(chunk, validate_blob))
-                        {
+                        if batches_blobs_valid(&tx_vec, validate_blob)? {
                             out.extend(tx_vec);
                         }
                         pending_tx = None;
@@ -986,22 +997,21 @@ where
                     }
                     if has_commit {
                         let completed_tx = pending_tx.take().unwrap();
-                        if completed_tx
-                            .iter()
-                            .all(|chunk| batch_blobs_valid(chunk, validate_blob))
-                        {
+                        if batches_blobs_valid(&completed_tx, validate_blob)? {
                             out.extend(completed_tx);
                         }
                     }
-                } else if !b.records.is_empty() && batch_blobs_valid(&b, validate_blob) {
+                } else if !b.records.is_empty()
+                    && batches_blobs_valid(core::slice::from_ref(&b), validate_blob)?
+                {
                     out.push(b);
                 }
             }
-            out
+            Ok(out)
         };
 
-    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob);
-    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob);
+    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob)?;
+    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob)?;
 
     // Two-way merge sort by ascending `lsn` by value (zero-clone).
     let mut merged = Vec::with_capacity(sync_batches.len() + buf_batches.len());
@@ -1301,7 +1311,7 @@ mod tests {
             )
             .unwrap();
 
-        let res = recover_two_streams(&*sync_f, 5, &*buf_f, 3, 10, |ptr| ptr.seg_id == 1)
+        let res = recover_two_streams(&*sync_f, 5, &*buf_f, 3, 10, |ptr| Ok(ptr.seg_id == 1))
             .expect("recover two streams");
 
         // Expected LSN order: 11 (from buf), 12 (from sync), 14 (from sync).
@@ -1426,7 +1436,7 @@ mod tests {
             )
             .unwrap();
 
-        let res = recover_two_streams(&*sync_f, 1, &*buf_f, 1, 0, |_ptr| false)
+        let res = recover_two_streams(&*sync_f, 1, &*buf_f, 1, 0, |_ptr| Ok(false))
             .expect("recover two streams");
 
         // Entire Batch 2 must be discarded so companion Delete("k1") and PutInline("sec_idx_for_k2") are not applied
@@ -1531,7 +1541,7 @@ mod tests {
             &**buf_w.file(),
             1,
             0,
-            |ptr| ptr.seg_id == 7,
+            |ptr| Ok(ptr.seg_id == 7),
         )
         .unwrap();
 

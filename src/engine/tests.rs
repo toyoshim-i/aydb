@@ -3832,3 +3832,104 @@ fn background_install_with_dirty_memtable_does_not_persist_blob_accounting() {
     assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(v));
     assert_eq!(engine.get_row(1, b"k1").unwrap(), Some(b"small".to_vec()));
 }
+
+#[test]
+fn transient_blob_read_error_during_recovery_fails_open_without_dropping_commit() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    struct BlobReadFaultFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        is_blob: bool,
+        fail_blob_reads: Arc<AtomicBool>,
+    }
+
+    impl PlatformFile for BlobReadFaultFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            if self.is_blob && self.fail_blob_reads.load(Ordering::SeqCst) {
+                return Err(io::Error::other("simulated transient read error"));
+            }
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct BlobReadFaultFs {
+        inner: OsFs,
+        fail_blob_reads: Arc<AtomicBool>,
+    }
+
+    impl PlatformFs for BlobReadFaultFs {
+        type File = BlobReadFaultFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(BlobReadFaultFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                is_blob: rel_name.starts_with("blob_"),
+                fail_blob_reads: Arc::clone(&self.fail_blob_reads),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("recovery_transient_blob_error");
+    let fail_flag = Arc::new(AtomicBool::new(false));
+    let make_fs = || {
+        Arc::new(BlobReadFaultFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            fail_blob_reads: Arc::clone(&fail_flag),
+        })
+    };
+    let value = vec![0x11u8; 8192];
+    {
+        let mut engine = StorageEngine::open(make_fs(), EngineConfig::default()).unwrap();
+        engine
+            .put_row(1, b"k", &value, &[], WriteDurability::SyncTransactional)
+            .unwrap();
+    } // crash: the row exists only in the WAL and an uncataloged blob segment
+
+    fail_flag.store(true, Ordering::SeqCst);
+    assert!(
+        StorageEngine::open(make_fs(), EngineConfig::default()).is_err(),
+        "open must fail when blob validation hits an I/O error"
+    );
+
+    fail_flag.store(false, Ordering::SeqCst);
+    let mut engine = StorageEngine::open(make_fs(), EngineConfig::default()).unwrap();
+    assert_eq!(engine.get_row(1, b"k").unwrap(), Some(value));
+}

@@ -299,6 +299,19 @@ pub struct StorageEngine<FS: PlatformFs> {
     pending_corrupt_evictions: Mutex<HashMap<(u16, Vec<u8>), PendingCorruptEviction>>,
 }
 
+/// Opens a blob segment found by directory listing but absent from the catalog. A file that
+/// vanished since the listing is skipped; any other error aborts the caller.
+fn open_uncataloged_blob<FS: PlatformFs>(
+    fs: &FS,
+    fname: &str,
+) -> io::Result<Option<Arc<FS::File>>> {
+    match fs.open_file(fname, false, true, OpenHint::ImmutableSequential) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Opens or recovers a `StorageEngine` rooted at `fs`.
     pub fn open(fs: Arc<FS>, config: EngineConfig) -> io::Result<Self> {
@@ -367,10 +380,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             {
                 if let Ok(seq_id) = u64::from_str_radix(hex, 16) {
                     if !std_blobs.contains_key(&seq_id) {
-                        if let Ok(file) =
-                            fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)
-                        {
-                            let flen = file.file_len().unwrap_or(0);
+                        if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
+                            let flen = file.file_len()?;
                             std_valid_end.insert(seq_id, 0);
                             std_blobs.insert(
                                 seq_id,
@@ -393,10 +404,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         u64::from_str_radix(seq_hex, 16),
                     ) {
                         if !lru_blobs.contains_key(&(tbl_id, seq_id)) {
-                            if let Ok(file) =
-                                fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)
-                            {
-                                let flen = file.file_len().unwrap_or(0);
+                            if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
+                                let flen = file.file_len()?;
                                 lru_valid_end.insert((tbl_id, seq_id), 0);
                                 lru_blobs.insert(
                                     (tbl_id, seq_id),
@@ -478,14 +487,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             state_snapshot.buf_wal_epoch,
             state_snapshot.checkpoint_lsn,
             |ptr| match ptr.kind {
-                BlobKind::Standard => std_blobs
-                    .get(&ptr.seg_id)
-                    .map(|b| b.reader.validate_blob_ptr(ptr))
-                    .unwrap_or(false),
-                BlobKind::Lru => lru_blobs
-                    .get(&(ptr.table_id, ptr.seg_id))
-                    .map(|b| b.reader.validate_blob_ptr(ptr))
-                    .unwrap_or(false),
+                BlobKind::Standard => match std_blobs.get(&ptr.seg_id) {
+                    Some(b) => b.reader.validate_blob_ptr(ptr),
+                    None => Ok(false),
+                },
+                BlobKind::Lru => match lru_blobs.get(&(ptr.table_id, ptr.seg_id)) {
+                    Some(b) => b.reader.validate_blob_ptr(ptr),
+                    None => Ok(false),
+                },
             },
         )?;
 

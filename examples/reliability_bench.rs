@@ -1428,7 +1428,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
                 ],
             ))
             .unwrap();
-            let rec = recover_two_streams(&**sync.file(), 1, &**buf.file(), 1, 0, |_| false).unwrap();
+            let rec = recover_two_streams(&**sync.file(), 1, &**buf.file(), 1, 0, |_| Ok(false)).unwrap();
             let lsns: Vec<u64> = rec.merged_batches.iter().map(|b| b.lsn).collect();
             drop(buf);
             drop(sync);

@@ -343,8 +343,12 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
 
     /// Validates whether `ptr` points to an intact, CRC-verified blob record on disk.
     /// Used by the WAL recovery coordinator (`recover_two_streams`) to filter out uncommitted blobs.
-    pub fn validate_blob_ptr(&self, ptr: &BlobPtr) -> bool {
-        matches!(self.read_blob(ptr, None), Ok(Some(_)))
+    ///
+    /// Returns `Ok(false)` when the record is absent or fails verification (the blob was never
+    /// durably written) and `Err` for genuine I/O errors, which must not be mistaken for an
+    /// uncommitted record.
+    pub fn validate_blob_ptr(&self, ptr: &BlobPtr) -> io::Result<bool> {
+        Ok(self.read_blob(ptr, None)?.is_some())
     }
 }
 
@@ -430,7 +434,7 @@ mod tests {
             crc32c: 0x1122_3344,
         };
         assert!(reader.read_blob(&dangling_ptr, None).unwrap().is_none());
-        assert!(!reader.validate_blob_ptr(&dangling_ptr));
+        assert!(!reader.validate_blob_ptr(&dangling_ptr).unwrap());
     }
 
     #[test]
