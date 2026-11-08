@@ -4129,3 +4129,156 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
     }
     assert!(engine.capped_table_state(1).unwrap().current_logical_bytes > 0);
 }
+
+/// Counts `sync_durable` calls on blob segment files and records the blob sync count observed
+/// at the time of each WAL sync.
+mod blob_sync_counting {
+    use super::*;
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicU64;
+
+    #[derive(Default)]
+    pub struct Ctl {
+        pub blob_syncs: AtomicU64,
+        pub blob_syncs_at_wal_sync: AtomicU64,
+        pub fail_blob_sync: std::sync::atomic::AtomicBool,
+    }
+    pub struct CountFile<F> {
+        inner: Arc<F>,
+        name: String,
+        ctl: Arc<Ctl>,
+    }
+    impl<F> CountFile<F> {
+        fn record_wal_sync(&self) {
+            if self.name.starts_with("wal_sync") {
+                self.ctl
+                    .blob_syncs_at_wal_sync
+                    .store(self.ctl.blob_syncs.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }
+    }
+    impl<F: PlatformFile> PlatformFile for CountFile<F> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.record_wal_sync();
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.record_wal_sync();
+            if self.name.starts_with("blob_") {
+                if self.ctl.fail_blob_sync.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("simulated blob sync failure"));
+                }
+                self.ctl.blob_syncs.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+    pub struct CountFs {
+        pub inner: OsFs,
+        pub ctl: Arc<Ctl>,
+    }
+    impl PlatformFs for CountFs {
+        type File = CountFile<<OsFs as PlatformFs>::File>;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+            Ok(Arc::new(CountFile {
+                inner,
+                name: rel_name.to_string(),
+                ctl: Arc::clone(&self.ctl),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+}
+
+#[test]
+fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
+    use blob_sync_counting::{CountFs, Ctl};
+
+    let tmp = TempTestDir::new("idle_blob_sync");
+    let ctl = Arc::new(Ctl::default());
+    let fs = Arc::new(CountFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        ctl: Arc::clone(&ctl),
+    });
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+
+    // A blob commit must sync the blob segment before its WAL record is made durable.
+    engine.begin_transaction();
+    engine.put_row(1, b"blob", &vec![1u8; 8192], &[], sync).unwrap();
+    engine.commit_transaction().unwrap();
+    let after_blob = ctl.blob_syncs.load(Ordering::SeqCst);
+    assert!(after_blob >= 1);
+    assert_eq!(ctl.blob_syncs_at_wal_sync.load(Ordering::SeqCst), after_blob);
+
+    for i in 0..100u32 {
+        engine.begin_transaction();
+        engine.put_row(1, &i.to_be_bytes(), b"inline", &[], sync).unwrap();
+        engine.prepare_commit_transaction(sync).unwrap();
+        engine.commit_transaction().unwrap();
+    }
+    assert_eq!(ctl.blob_syncs.load(Ordering::SeqCst), after_blob);
+
+    // A later blob write is synced again.
+    engine.begin_transaction();
+    engine.put_row(1, b"blob2", &vec![2u8; 8192], &[], sync).unwrap();
+    engine.commit_transaction().unwrap();
+    assert!(ctl.blob_syncs.load(Ordering::SeqCst) > after_blob);
+}
+
+#[test]
+fn failed_blob_sync_is_retried_by_the_next_commit() {
+    use blob_sync_counting::{CountFs, Ctl};
+
+    let tmp = TempTestDir::new("blob_sync_retry");
+    let ctl = Arc::new(Ctl::default());
+    let fs = Arc::new(CountFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        ctl: Arc::clone(&ctl),
+    });
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    engine.begin_transaction();
+    engine.put_row(1, b"blob", &vec![3u8; 8192], &[], sync).unwrap();
+
+    ctl.fail_blob_sync.store(true, Ordering::SeqCst);
+    assert!(engine.prepare_commit_transaction(sync).is_err());
+    ctl.fail_blob_sync.store(false, Ordering::SeqCst);
+    let before = ctl.blob_syncs.load(Ordering::SeqCst);
+    engine.prepare_commit_transaction(sync).unwrap();
+    assert!(ctl.blob_syncs.load(Ordering::SeqCst) > before);
+}

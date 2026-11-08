@@ -38,6 +38,10 @@ pub struct BlobSegmentWriter<F: PlatformFile> {
     seq_id: u64,
     write_offset: u64,
     buf_start_offset: u64,
+    /// File offset up to which `sync_durable` has completed successfully. Bytes below this
+    /// offset need no further OS sync; the value starts at zero so that the first sync after
+    /// open also covers a tail written by a previous process.
+    synced_offset: u64,
     write_buf: Vec<u8>,
 }
 
@@ -66,6 +70,7 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             seq_id,
             write_offset,
             buf_start_offset: write_offset,
+            synced_offset: 0,
             write_buf: Vec::with_capacity(64 * 1024),
         })
     }
@@ -167,9 +172,17 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
     }
 
     /// Flushes buffered blob writes to the OS file handle and syncs to physical storage (used during checkpointing).
+    ///
+    /// The OS sync is skipped when no bytes have been written since the last successful sync.
+    /// `synced_offset` advances only after the sync returns, so a failed sync is retried by the
+    /// next call.
     pub fn sync_durable(&mut self) -> io::Result<()> {
         self.flush_buffer()?;
-        self.file.sync_durable()
+        if self.buf_start_offset > self.synced_offset {
+            self.file.sync_durable()?;
+            self.synced_offset = self.buf_start_offset;
+        }
+        Ok(())
     }
 }
 
