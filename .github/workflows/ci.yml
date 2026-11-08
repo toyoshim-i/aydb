@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The crate links the system SQLite: winsqlite3 on Windows (part of
+      # the OS image), libsqlite3 on macOS (part of the OS), and the
+      # development package on Linux.
+      - name: Install libsqlite3 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      # Every step below runs under "bash -e -o pipefail", so a cargo
+      # failure is not hidden by the tee that follows it.
+      - name: Prepare results directory
+        run: mkdir -p results
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee results/clippy.txt
+
+      - name: Tests
+        run: cargo test --all-targets 2>&1 | tee results/tests.txt
+
+      - name: Reliability benchmark
+        run: cargo run --release --example reliability_bench 2>&1 | tee results/reliability.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+
+  # Benchmarks depend on "test" only to avoid starting them for pull
+  # requests that do not even build. The condition below is "not
+  # cancelled" rather than "all test jobs succeeded": if the test job
+  # fails on one operating system (or on all of them), the benchmarks
+  # still run on every operating system, so the published results page
+  # shows the partial state (for example, a red Linux test column next to
+  # complete benchmark numbers) instead of nothing. A manual or
+  # superseding cancellation still skips the job. Each matrix leg of
+  # "bench" is independent of the others, and it does not read the
+  # outcome of its own test leg.
+  bench:
+    name: bench (${{ matrix.os }})
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libsqlite3 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      # Run every benchmark even if an earlier one fails, record the
+      # failures, and fail the job at the end so one panic does not
+      # discard the other measurements.
+      - name: Run benchmarks
+        run: |
+          mkdir -p results/bench
+          failed=""
+          for name in \
+            standard_sql_bench \
+            sqlite_vs_aydb_bench \
+            concurrent_read_bench \
+            tx_isolation_read_bench \
+            compaction_latency_bench \
+            pal_bench \
+            meta_wal_bench \
+            wisckey_bench \
+            lru_engine_bench; do
+            echo "::group::$name"
+            start=$(date +%s)
+            set +e
+            cargo run --release --example "$name" 2>&1 | tee "results/bench/$name.txt"
+            status=${PIPESTATUS[0]}
+            set -e
+            echo "$name exit=$status seconds=$(( $(date +%s) - start ))" | tee -a results/bench/status.txt
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              failed="$failed $name"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::benchmarks failed:$failed"
+            exit 1
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
