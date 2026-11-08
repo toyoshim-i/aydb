@@ -99,6 +99,7 @@ fn bench_small_sync_config_updates(root: &PathBuf) {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
+             PRAGMA fullfsync = ON;
              CREATE TABLE app_config (key TEXT PRIMARY KEY, val TEXT);",
         )
         .unwrap();

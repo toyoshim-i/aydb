@@ -1070,6 +1070,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;
+                 PRAGMA fullfsync = ON;
                  CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER);
                  CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER);
                  CREATE TABLE accounts (aid INTEGER PRIMARY KEY, bid INTEGER, abalance INTEGER);
@@ -1308,6 +1309,7 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
+             PRAGMA fullfsync = ON;
              CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER);
              CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER);
              CREATE TABLE accounts (aid INTEGER PRIMARY KEY, bid INTEGER, abalance INTEGER);
