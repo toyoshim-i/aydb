@@ -619,13 +619,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
         if self.pending_tx_buf.len() <= MAX_WAL_CHUNK_BYTES {
+            // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
+            // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
             let lsn = self.next_lsn;
-            self.next_lsn += 1;
             WalBatch::finalize_encoded_buf(lsn, record_count, &mut self.pending_tx_buf);
             let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
             let res = self.append_raw_wal_batch_with_rotation(&raw_buf, durability);
             raw_buf.clear();
             self.pending_tx_buf = raw_buf;
+            if res.is_ok() {
+                self.next_lsn = lsn + 1;
+            }
             return res;
         }
 
@@ -706,9 +710,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             single_buf.remove(16);
             single_records -= 1;
             let lsn = self.next_lsn;
-            self.next_lsn += 1;
             WalBatch::finalize_encoded_buf(lsn, single_records, &mut single_buf);
-            return self.append_raw_wal_batch_with_rotation(&single_buf, durability);
+            self.append_raw_wal_batch_with_rotation(&single_buf, durability)?;
+            self.next_lsn = lsn + 1;
+            return Ok(());
         }
 
         if let Some((last_buf, last_records)) = chunks.last_mut() {
@@ -741,9 +746,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         for (mut cbuf, crec) in chunks {
             let lsn = self.next_lsn;
-            self.next_lsn += 1;
             WalBatch::finalize_encoded_buf(lsn, crec, &mut cbuf);
             self.append_raw_wal_batch_with_rotation(&cbuf, durability)?;
+            self.next_lsn = lsn + 1;
         }
 
         Ok(())

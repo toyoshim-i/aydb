@@ -3772,3 +3772,35 @@ fn rollback_without_active_transaction_is_a_noop() {
     engine.flush_memtable().unwrap();
     assert_eq!(engine.get_row(1, b"k").unwrap(), Some(vec![0x33u8; 8192]));
 }
+
+#[test]
+fn sync_commit_hitting_wal_ring_full_survives_crash() {
+    let tmp = TempTestDir::new("tx_ring_full");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    // Each single-statement sync transaction occupies one sector of the 8-sector sync WAL.
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 8 * 4096;
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    for i in 0..9u32 {
+        engine.begin_transaction();
+        engine
+            .put_row(
+                1,
+                &i.to_be_bytes(),
+                b"value",
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        engine.commit_transaction().unwrap();
+    }
+    drop(engine);
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    for i in 0..9u32 {
+        assert!(
+            engine.get_row(1, &i.to_be_bytes()).unwrap().is_some(),
+            "committed row {i} lost after crash"
+        );
+    }
+}
