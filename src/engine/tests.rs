@@ -2952,3 +2952,201 @@ fn corrupt_policy_override_and_defaults() {
     engine.reset_table_corrupt_policy(5);
     assert_eq!(engine.corrupt_policy(5), CorruptPolicy::Evict);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Background (3-phase) compaction
+// ---------------------------------------------------------------------------------------------
+
+fn bg_cfg() -> EngineConfig {
+    let mut cfg = EngineConfig::default();
+    cfg.auto_compact_segment_threshold = 4;
+    cfg.background_compaction = true;
+    cfg
+}
+
+fn bg_put_round(engine: &mut StorageEngine<OsFs>, round: usize, rows: usize, len: usize) {
+    for i in 0..rows {
+        let key = format!("r{round:03}_{i:03}");
+        engine
+            .put_row(1, key.as_bytes(), &vec![round as u8; len], &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+}
+
+fn idx_file_names(fs: &OsFs) -> Vec<String> {
+    let mut v: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.starts_with("idx_"))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn background_mode_flush_only_marks_pending_and_install_after_new_flushes() {
+    let tmp = TempTestDir::new("bg_install");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+
+    for r in 0..4 {
+        bg_put_round(&mut engine, r, 5, 64);
+    }
+    assert_eq!(engine.active_idx_segment_count(), 4, "no inline compaction in background mode");
+    assert!(engine.compaction_pending());
+
+    let job = engine.prepare_compaction().unwrap().expect("job");
+    let merged = job.input_count();
+    assert!(merged >= 2);
+
+    // Newer segments + overwrites + a delete land while the job is "running".
+    bg_put_round(&mut engine, 4, 5, 64);
+    engine.delete_row(1, b"r000_000", WriteDurability::BufferedFast).unwrap();
+    engine
+        .put_row(1, b"r001_000", b"overwritten", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    let before = engine.active_idx_segment_count();
+    assert_eq!(before, 6);
+
+    let out = job.run().unwrap();
+    assert!(engine.install_compaction(out).unwrap());
+    assert_eq!(engine.active_idx_segment_count(), before - merged + 1);
+
+    let check = |e: &mut StorageEngine<OsFs>| {
+        assert!(e.get_row(1, b"r000_000").unwrap().is_none());
+        assert_eq!(e.get_row(1, b"r001_000").unwrap().unwrap(), b"overwritten");
+        for r in 0..5usize {
+            for i in 0..5usize {
+                if (r, i) == (0, 0) || (r, i) == (1, 0) {
+                    continue;
+                }
+                let key = format!("r{r:03}_{i:03}");
+                assert_eq!(e.get_row(1, key.as_bytes()).unwrap().unwrap(), vec![r as u8; 64]);
+            }
+        }
+    };
+    check(&mut engine);
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, bg_cfg()).unwrap();
+    check(&mut reopened);
+}
+
+#[test]
+fn overlapping_jobs_second_install_aborts_and_removes_output() {
+    let tmp = TempTestDir::new("bg_abort");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+    for r in 0..5 {
+        bg_put_round(&mut engine, r, 4, 64);
+    }
+    let job1 = engine.prepare_compaction().unwrap().unwrap();
+    let job2 = engine.prepare_compaction().unwrap().unwrap();
+    assert_ne!(job1.output_seq_id(), job2.output_seq_id());
+    let out1 = job1.run().unwrap();
+    let out2 = job2.run().unwrap();
+    let id2_name = crate::meta::format_idx_file_name(out2.output_seq_id());
+    assert!(idx_file_names(&fs).contains(&id2_name));
+
+    assert!(engine.install_compaction(out1).unwrap());
+    assert!(!engine.install_compaction(out2).unwrap(), "inputs already replaced");
+    assert!(!idx_file_names(&fs).contains(&id2_name), "aborted output must be deleted");
+
+    // The aborted job's handles pinned the superseded inputs (undeletable on Windows) when
+    // `install(out1)` queued them; the retry on the next meta commit unlinks them.
+    bg_put_round(&mut engine, 5, 1, 64);
+    let live = idx_file_names(&fs);
+    assert_eq!(live.len(), engine.active_idx_segment_count());
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+    assert_eq!(idx_file_names(&fs), live, "reopen sweeps nothing live");
+    for r in 0..5usize {
+        for i in 0..4usize {
+            let key = format!("r{r:03}_{i:03}");
+            assert_eq!(reopened.get_row(1, key.as_bytes()).unwrap().unwrap(), vec![r as u8; 64]);
+        }
+    }
+}
+
+#[test]
+fn suffix_job_keeps_tombstones_shadowing_older_segments() {
+    let tmp = TempTestDir::new("bg_tombstone");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+    // Large base segment, then tiny ones, the first of which deletes a base key.
+    bg_put_round(&mut engine, 0, 600, 100);
+    engine.delete_row(1, b"r000_007", WriteDurability::BufferedFast).unwrap();
+    engine.flush_memtable().unwrap();
+    bg_put_round(&mut engine, 1, 1, 8);
+    bg_put_round(&mut engine, 2, 1, 8);
+    assert!(engine.compaction_pending());
+
+    let job = engine.prepare_compaction().unwrap().unwrap();
+    assert!(job.input_count() < engine.active_idx_segment_count(), "suffix only");
+    assert!(!job.drops_tombstones(), "suffix job must keep tombstones");
+    let out = job.run().unwrap();
+    assert!(engine.install_compaction(out).unwrap());
+
+    assert!(engine.get_row(1, b"r000_007").unwrap().is_none(), "tombstone must still shadow base");
+    assert!(engine.get_row(1, b"r000_008").unwrap().is_some());
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, bg_cfg()).unwrap();
+    assert!(reopened.get_row(1, b"r000_007").unwrap().is_none());
+    assert!(reopened.get_row(1, b"r000_008").unwrap().is_some());
+}
+
+#[test]
+fn uninstalled_compaction_output_is_swept_on_reopen() {
+    let tmp = TempTestDir::new("bg_crash");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+    for r in 0..4 {
+        bg_put_round(&mut engine, r, 4, 64);
+    }
+    let live = idx_file_names(&fs);
+    let job = engine.prepare_compaction().unwrap().unwrap();
+    let out = job.run().unwrap();
+    let orphan = crate::meta::format_idx_file_name(out.output_seq_id());
+    assert!(idx_file_names(&fs).contains(&orphan));
+    // "Crash": the output is never installed.
+    drop(out);
+    drop(engine);
+    assert!(idx_file_names(&fs).contains(&orphan));
+
+    let mut reopened = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
+    assert_eq!(idx_file_names(&fs), live, "orphan swept, live segments untouched");
+    // A fresh allocation never reuses the orphan's id.
+    bg_put_round(&mut reopened, 9, 2, 64);
+    assert!(!idx_file_names(&fs).iter().any(|n| n == &orphan));
+    assert!(reopened.get_row(1, b"r002_001").unwrap().is_some());
+}
+
+#[test]
+fn backpressure_falls_back_to_inline_compaction() {
+    let tmp = TempTestDir::new("bg_backpressure");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = bg_cfg();
+    cfg.max_segments_before_inline_compaction = 6;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    for r in 0..12 {
+        bg_put_round(&mut engine, r, 3, 64);
+        assert!(engine.active_idx_segment_count() <= 6);
+    }
+}
+
+#[test]
+fn sync_compact_still_works_with_shared_segments() {
+    let tmp = TempTestDir::new("bg_sync");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.auto_compact_segment_threshold = 4;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    for r in 0..9 {
+        bg_put_round(&mut engine, r, 3, 64);
+    }
+    assert!(engine.active_idx_segment_count() < 5);
+    engine.compact().unwrap();
+    assert_eq!(engine.active_idx_segment_count(), 1);
+}

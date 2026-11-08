@@ -54,12 +54,36 @@ impl SqliteConnection {
     }
 
     /// Registers the `"aydb"` Virtual Table module (`USING aydb(...)`) backed by `engine`.
+    ///
+    /// Index compaction runs on a dedicated background thread (merge executed with the engine
+    /// mutex released) so other connections are not blocked behind a long merge. The thread is
+    /// joined when the module registration is dropped (connection close). Use
+    /// [`Self::register_aydb_module_with_options`] to keep compaction inline instead.
     pub fn register_aydb_module(
         &self,
         engine: Arc<Mutex<StorageEngine<OsFs>>>,
     ) -> io::Result<()> {
+        self.register_aydb_module_with_options(engine, true)
+    }
+
+    /// Like [`Self::register_aydb_module`], choosing whether to spawn the background compaction
+    /// worker. With `false`, the engine's own `background_compaction` setting is left untouched
+    /// (default: inline compaction inside the write path).
+    pub fn register_aydb_module_with_options(
+        &self,
+        engine: Arc<Mutex<StorageEngine<OsFs>>>,
+        background_compaction: bool,
+    ) -> io::Result<()> {
         let c_name = CString::new("aydb").unwrap();
-        let aux = Box::new(ModuleAuxContext { engine });
+        let worker = if background_compaction {
+            crate::vtab::compaction_worker::CompactionWorker::spawn(Arc::clone(&engine))
+        } else {
+            None
+        };
+        let aux = Box::new(ModuleAuxContext {
+            engine,
+            _compaction_worker: worker,
+        });
         let rc = unsafe {
             sqlite3_create_module_v2(
                 self.db,

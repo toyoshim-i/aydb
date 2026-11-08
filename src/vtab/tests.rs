@@ -2437,3 +2437,112 @@ fn vtab_corrupt_blob_on_corrupt_evict_hides_row_and_removes_it() {
         vec![1, 2, 4, 5, 6]
     );
 }
+
+#[test]
+fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
+    let tmp = TempTestDir::new("vtab_bg_compact");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 8 * 1024;
+    cfg.auto_compact_segment_threshold = 4;
+    // Only the worker can compact: the inline backpressure fallback is effectively disabled.
+    cfg.max_segments_before_inline_compaction = 10_000;
+    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    {
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE bgc USING aydb(
+                table_id = 1,
+                durability = 'buffered',
+                columns = 'id INTEGER PRIMARY KEY, body BLOB'
+            );",
+        )
+        .unwrap();
+        let mut ins = conn.prepare("INSERT INTO bgc VALUES (?1, ?2)").unwrap();
+        for i in 0..2_000i64 {
+            ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![(i % 251) as u8; 100])])
+                .unwrap();
+        }
+        drop(ins);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let (segs, pending) = {
+                let eng = engine.lock().unwrap();
+                (eng.active_idx_segment_count(), eng.compaction_pending())
+            };
+            if !pending && segs < 4 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background worker did not compact (segments = {segs})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let rows = conn.query_all("SELECT count(*) FROM bgc", &[]).unwrap();
+        assert_eq!(rows[0][0], SqlValue::Integer(2_000));
+        let row = conn.query_all("SELECT body FROM bgc WHERE id = 1234", &[]).unwrap();
+        assert_eq!(row[0][0], SqlValue::Blob(vec![(1234 % 251) as u8; 100]));
+        assert!(Arc::strong_count(&engine) > 1, "worker holds an engine handle while registered");
+    }
+
+    // Connection closed: the module aux context was dropped, the worker joined (it owned an
+    // engine Arc clone) and the engine is back to inline compaction.
+    assert_eq!(Arc::strong_count(&engine), 1, "worker thread must be joined on drop");
+    let eng = engine.lock().unwrap();
+    assert!(!eng.compaction_pending() || eng.active_idx_segment_count() >= 4);
+}
+
+#[test]
+fn compaction_worker_is_shared_per_engine_and_refcounted() {
+    use crate::vtab::compaction_worker::worker_stats;
+    use std::sync::atomic::Ordering;
+    let tmp = TempTestDir::new("vtab_bg_shared");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 8 * 1024;
+    cfg.auto_compact_segment_threshold = 4;
+    cfg.max_segments_before_inline_compaction = 10_000;
+    let engine = Arc::new(Mutex::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let conn1 = SqliteConnection::open_in_memory().unwrap();
+    conn1.register_aydb_module(engine.clone()).unwrap();
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    conn2.register_aydb_module(engine.clone()).unwrap();
+    let (refs, alive) = worker_stats(&engine).expect("worker registered");
+    assert_eq!(refs, 2, "exactly one worker, two registrations");
+    assert!(alive.load(Ordering::SeqCst));
+
+    drop(conn1);
+    assert_eq!(worker_stats(&engine).unwrap().0, 1);
+    assert!(alive.load(Ordering::SeqCst));
+    assert!(engine.lock().unwrap().background_compaction_enabled());
+
+    // Compaction still progresses through the surviving registration.
+    conn2
+        .execute_batch(
+            "CREATE VIRTUAL TABLE shared USING aydb(table_id = 1, durability = 'buffered',
+                columns = 'id INTEGER PRIMARY KEY, body BLOB');",
+        )
+        .unwrap();
+    let mut ins = conn2.prepare("INSERT INTO shared VALUES (?1, ?2)").unwrap();
+    for i in 0..2_000i64 {
+        ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![7u8; 100])]).unwrap();
+    }
+    drop(ins);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while engine.lock().unwrap().compaction_pending() {
+        assert!(std::time::Instant::now() < deadline, "no compaction progress");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    drop(conn2);
+    assert!(worker_stats(&engine).is_none());
+    assert!(!alive.load(Ordering::SeqCst), "worker thread joined");
+    assert!(!engine.lock().unwrap().background_compaction_enabled());
+    assert_eq!(Arc::strong_count(&engine), 1);
+}

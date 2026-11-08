@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
 
 use crate::index::{IdxSegmentReader, IndexValue, compact_idx_segments};
 use crate::meta::{
@@ -13,6 +14,77 @@ use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, WalRecord};
 
 use super::{StorageEngine, WriteDurability};
+
+/// A prepared compaction: owns everything the merge needs, independent of the engine, so it can
+/// run on another thread while the engine keeps serving reads and writes.
+pub struct CompactionJob<FS: PlatformFs> {
+    fs: Arc<FS>,
+    /// Input segments, newest first.
+    inputs: Vec<Arc<IdxSegmentReader<FS::File>>>,
+    out_seq_id: u64,
+    level: u16,
+    bloom_bits: usize,
+    drop_tombstones: bool,
+}
+
+/// Result of [`CompactionJob::run`], handed to [`StorageEngine::install_compaction`].
+pub struct CompactionOutput<FS: PlatformFs> {
+    new_segment: Arc<IdxSegmentReader<FS::File>>,
+    /// Input segments, newest first.
+    inputs: Vec<Arc<IdxSegmentReader<FS::File>>>,
+    drop_tombstones: bool,
+}
+
+impl<FS: PlatformFs> CompactionJob<FS> {
+    /// `SeqID` reserved for the output segment.
+    pub fn output_seq_id(&self) -> u64 {
+        self.out_seq_id
+    }
+
+    /// Number of input segments being merged.
+    pub fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    /// Whether the merge drops tombstones (only true for runs starting at the oldest segment).
+    pub fn drops_tombstones(&self) -> bool {
+        self.drop_tombstones
+    }
+
+    /// Performs the K-way merge and writes `idx_<out_seq_id>.db`. Needs no engine access. On
+    /// failure the partial output file is removed.
+    pub fn run(self) -> io::Result<CompactionOutput<FS>> {
+        let refs: Vec<&IdxSegmentReader<FS::File>> = self.inputs.iter().map(|a| &**a).collect();
+        let res = compact_idx_segments(
+            &*self.fs,
+            &refs,
+            self.out_seq_id,
+            self.level,
+            self.bloom_bits,
+            self.drop_tombstones,
+        );
+        drop(refs);
+        match res {
+            Ok(res) => Ok(CompactionOutput {
+                new_segment: Arc::new(res.new_segment),
+                inputs: self.inputs,
+                drop_tombstones: self.drop_tombstones,
+            }),
+            Err(e) => {
+                let _ = self.fs.remove_file(&format_idx_file_name(self.out_seq_id));
+                Err(e)
+            }
+        }
+    }
+}
+
+impl<FS: PlatformFs> CompactionOutput<FS> {
+    /// `SeqID` of the produced segment.
+    pub fn output_seq_id(&self) -> u64 {
+        self.new_segment.seq_id()
+    }
+}
+
 
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
@@ -28,11 +100,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.drain_corrupt_evictions()?;
         self.flush_memtable_no_auto_compact()?;
-        if self.tx_depth == 0
-            && self.config.auto_compact_segment_threshold > 1
-            && self.idx_segments.len() >= self.config.auto_compact_segment_threshold
-        {
-            self.compact_auto_tiered()?;
+        if self.tx_depth == 0 && self.compaction_pending() {
+            // Background mode only marks compaction as pending (observable through
+            // `compaction_pending()`); the merge runs outside the engine. The inline fallback
+            // bounds segment growth (and read amplification) if the worker falls behind.
+            let limit = if self.config.max_segments_before_inline_compaction > 0 {
+                self.config.max_segments_before_inline_compaction
+            } else {
+                self.config.auto_compact_segment_threshold.saturating_mul(2)
+            };
+            if !self.config.background_compaction || self.idx_segments.len() >= limit {
+                self.compact_auto_tiered()?;
+            } else if let Some(hook) = &self.compaction_hook {
+                hook();
+            }
         }
         Ok(())
     }
@@ -131,7 +212,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         self.memtable.clear();
-        self.idx_segments.push(new_reader);
+        self.idx_segments.push(Arc::new(new_reader));
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
         Ok(())
@@ -256,96 +337,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
-        let comp_seq_id = self.meta_mgr.state().next_seq_id;
-
-        // Pass segments ordered newest-first (`rev()`) to `compact_idx_segments`
-        let refs_newest_first: Vec<&IdxSegmentReader<FS::File>> =
-            self.idx_segments.iter().rev().collect();
-        let outcome = match compact_idx_segments(
-            &*self.fs,
-            &refs_newest_first,
-            comp_seq_id,
-            1,
-            self.config.bloom_bits_per_key,
-            true,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
-                return Err(e);
-            }
-        };
-
-        let old_idx_names: Vec<String> = self
-            .idx_segments
-            .iter()
-            .map(|r| format_idx_file_name(r.seq_id()))
-            .collect();
-
-        let new_meta = IdxSegmentMeta {
-            seq_id: outcome.new_segment.seq_id(),
-            file_len: outcome.new_segment.file_len(),
-            level: outcome.new_segment.level(),
-            record_count: outcome.new_segment.record_count(),
-        };
-
-        let (dead_std_seqs, dead_lru_keys, dead_blob_files) =
-            self.collect_fully_dead_blob_segments();
-        let std_metas: Vec<StdBlobSegmentMeta> = self
-            .std_blobs
-            .iter()
-            .filter(|(seq, _)| !dead_std_seqs.contains(seq))
-            .map(|(&seq_id, b)| StdBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-            })
-            .collect();
-        let lru_metas: Vec<LruBlobSegmentMeta> = self
-            .lru_blobs
-            .iter()
-            .filter(|(k, _)| !dead_lru_keys.contains(k))
-            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-                table_id: b.table_id,
-            })
-            .collect();
-        let quota_metas = self.build_quota_metas();
-
-        if let Err(e) = self.meta_mgr.commit_update(|st| {
-            let allocated = st.allocate_seq_id();
-            debug_assert_eq!(allocated, comp_seq_id);
-            st.idx_segments = vec![new_meta];
-            st.std_blob_segments = std_metas;
-            st.lru_blob_segments = lru_metas;
-            st.table_quotas = quota_metas;
-            for name in old_idx_names {
-                st.queue_pending_delete(name);
-            }
-            for fname in &dead_blob_files {
-                st.queue_pending_delete(fname.clone());
-            }
-        }) {
-            drop(outcome);
-            let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
-            return Err(e);
-        }
-
-        for seq in dead_std_seqs {
-            self.std_blobs.remove(&seq);
-        }
-        for key in dead_lru_keys {
-            self.lru_blobs.remove(&key);
-        }
-
-        // Drop old segment readers and run pending deletes so superseded `idx_<SeqID>.db`
-        // and 100%-dead blob files are unlinked immediately now that `boot_meta.db` is committed!
-        self.idx_segments.clear();
-        self.idx_segments.push(outcome.new_segment);
-        self.meta_mgr.try_process_pending_deletes();
-        Ok(())
+        self.run_compaction_sync(0)
     }
 
     /// Runs size-tiered suffix automatic compaction.
@@ -372,7 +364,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
+        let Some(start_idx) = self.select_tiered_start() else {
+            return Ok(());
+        };
+        if start_idx == 0 {
+            return self.compact();
+        }
+        self.run_compaction_sync(start_idx)
+    }
+
+    /// Size-tiered selection: returns the start of the contiguous suffix to merge, or `None`
+    /// when fewer than two segments exist. `Some(0)` means a full compaction.
+    fn select_tiered_start(&self) -> Option<usize> {
         let n = self.idx_segments.len();
+        if n <= 1 {
+            return None;
+        }
         let mut start_idx = (n / 2).min(n - 2);
         for i in 0..(n - 1) {
             let curr_bytes = self.idx_segments[i].file_len();
@@ -382,92 +389,172 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 break;
             }
         }
+        Some(start_idx)
+    }
 
-        if start_idx == 0 {
-            return self.compact();
+    /// `true` when the segment count has reached `auto_compact_segment_threshold` (and the
+    /// engine is healthy), i.e. a worker should run `prepare_compaction`.
+    pub fn compaction_pending(&self) -> bool {
+        self.poisoned.is_none()
+            && self.config.auto_compact_segment_threshold > 1
+            && self.idx_segments.len() >= self.config.auto_compact_segment_threshold
+    }
+
+    /// Phase 1 of background compaction (cheap, under `&mut self`): picks the same size-tiered
+    /// suffix as [`Self::compact_auto_tiered`] (a full compaction when it starts at index 0),
+    /// durably reserves the output `SeqID` (a `next_seq_id` bump committed to `boot_meta.db`, so
+    /// flushes running before install can never collide with it) and snapshots the input readers
+    /// as shared handles. Returns `None` if there is nothing to merge. Does not flush the
+    /// MemTable and never touches blobs, WAL or the MemTable.
+    ///
+    /// Crash safety: until [`Self::install_compaction`] commits, the output file is an
+    /// unreferenced orphan that `open()` sweeps.
+    pub fn prepare_compaction(&mut self) -> io::Result<Option<CompactionJob<FS>>> {
+        self.check_not_poisoned()?;
+        match self.select_tiered_start() {
+            Some(start) => self.prepare_compaction_at(start),
+            None => Ok(None),
         }
+    }
 
-        let comp_seq_id = self.meta_mgr.state().next_seq_id;
-        let new_level = self.idx_segments[start_idx..]
-            .iter()
-            .map(|s| s.level())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-
-        // Pass suffix segments ordered newest-first (`rev()`) with `drop_tombstones = false`
-        let refs_newest_first: Vec<&IdxSegmentReader<FS::File>> =
-            self.idx_segments[start_idx..].iter().rev().collect();
-        let outcome = match compact_idx_segments(
-            &*self.fs,
-            &refs_newest_first,
-            comp_seq_id,
-            new_level,
-            self.config.bloom_bits_per_key,
-            false,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
-                return Err(e);
-            }
+    pub(super) fn prepare_compaction_at(
+        &mut self,
+        start_idx: usize,
+    ) -> io::Result<Option<CompactionJob<FS>>> {
+        self.check_not_poisoned()?;
+        if start_idx + 2 > self.idx_segments.len() {
+            return Ok(None);
+        }
+        let mut out_seq_id = 0u64;
+        self.meta_mgr.commit_update(|st| {
+            out_seq_id = st.allocate_seq_id();
+        })?;
+        let full = start_idx == 0;
+        let level = if full {
+            1
+        } else {
+            self.idx_segments[start_idx..]
+                .iter()
+                .map(|s| s.level())
+                .max()
+                .unwrap_or(1)
+                .max(1)
         };
+        Ok(Some(CompactionJob {
+            fs: Arc::clone(&self.fs),
+            inputs: self.idx_segments[start_idx..].iter().rev().cloned().collect(),
+            out_seq_id,
+            level,
+            bloom_bits: self.config.bloom_bits_per_key,
+            // Tombstones may only be dropped when nothing older than the inputs exists.
+            drop_tombstones: full,
+        }))
+    }
 
-        let old_idx_names: Vec<String> = self.idx_segments[start_idx..]
+    fn run_compaction_sync(&mut self, start_idx: usize) -> io::Result<()> {
+        if let Some(job) = self.prepare_compaction_at(start_idx)? {
+            let out = job.run()?;
+            self.install_compaction(out)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 of background compaction (cheap, under `&mut self`). Verifies that the job's input
+    /// segments are still exactly one contiguous run of `idx_segments` (newer segments appended
+    /// by flushes since `prepare_compaction` are fine), commits the new segment list (plus dead
+    /// blob segments, quotas and pending deletes) to `boot_meta.db`, and swaps the readers in
+    /// place of the inputs, preserving oldest-to-newest order.
+    ///
+    /// Returns `Ok(false)` after deleting the output file if the inputs vanished (another
+    /// compaction won), or if the job dropped tombstones but its inputs no longer start at index
+    /// 0. While a transaction is active only the segment list is committed (blob/quota metadata
+    /// may be provisional then).
+    ///
+    /// The superseded `idx_<SeqID>.db` files are queued for deferred deletion. Their readers are
+    /// dropped here, but a file still held open elsewhere (e.g. by another in-flight job's `Arc`)
+    /// cannot be unlinked on Windows (share mode 0); it stays in `pending_delete_files` and is
+    /// retried on later commits / at startup.
+    pub fn install_compaction(&mut self, out: CompactionOutput<FS>) -> io::Result<bool> {
+        if let Err(e) = self.check_not_poisoned() {
+            self.discard_compaction_output(out);
+            return Err(e);
+        }
+        let k = out.inputs.len();
+        // `inputs` is newest-first; the run's oldest member is the last element.
+        let first_seq = out.inputs[k - 1].seq_id();
+        let start = self
+            .idx_segments
+            .iter()
+            .position(|s| s.seq_id() == first_seq);
+        let valid = match start {
+            Some(st) if st + k <= self.idx_segments.len() => {
+                (0..k).all(|i| Arc::ptr_eq(&self.idx_segments[st + i], &out.inputs[k - 1 - i]))
+                    && (!out.drop_tombstones || st == 0)
+            }
+            _ => false,
+        };
+        if !valid {
+            self.discard_compaction_output(out);
+            return Ok(false);
+        }
+        let start = start.unwrap();
+
+        let meta_of = |r: &Arc<IdxSegmentReader<FS::File>>| IdxSegmentMeta {
+            seq_id: r.seq_id(),
+            file_len: r.file_len(),
+            level: r.level(),
+            record_count: r.record_count(),
+        };
+        let mut new_idx_metas: Vec<IdxSegmentMeta> = Vec::with_capacity(self.idx_segments.len());
+        new_idx_metas.extend(self.idx_segments[..start].iter().map(meta_of));
+        new_idx_metas.push(meta_of(&out.new_segment));
+        new_idx_metas.extend(self.idx_segments[start + k..].iter().map(meta_of));
+        let old_idx_names: Vec<String> = out
+            .inputs
             .iter()
             .map(|r| format_idx_file_name(r.seq_id()))
             .collect();
 
-        let new_meta = IdxSegmentMeta {
-            seq_id: outcome.new_segment.seq_id(),
-            file_len: outcome.new_segment.file_len(),
-            level: outcome.new_segment.level(),
-            record_count: outcome.new_segment.record_count(),
+        let in_tx = self.tx_depth > 0;
+        let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if in_tx {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            self.collect_fully_dead_blob_segments()
+        };
+        let blob_quota = if in_tx {
+            None
+        } else {
+            let std_metas: Vec<StdBlobSegmentMeta> = self
+                .std_blobs
+                .iter()
+                .filter(|(seq, _)| !dead_std_seqs.contains(seq))
+                .map(|(&seq_id, b)| StdBlobSegmentMeta {
+                    seq_id,
+                    file_len: b.file_len,
+                    dead_bytes: b.dead_bytes,
+                })
+                .collect();
+            let lru_metas: Vec<LruBlobSegmentMeta> = self
+                .lru_blobs
+                .iter()
+                .filter(|(k, _)| !dead_lru_keys.contains(k))
+                .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
+                    seq_id,
+                    file_len: b.file_len,
+                    dead_bytes: b.dead_bytes,
+                    table_id: b.table_id,
+                })
+                .collect();
+            Some((std_metas, lru_metas, self.build_quota_metas()))
         };
 
-        let mut new_idx_metas: Vec<IdxSegmentMeta> = Vec::with_capacity(start_idx + 1);
-        for seg in &self.idx_segments[..start_idx] {
-            new_idx_metas.push(IdxSegmentMeta {
-                seq_id: seg.seq_id(),
-                file_len: seg.file_len(),
-                level: seg.level(),
-                record_count: seg.record_count(),
-            });
-        }
-        new_idx_metas.push(new_meta);
-
-        let (dead_std_seqs, dead_lru_keys, dead_blob_files) =
-            self.collect_fully_dead_blob_segments();
-        let std_metas: Vec<StdBlobSegmentMeta> = self
-            .std_blobs
-            .iter()
-            .filter(|(seq, _)| !dead_std_seqs.contains(seq))
-            .map(|(&seq_id, b)| StdBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-            })
-            .collect();
-        let lru_metas: Vec<LruBlobSegmentMeta> = self
-            .lru_blobs
-            .iter()
-            .filter(|(k, _)| !dead_lru_keys.contains(k))
-            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-                table_id: b.table_id,
-            })
-            .collect();
-        let quota_metas = self.build_quota_metas();
-
         if let Err(e) = self.meta_mgr.commit_update(|st| {
-            let allocated = st.allocate_seq_id();
-            debug_assert_eq!(allocated, comp_seq_id);
             st.idx_segments = new_idx_metas;
-            st.std_blob_segments = std_metas;
-            st.lru_blob_segments = lru_metas;
-            st.table_quotas = quota_metas;
+            if let Some((std_metas, lru_metas, quota_metas)) = blob_quota {
+                st.std_blob_segments = std_metas;
+                st.lru_blob_segments = lru_metas;
+                st.table_quotas = quota_metas;
+            }
             for name in old_idx_names {
                 st.queue_pending_delete(name);
             }
@@ -475,8 +562,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 st.queue_pending_delete(fname.clone());
             }
         }) {
-            drop(outcome);
-            let _ = self.fs.remove_file(&format_idx_file_name(comp_seq_id));
+            self.discard_compaction_output(out);
             return Err(e);
         }
 
@@ -487,10 +573,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.lru_blobs.remove(&key);
         }
 
-        self.idx_segments.truncate(start_idx);
-        self.idx_segments.push(outcome.new_segment);
+        let CompactionOutput {
+            new_segment, inputs, ..
+        } = out;
+        let removed: Vec<_> = self
+            .idx_segments
+            .splice(start..start + k, std::iter::once(new_segment))
+            .collect();
+        // Release our handles before unlinking so the files can actually be deleted.
+        drop(removed);
+        drop(inputs);
         self.meta_mgr.try_process_pending_deletes();
-        Ok(())
+        Ok(true)
+    }
+
+    /// Drops an uninstalled output and unlinks its (unreferenced) file.
+    fn discard_compaction_output(&self, out: CompactionOutput<FS>) {
+        let name = format_idx_file_name(out.new_segment.seq_id());
+        drop(out);
+        let _ = self.fs.remove_file(&name);
     }
 
     pub(super) fn collect_fully_dead_blob_segments(

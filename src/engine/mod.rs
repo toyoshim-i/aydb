@@ -6,6 +6,7 @@
 //! compaction, and Capped Table (`MAX_BYTES`) delayed LRU eviction.
 
 mod compaction;
+pub use compaction::{CompactionJob, CompactionOutput};
 mod eviction;
 mod scan;
 mod tx;
@@ -131,6 +132,14 @@ pub struct EngineConfig {
     /// Automatically triggers `compact_auto_tiered()` after `flush_memtable()` when the active
     /// segment count reaches this threshold (`0` disables automatic compaction).
     pub auto_compact_segment_threshold: usize,
+    /// When `true`, `flush_memtable()` does NOT merge segments inline; the segment count merely
+    /// becomes visible through [`StorageEngine::compaction_pending`] and an external worker is
+    /// expected to run [`StorageEngine::prepare_compaction`] -> [`CompactionJob::run`] (without
+    /// the engine) -> [`StorageEngine::install_compaction`]. Default `false` (inline compaction).
+    pub background_compaction: bool,
+    /// Backpressure bound for `background_compaction`: once the segment count reaches this value
+    /// the flush falls back to inline compaction. `0` means `2 * auto_compact_segment_threshold`.
+    pub max_segments_before_inline_compaction: usize,
     /// Maximum uncommitted transaction payload + WAL record budget in bytes (`0` = unlimited).
     pub max_transaction_bytes: usize,
 }
@@ -148,6 +157,8 @@ impl Default for EngineConfig {
             lru_read_tracking: LruReadTrackingMode::CoalescedLazyPromotion,
             max_in_memory_access_ticks: 65_536,
             auto_compact_segment_threshold: DEFAULT_AUTO_COMPACT_SEGMENT_THRESHOLD,
+            background_compaction: false,
+            max_segments_before_inline_compaction: 0,
             max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
         }
     }
@@ -201,7 +212,7 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) next_lsn: u64,
     pub(super) memtable: MemTable,
     /// Active immutable index segments (`idx_<SeqID>.db`), ordered oldest to newest (`last()` is newest).
-    pub(super) idx_segments: Vec<IdxSegmentReader<FS::File>>,
+    pub(super) idx_segments: Vec<Arc<IdxSegmentReader<FS::File>>>,
     /// Active standard blob segments (`seq_id -> reader + stats`).
     pub(super) std_blobs: BTreeMap<u64, TrackedStdBlob<FS::File>>,
     pub(super) active_std_writer: Option<BlobSegmentWriter<FS::File>>,
@@ -222,6 +233,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
     pub(super) deferred_compact_on_commit: bool,
+    /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
+    /// compaction pending in background mode.
+    pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// True if `prepare_commit_transaction()` (`xSync`) has already run for the current commit.
     pub(super) tx_prepared: bool,
     /// True while `prepare_commit_transaction()` is running internal quota eviction.
@@ -272,7 +286,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut idx_segments = Vec::with_capacity(state_snapshot.idx_segments.len());
         for seg_meta in &state_snapshot.idx_segments {
             let reader = IdxSegmentReader::open(&*fs, seg_meta.seq_id)?;
-            idx_segments.push(reader);
+            idx_segments.push(Arc::new(reader));
         }
 
         // 2. Open active `blob_std_<SeqID>.db` segments
@@ -637,6 +651,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_owner_conn: None,
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
+            compaction_hook: None,
             tx_prepared: false,
             tx_preparing: false,
             pending_tx_buf: Vec::new(),
@@ -708,6 +723,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
+    }
+
+    /// Enables or disables background compaction mode at runtime (see
+    /// [`EngineConfig::background_compaction`]).
+    pub fn set_background_compaction(&mut self, enabled: bool) {
+        self.config.background_compaction = enabled;
+    }
+
+    /// Whether background compaction mode is currently enabled.
+    pub fn background_compaction_enabled(&self) -> bool {
+        self.config.background_compaction
+    }
+
+    /// Installs a hook called after a flush when background compaction is pending. It runs under
+    /// the caller's `&mut self`, so it must only signal (e.g. a `Condvar`), never lock the engine.
+    pub fn set_compaction_hook(&mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.compaction_hook = hook;
     }
 
     /// Returns the number of currently active `idx_<SeqID>.db` segments.

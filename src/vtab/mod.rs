@@ -6,6 +6,7 @@
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
 pub mod connection;
+mod compaction_worker;
 mod ddl;
 pub mod ffi;
 pub mod row_codec;
@@ -272,6 +273,8 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
 
 pub(super) struct ModuleAuxContext {
     pub(super) engine: Arc<Mutex<StorageEngine<OsFs>>>,
+    /// Background compaction worker; joined when the module (and thus this context) is dropped.
+    pub(super) _compaction_worker: Option<compaction_worker::CompactionWorker>,
 }
 
 #[repr(C)]
