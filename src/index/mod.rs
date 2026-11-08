@@ -1178,22 +1178,23 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
                 .read_exact_at(&mut block_buf, (b as u64) * (IDX_BLOCK_SIZE as u64))?;
             let reader = IdxBlockReader::open_verified(&block_buf)?;
             for i in 0..reader.num_entries() {
-                let entry = reader.decode_entry_at(i)?;
-                if entry.key.as_slice() < effective_start {
+                let k = reader.key_at(i)?;
+                if k < effective_start {
                     continue;
                 }
-                if !entry.key.starts_with(prefix) {
+                if !k.starts_with(prefix) {
                     return Ok(out);
                 }
                 if let Some((ub, inclusive)) = upper_key_bound {
                     if inclusive {
-                        if entry.key.as_slice() > ub {
+                        if k > ub {
                             return Ok(out);
                         }
-                    } else if entry.key.as_slice() >= ub {
+                    } else if k >= ub {
                         return Ok(out);
                     }
                 }
+                let entry = reader.decode_entry_at(i)?;
                 out.push(entry);
                 if out.len() >= limit {
                     return Ok(out);

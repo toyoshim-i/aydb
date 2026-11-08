@@ -26,9 +26,6 @@ pub const BLOB_RECORD_HEADER_LEN: usize = 16;
 /// Maximum user-space write buffer size (`256 KB`) in [`BlobSegmentWriter`] before flushing
 /// coalesced blob records to the OS file handle.
 const BLOB_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
-/// Maximum blob frame size (`16 KB`) read via a stack buffer in [`BlobSegmentReader::append_blob_into`]
-/// to avoid redundant `Vec::resize` zero-filling and `copy_within` payload shifting.
-const BLOB_STACK_READ_MAX_LEN: usize = 16 * 1024;
 
 /// Append-only writer for a single standard or per-table LRU blob segment file.
 ///
@@ -262,54 +259,6 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         let len = ptr.len as usize;
         if len < BLOB_RECORD_HEADER_LEN {
             return Ok(false);
-        }
-
-        // Fast path: for typical blobs (`<= 16 KB`), read into a stack buffer so we
-        // avoid `Vec::resize` user-space zero-filling and `copy_within` overlapping memmove!
-        if len <= BLOB_STACK_READ_MAX_LEN {
-            let mut stack_buf = [0u8; BLOB_STACK_READ_MAX_LEN];
-            let buf = &mut stack_buf[..len];
-            match self.file.read_exact_at(buf, ptr.offset as u64) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Ok(false);
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-
-            if &buf[0..4] != BLOB_RECORD_MAGIC {
-                return Ok(false);
-            }
-            let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-            if stored_crc != ptr.crc32c {
-                return Ok(false);
-            }
-            if crc32c(&buf[8..]) != ptr.crc32c {
-                return Ok(false);
-            }
-
-            let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-            let val_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-            if BLOB_RECORD_HEADER_LEN
-                .checked_add(key_len)
-                .and_then(|n| n.checked_add(val_len))
-                != Some(len)
-            {
-                return Ok(false);
-            }
-
-            let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
-            if let Some(exp_k) = expected_key {
-                if key_slice != exp_k {
-                    return Ok(false);
-                }
-            }
-
-            let val_start = BLOB_RECORD_HEADER_LEN + key_len;
-            out.extend_from_slice(&buf[val_start..val_start + val_len]);
-            return Ok(true);
         }
 
         let orig_len = out.len();

@@ -153,7 +153,7 @@ fn with_read_access<R>(
 ) -> Option<R> {
     {
         let g = engine.read().ok()?;
-        if !g.read_needs_exclusive(conn_id, table_id) {
+        if !g.vtab_read_needs_exclusive(conn_id, table_id) {
             let rd = g.reader_for_conn(conn_id);
             let r = f(&rd);
             if !rd.needs_exclusive_retry() {

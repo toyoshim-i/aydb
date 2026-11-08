@@ -1275,9 +1275,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lo: Bound<&'a [u8]>,
         hi: Bound<&'a [u8]>,
     ) -> MemView<'a> {
+        static EMPTY: std::collections::BTreeMap<Vec<u8>, crate::memtable::MemEntry> =
+            std::collections::BTreeMap::new();
+        let ov_range = if view == ReadView::Committed || !self.tx_overlay.overlaps_range(lo, hi) {
+            EMPTY.range::<[u8], _>((lo, hi))
+        } else {
+            self.tx_overlay.map.range::<[u8], _>((lo, hi))
+        };
         MemView::new(
             self.memtable.iter_range(lo, hi),
-            self.visible_overlay(view).range::<[u8], _>((lo, hi)),
+            ov_range,
             false,
         )
     }

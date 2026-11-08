@@ -1355,6 +1355,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 && self.capped_tables.contains_key(&table_id))
     }
 
+    /// True if a shared-lock read by `conn_id` on `table_id` must upgrade to an exclusive lock
+    /// before attempting [`Self::reader_for_conn`]: either `EagerWriteOnRead` tracking applies to
+    /// a capped table, or `conn_id` owns an active transaction that currently has buffered
+    /// (unflushed) blob bytes.
+    #[inline]
+    pub fn vtab_read_needs_exclusive(&self, conn_id: usize, table_id: u16) -> bool {
+        if self.read_view_for_conn(conn_id) == ReadView::Committed {
+            return false;
+        }
+        (self.tx_depth > 0 && self.any_blob_unflushed())
+            || (self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+                && self.capped_tables.contains_key(&table_id))
+    }
+
     /// Shared-access reader for `conn_id` (see [`EngineReader`]). Must only be used when
     /// [`Self::read_needs_exclusive`] is `false`; otherwise reads may fail with an
     /// "unflushed blob" error and `EagerWriteOnRead` is downgraded to coalesced tracking.
@@ -2384,7 +2398,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         view: ReadView,
         key: &[u8],
     ) -> Option<&crate::memtable::MemEntry> {
-        if view == ReadView::Owner {
+        if view == ReadView::Owner && self.tx_overlay.may_contain_key(key) {
             if let Some(e) = self.tx_overlay.map.get(key) {
                 return Some(e);
             }
@@ -2392,14 +2406,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.memtable.get(key)
     }
 
-    /// Overlay map visible to `view` (empty for the committed view).
+    /// Overlay map visible to `view` (empty for the committed view or empty overlay).
     #[inline]
     pub(super) fn visible_overlay(
         &self,
         view: ReadView,
     ) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
         static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
-        if view == ReadView::Committed {
+        if view == ReadView::Committed || self.tx_overlay.is_empty() {
             &EMPTY
         } else {
             &self.tx_overlay.map

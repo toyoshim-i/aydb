@@ -240,11 +240,24 @@ impl MemTable {
     ) -> io::Result<IdxSegmentReader<F>> {
         let mut builder = IdxSegmentBuilder::create(fs, seq_id, 0, bloom_bits_per_key)?;
         for (k, entry) in &self.map {
-            builder.add_entry(&IndexEntry {
-                key: k.clone(),
-                lsn: entry.lsn,
-                value: entry.value.clone(),
-            })?;
+            match &entry.value {
+                IndexValue::Inline(val) => {
+                    builder.add_raw_entry(k, entry.lsn, 1, val)?;
+                }
+                IndexValue::Blob(ptr) => {
+                    let mut blob_buf = [0u8; crate::index::BLOB_PTR_ENCODED_LEN];
+                    blob_buf[0] = ptr.kind as u8;
+                    blob_buf[1..3].copy_from_slice(&ptr.table_id.to_le_bytes());
+                    blob_buf[3..11].copy_from_slice(&ptr.seg_id.to_le_bytes());
+                    blob_buf[11..15].copy_from_slice(&ptr.offset.to_le_bytes());
+                    blob_buf[15..19].copy_from_slice(&ptr.len.to_le_bytes());
+                    blob_buf[19..23].copy_from_slice(&ptr.crc32c.to_le_bytes());
+                    builder.add_raw_entry(k, entry.lsn, 2, &blob_buf)?;
+                }
+                IndexValue::Tombstone => {
+                    builder.add_raw_entry(k, entry.lsn, 3, &[])?;
+                }
+            }
         }
         builder.finish()
     }

@@ -40,12 +40,77 @@ pub(crate) struct TxOverlay {
     /// Per-key undo log (`key`, previous overlay entry), recorded only while at least one
     /// savepoint exists. `rollback_to_savepoint` pops it back to the marker's length.
     pub(super) undo: Vec<(Vec<u8>, Option<MemEntry>)>,
+    /// Cached bounds of keys present in `map` for O(1) membership rejection.
+    pub(super) min_key: Option<Vec<u8>>,
+    pub(super) max_key: Option<Vec<u8>>,
+    /// Fast 1024-bit Bloom filter over keys currently in `map`.
+    pub(super) filter: [u64; 16],
 }
 
 impl TxOverlay {
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub(super) fn clear(&mut self) {
         self.map.clear();
         self.undo.clear();
+        self.min_key = None;
+        self.max_key = None;
+        self.filter = [0; 16];
+    }
+
+    #[inline]
+    pub(super) fn may_contain_key(&self, key: &[u8]) -> bool {
+        if self.map.is_empty() {
+            return false;
+        }
+        if let Some(min) = &self.min_key {
+            if key < min.as_slice() {
+                return false;
+            }
+        }
+        if let Some(max) = &self.max_key {
+            if key > max.as_slice() {
+                return false;
+            }
+        }
+        let h1 = crate::util::crc32c::crc32c_append(0, key);
+        if (self.filter[(h1 as usize & 1023) / 64] & (1 << (h1 & 63))) == 0 {
+            return false;
+        }
+        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, key);
+        if (self.filter[(h2 as usize & 1023) / 64] & (1 << (h2 & 63))) == 0 {
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    pub(super) fn overlaps_range(
+        &self,
+        lo: std::ops::Bound<&[u8]>,
+        hi: std::ops::Bound<&[u8]>,
+    ) -> bool {
+        if self.map.is_empty() {
+            return false;
+        }
+        if let Some(max) = &self.max_key {
+            match lo {
+                std::ops::Bound::Included(lo_k) if lo_k > max.as_slice() => return false,
+                std::ops::Bound::Excluded(lo_k) if lo_k >= max.as_slice() => return false,
+                _ => {}
+            }
+        }
+        if let Some(min) = &self.min_key {
+            match hi {
+                std::ops::Bound::Included(hi_k) if hi_k < min.as_slice() => return false,
+                std::ops::Bound::Excluded(hi_k) if hi_k <= min.as_slice() => return false,
+                _ => {}
+            }
+        }
+        true
     }
 
     pub(super) fn apply(&mut self, lsn: u64, rec: WalRecord, record_undo: bool) {
@@ -55,6 +120,22 @@ impl TxOverlay {
             WalRecord::Delete { key } => (key, IndexValue::Tombstone),
             WalRecord::TxBegin | WalRecord::TxCommit => return,
         };
+
+        match &mut self.min_key {
+            Some(min) if key < *min => *min = key.clone(),
+            None => self.min_key = Some(key.clone()),
+            _ => {}
+        }
+        match &mut self.max_key {
+            Some(max) if key > *max => *max = key.clone(),
+            None => self.max_key = Some(key.clone()),
+            _ => {}
+        }
+        let h1 = crate::util::crc32c::crc32c_append(0, &key);
+        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, &key);
+        self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
+        self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
+
         if record_undo {
             let undo_key = key.clone();
             let prev = self.map.insert(key, MemEntry { lsn, value });
@@ -66,7 +147,9 @@ impl TxOverlay {
 
     /// Pops undo entries until `undo.len() == target_len`, restoring the overlay exactly.
     pub(super) fn rollback_to(&mut self, target_len: usize) {
+        let mut popped = false;
         while self.undo.len() > target_len {
+            popped = true;
             let (key, prev) = self.undo.pop().unwrap();
             match prev {
                 Some(e) => {
@@ -74,6 +157,23 @@ impl TxOverlay {
                 }
                 None => {
                     self.map.remove(&key);
+                }
+            }
+        }
+        if popped {
+            if self.map.is_empty() {
+                self.min_key = None;
+                self.max_key = None;
+                self.filter = [0; 16];
+            } else {
+                self.min_key = self.map.first_key_value().map(|(k, _)| k.clone());
+                self.max_key = self.map.last_key_value().map(|(k, _)| k.clone());
+                self.filter = [0; 16];
+                for k in self.map.keys() {
+                    let h1 = crate::util::crc32c::crc32c_append(0, k);
+                    let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, k);
+                    self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
+                    self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
                 }
             }
         }
