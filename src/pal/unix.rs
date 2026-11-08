@@ -6,6 +6,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::path::{normalize_db_root_path, validate_flat_file_name};
@@ -31,6 +32,11 @@ pub const DEFAULT_HANDLE_POOL_CAP: usize = 128;
 /// Reference-aware descriptor pool for POSIX systems (e.g. macOS `RLIMIT_NOFILE = 256`).
 /// Bounds simultaneously open descriptors across idle segment files while never closing
 /// handles actively pinned by queries, cursors, or in-flight I/O.
+///
+/// The pool tracks every live pooled handle, open or closed, so a handle that is reopened after
+/// an eviction counts against the cap again. Eviction only uses `try_write` on a handle, so the
+/// pool mutex never waits for in-flight I/O or for a handle that is being reopened (the reopening
+/// thread holds that handle's write lock while it calls into the pool).
 pub struct HandlePool {
     max_descriptors: usize,
     inner: Mutex<HandlePoolInner>,
@@ -49,7 +55,7 @@ struct HandlePoolInner {
 }
 
 struct TrackedHandle {
-    _path: PathBuf,
+    path: PathBuf,
     file: Weak<UnixPlatformFile>,
 }
 
@@ -67,7 +73,7 @@ impl HandlePool {
         let mut inner = self.inner.lock().unwrap();
         self.evict_if_needed(&mut inner);
         inner.tracked.push(TrackedHandle {
-            _path: path.to_path_buf(),
+            path: path.to_path_buf(),
             file: Arc::downgrade(file),
         });
     }
@@ -78,31 +84,61 @@ impl HandlePool {
     }
 
     fn evict_if_needed(&self, inner: &mut HandlePoolInner) {
-        inner.tracked.retain(|th| th.file.upgrade().is_some());
+        inner.tracked.retain(|th| th.file.strong_count() > 0);
 
-        if inner.tracked.len() < self.max_descriptors {
+        let open_count = inner
+            .tracked
+            .iter()
+            .filter_map(|th| th.file.upgrade())
+            .filter(|f| f.descriptor_open.load(Ordering::Acquire))
+            .count();
+        if open_count < self.max_descriptors {
             return;
         }
 
-        // Find the oldest unpinned handle (strong_count <= 2: 1 for engine/pool, 1 for local upgraded Arc)
-        let mut evict_idx = None;
-        for (idx, th) in inner.tracked.iter().enumerate() {
-            if let Some(arc) = th.file.upgrade() {
-                if Arc::strong_count(&arc) <= 2 {
-                    if let Ok(mut guard) = arc.file.write() {
-                        if guard.is_some() {
-                            *guard = None;
-                            evict_idx = Some(idx);
-                            break;
-                        }
-                    }
+        // Close the oldest unpinned open handle. Unpinned means the only owner besides the local
+        // upgraded Arc is the engine or caller (strong_count <= 2) and the file has not been
+        // unlinked. The handle stays tracked so that a later reopen counts against the cap.
+        for th in &inner.tracked {
+            let Some(arc) = th.file.upgrade() else {
+                continue;
+            };
+            if arc.keep_open.load(Ordering::Acquire) || Arc::strong_count(&arc) > 2 {
+                continue;
+            }
+            if let Ok(mut guard) = arc.file.try_write() {
+                if guard.is_some() {
+                    *guard = None;
+                    arc.descriptor_open.store(false, Ordering::Release);
+                    return;
                 }
             }
         }
+    }
 
-        if let Some(idx) = evict_idx {
-            inner.tracked.remove(idx);
+    /// Makes every handle to `path` that is still referenced hold an open descriptor and exempts
+    /// it from eviction, so the file stays readable through that descriptor after it is unlinked.
+    fn pin_open_before_unlink(&self, path: &Path) -> io::Result<()> {
+        let handles: Vec<Arc<UnixPlatformFile>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .tracked
+                .iter()
+                .filter(|th| th.path == path)
+                .filter_map(|th| th.file.upgrade())
+                .filter(|arc| Arc::strong_count(arc) > 1)
+                .collect()
+        };
+        // The pool mutex is released: reopening may wait for in-flight I/O on the handle.
+        for arc in handles {
+            arc.keep_open.store(true, Ordering::Release);
+            match arc.with_file(|_| Ok(())) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(())
     }
 }
 
@@ -112,6 +148,11 @@ pub struct UnixPlatformFile {
     writable: bool,
     hint: OpenHint,
     file: RwLock<Option<File>>,
+    /// Mirrors `file.is_some()` so the pool can count open descriptors without taking `file`.
+    descriptor_open: AtomicBool,
+    /// Set once the file is about to be unlinked while still referenced: the descriptor must
+    /// stay open because the path can no longer be reopened.
+    keep_open: AtomicBool,
     pool: Option<Arc<HandlePool>>,
 }
 
@@ -148,6 +189,8 @@ impl UnixPlatformFile {
             writable,
             hint,
             file: RwLock::new(Some(file)),
+            descriptor_open: AtomicBool::new(true),
+            keep_open: AtomicBool::new(false),
             pool,
         })
     }
@@ -172,12 +215,13 @@ impl UnixPlatformFile {
             .open(&self.path)?;
         let res = f(&reopened);
         *guard = Some(reopened);
+        self.descriptor_open.store(true, Ordering::Release);
         res
     }
 
     /// Whether the underlying file descriptor is currently open in memory.
     pub fn is_descriptor_open(&self) -> bool {
-        self.file.read().unwrap().is_some()
+        self.descriptor_open.load(Ordering::Acquire)
     }
 }
 
@@ -342,6 +386,7 @@ impl PlatformFs for UnixPlatformFs {
     fn remove_file(&self, rel_name: &str) -> io::Result<()> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(rel_name);
+        self.pool.pin_open_before_unlink(&full_path)?;
         match std::fs::remove_file(full_path) {
             Ok(()) => {
                 self.sync_dir()?;
@@ -394,14 +439,15 @@ mod tests {
         assert!(f2.is_descriptor_open());
         assert!(f3.is_descriptor_open());
 
+        // Pin f2 by holding another Arc reference
+        let f2_pinned = Arc::clone(&f2);
+
         // Reading from f1 transparently reopens its descriptor
         let mut buf = [0u8; 5];
         f1.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"hello");
         assert!(f1.is_descriptor_open(), "f1 should be reopened on access");
 
-        // Pinning test: pin f2 by holding another Arc reference
-        let f2_pinned = Arc::clone(&f2);
         // Open f4: f2 is pinned (strong_count > 2), so f3 or f1 should be evicted instead!
         let f4 = fs
             .open_file("idx_0004.db", true, true, OpenHint::ImmutableRandom)
@@ -410,5 +456,70 @@ mod tests {
 
         assert!(f2.is_descriptor_open(), "f2 was pinned and must not be evicted");
         drop(f2_pinned);
+    }
+
+    fn open_count(handles: &[&Arc<UnixPlatformFile>]) -> usize {
+        handles.iter().filter(|h| h.is_descriptor_open()).count()
+    }
+
+    #[test]
+    fn reopened_handles_count_against_the_cap() {
+        let tmp = TempTestDir::new("handle_pool_reopen_cap");
+        let fs = UnixPlatformFs::open_with_pool_cap(&tmp.path, true, 2).expect("open fs");
+        let mk = |name: &str| {
+            let f = fs
+                .open_file(name, true, true, OpenHint::ImmutableRandom)
+                .unwrap();
+            f.write_all_at(b"data!", 0).unwrap();
+            f
+        };
+        let f1 = mk("idx_0001.db");
+        let f2 = mk("idx_0002.db");
+        let f3 = mk("idx_0003.db");
+        assert!(!f1.is_descriptor_open());
+
+        // Reopening f1 must evict another idle handle instead of exceeding the cap.
+        let mut buf = [0u8; 5];
+        f1.read_exact_at(&mut buf, 0).unwrap();
+        assert!(f1.is_descriptor_open());
+        assert_eq!(open_count(&[&f1, &f2, &f3]), 2);
+
+        // Cycling through all handles keeps the open count at the cap.
+        for f in [&f2, &f3, &f1, &f2] {
+            f.read_exact_at(&mut buf, 0).unwrap();
+            assert_eq!(&buf, b"data!");
+            assert_eq!(open_count(&[&f1, &f2, &f3]), 2);
+        }
+    }
+
+    #[test]
+    fn referenced_handle_stays_readable_after_remove_file() {
+        let tmp = TempTestDir::new("handle_pool_unlink");
+        let fs = UnixPlatformFs::open_with_pool_cap(&tmp.path, true, 1).expect("open fs");
+
+        // The only owner of f1 plays the role of a LazyBlob cursor.
+        let f1 = fs
+            .open_file("idx_0001.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f1.write_all_at(b"hello", 0).unwrap();
+        let f2 = fs
+            .open_file("idx_0002.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        assert!(!f1.is_descriptor_open(), "f1 was evicted by the cap");
+
+        fs.remove_file("idx_0001.db").unwrap();
+        assert!(!fs.list_files().unwrap().contains(&"idx_0001.db".to_string()));
+        assert!(f1.is_descriptor_open());
+
+        // Later opens must not close the unlinked file's descriptor.
+        let f3 = fs
+            .open_file("idx_0003.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f3.write_all_at(b"x", 0).unwrap();
+        f2.write_all_at(b"y", 0).unwrap();
+        assert!(f1.is_descriptor_open());
+        let mut buf = [0u8; 5];
+        f1.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"hello");
     }
 }
