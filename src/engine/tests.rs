@@ -4107,6 +4107,11 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
                 }];
             })
             .unwrap();
+        // A WAL record that is not checkpointed makes the next open replay, which is what
+        // forces the full reconciliation; without it the persisted totals are trusted.
+        engine
+            .put_row(1, b"d", b"value", &[], WriteDurability::BufferedFast)
+            .unwrap();
     }
 
     let epochs = {
@@ -4281,4 +4286,143 @@ fn failed_blob_sync_is_retried_by_the_next_commit() {
     let before = ctl.blob_syncs.load(Ordering::SeqCst);
     engine.prepare_commit_transaction(sync).unwrap();
     assert!(ctl.blob_syncs.load(Ordering::SeqCst) > before);
+}
+
+#[test]
+fn checkpoint_is_rejected_during_a_transaction() {
+    let tmp = TempTestDir::new("checkpoint_in_tx");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.begin_transaction();
+    let err = engine.checkpoint().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    engine.rollback_transaction().unwrap();
+    engine.checkpoint().unwrap();
+}
+
+#[test]
+fn checkpoint_with_empty_memtable_persists_blob_segment_lengths() {
+    let tmp = TempTestDir::new("checkpoint_blob_len");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 128;
+    let wal = WriteDurability::BufferedFast;
+
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    engine.put_row(1, b"a", &vec![1u8; 4000], &[], wal).unwrap();
+    engine.flush_memtable().unwrap();
+    // A rolled-back blob write leaves bytes in the segment beyond the committed length while
+    // the MemTable stays empty.
+    engine.begin_transaction();
+    engine.put_row(1, b"b", &vec![2u8; 4000], &[], wal).unwrap();
+    engine.rollback_transaction().unwrap();
+    assert!(engine.memtable.is_empty());
+    let committed = engine.meta_mgr.state().std_blob_segments[0].file_len;
+    let in_memory = engine.std_blobs.values().next().unwrap().file_len;
+    assert!(in_memory > committed);
+
+    engine.checkpoint().unwrap();
+    let st = engine.meta_mgr.state();
+    assert_eq!(st.std_blob_segments.len(), 1);
+    assert_eq!(st.std_blob_segments[0].file_len, in_memory);
+    let dead = st.std_blob_segments[0].dead_bytes;
+    assert!(dead > 0);
+    drop(engine);
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    let seg = &engine.meta_mgr.state().std_blob_segments[0];
+    assert_eq!(seg.file_len, in_memory);
+    assert_eq!(seg.dead_bytes, dead);
+    assert_eq!(engine.get_row(1, b"a").unwrap(), Some(vec![1u8; 4000]));
+    assert_eq!(engine.get_row(1, b"b").unwrap(), None);
+}
+
+#[test]
+fn checkpoint_flushes_pending_memtable() {
+    let tmp = TempTestDir::new("checkpoint_flush");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let cfg = EngineConfig::default();
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    engine
+        .put_row(1, b"k", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.checkpoint().unwrap();
+    assert!(engine.memtable.is_empty());
+    assert_eq!(engine.meta_mgr.state().idx_segments.len(), 1);
+    drop(engine);
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert!(engine.memtable.is_empty());
+    assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn clean_reopen_skips_capped_reconcile_and_keeps_tick_order() {
+    let tmp = TempTestDir::new("capped_fast_reopen");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 4096;
+    let wal = WriteDurability::BufferedFast;
+    let payload = vec![0x42u8; 1000];
+
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    engine.register_capped_table(1, 3_200).unwrap();
+    for k in [b"k1", b"k2", b"k3"] {
+        engine.put_row(1, k, &payload, &[], wal).unwrap();
+    }
+    let bytes = engine.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(bytes > 0);
+    engine.checkpoint().unwrap();
+    drop(engine);
+
+    // Reopen after the checkpoint: byte totals are taken from boot_meta and the new row gets a
+    // tick above every existing one, so the oldest row is the one evicted.
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, bytes);
+    assert!(engine.access_tracker.next_tick() > 3);
+    engine.put_row(1, b"k4", &payload, &[], wal).unwrap();
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), None);
+    for k in [b"k2", b"k3", b"k4"] {
+        assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()), "{k:?}");
+    }
+    engine.checkpoint().unwrap();
+    drop(engine);
+
+    // The persisted total is authoritative when nothing was replayed: a deliberately altered
+    // value survives the open, which a full row scan would have corrected.
+    {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        engine
+            .meta_mgr
+            .commit_update(|st| st.table_quotas[0].current_logical_bytes = 12_345)
+            .unwrap();
+    }
+    let engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, 12_345);
+}
+
+#[test]
+fn crash_with_wal_contents_runs_full_capped_reconcile() {
+    let tmp = TempTestDir::new("capped_full_reopen");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 4096;
+    let wal = WriteDurability::BufferedFast;
+    let payload = vec![0x42u8; 1000];
+
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    engine.register_capped_table(1, 100_000).unwrap();
+    engine.put_row(1, b"k1", &payload, &[], wal).unwrap();
+    engine.checkpoint().unwrap();
+    let flushed_bytes = engine.capped_table_state(1).unwrap().current_logical_bytes;
+    engine.put_row(1, b"k2", &payload, &[], wal).unwrap();
+    engine.put_row(1, b"k3", &payload, &[], wal).unwrap();
+    let expected = engine.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(expected > flushed_bytes);
+    drop(engine); // crash: k2 and k3 exist only in the WAL
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, expected);
+    for k in [b"k1", b"k2", b"k3"] {
+        assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()), "{k:?}");
+    }
 }

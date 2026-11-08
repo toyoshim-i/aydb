@@ -15,6 +15,7 @@ use crate::meta::{EvictionPolicy, TableQuotaMeta};
 use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
+use super::reader::ReadView;
 use super::{StorageEngine, WriteDurability};
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -382,10 +383,45 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    pub(super) fn reconcile_capped_tables_after_recovery(&mut self) -> io::Result<()> {
+    /// Rebuilds the byte totals and access ticks of every capped table after recovery.
+    ///
+    /// When `replayed_wal` is false, recovery applied nothing, so the memtable is empty and the
+    /// persisted `current_logical_bytes` is authoritative. The row scan is then skipped and only
+    /// the access tick counter is advanced past the ticks already present in each LRU queue.
+    pub(super) fn reconcile_capped_tables_after_recovery(
+        &mut self,
+        replayed_wal: bool,
+    ) -> io::Result<()> {
         let table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in table_ids {
-            self.reconcile_single_capped_table(tid)?;
+            if replayed_wal {
+                self.reconcile_single_capped_table(tid)?;
+            } else {
+                self.observe_lru_queue_ticks(tid)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Advances `access_tracker` past the newest tick in `table_id`'s LRU queue. Queue keys sort
+    /// by tick, so a reverse scan limited to one entry yields the maximum.
+    fn observe_lru_queue_ticks(&mut self, table_id: u16) -> io::Result<()> {
+        let lru_prefix = encode_namespace_prefix(table_id, NS_LRU_QUEUE);
+        let mut newest_tick = None;
+        self.visit_merged_prefix_range_reverse_view(
+            ReadView::Owner,
+            &lru_prefix,
+            &lru_prefix,
+            true,
+            None,
+            1,
+            |key, _lsn, _value| {
+                newest_tick = decode_lru_queue_key(table_id, key).map(|(tick, _)| tick);
+                Ok(true)
+            },
+        )?;
+        if let Some(tick) = newest_tick {
+            self.access_tracker.observe_tick(tick);
         }
         Ok(())
     }

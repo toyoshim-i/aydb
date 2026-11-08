@@ -507,6 +507,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);
         buf_wal.set_cursor_after_recovery(rec.next_buf_sector_idx);
 
+        // Recovery that found no valid sector in either stream and replayed no batch leaves the
+        // persisted capped-table byte totals authoritative.
+        let replayed_wal = !rec.merged_batches.is_empty()
+            || rec.next_sync_sector_idx > 0
+            || rec.next_buf_sector_idx > 0;
+
         let mut memtable = MemTable::new(config.memtable_capacity_bytes);
         for batch in rec.merged_batches {
             let batch_lsn = batch.lsn;
@@ -729,7 +735,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // Reconciliation records land in the fresh epoch and are replayed by the next recovery.
-        engine.reconcile_capped_tables_after_recovery()?;
+        engine.reconcile_capped_tables_after_recovery(replayed_wal)?;
 
         // Now that WAL recovery and the post-recovery checkpoint are complete, sweep any truly
         // orphaned segment/manifest files and process pending deletes!

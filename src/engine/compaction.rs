@@ -118,6 +118,72 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Brings the persisted state up to date so that the next `open` has no replay work.
+    ///
+    /// A non-empty `MemTable` is flushed to a new `idx` segment, which also commits the blob
+    /// segment lengths, dead bytes, and quota totals. With an empty `MemTable` there is nothing
+    /// to flush, but blob segments may have grown since the last commit (for example by a rolled
+    /// back transaction); their lengths are committed so that `open` does not walk every `idx`
+    /// segment to find the end of the valid data. Dead bytes can be persisted in full here
+    /// because an empty `MemTable` means no logged mutation is still waiting for a checkpoint.
+    ///
+    /// Fails with `InvalidInput` while a transaction is active. Dropping the engine does not
+    /// call this; a drop without `checkpoint` is treated as a crash by the next `open`.
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        if self.tx_depth > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint is not allowed while a transaction is active",
+            ));
+        }
+        self.drain_corrupt_evictions()?;
+        if !self.memtable.is_empty() {
+            return self.flush_memtable();
+        }
+        self.buf_wal.flush_buffered_to_os()?;
+        self.sync_active_blob_writers()?;
+
+        let std_metas: Vec<StdBlobSegmentMeta> = self
+            .std_blobs
+            .iter()
+            .map(|(&seq_id, b)| StdBlobSegmentMeta {
+                seq_id,
+                file_len: b.file_len,
+                dead_bytes: b.dead_bytes,
+            })
+            .collect();
+        let lru_metas: Vec<LruBlobSegmentMeta> = self
+            .lru_blobs
+            .iter()
+            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
+                seq_id,
+                file_len: b.file_len,
+                dead_bytes: b.dead_bytes,
+                table_id: b.table_id,
+            })
+            .collect();
+        let quota_metas = self.build_quota_metas();
+        let st = self.meta_mgr.state();
+        // `build_quota_metas` iterates a `HashMap`, so compare the quotas in table order.
+        let sorted_quotas = |v: &[crate::meta::TableQuotaMeta]| {
+            let mut v = v.to_vec();
+            v.sort_by_key(|q| q.table_id);
+            v
+        };
+        if st.std_blob_segments == std_metas
+            && st.lru_blob_segments == lru_metas
+            && sorted_quotas(&st.table_quotas) == sorted_quotas(&quota_metas)
+        {
+            return Ok(());
+        }
+        self.meta_mgr.commit_update(|st| {
+            st.std_blob_segments = std_metas;
+            st.lru_blob_segments = lru_metas;
+            st.table_quotas = quota_metas;
+        })
+    }
+
     pub(super) fn flush_memtable_no_auto_compact(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
         if self.tx_depth > 0 {
