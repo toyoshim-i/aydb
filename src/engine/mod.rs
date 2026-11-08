@@ -854,6 +854,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         ));
                     }
                 }
+                if let Some(owner) = persisted_id_to_name.get(&id) {
+                    if owner != &norm_name {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("table_id {id} is already persisted for virtual table '{owner}'"),
+                        ));
+                    }
+                }
+                if let Some(&persisted_id) = persisted_name_to_id.get(&norm_name) {
+                    if persisted_id != id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "virtual table '{norm_name}' is already persisted with table_id {persisted_id}"
+                            ),
+                        ));
+                    }
+                }
                 id
             }
             None => {

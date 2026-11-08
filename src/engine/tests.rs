@@ -3990,3 +3990,26 @@ fn drop_table_with_tombstones_larger_than_wal_is_atomic_and_durable() {
     }
     assert_eq!(engine.get_row(2, b"keep").unwrap(), Some(b"v".to_vec()));
 }
+
+#[test]
+fn explicit_table_id_cannot_alias_or_remap_a_persisted_table() {
+    let tmp = TempTestDir::new("explicit_table_id_alias");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let id = engine.register_or_resolve_vtab("alpha", Some(5)).unwrap();
+    engine
+        .put_row(id, b"k", b"alpha-data", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.unregister_vtab(id, "alpha");
+
+    // Another name must not take over the persisted id.
+    let err = engine.register_or_resolve_vtab("beta", Some(5)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    // The persisted name must not be re-bound to a different id.
+    let err = engine.register_or_resolve_vtab("alpha", Some(6)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+    // The original binding still resolves.
+    assert_eq!(engine.register_or_resolve_vtab("alpha", Some(5)).unwrap(), 5);
+    assert_eq!(engine.register_or_resolve_vtab("alpha", None).unwrap(), 5);
+}
