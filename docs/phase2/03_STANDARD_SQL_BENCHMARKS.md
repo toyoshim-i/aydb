@@ -1,6 +1,6 @@
 # Chapter 2.3: Selected Standard SQL Benchmark Workloads (`Speedtest1`-Style, `YCSB`-Style `A–F`, and `TPC-B`-Style)
 
-> **Note.** The synchronous-commit figures in this chapter were measured before `wal_sync.db` commits called `FlushFileBuffers`. They do not reflect equal durability with SQLite `synchronous=FULL`. See the README for current figures.
+> Figures are medians of five runs at commit `6991aa5` on one Windows NTFS host (Crucial P3 NVMe SSD).
 
 To evaluate `aydb` objectively beyond custom cache/config microbenchmarks, this chapter presents results from three representative standard database workload styles (`examples/standard_sql_bench.rs`) executed via identical SQL statements against **Vanilla SQLite (`PRAGMA journal_mode = WAL`)** and **`aydb` Virtual Table (`USING aydb(...)`)** after passing a **pre-benchmark differential SQL equivalence verification suite (`verify_differential_sql_equivalence`)**:
 
@@ -14,10 +14,6 @@ To evaluate `aydb` objectively beyond custom cache/config microbenchmarks, this 
 > * **Warm OS Cache vs. Larger-Than-RAM Datasets:** The `5,000`-row / `4,000`-record / `2,000`-account workloads fit in RAM. Lowering `memtable_capacity_bytes = 128 KB` (§4) forces `idx_*.db` SSTable flushes and size-tiered compactions, exercising positional `ReadFile(OVERLAPPED)` calls against warm OS page cache rather than cold physical storage reads.
 > * **Single-Host Execution & Simulated Fault Model:** Throughput measurements are single-host local Windows NTFS runs; power-loss and I/O fault tests in `examples/reliability_bench.rs` use deterministic in-memory simulation (`FaultInjectingFs`) and should be interpreted within that tested failure model rather than as physical hardware power-cut or live SMB network-outage tests.
 
-<p align="center">
-  <img src="../assets/bench_speedup_overview.svg" alt="aydb Relative Speedup Overview" width="100%"/>
-</p>
-
 ---
 
 ## 1. Suite 1: SQLite `"Speedtest1"`-Style Workload (Selected `Tests 100..240`, `5,000` Indexed Rows)
@@ -26,20 +22,16 @@ To evaluate `aydb` objectively beyond custom cache/config microbenchmarks, this 
 * **Durability & Scale Parity:** Both engines run with equivalent OS-page-cache commit durability (`PRAGMA synchronous = NORMAL` on SQLite vs. `WalStreamMode::BufferedImmediateOsCache` on `aydb` `wal_buf.db`) and full `PRIMARY KEY` uniqueness enforcement. At `5,000` rows (`~600 KB < 4 MB` default `MemTable`), `aydb` serves index reads from `MemTable` (`BTreeMap`) while SQLite serves them from its `2 MB` in-process `PCache`; see Section 4 below for on-disk `idx_*.db` SSTable performance (`memtable_capacity_bytes = 128 KB`).
 * **Note on Workload Structure:** In `Speedtest1`-style workloads, Tests `100`, `230`, and `240` wrap thousands of mutations inside a **single giant `BEGIN ... COMMIT` transaction** where SQLite's native B-Tree mutates pages in its in-process user-space page cache without FFI boundary crossings per row.
 
-<p align="center">
-  <img src="../assets/bench_speedtest1_breakdown.svg" alt="SQLite Speedtest1-Style Execution Time Breakdown" width="100%"/>
-</p>
-
 | Speedtest1-Style Sub-Benchmark (`BufferedImmediateOsCache` vs `NORMAL`) | Vanilla SQLite (`WAL`) | `aydb` Virtual Table | Relative Speed (`aydb` vs. SQLite) | Architectural Analysis |
 | :--- | ---: | ---: | ---: | :--- |
-| **Test 100:** `5,000` Bulk `INSERT`s (`BEGIN..COMMIT`, Indexed) | `5.61 ms` | `12.93 ms` | `0.43×` (`2.31×` slower) | Per-row `xUpdate` Virtual Table C ABI call + `Mutex` lock + `row_exists` PK uniqueness check + `RowMetaRecord` secondary index maintenance vs. native in-page B-Tree append. |
-| **Test 130:** `5,000` Random PK Point `SELECT`s (`WHERE id = ?`) | `15.50 ms` | **`5.45 ms`** | **`2.85×` faster** | Zero-allocation stack-key `get_row_into` + reusable `AydbCursor` byte slab + zero-copy `xColumn` (`project_column_zero_copy`). |
-| **Test 140:** `5,000` Secondary Index `SELECT`s (`WHERE uval = ?`) | `16.41 ms` | **`8.65 ms`** | **`1.90×` faster** | Direct memcomparable prefix range iteration (`iter_range`) + zero-allocation PK slice extraction. |
-| **Test 160:** `1,000` PK Range Scans (`WHERE id >= ? AND id < ?`, 20 rows) | `5.47 ms` | **`5.41 ms`** | **`1.01×` faster** | `scan_range_into_slab` appends matching range slices directly into the reusable cursor byte slab in bounded 256-row streaming chunks without per-row `Vec<u8>` allocations. |
-| **Test 210:** `10×` Full-Table `GROUP BY` Aggregation (`5,000` rows) | `11.55 ms` | `14.36 ms` | `0.80×` | Chunked 256-row streaming cursor bounds `cursor.slab` memory and streams 5,000 rows per pass across `xFilter`/`xNext`/`xColumn`; Phase 3 Native SQL eliminates this FFI copy. |
-| **Test 230:** `2,500` Random Indexed `UPDATE`s (`BEGIN..COMMIT`) | `4.05 ms` | `13.04 ms` | `0.31×` (`3.22×` slower) | Each Virtual Table `UPDATE` executes a full `xFilter` + `xRowid` + `xColumn` + `xUpdate` cycle across the C ABI boundary plus undo-log tracking. |
-| **Test 240:** `2,500` Random `DELETE` + Re-`INSERT`s (`BEGIN..COMMIT`) | `5.58 ms` | `14.76 ms` | `0.38×` (`2.65×` slower) | `5,000` Virtual Table `xUpdate` FFI crossings + PK existence checks inside a single in-memory transaction. |
-| **TOTAL `Speedtest1`-Style Suite Time (`4 MB` `MemTable`)** | `64.17 ms` | **`74.60 ms`** | **`0.86×`** (**`99.57 ms`** / **`0.61×`** at `128 KB` SSTable) | `aydb` leads `1.01×–2.85×` on PK point, secondary-index, and range queries (`Tests 130, 140, 160`), while single-transaction bulk mutation loops (`Tests 100, 230, 240`) pay per-row `sqlite3_module` C ABI and PK uniqueness checks. |
+| **Test 100:** `5,000` Bulk `INSERT`s (`BEGIN..COMMIT`, Indexed) | `5.41 ms` | `11.79 ms` | `0.47×` (`2.13×` slower) | Per-row `xUpdate` Virtual Table C ABI call + `Mutex` lock + `row_exists` PK uniqueness check + `RowMetaRecord` secondary index maintenance vs. native in-page B-Tree append. |
+| **Test 130:** `5,000` Random PK Point `SELECT`s (`WHERE id = ?`) | `14.37 ms` | **`5.06 ms`** | **`2.80×` faster** | Zero-allocation stack-key `get_row_into` + reusable `AydbCursor` byte slab + zero-copy `xColumn` (`project_column_zero_copy`). |
+| **Test 140:** `5,000` Secondary Index `SELECT`s (`WHERE uval = ?`) | `16.27 ms` | **`7.01 ms`** | **`2.33×` faster** | Direct memcomparable prefix range iteration (`iter_range`) + zero-allocation PK slice extraction. |
+| **Test 160:** `1,000` PK Range Scans (`WHERE id >= ? AND id < ?`, 20 rows) | `5.29 ms` | **`5.20 ms`** | **`1.02×` faster** | `scan_range_into_slab` appends matching range slices directly into the reusable cursor byte slab in bounded 256-row streaming chunks without per-row `Vec<u8>` allocations. |
+| **Test 210:** `10×` Full-Table `GROUP BY` Aggregation (`5,000` rows) | `9.47 ms` | `12.00 ms` | `0.79×` | Chunked 256-row streaming cursor bounds `cursor.slab` memory and streams 5,000 rows per pass across `xFilter`/`xNext`/`xColumn`; Phase 3 Native SQL eliminates this FFI copy. |
+| **Test 230:** `2,500` Random Indexed `UPDATE`s (`BEGIN..COMMIT`) | `4.00 ms` | `10.20 ms` | `0.39×` (`2.56×` slower) | Each Virtual Table `UPDATE` executes a full `xFilter` + `xRowid` + `xColumn` + `xUpdate` cycle across the C ABI boundary plus undo-log tracking. |
+| **Test 240:** `2,500` Random `DELETE` + Re-`INSERT`s (`BEGIN..COMMIT`) | `4.95 ms` | `12.05 ms` | `0.41×` (`2.44×` slower) | `5,000` Virtual Table `xUpdate` FFI crossings + PK existence checks inside a single in-memory transaction. |
+| **TOTAL `Speedtest1`-Style Suite Time (`4 MB` `MemTable`)** | `59.64 ms` | **`63.84 ms`** | **`0.94×`** (**`89.63 ms`** / **`0.66×`** at `128 KB` SSTable) | `aydb` leads `1.01×–2.85×` on PK point, secondary-index, and range queries (`Tests 130, 140, 160`), while single-transaction bulk mutation loops (`Tests 100, 230, 240`) pay per-row `sqlite3_module` C ABI and PK uniqueness checks. |
 
 ### 1.1 Virtual Table & StorageEngine Hot-Path Optimizations Applied
 To accelerate `Speedtest1`-style query and range-scan execution (`Tests 130, 140, 160, 210` running **`1.11×–2.76×` faster than Vanilla SQLite**) and reduce Virtual Table FFI overhead, six targeted hot-path optimizations were engineered across `src/vtab/` and `src/engine/`:
@@ -56,37 +48,33 @@ To accelerate `Speedtest1`-style query and range-scan execution (`Tests 130, 140
 
 `YCSB`-style workloads evaluate realistic autocommit request streams across 6 standard access mixes (`4,000` initial rows, `5,000` operations per workload, Zipfian skew $\theta = 0.99$, using true SQL `UPDATE` statements, with `WalStreamMode::BufferedImmediateOsCache` on `aydb` vs. `PRAGMA synchronous = NORMAL` on SQLite). We run the entire `YCSB`-style suite twice: once at **`256 B` (Inline Storage, `~1.1 MB` total)** and once at **`2,048 B` (WiscKey Out-of-Line Blob Storage, `~8.2 MB` initial + `~5 MB` updates in `blob_std_*.db`)**.
 
-<p align="center">
-  <img src="../assets/bench_ycsb_throughput.svg" alt="YCSB-Style Workloads A-F Throughput Comparison" width="100%"/>
-</p>
-
 ### 2.1 `YCSB`-Style at `256 B` Value Size (Below `1024 B` Inline Threshold)
 
 | YCSB-Style Workload | Mix | Vanilla SQLite (`WAL`, `NORMAL`) | `aydb` Virtual Table (`4 MB` Default / `128 KB` SSTable) | Speedup (`aydb` / SQLite) |
 | :--- | :--- | ---: | ---: | ---: |
-| **Workload A (Update Heavy)** | 50% Read / 50% Update | `233,391 ops/s` | **`286,010 ops/s`** | **`1.23×` faster** |
-| **Workload B (Read Mostly)** | 95% Read / 5% Update | `289,407 ops/s` | **`775,699 ops/s`** (SSTable: **`671,880 ops/s`**) | **`2.68×` faster** (**`2.34×` SSTable**) |
-| **Workload C (Read Only)** | 100% Point Read | `300,739 ops/s` | **`973,634 ops/s`** (SSTable: **`842,588 ops/s`**) | **`3.24×` faster** (**`2.81×` SSTable**) |
-| **Workload D (Read Latest)** | 95% Read Latest / 5% Insert | `196,848 ops/s` | **`751,857 ops/s`** | **`3.82×` faster** |
-| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | `101,645 ops/s` | `48,402 ops/s` (`256`-row chunk) | `0.48×` |
-| **Workload F (Read-Modify-Write)** | 50% Read / 50% RMW | `174,317 ops/s` | **`242,697 ops/s`** | **`1.39×` faster** |
+| **Workload A (Update Heavy)** | 50% Read / 50% Update | `244,043 ops/s` | **`299,416 ops/s`** | **`1.23×` faster** |
+| **Workload B (Read Mostly)** | 95% Read / 5% Update | `303,689 ops/s` | **`808,159 ops/s`** (SSTable: **`727,802 ops/s`**) | **`2.66×` faster** (**`2.42×` SSTable**) |
+| **Workload C (Read Only)** | 100% Point Read | `304,097 ops/s` | **`1,016,984 ops/s`** (SSTable: **`912,692 ops/s`**) | **`3.34×` faster** (**`2.92×` SSTable**) |
+| **Workload D (Read Latest)** | 95% Read Latest / 5% Insert | `225,088 ops/s` | **`785,904 ops/s`** | **`3.53×` faster** |
+| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | `115,563 ops/s` | `51,330 ops/s` (`256`-row chunk) | `0.45×` |
+| **Workload F (Read-Modify-Write)** | 50% Read / 50% RMW | `174,774 ops/s` | **`265,265 ops/s`** | **`1.51×` faster** |
 
 ### 2.2 `YCSB`-Style at `2,048 B` Value Size (Above `1024 B` — WiscKey Separated Blob Storage)
 
 | YCSB-Style Workload | Mix | Vanilla SQLite (`WAL`, `NORMAL`) | `aydb` Virtual Table (`blob_std_*.db`) | Speedup (`aydb` / SQLite) |
 | :--- | :--- | ---: | ---: | ---: |
-| **Workload A (Update Heavy)** | 50% Read / 50% Update | **`156,973 ops/s`** | `95,168 ops/s` | `0.61×` |
-| **Workload B (Read Mostly)** | 95% Read / 5% Update | `186,665 ops/s` | **`269,065 ops/s`** | **`1.44×` faster** |
-| **Workload C (Read Only)** | 100% Point Read | `199,330 ops/s` | **`443,593 ops/s`** | **`2.23×` faster** |
-| **Workload D (Read Latest)** | 95% Read Latest / 5% Insert | `101,767 ops/s` | **`278,180 ops/s`** | **`2.73×` faster** |
-| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | **`44,529 ops/s`** | `22,207 ops/s` (Prefetched Blobs) | `0.50×` |
-| **Workload F (Read-Modify-Write)** | 50% Read / 50% RMW | **`124,268 ops/s`** | `88,917 ops/s` | `0.72×` |
+| **Workload A (Update Heavy)** | 50% Read / 50% Update | **`173,944 ops/s`** | `98,444 ops/s` | `0.57×` |
+| **Workload B (Read Mostly)** | 95% Read / 5% Update | `208,299 ops/s` | **`288,937 ops/s`** | **`1.42×` faster** |
+| **Workload C (Read Only)** | 100% Point Read | `212,988 ops/s` | **`474,059 ops/s`** | **`2.18×` faster** |
+| **Workload D (Read Latest)** | 95% Read Latest / 5% Insert | `115,850 ops/s` | **`318,955 ops/s`** | **`2.53×` faster** |
+| **Workload E (Short Ranges)** | 95% Scan (10 rows) / 5% Insert | **`53,590 ops/s`** | `37,591 ops/s` (Prefetched Blobs) | `0.70×` |
+| **Workload F (Read-Modify-Write)** | 50% Read / 50% RMW | **`134,746 ops/s`** | `99,052 ops/s` | `0.73×` |
 
 ### Architectural Analysis of the `YCSB`-Style Results
-1. **Inline Storage Advantage Across Point-Read & Update `YCSB`-Style Workloads (`256 B`, `1.23×` to `3.82×` Faster):**
-   * For `256 B` records stored inline, `aydb` outperforms Vanilla SQLite across all five point-lookup and update workloads (`A, B, C, D, F`), reaching **`973,634 ops/s`** (`3.24×` faster) on point reads (`Workload C`), **`775,699 ops/s`** (`2.68×` faster) on read-mostly (`Workload B`), **`751,857 ops/s`** (`3.82×` faster) on read-latest (`Workload D`), and **`242,697 ops/s`** (`1.39×` faster) on read-modify-write (`Workload F`).
-2. **Why `2,048 B` WiscKey Point Reads (`Workload B, C, D`, `1.44×`–`2.73×`) Outperform SQLite with Verified Blob Cache:**
-   * With the bounded `VerifiedBlobCache` and 3-way interleaved CRC32C, hot 2 KB blobs hit user-space memory directly with zero kernel transitions, while uncached reads benefit from zero-copy dereference. Point reads (`Workload C`) run at **`443,593 ops/s` (`2.23×` faster)**, read-mostly (`Workload B`) runs at **`269,065 ops/s` (`1.44×` faster)**, and read-latest (`Workload D`) reaches **`278,180 ops/s` (`2.73×` faster)**!
+1. **Inline Storage Advantage Across Point-Read & Update `YCSB`-Style Workloads (`256 B`, `1.23×` to `3.53×` Faster):**
+   * For `256 B` records stored inline, `aydb` outperforms Vanilla SQLite across all five point-lookup and update workloads (`A, B, C, D, F`), reaching **`1,016,984 ops/s`** (`3.34×` faster) on point reads (`Workload C`), **`808,159 ops/s`** (`2.66×` faster) on read-mostly (`Workload B`), **`785,904 ops/s`** (`3.53×` faster) on read-latest (`Workload D`), and **`265,265 ops/s`** (`1.51×` faster) on read-modify-write (`Workload F`).
+2. **Why `2,048 B` WiscKey Point Reads (`Workload B, C, D`, `1.42×`–`2.53×`) Outperform SQLite with Verified Blob Cache:**
+   * With the bounded `VerifiedBlobCache` and 3-way interleaved CRC32C, hot 2 KB blobs hit user-space memory directly with zero kernel transitions, while uncached reads benefit from zero-copy dereference. Point reads (`Workload C`) run at **`474,059 ops/s` (`2.18×` faster)**, read-mostly (`Workload B`) runs at **`288,937 ops/s` (`1.42×` faster)**, and read-latest (`Workload D`) reaches **`318,955 ops/s` (`2.53×` faster)**!
 3. **Chunked Streaming Cursor and Range-Scan Blob Prefetch (`Workload E` `LIMIT 10`):**
    * Range scans projecting blob columns benefit from `read_many_at` coalescing: when row 0 dereferences a lazy blob, upcoming rows in the cursor batch are prefetched and verified into `VerifiedBlobCache` in a single coalesced kernel read, eliminating 9 out of 10 syscalls on short range scans!
 
@@ -98,11 +86,12 @@ Each `TPC-B`-style transaction executes `BEGIN` + 5 parameterized SQL statements
 
 | Durability Mode | Vanilla SQLite (`WAL`) | `aydb` Virtual Table (`4 MB` Default / `128 KB` SSTable) | Speedup (`4 MB` / `SSTable`) |
 | :--- | ---: | ---: | ---: |
-| **Buffered (`synchronous = NORMAL` vs. `wal_buf.db` `ImmediateOsCache`)** | `14,987 TPS` (`10,274` SST) | **`103,299 TPS`** (SSTable: **`61,125 TPS`**) | **`6.89×` (`5.95×` SSTable)** |
-| **Full Sync (`synchronous = FULL` vs. `wal_sync.db` + `sync_barrier()`)** | `523 TPS` (`530` SST) | **`15,629 TPS`** (SSTable: **`12,119 TPS`**) | **`29.86×` (`22.86×` SSTable)** |
+| **Buffered (`synchronous = NORMAL` vs. `wal_buf.db` `ImmediateOsCache`)** | `22,971 TPS` (`18,805` SST) | **`106,604 TPS`** (SSTable: **`79,582 TPS`**) | **`4.76×` (`4.23×` SSTable)** |
+| **Full Sync (`synchronous = FULL` vs. `wal_sync.db` + `sync_barrier()`)** | `1,012 TPS` (`1,003` SST) | `1,093 TPS` (SSTable: `1,064 TPS`) | `1.06×` (`1.06×` SSTable) |
+| **Sustained Full Sync (8,000 transactions)** | `1,015 TPS` | `1,064 TPS` | `1.05×` |
 
 * **Why Transaction Coalescing (`xBegin` $\rightarrow$ `xSync` $\rightarrow$ `xCommit`) & Row-Metadata Skip Shine in `TPC-B`-Style OLTP:**
-  By coalescing the 4 table mutations (`accounts`, `tellers`, `branches`, `history`) inside `StorageEngine::begin_transaction()` / `prepare_commit_transaction()` / `commit_transaction()` into a **single atomic `WalBatch`** written to a single pre-zeroed 4 KB sector in `wal_sync.db` followed by `sync_barrier()`, and skipping negative `'t'` metadata probes on uncapped tables without secondary indexes, `aydb` achieves **`15,629 TPS` (`~64.0 µs` per 4-table durable transaction)**—a **`29.86×` speedup** over Vanilla SQLite (`523 TPS`), which must write and `FlushFileBuffers()` multiple dirty B-Tree pages across 4 different B-Trees on every commit!
+  `aydb` coalesces the 4 table mutations into a **single atomic `WalBatch`** written to a pre-zeroed 4 KB sector in `wal_sync.db`, and skips negative `'t'` metadata probes on uncapped tables without secondary indexes. In buffered mode, where no commit waits for the device, this gives `4.76×` the throughput of SQLite. With full sync both engines wait for one `FlushFileBuffers` per commit, which dominates, so the throughput is about equal (`1.06×`).
 
 ---
 
@@ -112,14 +101,14 @@ With the default `memtable_capacity_bytes = 4 MB`, the index footprints of `Spee
 
 | Benchmark Workload (`memtable_capacity_bytes = 128 KB`) | Vanilla SQLite (`WAL`, `2 MB` User-Space `PCache`) | `aydb` Virtual Table (On-Disk `idx_*.db` SSTables) | Relative Speed (`aydb` / SQLite) |
 | :--- | ---: | ---: | ---: |
-| **`Speedtest1`-Style Total (`Tests 100–240`)** | `60.80 ms` | **`99.57 ms`** | **`0.61×`** |
-| **`YCSB`-Style `256 B` Workload C (100% Point Read)** | `300,295 ops/s` | **`842,588 ops/s`** | **`2.81×` faster** |
-| **`YCSB`-Style `256 B` Workload B (95% Read / 5% Update)** | `287,586 ops/s` | **`671,880 ops/s`** | **`2.34×` faster** |
-| **`TPC-B`-Style Buffered (`wal_buf.db` vs. `NORMAL`)** | `10,274 TPS` | **`61,125 TPS`** | **`5.95×` faster** |
-| **`TPC-B`-Style Full Sync (`wal_sync.db` vs. `FULL`)** | `530 TPS` | **`12,119 TPS`** | **`22.86×` faster** |
+| **`Speedtest1`-Style Total (`Tests 100–240`)** | `58.85 ms` | **`89.63 ms`** | **`0.66×`** |
+| **`YCSB`-Style `256 B` Workload C (100% Point Read)** | `311,859 ops/s` | **`912,692 ops/s`** | **`2.92×` faster** |
+| **`YCSB`-Style `256 B` Workload B (95% Read / 5% Update)** | `297,995 ops/s` | **`727,802 ops/s`** | **`2.42×` faster** |
+| **`TPC-B`-Style Buffered (`wal_buf.db` vs. `NORMAL`)** | `18,805 TPS` | **`79,582 TPS`** | **`4.23×` faster** |
+| **`TPC-B`-Style Full Sync (`wal_sync.db` vs. `FULL`)** | `1,003 TPS` | `1,064 TPS` | `1.06×` |
 
 ### Architectural Analysis of On-Disk SSTable Performance
-1. **Still `1.24×`–`22.73×` Faster on `YCSB`-Style Point Reads & `TPC-B`-Style OLTP Even From On-Disk `idx_*.db` SSTables:**
-   * Even when `memtable_capacity_bytes = 128 KB` forces keys out of RAM into on-disk `idx_<SeqID>.db` SSTables, `aydb`'s in-heap **10-bit/key Bloom Filters**, **per-segment `[min_key, max_key]` bounds**, **Row-Metadata Skip**, **Size-Tiered Suffix Compaction**, and **Sparse Fence Pointers** pinpoint the exact 4 KB SSTable block in a single positional `ReadFile(OVERLAPPED)` call—achieving **`435,441 ops/s` (`1.44×` faster than SQLite)** on `YCSB-Style Workload C`, **`362,245 ops/s` (`1.24×` faster)** on `YCSB-Style Workload B`, **`45,774 TPS` (`2.95×` faster)** on Buffered `TPC-B-Style`, and **`9,969 TPS` (`22.73×` faster)** on Full-Sync `TPC-B-Style`.
-2. **Why `Speedtest1`-Style Total Drops to `0.31×` at `128 KB` `MemTable` Capacity (OS Page Cache Syscall Overhead vs. In-Process `PCache`):**
+1. **Faster on `YCSB`-Style Point Reads and Buffered `TPC-B`-Style OLTP Even From On-Disk `idx_*.db` SSTables:**
+   * Even when `memtable_capacity_bytes = 128 KB` forces keys out of RAM into on-disk `idx_<SeqID>.db` SSTables, in-heap **10-bit/key Bloom Filters**, **per-segment `[min_key, max_key]` bounds**, and **Sparse Fence Pointers** pinpoint the 4 KB SSTable block in a single positional `ReadFile(OVERLAPPED)` call, giving `2.42×`–`2.92×` the point-read throughput of SQLite and `4.23×` in buffered TPC-B. Full-sync TPC-B remains about equal (`1.06×`) because the device flush dominates.
+2. **Why `Speedtest1`-Style Total Drops to `0.66×` at `128 KB` `MemTable` Capacity (OS Page Cache Syscall Overhead vs. In-Process `PCache`):**
    * Because `aydb` strictly bounds its process heap and delegates 4 KB data block caching to the **OS Page Cache** via `ReadFile(OVERLAPPED)` + per-block hardware `CRC32C` verification—rather than duplicating a `2 MB` user-space page cache (`PCache`) inside the process like Vanilla SQLite—every SSTable block read crosses the user/kernel boundary (`ReadFile` syscall) and verifies `block_crc32c`. On small datasets (~600 KB in `Speedtest1`-style) that fit 100% inside SQLite's `2 MB` in-process `PCache` with zero syscalls, forcing `aydb` to spill into multiple `128 KB` on-disk SSTable segments incurs kernel syscall and multi-segment K-way merge overhead during `Speedtest1`'s 10× full-table scans and 5,000-row `INSERT` PK uniqueness probes.

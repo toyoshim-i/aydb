@@ -342,6 +342,8 @@ To validate the theoretical kernel analysis in Sections 2 and 4, we executed `ca
 
 ### 7.1 Benchmark 1: The NTFS Valid Data Length (VDL) Cliff on 4 KB WAL Writes
 
+> **Note.** The `wal_sync.db` rows below time write-through writes without a device flush. Sync commits now also call `FlushFileBuffers`, which dominates the latency on a consumer SSD, and `pal_bench` includes that flush.
+
 | Target File & Mode | `PreallocStrategy` | Prealloc Time | Epoch 1 Total | Epoch 1 P50 | Epoch 1 P99 | Epoch 2 Total | Epoch 2 P50 | Epoch 2 P99 |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | **`wal_sync.db`**<br/>(`WRITE_THROUGH`, 2 MB / 512 sectors) | `LogicalExtendOnly` (`VDL = 0`) | `0.56 ms` | **`63.13 ms`** | **`121.30 µs`** | **`191.90 µs`** | `39.94 ms` | `76.80 µs` | `134.50 µs` |

@@ -10,15 +10,14 @@ This document collects design changes aimed at the workloads where `aydb` still 
 
 `aydb` was designed from the start around the behaviour of Windows file systems. Its file layout, open flags, and durability protocol follow from NTFS, the Cache Manager, SMB leases, and antivirus filter drivers. The benchmark results in `README.md` show that this pays off exactly where those behaviours dominate:
 
-- **Synchronous commits:** with `FlushFileBuffers` on every commit, as SQLite's `synchronous=FULL` does, TPC-B-style commits run at about the same speed as SQLite (`1.05×`, `1,087` vs `1,034` TPS in one run) because the device flush dominates the commit. Earlier figures of `15–26×` were measured without that flush and did not reflect equal durability.
-- **Point reads served from the MemTable:** Speedtest1 test 130 (`2.76×`) and YCSB C with `256 B` values (`3.98×`) hit the in-process `BTreeMap` and issue no system call.
+- **Synchronous commits:** with `FlushFileBuffers` on every commit, as SQLite's `synchronous=FULL` does, TPC-B-style commits run at about the same speed as SQLite (`1.06×`, `1,093` vs `1,012` TPS, median of five runs) because the device flush dominates the commit. Earlier figures of `15–26×` were measured without that flush and did not reflect equal durability.
+- **Point reads served from the MemTable:** Speedtest1 test 130 (`2.80×`) and YCSB C with `256 B` values (`3.34×`) hit the in-process `BTreeMap` and issue no system call.
 
 Despite this design work, several workloads still lose to SQLite, some by a wide margin:
 
-- YCSB A and F with `2 KB` values: `0.55×` and `0.58×`.
-- YCSB E (short range scans) with `2 KB` values: `0.39×`.
-- Speedtest1-style suite in SSTable mode: `0.31×`.
-- Read-heavy YCSB B and C with `2 KB` values: `0.83×` and `0.98×`.
+- YCSB A and F with `2 KB` values: `0.57×` and `0.73×`.
+- YCSB E (short range scans) with `256 B` and `2 KB` values: `0.45×` and `0.70×`.
+- Speedtest1-style suite in SSTable mode: `0.66×`; its bulk `INSERT`, `UPDATE`, and `DELETE` tests: `0.39×`–`0.47×`.
 
 These losses do not come from missing Windows tuning in `aydb` or extra Windows tuning in SQLite. SQLite's Windows layer (`os_win.c`) is mostly about robustness (antivirus retry, `LockFileEx`, mmap off by default). The gap is architectural:
 
@@ -37,10 +36,9 @@ The post-audit performance work on `main` confirms this direction. Moving compac
 
 | Workload (README) | aydb vs SQLite | Root cause |
 | :--- | ---: | :--- |
-| YCSB B/C, `2 KB` values (WiscKey) | `0.83×` / `0.98×` | Every read issues a `ReadFile` on `blob_*.db` plus a CRC32C over the record. SQLite serves the same row from its in-process page cache with no syscall. |
-| YCSB A/F, `2 KB` values | `0.55×` / `0.58×` | Each buffered commit issues at least two `WriteFile` calls (blob append + 4 KB WAL sector rewrite) versus one WAL frame append in SQLite. |
-| YCSB E (short ranges), `2 KB` values | `0.39×` | One random blob read per row; B-tree rows are clustered in leaf pages. |
-| Speedtest1-style, SSTable mode | `0.31×` | LSM read amplification: several segments probed per lookup, each probe a `ReadFile` + 4 KB CRC verification, no block reuse. |
+| YCSB A/F, `2 KB` values | `0.57×` / `0.73×` | Each buffered commit issues at least two `WriteFile` calls (blob append + 4 KB WAL sector rewrite) versus one WAL frame append in SQLite. |
+| YCSB E (short ranges), `2 KB` values | `0.70×` | One random blob read per row; B-tree rows are clustered in leaf pages. |
+| Speedtest1-style, SSTable mode | `0.66×` | LSM read amplification: several segments probed per lookup, each probe a `ReadFile` + 4 KB CRC verification, no block reuse. |
 
 The wins (MemTable point reads `2–4×`, buffered commits) come from the in-process MemTable and the buffered WAL. Synchronous commits are on par with SQLite once both flush the device.
 

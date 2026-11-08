@@ -195,9 +195,9 @@ Executed via `cargo run --release --example meta_wal_bench` on Windows (Local NT
 
 | WAL Stream & Mode | Records / Batch | Throughput (`records/sec`) | Latency / Record | Crash Resilience Guarantee |
 | :--- | ---: | ---: | ---: | :--- |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `12,736 rec/s` | `78.52 µs` | Durable on return (assumes write-through is honoured) |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `130,803 rec/s` | `7.65 µs` | Durable on return (assumes write-through is honoured) |
-| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | **`568,372 rec/s`** | **`1.76 µs`** | Durable on return (assumes write-through is honoured) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `1` | `1,081 rec/s` | `924.78 µs` | Durable on return (the device is flushed before each commit returns) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `10` | `10,833 rec/s` | `92.31 µs` | Durable on return (the device is flushed before each commit returns) |
+| **`wal_sync.db` (`SyncSectorIsolated`)** | `50` | `54,671 rec/s` | `18.29 µs` | Durable on return (the device is flushed before each commit returns) |
 | **`wal_buf.db` (`BufferedImmediateOsCache`)** | `1` | **`282,076 rec/s`** | **`3.55 µs`** | Survives process kill (`kill -9` / `TerminateProcess`); OS crash may lose recent tail |
 | **`wal_buf.db` (`BufferedUserSpaceCoalesced`)** | `1` | **`6,482,562 rec/s`** | **`0.15 µs` (`150 ns`)** | Flushed to OS Page Cache every 4 KB sector |
 
