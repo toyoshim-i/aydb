@@ -14,10 +14,15 @@
   * **Settings & State Management:** Small records (tens to hundreds of bytes), random updates, durability on return for `SyncTransactional` commits.
   * **Cache Management:** Medium-to-large payloads (blobs ranging from a few KB to several MB), high churn rates, and automatic LRU purging governed by per-table logical size limits (`MAX_BYTES`).
 * **Zero-Allocation & Bounded Memory Footprint:**
-  * The private working set (heap) consumed by the database engine itself remains strictly bounded within a deterministic budget of a few megabytes to tens of megabytes (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`).
+  * The data-holding components have fixed budgets: the MemTable (`memtable_capacity_bytes`), the verified block cache (`block_cache_bytes`, default 4 MB) and the verified blob cache (`blob_cache_bytes`, default 4 MB). Their sum is the deterministic part of the private heap.
+  * Four further structures are bounded differently and are **not** included in that sum:
+    * *Bloom filters and sparse fence pointers* are kept in memory for every `idx_*.db` segment. They are small relative to the data (about one fence pointer per 4 KB block and `bloom_bits_per_key` bits, default 10, per key) but grow in proportion to the size of the database.
+    * *The transaction overlay* holds the uncommitted writes of the open transaction. It is limited by `max_transaction_bytes` (default 64 MB; `0` means unlimited), and a write that would exceed the limit fails.
+    * *The `AccessTracker`* that coalesces read hits for LRU is capped by entry count (`max_in_memory_access_ticks`, default 65,536 keys), not by bytes.
+    * *The SQLite adapter's rowid map* for non-integer primary keys retains at most 262,144 entries once all cursors are closed; while cursors are open it can hold more.
   * **Primary Storage Caching via OS Page Cache:** Raw file caching, OS-level write-behind, and sequential readahead are delegated to the host operating system's page cache (e.g., Windows Cache Manager VACBs).
   * **Optional Bounded Verified Block/Blob Cache:** Rather than a blanket prohibition on in-process caching, the engine supports an optional, strictly-bounded user-space cache for verified 4 KB index blocks (`block_cache_bytes`) and small verified blobs (`blob_cache_bytes` in `EngineConfig`).
-    * *Rationale:* While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread` via `CcCopyRead`) plus a full-block CRC32C pass. On Windows, this overhead amounts to microseconds per lookup. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, reducing lookup latency to tens of nanoseconds while keeping total process memory strictly bounded and deterministic (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
+    * *Rationale:* While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread` via `CcCopyRead`) plus a full-block CRC32C pass. On Windows, this overhead amounts to microseconds per lookup. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, reducing lookup latency to tens of nanoseconds while keeping the cache and MemTable budgets fixed (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`; the structures listed above are accounted for separately). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
 * **Optimization for Windows FS (NTFS) and SMB (CIFS / Samba):**
   * Must operate without performance degradation or data corruption not only on local NTFS volumes, but also over SMB/CIFS shares common in enterprise folder redirection, roaming profiles, and WSL/container mounts.
 * **Cross-Platform Portability:**
@@ -80,14 +85,14 @@ To support both fast random updates of small configuration records and zero writ
 * **Writable MemTable (In-Memory, Fixed Size Cap: e.g., 4 MB – 8 MB):**
   An in-memory B-Tree or SkipList absorbing the latest writes. Once it reaches its memory cap (`memtable_capacity_bytes`), it is flushed to disk as an immutable `idx_<SeqID>.db` segment.
 * **Immutable Index Segments (Sparse Fence Pointers & In-Heap Bloom Filters):**
-  On-disk `idx_<SeqID>.db` files are organized into 4 KB blocks. The database process keeps **only the first key of each 4 KB block (Sparse Fence Pointers) and a Bloom Filter in heap memory (consuming only a few hundred KB to a few MB)**. During lookups, the engine locates the target block offset via binary search over the fence pointers and reads the 4 KB block.
+  On-disk `idx_<SeqID>.db` files are organized into 4 KB blocks. The database process keeps **only the first key of each 4 KB block (Sparse Fence Pointers) and a Bloom Filter in heap memory**. Both are proportional to the indexed data (a few hundred KB to a few MB for typical databases, more for larger ones) and are not covered by the fixed cache budgets below. During lookups, the engine locates the target block offset via binary search over the fence pointers and reads the 4 KB block.
 * **Complementary Caching Architecture: OS Page Cache + Optional Bounded Verified Cache:**
   * **OS Page Cache as Primary Substrate:** The host OS page cache (Windows Standby List / VACBs, Linux page cache) serves as the primary data cache, handling physical file buffering, write-behind, and sequential read-ahead without custom in-process buffer pool bloat.
   * **Optional Bounded Verified Block Cache (`block_cache_bytes`):** Caches 4 KB `idx_*.db` data blocks in user-space fixed slots indexed by `(seq_id, block_idx)` **after** CRC32C verification.
   * **Optional Bounded Small Blob Cache (`blob_cache_bytes`):** Caches verified small blob payloads ($\le 16\text{ KB}$) indexed by `(BlobKind, table_id, seg_id, offset)` with a dedicated sub-budget so that large-blob churn cannot evict index blocks. For the append-only active blob segment, only records below `flushed_offset()` are cached.
-  * **Rationale:** While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread`) plus a full-block CRC32C pass. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, dropping read latency from microseconds to tens of nanoseconds while keeping total memory strictly bounded and deterministic (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
+  * **Rationale:** While the OS page cache eliminates physical disk I/O on warm pages, every uncached `idx_*.db` 4 KB block read still pays an OS kernel transition (`ReadFile` / `pread`) plus a full-block CRC32C pass. Caching already-verified immutable 4 KB data blocks and small verified blobs in user space eliminates both the syscall and repeated CRC verification on hot internal/leaf blocks, dropping read latency from microseconds to tens of nanoseconds while keeping the cache and MemTable budgets fixed (`memtable_capacity_bytes` + `block_cache_bytes` + `blob_cache_bytes`). Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` preserves the zero-cache footprint for ultra-constrained environments.
   * **Immutability & Zero Cache Invalidation Hazard:** Because `idx` and `blob` segments are immutable and `SeqID`s are never reused (`ARCHITECTURE.md` §2.3), cached entries never become stale. Invalidation is needed only when a segment is retired (during compaction commit or LRU segment reclamation), where all cached blocks for that `seq_id` are purged.
-  * **Scan-Resistance:** Compaction bulk inputs (`BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table scans bypass cache insertion (read-through without caching), preventing batch passes from displacing hot point-lookup working sets.
+  * **Scan-Resistance:** Unbounded full-table scans do not insert blocks into the cache, and compaction reads `idx_*.db` inputs through a streaming reader that fetches one 4 KB block at a time without cache insertion. Batch passes therefore do not displace hot point-lookup working sets. This bypass comes from the readers, not from an open hint: `OpenHint::BackgroundBulk` (`FILE_FLAG_SEQUENTIAL_SCAN` plus a low I/O priority hint on Windows) is defined and implemented in the Windows PAL, but compaction does not currently open its files with it, so it is not used.
 
 ---
 
@@ -101,15 +106,16 @@ To support both fast random updates of small configuration records and zero writ
 
 ### 4.1 `boot_meta.db` Ping-Pong Buffer (Double Buffering)
 
-* Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B** (automatically extended with an auxiliary `boot_meta_ext_<Generation>.db` payload file if the catalog ever exceeds 4,028 bytes).
-* Layout of each 4 KB slot (64-byte fixed header + variable catalog payload + 4-byte slot trailer):
-  `[Header(64B): Magic "AYBM"(4B) | Version(2B) |HeaderFlags(2B) | Generation(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | NextSeqID(8B) | IdxCount(2B) | StdBlobCount(2B) | LruBlobCount(2B) | QuotaCount(2B) | PendingDelCount(2B) | PayloadLen(2B) | HeaderCRC32C(4B)] + [CatalogPayload: ActiveIdxList | ActiveStdBlobList | ActiveLruBlobList | TableQuotaList | PendingDeleteList] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
+* Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B** (if the catalog payload exceeds 4,028 bytes it is written to an immutable overflow file `manifest_<SeqID>.db`, and the slot stores a 20-byte pointer to it: `[SeqID (8B) | FileLen (8B) | PayloadCRC32C (4B)]`).
+* Layout of each 4 KB slot (64-byte fixed header + variable payload + 4-byte slot trailer):
+  `[Header(64B): Magic "AYDB"(4B) | Version(2B) | Flags(2B) | Generation(8B) | NextSeqID(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | PayloadLen(4B) | PayloadCRC32C(4B) | Reserved(4B) | HeaderCRC32C(4B)] + [Payload: CatalogPayload, or the external manifest pointer when `Flags` bit 0 is set] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
+  The header offsets are `0..4` magic, `4..6` version, `6..8` flags, `8..16` generation, `16..24` next sequence ID, `24..32` checkpoint LSN, `32..40` sync WAL epoch, `40..48` buffered WAL epoch, `48..52` payload length, `52..56` payload CRC32C, `56..60` reserved, `60..64` header CRC32C (over bytes `0..60`). The trailer CRC32C covers bytes `0..4092`. The segment counts are not part of the header: the catalog payload is a sequence of length-prefixed lists (index segments, standard blob segments, LRU blob segments, table quotas, pending deletes). The overflow file starts with its own magic `AYMF` and carries a payload CRC32C. See [phase1/02_BOOT_META_AND_GC.md](./phase1/02_BOOT_META_AND_GC.md) for the field-level specification.
 * When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected. Fallback to the other slot happens only on genuine corruption (CRC / format failure or a missing external manifest); a transient I/O error fails the open instead of silently booting from an older generation.
 
 ### 4.2 Pre-Allocated Fixed-Size WAL and Physical Two-Stream Commit
 
 * **Zero-Fill-Free Reuse via Epoch Numbers:**
-  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 7-byte fragment headers (`[FragType (1B) | FragLen (2B) | FragCRC32C (4B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented (and **both** epochs are rotated unconditionally on every `open`, even if recovery found nothing, so a stale same-epoch sector left behind by write-back reordering can never be replayed; this costs one `boot_meta.db` commit per open) and sectors are overwritten directly without zero-filling the file. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
+  Both WAL files (`wal_sync.db` at 2 MB fixed, `wal_buf.db` at 16 MB fixed) are treated as arrays of 4 KB sectors. Each sector begins with a 16-byte `WalSectorHeader`: `[SectorCRC32C (4B) | WalEpoch (8B) | ValidBytes (2B) | Reserved (2B)]`, followed by 3-byte fragment headers (`[FragType (1B) | FragLen (2B)]`) framing logical `WalBatch` payloads (`[LSN (8B) | BatchCRC32C (4B) | RecordCount (4B) | Records...]`). When a WAL file wraps around or is reused after a MemTable flush, its `WalEpoch` is incremented (and **both** epochs are rotated unconditionally on every `open`, even if recovery found nothing, so a stale same-epoch sector left behind by write-back reordering can never be replayed; this costs one `boot_meta.db` commit per open) and sectors are overwritten directly without zero-filling the file. Fragments carry no checksum of their own: the sector CRC32C covers the whole sector (header, fragments and padding), and each reassembled batch is additionally verified by its `BatchCRC32C`. During recovery, the engine scans sequentially from the beginning of each file and identifies the exact log tail at the first sector exhibiting either a **CRC mismatch (torn write)** or an **older `WalEpoch`**.
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
   1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Opened with `FILE_FLAG_WRITE_THROUGH` and physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries and written directly through to non-volatile storage.
@@ -119,13 +125,19 @@ To support both fast random updates of small configuration records and zero writ
 
 To prevent dangling pointers (where an index entry survives recovery but its target blob payload is missing), the following write ordering is strictly enforced:
 
-1. **Write Ordering:** Always write `[Magic | BlobCRC32C | Key | Value]` to `blob_<SeqID>.db` first, and only then append the pointer record `[Key | BlobSegID | Offset | Len | BlobCRC32C]` to `wal.db`.
+1. **Write Ordering:** Always write `[Magic | BlobCRC32C | Key | Value]` to `blob_<SeqID>.db` first, and only then append the pointer record `[Key | BlobSegID | Offset | Len | BlobCRC32C]` to the WAL (`wal_sync.db` or `wal_buf.db`).
 2. **CRC Verification on Recovery and Read:**
    Expensive `FlushFileBuffers` calls on `blob` files are omitted on every write. Instead, during WAL replay after a power failure (or during normal reads), the engine verifies the `BlobCRC32C` stored in the WAL/index against the actual bytes in the `blob` file. If a power outage prevented the blob write from reaching disk (file truncated or CRC mismatch), the engine does **not** treat the database as corrupted; instead, it safely discards the uncommitted record. This validation happens only at startup (`recover_two_streams` + `validate_blob_ptr` for WAL-replayed pointers; blobs referenced from `idx` segments were synced before their checkpoint). After open, a blob that fails verification (CRC/magic/key mismatch, short read, missing segment) is genuine corruption and is **never** silently reported as absence: per-table `on_corrupt` policy either returns `InvalidData` / `SQLITE_CORRUPT` naming the table and primary key (`error`, default for uncapped tables; explicit deletes still succeed and clean up) or hides the row and queues it for automatic deletion at the next safe write (`evict`, default for capped tables). Both modes bump `StorageEngine::corrupt_blob_detections()`.
+   Recovery applies the startup validation per stream. In `wal_sync.db` a batch whose blob cannot be verified is dropped on its own, because the blob is synced before the WAL record is written. In `wal_buf.db` blobs and WAL records are flushed independently, so a power loss can persist a later commit while losing an earlier one. Recovery of the buffered stream therefore has **prefix semantics**: it stops at the first batch (or transaction group) with an unverifiable blob and discards everything after it in that stream, so that replay never exposes a hole in the commit order. Only a blob that was never durably written counts as unverifiable. A real I/O error while reading a blob during validation is not treated as absence; it aborts recovery and fails the open, so that a transient error cannot cause a committed batch to be dropped.
 3. **WAL Failure Poisons the Engine:**
    If a WAL write or sync fails, the engine is poisoned: further mutations return errors until the database is reopened, while reads keep working. After reopen, the failed commit's outcome is unknown (it may or may not be present, but it is never partially applied).
-4. **Recovery from SMB Write-Behind Failures:**
-   If a background flush error is detected on an SMB handle, the engine closes and reopens the file handles to discard any poisoned local OS cache pages and reconstructs the MemTable from the last verified checkpoint generation.
+4. **Recovery from SMB Write-Behind Failures (design intent, not implemented):**
+   The intended design is that, if a background flush error is detected on an SMB handle, the engine closes and reopens the file handles to discard any poisoned local OS cache pages and reconstructs the MemTable from the last verified checkpoint generation. This in-place recovery does not exist. The engine instead poisons itself on the first failed WAL append or sync (item 3), and the application has to drop the engine and reopen the database, which runs the normal crash recovery from the last verified state. A write-behind failure that is reported only when the OS later flushes cached pages is not detected unless a sync call returns it.
+
+### 4.4 Checkpoints and Post-Commit Maintenance
+
+* **`StorageEngine::checkpoint`:** Brings the persisted state up to date so that the next `open` has no replay work. A non-empty MemTable is flushed to a new `idx` segment, which also commits blob segment lengths, dead bytes and quota totals. With an empty MemTable, the lengths of blob segments that have grown since the last commit (for example through a rolled-back transaction) are committed instead. It fails with `InvalidInput` while a transaction is active. Dropping the engine does not run a checkpoint; a drop without one is treated as a crash by the next `open`.
+* **Post-commit maintenance failures do not fail the commit:** Once the WAL append of a write or transaction has succeeded, the commit is durable and the call returns `Ok`, even if the follow-up maintenance (blob segment reclaim, quota persistence, quota eviction, compaction, MemTable flush) fails. Such failures are counted in `StorageEngine::maintenance_failures()` and the text of the latest one is kept in `last_maintenance_error()`. The work is retried by later commits because the flush condition or the exceeded quota is still true. WAL append and sync failures are different: they poison the engine (item 3 above).
 
 ---
 
@@ -171,25 +183,33 @@ use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenHint {
-    /// For idx_NNNN.db
+    /// For boot_meta.db and wal_sync.db
+    /// - Win: FILE_FLAG_WRITE_THROUGH
+    /// - Unix: no open flag; the hint only selects the sync behaviour below
+    MutableSyncLog,
+
+    /// For wal_buf.db
+    /// - Win: FILE_FLAG_SEQUENTIAL_SCAN
+    /// - Unix: no open flag
+    MutableBufferedLog,
+
+    /// For idx_<SeqID>.db
     /// - Win: FILE_FLAG_RANDOM_ACCESS
-    /// - Linux: POSIX_FADV_RANDOM
-    /// - macOS: F_RDAHEAD(0)
+    /// - Unix: no fadvise / fcntl call is issued (the design intent is
+    ///   POSIX_FADV_RANDOM on Linux and F_RDAHEAD(0) on macOS)
     ImmutableRandom,
 
-    /// For blob_NNNN.db (random point reads + buffered append writes)
+    /// For blob_*_<SeqID>.db (random point reads + buffered append writes)
     /// - Win: Standard OVERLAPPED handle without FILE_FLAG_SEQUENTIAL_SCAN (avoids 256 KB read-ahead amplification on point reads)
-    /// - Linux/macOS: Standard positional pread/pwrite handle
+    /// - Unix: Standard positional pread/pwrite handle
     ImmutableSequential,
 
-    /// For Compaction / GC bulk read/write
+    /// For Compaction / GC bulk read/write. Defined, but not used by the
+    /// engine: compaction does not open its files with this hint.
     /// - Win: FILE_FLAG_SEQUENTIAL_SCAN + SetFileInformationByHandle(IoPriorityHint = Low)
-    /// - Linux: POSIX_FADV_NOREUSE / DONTNEED
-    /// - macOS: F_NOCACHE(1)
+    /// - Unix: no open flag (the design intent is POSIX_FADV_NOREUSE /
+    ///   DONTNEED on Linux and F_NOCACHE(1) on macOS)
     BackgroundBulk,
-
-    /// For wal.db / boot_meta.db
-    MutableLog,
 }
 
 pub trait PlatformFile: Send + Sync {
@@ -199,8 +219,11 @@ pub trait PlatformFile: Send + Sync {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
 
     /// Batched positional reads for scatter/gather prefetching (e.g., WiscKey blob dereferencing)
-    /// - Win: Parallel asynchronous ReadFile calls via OVERLAPPED handles
-    /// - Unix: Sequential pread calls (or io_uring batching)
+    /// - All platforms: requests are sorted by offset, nearby ones are
+    ///   coalesced into one larger read (gap <= 16 KB, span <= 64 KB), and
+    ///   the resulting reads are issued sequentially with read_exact_at.
+    ///   Concurrent OVERLAPPED reads on Windows and io_uring batching on
+    ///   Linux are possible extensions and are not implemented.
     fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()>;
 
     /// Thread-safe positional write at a given offset
@@ -209,21 +232,23 @@ pub trait PlatformFile: Send + Sync {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
 
     /// Write ordering barrier (guarantees ordering prior to metadata update)
-    /// - Win: FlushFileBuffers (or write via WRITE_THROUGH handle)
+    /// - Win: no-op for WRITE_THROUGH handles (MutableSyncLog), otherwise FlushFileBuffers
     /// - Linux: fdatasync
-    /// - macOS: fcntl(fd, F_BARRIERFSYNC) — avoids heavy F_FULLFSYNC stall
+    /// - macOS: same as sync_durable (F_FULLFSYNC) for MutableSyncLog
+    ///   handles, otherwise fsync. F_BARRIERFSYNC is not used.
     fn sync_barrier(&self) -> io::Result<()>;
 
     /// Full durability flush to non-volatile physical media
-    /// - Win: FlushFileBuffers / WRITE_THROUGH
-    /// - Linux: fdatasync
-    /// - macOS: fcntl(fd, F_FULLFSYNC)
+    /// - Win: FlushFileBuffers
+    /// - Linux: fsync (File::sync_all)
+    /// - macOS: fcntl(fd, F_FULLFSYNC), falling back to fsync if it fails
     fn sync_durable(&self) -> io::Result<()>;
 
-    /// Explicit eviction of unneeded OS page cache pages (e.g., after compaction reads)
-    /// - Win: No-op (automatically released via SEQUENTIAL_SCAN)
-    /// - Linux: posix_fadvise(POSIX_FADV_DONTNEED)
-    /// - macOS: F_NOCACHE
+    /// Intended: explicit eviction of unneeded OS page cache pages (e.g.,
+    /// after compaction reads). Current state: a no-op returning Ok(())
+    /// on every platform, and not called by the engine. The design intent
+    /// was posix_fadvise(POSIX_FADV_DONTNEED) on Linux and F_NOCACHE on
+    /// macOS.
     fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()>;
 }
 ```
@@ -237,7 +262,7 @@ pub trait PlatformFile: Send + Sync {
 
 ### Phase 1: Core Storage Engine in Rust & Low-Level Ordered KV API
 * Implement the `PlatformFile` trait (Windows / Unix) and extended-length path normalization (`\\?\` prefix on Windows to bypass `MAX_PATH` limits).
-* Implement `boot_meta.db` (ping-pong buffer), pre-allocated fixed-size `wal.db` (Epoch + CRC recovery), and the KV-separated `idx` / `blob` segment engine.
+* Implement `boot_meta.db` (ping-pong buffer), pre-allocated fixed-size `wal_sync.db` / `wal_buf.db` (Epoch + CRC recovery), and the KV-separated `idx` / `blob` segment engine.
 * Implement per-table `MAX_BYTES` accounting, the in-memory `AccessTick` coalescing buffer, and automatic LRU eviction.
 * Expose a low-level Rust-native Ordered KV API (`get`, `put`, `delete`, `scan_prefix`, `batch_write`).
 

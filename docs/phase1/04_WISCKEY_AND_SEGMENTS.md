@@ -181,10 +181,10 @@ While sparse fence pointers and Bloom filters in heap memory keep default memory
 #### 2. Lifetime, Invalidation, and Scan Resistance
 * **Immutability & Zero Cache Invalidation Hazards:** Completed `idx` and `blob` segments are immutable and `SeqID`s are never recycled (`ARCHITECTURE.md` §2.3). Consequently, cached blocks and blobs remain permanently valid for the entire active lifetime of the segment.
 * **Automatic Invalidation on Segment Compaction/Reclamation:** When background compaction commits a replacement index segment, or when LRU reclamation deletes an obsolete `blob_lru` segment file, all cache entries corresponding to the retired `seq_id` are purged wholesale.
-* **Scan-Resistance (Bulk Scan Bypass):** Compaction readers (opened with `OpenHint::BackgroundBulk` / `FILE_FLAG_SEQUENTIAL_SCAN`) and full-table sequential scans bypass insertion into the cache (read-through without caching), preventing bulk sequential operations from polluting or displacing the hot point-lookup cache working set.
-* **Strict Heap Determinism:** Total process memory consumed by the database engine remains strictly bounded and deterministic:
-  $$\text{Total Heap} = \text{memtable\_capacity\_bytes} + \text{block\_cache\_bytes} + \text{blob\_cache\_bytes} + \text{sparse\_fence\_metadata}$$
-  Setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` (the default) completely disables in-process block caching, preserving the zero-cache footprint for memory-constrained environments.
+* **Scan-Resistance (Bulk Scan Bypass):** Compaction readers (a streaming reader that fetches one block at a time; `OpenHint::BackgroundBulk` exists but is not used for these files) and unbounded full-table scans bypass insertion into the cache (read-through without caching), preventing bulk sequential operations from polluting or displacing the hot point-lookup cache working set.
+* **Heap Accounting:** The data-holding budgets are fixed and the remaining structures scale with the workload:
+  $$\text{Heap} \approx \text{memtable\_capacity\_bytes} + \text{block\_cache\_bytes} + \text{blob\_cache\_bytes} + \text{bloom\_and\_fence\_metadata} + \text{transaction\_overlay} + \text{access\_tracker} + \text{rowid\_map}$$
+  The Bloom filters and fence pointers grow with the database size, the transaction overlay is limited by `max_transaction_bytes` (default 64 MB), the access tracker by `max_in_memory_access_ticks` entries, and the SQLite adapter's rowid map retains at most 262,144 entries once cursors close. Both cache budgets default to 4 MB; setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` disables in-process block and blob caching, preserving the zero-cache footprint for memory-constrained environments.
 
 ---
 

@@ -18,7 +18,7 @@ CREATE VIRTUAL TABLE http_cache USING aydb(
 );
 ```
 
-`aydb`'s `xCreate` / `xConnect` callback parses the key-value arguments passed in `argv[3..]`:
+`aydb`'s `xCreate` / `xConnect` callback parses the key-value arguments passed in `argv[3..]`. Validation is strict (`src/vtab/ddl.rs`): an unknown option key, an argument that is not of the form `key=value`, a value that does not parse (`table_id = 0`, a non-numeric `max_bytes`, `inline_max` above 4096, a `durability` or `on_corrupt` value other than the listed ones), an unknown collation, a table-level constraint in `columns` (`PRIMARY KEY(...)`, `UNIQUE(...)`, `CHECK(...)`, `FOREIGN KEY(...)`, `CONSTRAINT ...`), or an `indexes` entry that names no declared column makes the statement fail with `SQLITE_ERROR` instead of being silently ignored.
 
 1. **`table_id` (`u16`, optional):** Unique 16-bit table identifier (`!= 0`) inside the `StorageEngine` namespace. If omitted, `StorageEngine::register_or_resolve_vtab` resolves or auto-assigns a collision-free `table_id` persisted in the engine catalog (`[0, 0, 'c', table_name]`).
 2. **`max_bytes` (`u64`, optional, default `0` = unbounded):** If `> 0`, registers `table_id` as a Capped Table (`engine.register_capped_table(table_id, max_bytes)`) with automatic LRU eviction and dedicated `blob_lru_<TblID>_<SeqID>.db` storage.

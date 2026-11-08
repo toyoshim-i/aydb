@@ -196,8 +196,10 @@ Thanks to our two-stream WAL separation (Design Decision 3), we get the best of 
 | `MutableSyncLog` | `boot_meta.db`,<br/>`wal_sync.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_WRITE_THROUGH` | `O_DSYNC` (or `fdatasync`) | `F_BARRIERFSYNC` / `F_FULLFSYNC` | Writes go through OS cache directly to non-volatile media; no stale cache views. |
 | `MutableBufferedLog` | `wal_buf.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Fast buffered sequential appends in 256 KB VACB views; survives process crash. |
 | `ImmutableRandom` | `idx_<SeqID>.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_RANDOM_ACCESS` | `POSIX_FADV_RANDOM` | `F_RDAHEAD(0)` | Disables speculative read-ahead so 4 KB point lookups do not fetch 252 KB of unused neighbors. |
-| `ImmutableSequential` | `blob_std_<SeqID>.db`,<br/>`blob_lru_<TblID>_<SeqID>.db` | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Triggers asynchronous 256 KB VACB stride read-ahead and unmaps behind the reader to protect working set. |
+| `ImmutableSequential` | `blob_std_<SeqID>.db`,<br/>`blob_lru_<TblID>_<SeqID>.db` | `FILE_FLAG_OVERLAPPED` only (`FILE_FLAG_SEQUENTIAL_SCAN` is deliberately omitted) | `POSIX_FADV_SEQUENTIAL` | `F_RDAHEAD(1)` | Blob files serve random point reads, so the Windows implementation avoids asynchronous 256 KB VACB read-ahead on them. |
 | `BackgroundBulk` | Compaction inputs & outputs | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` + `IoPriorityHintLow` | `POSIX_FADV_NOREUSE` + `DONTNEED` | `F_NOCACHE(1)` | Prevents background compaction reads/writes from evicting hot foreground index blocks. |
+
+> **Implementation status.** The table describes the intended mapping. Only the Windows column is implemented, with the exception below. The Unix implementation (`src/pal/unix.rs`) ignores the hint for open flags: it issues no `posix_fadvise` or `fcntl` call. On Unix the hint only decides whether a handle participates in the `HandlePool` (idx and blob handles do, the two WAL handles and `boot_meta.db` do not) and, on macOS, whether `sync_barrier` is promoted to `F_FULLFSYNC` (`MutableSyncLog` handles). `OpenHint::BackgroundBulk` is defined and handled by the Windows PAL, but the engine never opens a file with it: compaction reads idx segments through the same `ImmutableRandom` handles, using a streaming reader that bypasses the block cache.
 
 ### 5.2 Extended-Length Path Normalization (`\\?\`) on Windows
 
@@ -262,8 +264,10 @@ pub trait PlatformFile: Send + Sync + 'static {
     ///
     /// Allows range scans projecting blob columns to submit multiple `(offset, &mut [u8])`
     /// read requests across a segment in a single operation:
-    /// - Windows: Dispatches multiple concurrent OVERLAPPED ReadFile requests.
-    /// - Unix: Executes sequential pread calls (or batch submissions via io_uring).
+    /// - All platforms: sorts the requests by offset, coalesces nearby ones
+    ///   into larger reads, and issues them sequentially with `read_exact_at`.
+    ///   Concurrent OVERLAPPED reads (Windows) and `io_uring` batches
+    ///   (Linux) are not implemented.
     fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()>;
 
     /// Writes all bytes in `buf` starting at `offset`.
@@ -279,16 +283,19 @@ pub trait PlatformFile: Send + Sync + 'static {
     /// before subsequent metadata updates.
     /// - Windows: `FlushFileBuffers` (or no-op if opened with `MutableSyncLog` / `WRITE_THROUGH`)
     /// - Linux: `fdatasync`
-    /// - macOS: `fcntl(fd, F_BARRIERFSYNC)`
+    /// - macOS: `F_FULLFSYNC` for `MutableSyncLog` handles, otherwise `fsync`
+    ///   (`F_BARRIERFSYNC` is not used)
     fn sync_barrier(&self) -> io::Result<()>;
 
     /// Flushes all modified data and metadata to non-volatile physical media.
     /// - Windows: `FlushFileBuffers`
-    /// - Linux: `fdatasync`
-    /// - macOS: `fcntl(fd, F_FULLFSYNC)`
+    /// - Linux: `fsync` (`File::sync_all`)
+    /// - macOS: `fcntl(fd, F_FULLFSYNC)`, falling back to `fsync`
     fn sync_durable(&self) -> io::Result<()>;
 
-    /// Hints to the OS kernel that cached pages in `[offset, offset + len)` are no longer needed.
+    /// Intended to hint to the OS kernel that cached pages in `[offset, offset + len)` are no
+    /// longer needed. Currently a no-op that returns `Ok(())` on every platform, and the engine
+    /// does not call it.
     fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()>;
 }
 
@@ -323,8 +330,8 @@ pub trait PlatformFs: Send + Sync + 'static {
 Range scans that project out-of-line WiscKey blob columns can incur significant random read latency if blobs are dereferenced one-by-one synchronously. When a query scans a range of rows, the cursor streams index entries in chunks (`CURSOR_STREAM_CHUNK_ROWS`). For all rows within the chunk that reference out-of-line blobs in the same blob segment, their target offsets and lengths are known in advance.
 
 `PlatformFile::read_many_at` accepts a slice of `(offset, &mut [u8])` buffers and executes them as a batch:
-* **On Windows:** Leverages `FILE_FLAG_OVERLAPPED` handles to dispatch multiple concurrent `ReadFile` system calls without waiting synchronously between requests. The kernel's I/O subsystem can dispatch these requests in parallel to the NVMe controller or pipeline them over the SMB network, overlapping transfer latency and dramatically improving throughput for multi-row scans (e.g., YCSB E).
-* **On POSIX:** Issues sequential `pread` calls in user space, with an upgrade path to batch submission via `io_uring` on modern Linux kernels.
+* **Current implementation (all platforms):** The shared helper `coalesced_read_many_at` sorts the requests by offset, merges requests whose gap is at most 16 KB into one larger read as long as the merged span stays within 64 KB, and issues the resulting reads one after another with `read_exact_at`. The saving comes from fewer kernel transitions, not from parallelism.
+* **Design intent, not implemented:** On Windows, `FILE_FLAG_OVERLAPPED` handles would allow several `ReadFile` calls to be in flight at once, so that the NVMe controller or the SMB transport can overlap transfer latency for multi-row scans (e.g., YCSB E). On modern Linux kernels, batch submission through `io_uring` would serve the same purpose.
 * **Projection-Aware Triggering:** Batched prefetching is only triggered when the SQL query's column projection (`colUsed` in SQLite's `xBestIndex`) actually requires blob payload columns, avoiding unnecessary I/O when queries only inspect inline keys or counts.
 
 ---

@@ -69,13 +69,13 @@ Rationale: the double-caching cost of a small cache (a few MB duplicated in both
 - Optionally, small blob records (≤ `16 KB`): key `(BlobKind, table_id, seg_id, offset)`, value the verified payload. Separate sub-budget so large-blob churn cannot evict index blocks.
 
 **Configuration** (`EngineConfig`)
-- `block_cache_bytes: usize` — default `0` (disabled) or a small value such as `4 MB` after benchmarking.
-- `blob_cache_bytes: usize` — default `0`.
+- `block_cache_bytes: usize` — default `4 MB` (`0` disables the cache).
+- `blob_cache_bytes: usize` — default `4 MB` (`0` disables the cache).
 - Both count toward the documented heap budget, and memory accounting must include per-entry overhead.
 
 **Replacement policy**
 - CLOCK (or CLOCK-Pro) in fixed-size slots. Cheap hits with one reference-bit store, no list relinking, which suits concurrent readers.
-- Scan resistance: compaction inputs (`BackgroundBulk`) and full-table scans must bypass insertion (read-through without caching), mirroring the `FILE_FLAG_SEQUENTIAL_SCAN` intent.
+- Scan resistance: compaction inputs and unbounded full-table scans bypass insertion (read-through without caching). As implemented, this comes from a streaming compaction reader and a `populate_cache` flag in the scan path; `OpenHint::BackgroundBulk` is defined but not used.
 
 **Correctness invariants**
 - Segments are immutable and `SeqID`s are never reused (`ARCHITECTURE.md` §2.3), so cached entries never become stale. Invalidation is needed only to reclaim memory: drop all entries of a `seq_id` when the segment is retired (compaction install, blob segment reclaim).
@@ -99,10 +99,10 @@ Rationale: the double-caching cost of a small cache (a few MB duplicated in both
 
 ### 3.3 Blob Prefetch for Range Scans
 
-- After a cursor chunk is fetched (`CURSOR_STREAM_CHUNK_ROWS`), the blob pointers of the next `k` rows are known. The PAL already opens files with `FILE_FLAG_OVERLAPPED`, so several `ReadFile` calls can be in flight at once.
-- Add `PlatformFile::read_many_at(&[(offset, &mut [u8])])`: issue all reads, then wait. On Unix, `pread` sequentially (or `io_uring` later).
+- After a cursor chunk is fetched (`CURSOR_STREAM_CHUNK_ROWS`), the blob pointers of the next `k` rows are known. The PAL already opens files with `FILE_FLAG_OVERLAPPED`, so several `ReadFile` calls could be in flight at once.
+- Add `PlatformFile::read_many_at(&[(offset, &mut [u8])])`. As implemented, it sorts the requests, coalesces nearby ones (gap up to 16 KB, span up to 64 KB), and issues the reads sequentially on every platform. Issuing them concurrently (OVERLAPPED on Windows, `io_uring` on Linux) is not implemented.
 - Interaction with lazy dereference: prefetch only when the query projects blob columns. `colUsed` in `xBestIndex` already tells us this.
-- Expected effect: YCSB E (`2 KB`) bounded by device parallelism instead of per-row latency, which matters most on SMB.
+- Expected effect: fewer kernel transitions through coalescing today; with concurrent issue (not implemented), YCSB E (`2 KB`) would be bounded by device parallelism instead of per-row latency, which matters most on SMB.
 
 ### 3.4 Cheaper Verification
 
