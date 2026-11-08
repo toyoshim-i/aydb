@@ -404,6 +404,10 @@ impl PlatformFile for WinPlatformFile {
         Ok(())
     }
 
+    fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+        super::coalesced_read_many_at(self, requests)
+    }
+
     fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         while !buf.is_empty() {
             let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;

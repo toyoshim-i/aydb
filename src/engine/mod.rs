@@ -286,6 +286,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     corrupt_policies: HashMap<u16, CorruptPolicy>,
     /// Explicit per-table inline threshold overrides in bytes (see [`Self::set_table_inline_threshold`]).
     table_inline_thresholds: BTreeMap<u16, usize>,
+    /// Scratch buffer for encoded WAL batches on commit, avoiding per-commit heap allocation.
+    pub(super) scratch_wal_encoded: Vec<u8>,
     /// In-process verified 4 KB index block cache.
     pub(crate) block_cache: Arc<VerifiedBlockCache>,
     /// In-process small verified blob payload cache.
@@ -695,6 +697,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             poisoned: None,
             corrupt_policies: HashMap::new(),
             table_inline_thresholds: BTreeMap::new(),
+            scratch_wal_encoded: Vec::with_capacity(1024),
             block_cache,
             blob_cache,
             corrupt_blob_detections: AtomicU64::new(0),
@@ -1947,6 +1950,111 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(Some((start, end)))
     }
 
+    /// Prefetches and verifies a batch of upcoming out-of-line lazy blobs using [`PlatformFile::read_many_at`]
+    /// into [`VerifiedBlobCache`], avoiding per-row system calls on subsequent cursor accesses.
+    pub fn prefetch_lazy_blobs(
+        &mut self,
+        table_id: u16,
+        candidates: &[(&[u8], &LazyBlob<FS::File>)],
+    ) -> io::Result<()> {
+        self.owner_read(|eng, cx| eng.prefetch_lazy_blobs_cx(cx, table_id, candidates))
+    }
+
+    pub(super) fn prefetch_lazy_blobs_cx(
+        &self,
+        _cx: &ReadCtx,
+        table_id: u16,
+        candidates: &[(&[u8], &LazyBlob<FS::File>)],
+    ) -> io::Result<()> {
+        if self.config.blob_cache_bytes == 0 || candidates.is_empty() {
+            return Ok(());
+        }
+
+        struct PrefetchItem<'a, F: PlatformFile> {
+            cache_key: BlobCacheKey,
+            row_key: Vec<u8>,
+            ptr: BlobPtr,
+            reader: &'a BlobSegmentReader<F>,
+        }
+
+        let mut to_fetch: Vec<PrefetchItem<'_, FS::File>> = Vec::with_capacity(candidates.len());
+        for (pk, lazy) in candidates {
+            let ptr = &lazy.ptr;
+            if !self.is_blob_eligible_for_cache(ptr) {
+                continue;
+            }
+            let cache_key = BlobCacheKey {
+                kind: ptr.kind as u8,
+                table_id: ptr.table_id,
+                seg_id: ptr.seg_id,
+                offset: ptr.offset,
+            };
+            if self.blob_cache.contains(&cache_key) {
+                continue;
+            }
+            if let Some(ref reader) = lazy.reader {
+                let row_key = encode_primary_row_key(table_id, pk);
+                to_fetch.push(PrefetchItem {
+                    cache_key,
+                    row_key,
+                    ptr: *ptr,
+                    reader,
+                });
+            }
+        }
+
+        if to_fetch.is_empty() {
+            return Ok(());
+        }
+
+        to_fetch.sort_unstable_by_key(|c| (c.ptr.kind as u8, c.ptr.table_id, c.ptr.seg_id));
+
+        let mut group_start = 0;
+        while group_start < to_fetch.len() {
+            let cur_kind = to_fetch[group_start].ptr.kind;
+            let cur_tbl = to_fetch[group_start].ptr.table_id;
+            let cur_seg = to_fetch[group_start].ptr.seg_id;
+
+            let mut group_end = group_start + 1;
+            while group_end < to_fetch.len()
+                && to_fetch[group_end].ptr.kind == cur_kind
+                && to_fetch[group_end].ptr.table_id == cur_tbl
+                && to_fetch[group_end].ptr.seg_id == cur_seg
+            {
+                group_end += 1;
+            }
+
+            let group = &to_fetch[group_start..group_end];
+            let reader = group[0].reader;
+
+            let mut bufs: Vec<Vec<u8>> = group
+                .iter()
+                .map(|c| vec![0u8; c.ptr.len as usize])
+                .collect();
+            let mut reqs: Vec<(u64, &mut [u8])> = group
+                .iter()
+                .zip(bufs.iter_mut())
+                .map(|(c, buf)| (c.ptr.offset as u64, buf.as_mut_slice()))
+                .collect();
+
+            if reader.file().read_many_at(&mut reqs).is_ok() {
+                for (cand, buf) in group.iter().zip(bufs.iter()) {
+                    if let Some(val) = BlobSegmentReader::<FS::File>::verify_blob_record(
+                        buf,
+                        cand.ptr.crc32c,
+                        Some(&cand.row_key),
+                    ) {
+                        self.blob_cache.insert(cand.cache_key, val);
+                    }
+                }
+            }
+
+            group_start = group_end;
+        }
+
+        Ok(())
+    }
+
     // =========================================================================
     // Internal Helper Methods
     // =========================================================================
@@ -2326,9 +2434,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let batch = WalBatch::new(lsn, records);
-        let encoded = batch.encode();
+        let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
+        batch.encode_into(&mut raw);
         self.flush_active_blob_buffers()?;
-        self.append_raw_wal_batch_with_rotation(&encoded, durability)?;
+        let res = self.append_raw_wal_batch_with_rotation(&raw, durability);
+        raw.clear();
+        self.scratch_wal_encoded = raw;
+        res?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
         self.memtable.apply_wal_batch_owned(batch);
         if self.memtable.should_flush() {

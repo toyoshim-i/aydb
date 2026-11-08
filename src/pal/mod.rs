@@ -62,6 +62,17 @@ pub trait PlatformFile: Send + Sync + 'static {
     /// Returns [`io::ErrorKind::UnexpectedEof`] if fewer bytes are available.
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
 
+    /// Reads multiple non-overlapping slices at specified offsets.
+    ///
+    /// Default implementation sequentially reads each slice via [`PlatformFile::read_exact_at`].
+    /// Specialized implementations may coalesce nearby spans or issue concurrent requests.
+    fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+        for (offset, buf) in requests.iter_mut() {
+            self.read_exact_at(buf, *offset)?;
+        }
+        Ok(())
+    }
+
     /// Writes all bytes in `buf` starting at `offset`.
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
 
@@ -123,6 +134,65 @@ pub(crate) fn preallocate_physical_zero_fill<F: PlatformFile + ?Sized>(
         pos += to_write as u64;
     }
     file.sync_durable()
+}
+
+/// Coalesces adjacent or nearby non-overlapping positional read requests into larger contiguous
+/// physical reads (`<= 64 KB` span with gaps `<= 16 KB`) to minimize kernel transitions.
+pub(crate) fn coalesced_read_many_at<F: PlatformFile + ?Sized>(
+    file: &F,
+    requests: &mut [(u64, &mut [u8])],
+) -> io::Result<()> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    if requests.len() == 1 {
+        return file.read_exact_at(requests[0].1, requests[0].0);
+    }
+
+    let mut indices: Vec<usize> = (0..requests.len()).collect();
+    indices.sort_unstable_by_key(|&i| requests[i].0);
+
+    let mut i = 0;
+    while i < indices.len() {
+        let first_idx = indices[i];
+        let cluster_start = requests[first_idx].0;
+        let mut cluster_end = cluster_start.saturating_add(requests[first_idx].1.len() as u64);
+        let mut j = i + 1;
+
+        while j < indices.len() {
+            let next_idx = indices[j];
+            let next_start = requests[next_idx].0;
+            let next_end = next_start.saturating_add(requests[next_idx].1.len() as u64);
+            let gap = next_start.saturating_sub(cluster_end);
+            let new_span = next_end.max(cluster_end).saturating_sub(cluster_start);
+
+            if gap <= 16 * 1024 && new_span <= 64 * 1024 {
+                cluster_end = cluster_end.max(next_end);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if j == i + 1 {
+            let idx = indices[i];
+            let (off, buf) = &mut requests[idx];
+            file.read_exact_at(buf, *off)?;
+        } else {
+            let span = (cluster_end - cluster_start) as usize;
+            let mut scratch = vec![0u8; span];
+            file.read_exact_at(&mut scratch, cluster_start)?;
+            for &idx in &indices[i..j] {
+                let (off, buf) = &mut requests[idx];
+                let rel = (*off - cluster_start) as usize;
+                buf.copy_from_slice(&scratch[rel..rel + buf.len()]);
+            }
+        }
+
+        i = j;
+    }
+
+    Ok(())
 }
 
 /// Lists all regular files in `root` (excluding [`DB_LOCK_FILE_NAME`]), sorted lexicographically.
@@ -291,5 +361,46 @@ mod tests {
         for h in handles {
             h.join().expect("thread join");
         }
+    }
+
+    #[test]
+    fn read_many_at_coalesces_and_reads_correctly() {
+        let tmp = TempTestDir::new("read_many");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let file = fs
+            .open_file("test_data.db", true, true, OpenHint::ImmutableSequential)
+            .expect("open file");
+
+        // Write 64 KB of known pattern: byte at offset `i` is `(i % 251) as u8`
+        let total_size = 64 * 1024usize;
+        let mut data = vec![0u8; total_size];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        file.write_all_at(&data, 0).expect("write data");
+
+        // Request 1: 100 bytes at offset 100
+        let mut buf1 = vec![0u8; 100];
+        // Request 2: 200 bytes at offset 500
+        let mut buf2 = vec![0u8; 200];
+        // Request 3: 50 bytes at offset 1200
+        let mut buf3 = vec![0u8; 50];
+        // Request 4: 1000 bytes at offset 20000 (larger gap)
+        let mut buf4 = vec![0u8; 1000];
+
+        let mut reqs = [
+            (100u64, buf1.as_mut_slice()),
+            (500u64, buf2.as_mut_slice()),
+            (1200u64, buf3.as_mut_slice()),
+            (20000u64, buf4.as_mut_slice()),
+        ];
+
+        file.read_many_at(&mut reqs).expect("read_many_at");
+
+        assert_eq!(buf1, &data[100..200]);
+        assert_eq!(buf2, &data[500..700]);
+        assert_eq!(buf3, &data[1200..1250]);
+        assert_eq!(buf4, &data[20000..21000]);
     }
 }

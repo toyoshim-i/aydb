@@ -212,6 +212,56 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         self.seq_id
     }
 
+    pub fn file(&self) -> &Arc<F> {
+        &self.file
+    }
+
+    /// Verifies the framed blob record in `buf` against `expected_crc` and optional `expected_key`.
+    /// Returns a slice to the payload value on success, or `None` if verification fails.
+    pub fn verify_blob_record<'a>(
+        buf: &'a [u8],
+        expected_crc: u32,
+        expected_key: Option<&[u8]>,
+    ) -> Option<&'a [u8]> {
+        if buf.len() < BLOB_RECORD_HEADER_LEN {
+            return None;
+        }
+        if &buf[0..4] != BLOB_RECORD_MAGIC {
+            return None;
+        }
+
+        let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if stored_crc != expected_crc {
+            return None;
+        }
+
+        let actual_crc = crc32c(&buf[8..]);
+        if actual_crc != expected_crc {
+            return None;
+        }
+
+        let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        let val_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+
+        if BLOB_RECORD_HEADER_LEN
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(val_len))
+            != Some(buf.len())
+        {
+            return None;
+        }
+
+        let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
+        if let Some(exp_k) = expected_key {
+            if key_slice != exp_k {
+                return None;
+            }
+        }
+
+        let val_start = BLOB_RECORD_HEADER_LEN + key_len;
+        Some(&buf[val_start..val_start + val_len])
+    }
+
     /// Reads and verifies the blob payload referenced by `ptr`.
     ///
     /// Returns `Ok(Some(payload))` only when the record was read in full and passed the
@@ -280,44 +330,12 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         }
 
         let buf = &out[orig_len..orig_len + len];
-        if &buf[0..4] != BLOB_RECORD_MAGIC {
+        let Some(val_slice) = Self::verify_blob_record(buf, ptr.crc32c, expected_key) else {
             out.truncate(orig_len);
             return Ok(false);
-        }
-
-        let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        if stored_crc != ptr.crc32c {
-            out.truncate(orig_len);
-            return Ok(false);
-        }
-
-        let actual_crc = crc32c(&buf[8..]);
-        if actual_crc != ptr.crc32c {
-            out.truncate(orig_len);
-            return Ok(false);
-        }
-
-        let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-        let val_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-
-        if BLOB_RECORD_HEADER_LEN
-            .checked_add(key_len)
-            .and_then(|n| n.checked_add(val_len))
-            != Some(len)
-        {
-            out.truncate(orig_len);
-            return Ok(false);
-        }
-
-        let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
-        if let Some(exp_k) = expected_key {
-            if key_slice != exp_k {
-                out.truncate(orig_len);
-                return Ok(false);
-            }
-        }
-
-        let val_start = orig_len + BLOB_RECORD_HEADER_LEN + key_len;
+        };
+        let val_len = val_slice.len();
+        let val_start = (val_slice.as_ptr() as usize) - (out.as_ptr() as usize);
         out.copy_within(val_start..val_start + val_len, orig_len);
         out.truncate(orig_len + val_len);
         Ok(true)

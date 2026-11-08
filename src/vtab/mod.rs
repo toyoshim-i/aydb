@@ -1510,7 +1510,21 @@ unsafe extern "system" fn vtab_column(
                 return SQLITE_ERROR;
             };
             let conn_id = vtab.db as usize;
+
+            let mut upcoming: Vec<(&[u8], &LazyBlob<OsFile>)> = Vec::new();
+            let end = (cursor.pos + 16).min(cursor.lazy_blobs.len());
+            for i in cursor.pos..end {
+                if let Some(Some(lb)) = cursor.lazy_blobs.get(i) {
+                    if let Some(pk) = cursor.pks.get(i) {
+                        upcoming.push((pk.as_slice(), lb));
+                    }
+                }
+            }
+
             let Some(deref_res) = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
+                if upcoming.len() > 1 {
+                    let _ = eng.prefetch_lazy_blobs(vtab.table_id, &upcoming);
+                }
                 eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &lazy_blob, &mut cursor.slab)
             }) else {
                 return SQLITE_ERROR;

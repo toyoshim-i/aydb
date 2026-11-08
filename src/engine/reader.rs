@@ -126,6 +126,16 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
             .dereference_lazy_blob_into_cx(&self.cx, table_id, pk, lazy, slab)
     }
 
+    /// See [`StorageEngine::prefetch_lazy_blobs`].
+    pub fn prefetch_lazy_blobs(
+        &self,
+        table_id: u16,
+        candidates: &[(&[u8], &LazyBlob<FS::File>)],
+    ) -> io::Result<()> {
+        self.eng
+            .prefetch_lazy_blobs_cx(&self.cx, table_id, candidates)
+    }
+
     /// Whether a live row with primary key `pk` exists in this view.
     pub fn row_exists(&self, table_id: u16, pk: &[u8]) -> io::Result<bool> {
         let row_key = crate::lru::encode_primary_row_key(table_id, pk);

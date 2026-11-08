@@ -183,12 +183,19 @@ impl WalBatch {
     }
 
     /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`
+    /// reusing an existing buffer `out` without intermediate heap allocations.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&[0u8; 16]);
+        Self::append_records_to_buf(&self.records, out);
+        Self::finalize_encoded_buf(self.lsn, self.records.len() as u32, out);
+    }
+
+    /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`
     /// in a single allocation without intermediate copying.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(&[0u8; 16]);
-        Self::append_records_to_buf(&self.records, &mut out);
-        Self::finalize_encoded_buf(self.lsn, self.records.len() as u32, &mut out);
+        self.encode_into(&mut out);
         out
     }
 
@@ -323,6 +330,10 @@ pub struct WalStreamWriter<F: PlatformFile> {
     dirty_in_user_space: bool,
     /// Scratch buffer for the currently active 4 KB sector.
     sector_buf: [u8; WAL_SECTOR_SIZE],
+    /// Backup buffer for rolling back `sector_buf` on I/O error without per-append heap allocation.
+    backup_sector_buf: Box<[u8; WAL_SECTOR_SIZE]>,
+    /// Scratch buffer for `append_batch` serialization without per-call heap allocation.
+    scratch_encode_buf: Vec<u8>,
     /// Contiguous staging buffer for coalescing multi-sector batch writes into a single `write_all_at` syscall.
     multi_sector_buf: Vec<u8>,
 }
@@ -366,6 +377,8 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             current_valid_bytes: 0,
             dirty_in_user_space: false,
             sector_buf: [0u8; WAL_SECTOR_SIZE],
+            backup_sector_buf: Box::new([0u8; WAL_SECTOR_SIZE]),
+            scratch_encode_buf: Vec::with_capacity(512),
             multi_sector_buf: Vec::new(),
         })
     }
@@ -433,8 +446,12 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     /// Appends an atomic [`WalBatch`] to the WAL stream, fragmenting across 4 KB sectors if needed.
     pub fn append_batch(&mut self, batch: &WalBatch) -> io::Result<WalAppendOutcome> {
-        let encoded = batch.encode();
-        self.append_raw_batch(&encoded)
+        let mut raw = core::mem::take(&mut self.scratch_encode_buf);
+        batch.encode_into(&mut raw);
+        let res = self.append_raw_batch(&raw);
+        raw.clear();
+        self.scratch_encode_buf = raw;
+        res
     }
 
     /// Appends pre-encoded batch bytes.
@@ -450,17 +467,18 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         let saved_idx = self.current_sector_idx;
         let saved_valid = self.current_valid_bytes;
         let saved_dirty = self.dirty_in_user_space;
-        // A partially filled sector holds earlier committed bytes that must survive a rollback.
-        // When `valid == 0` the buffer is all zeros, so no copy is needed.
-        let saved_buf = (saved_valid > 0).then(|| Box::new(self.sector_buf));
+        if saved_valid > 0 {
+            self.backup_sector_buf.copy_from_slice(&self.sector_buf);
+        }
         let res = self.append_raw_batch_inner(remaining);
         if res.is_err() {
             self.current_sector_idx = saved_idx;
             self.current_valid_bytes = saved_valid;
             self.dirty_in_user_space = saved_dirty;
-            match saved_buf {
-                Some(b) => self.sector_buf.copy_from_slice(&*b),
-                None => self.sector_buf.fill(0),
+            if saved_valid > 0 {
+                self.sector_buf.copy_from_slice(&*self.backup_sector_buf);
+            } else {
+                self.sector_buf.fill(0);
             }
             self.multi_sector_buf.clear();
         }

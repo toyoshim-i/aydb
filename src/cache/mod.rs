@@ -332,6 +332,16 @@ impl VerifiedBlobCache {
         false
     }
 
+    /// Returns `true` if `key` is resident in the blob cache.
+    pub fn contains(&self, key: &BlobCacheKey) -> bool {
+        if self.shard_capacity == 0 {
+            return false;
+        }
+        let shard_idx = self.shard_index(key);
+        let shard = self.shards[shard_idx].lock().unwrap();
+        shard.index.contains_key(key)
+    }
+
     /// Inserts a small verified blob payload into the cache.
     pub fn insert(&self, key: BlobCacheKey, payload: &[u8]) {
         if self.shard_capacity == 0 || payload.len() > MAX_CACHED_BLOB_PAYLOAD_BYTES {
