@@ -3963,3 +3963,30 @@ fn orphan_segment_file_name_is_not_reused_after_crashed_flush() {
     assert_eq!(engine.get_row(1, b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(engine.get_row(1, b"b").unwrap(), Some(b"2".to_vec()));
 }
+
+#[test]
+fn drop_table_with_tombstones_larger_than_wal_is_atomic_and_durable() {
+    let tmp = TempTestDir::new("drop_table_larger_than_wal");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.buf_wal_size_bytes = 64 * 1024;
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    for i in 0..20000u32 {
+        engine
+            .put_row(1, &i.to_be_bytes(), b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.put_row(2, b"keep", b"v", &[], WriteDurability::BufferedFast).unwrap();
+    engine.flush_memtable().unwrap();
+
+    engine.drop_table(1, None).unwrap();
+    assert!(engine.get_row(1, &0u32.to_be_bytes()).unwrap().is_none());
+    assert!(engine.get_row(1, &19999u32.to_be_bytes()).unwrap().is_none());
+    drop(engine);
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    for i in [0u32, 9999, 19999] {
+        assert!(engine.get_row(1, &i.to_be_bytes()).unwrap().is_none());
+    }
+    assert_eq!(engine.get_row(2, b"keep").unwrap(), Some(b"v".to_vec()));
+}

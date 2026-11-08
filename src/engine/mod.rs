@@ -938,6 +938,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        // Without an enclosing transaction the deletes run in an internal one: its chunked
+        // TxBegin/TxCommit framing and WAL growth let a table larger than the WAL be dropped
+        // atomically. The internal transaction is exempt from `max_transaction_bytes`. It begins
+        // before any engine state is changed so a rollback restores that state.
+        let internal_tx = self.tx_depth == 0;
+        if internal_tx {
+            self.begin_transaction();
+        }
         let removed_name = self.active_vtab_ids.remove(&table_id).map(|s| s.to_string());
         let name_to_clean = table_name
             .map(|s| s.trim().to_ascii_lowercase())
@@ -946,13 +954,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());
             cat_key.extend_from_slice(&[0u8, 0u8, b'c']);
             cat_key.extend_from_slice(norm_name.as_bytes());
-            if self.check_existing_row(&cat_key)? != ExistingRowStatus::NotFound {
-                records.push(WalRecord::Delete { key: cat_key });
+            match self.check_existing_row(&cat_key) {
+                Ok(ExistingRowStatus::NotFound) => {}
+                Ok(_) => records.push(WalRecord::Delete { key: cat_key }),
+                Err(e) => {
+                    if internal_tx {
+                        let _ = self.rollback_transaction();
+                    }
+                    return Err(e);
+                }
             }
         }
 
         if !records.is_empty() {
-            self.commit_wal_and_memtable(records, WriteDurability::BufferedFast)?;
+            let was_preparing = core::mem::replace(&mut self.tx_preparing, internal_tx);
+            let res = self.commit_wal_and_memtable(records, WriteDurability::BufferedFast);
+            self.tx_preparing = was_preparing;
+            if let Err(e) = res {
+                if internal_tx {
+                    let _ = self.rollback_transaction();
+                }
+                return Err(e);
+            }
         }
         for ptr in dead_ptrs {
             self.record_dead_blob_bytes(&ptr);
@@ -973,16 +996,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        if self.tx_depth == 0 {
-            self.reclaim_fully_dead_lru_blob_segments(table_id)?;
-            if was_capped {
-                let quota_metas = self.build_quota_metas();
-                self.meta_mgr.commit_update(|st| {
-                    st.table_quotas = quota_metas;
-                })?;
-            }
-        } else {
-            self.dropped_tables_in_tx.push((table_id, was_capped));
+        // Blob reclaim and the quota commit happen exactly once: in `commit_transaction` for the
+        // internal and any enclosing transaction alike, via `dropped_tables_in_tx`.
+        self.dropped_tables_in_tx.push((table_id, was_capped));
+        if internal_tx {
+            self.commit_transaction()?;
         }
         Ok(())
     }

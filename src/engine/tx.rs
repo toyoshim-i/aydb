@@ -323,9 +323,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB).
+        // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB) or a
+        //    single batch that cannot fit even in an empty WAL file.
         const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
-        if self.pending_tx_buf.len() > MAX_WAL_CHUNK_BYTES {
+        let wal_total_sectors = match effective_durability {
+            WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
+            WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+        };
+        let exceeds_wal = self.pending_tx_buf.len() / 4070 + 2 > wal_total_sectors;
+        if self.pending_tx_buf.len() > MAX_WAL_CHUNK_BYTES || exceeds_wal {
             let required_sectors = (self.pending_tx_buf.len() / 4070) + 8;
             match effective_durability {
                 WriteDurability::SyncTransactional => {
