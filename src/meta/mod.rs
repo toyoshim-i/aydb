@@ -648,11 +648,14 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let target_slot = self.active_slot.opposite();
         Self::write_state_to_slot_internal(&self.fs, &self.file, target_slot, &mut next_state)?;
 
-        // If the previous generation used an external manifest that is no longer the active one,
-        // queue the old manifest file for deferred deletion.
-        if let Some(old_mf_id) = prev_manifest_id {
-            if next_state.active_manifest_seq_id != Some(old_mf_id) {
-                next_state.queue_pending_delete(format_manifest_file_name(old_mf_id));
+        // The previous generation becomes the standby slot and may be the fallback at the next
+        // open, so its external manifest is retained. The manifest that stops being referenced by
+        // either slot (the previous standby's) is queued for deferred deletion.
+        if let Some(old_standby_mf) = self.standby_manifest_id {
+            if next_state.active_manifest_seq_id != Some(old_standby_mf)
+                && prev_manifest_id != Some(old_standby_mf)
+            {
+                next_state.queue_pending_delete(format_manifest_file_name(old_standby_mf));
             }
         }
 
@@ -1150,6 +1153,16 @@ mod tests {
                 .expect("must overflow to second external manifest");
             assert_ne!(first_mf_id, second_mf_id);
 
+            // The first manifest is still referenced by the standby slot and must be retained.
+            let files = fs.list_files().unwrap();
+            assert!(files.contains(&format_manifest_file_name(first_mf_id)));
+            assert!(files.contains(&format_manifest_file_name(second_mf_id)));
+
+            // Once a third generation is committed the first manifest is referenced by neither slot.
+            mgr.commit_update(|s| {
+                s.checkpoint_lsn = 8888;
+            })
+            .expect("commit overflow gen 4");
             let files = fs.list_files().unwrap();
             assert!(!files.contains(&format_manifest_file_name(first_mf_id)));
             assert!(files.contains(&format_manifest_file_name(second_mf_id)));
@@ -1157,10 +1170,86 @@ mod tests {
 
         // Reopen and verify all 200 segments are recovered from the external manifest
         let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen overflow");
-        assert_eq!(mgr.state().generation, 3);
-        assert_eq!(mgr.state().checkpoint_lsn, 7777);
+        assert_eq!(mgr.state().generation, 4);
+        assert_eq!(mgr.state().checkpoint_lsn, 8888);
         assert_eq!(mgr.state().idx_segments.len(), 200);
-        assert_eq!(mgr.state().active_manifest_seq_id, Some(second_mf_id));
+        assert!(mgr.state().active_manifest_seq_id.is_some());
+    }
+
+    #[test]
+    fn standby_manifest_survives_commits_and_restart_sweep_and_serves_fallback() {
+        let tmp = TempTestDir::new("standby_manifest");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let manifests = |fs: &Arc<OsFs>| {
+            let mut v: Vec<String> = fs
+                .list_files()
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.starts_with("manifest_"))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let (active_mf, standby_mf, active_slot);
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
+            mgr.commit_update(|s| {
+                for i in 0..200 {
+                    let seq_id = s.allocate_seq_id();
+                    let fname = format_idx_file_name(seq_id);
+                    let _ = fs
+                        .open_file(&fname, true, true, OpenHint::ImmutableRandom)
+                        .unwrap();
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id,
+                        file_len: 4096 * (i + 1),
+                        level: 1,
+                        record_count: 100,
+                    });
+                }
+            })
+            .unwrap();
+            for lsn in 1..=4u64 {
+                let prev = mgr.state().active_manifest_seq_id.unwrap();
+                mgr.commit_update(|s| s.checkpoint_lsn = lsn).unwrap();
+                let cur = mgr.state().active_manifest_seq_id.unwrap();
+                assert_ne!(prev, cur);
+                // Exactly the active and the standby manifests exist after every commit.
+                assert_eq!(
+                    manifests(&fs),
+                    {
+                        let mut v = vec![format_manifest_file_name(prev), format_manifest_file_name(cur)];
+                        v.sort();
+                        v
+                    }
+                );
+            }
+            active_mf = mgr.state().active_manifest_seq_id.unwrap();
+            standby_mf = mgr.standby_manifest_id.unwrap();
+            active_slot = mgr.active_slot();
+        }
+
+        // A restart sweep keeps both manifests.
+        drop(BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen with sweep"));
+        assert!(manifests(&fs).contains(&format_manifest_file_name(active_mf)));
+        assert!(manifests(&fs).contains(&format_manifest_file_name(standby_mf)));
+
+        // Corrupt the active slot; the open must fall back to the standby generation.
+        let f = fs
+            .open_file(BOOT_META_FILE_NAME, false, true, OpenHint::MutableSyncLog)
+            .unwrap();
+        let off = match active_slot {
+            SlotIndex::SlotA => 0,
+            SlotIndex::SlotB => SLOT_SIZE as u64,
+        };
+        f.write_all_at(&[0xFF], off + SLOT_SIZE as u64 - 1).unwrap();
+        drop(f);
+
+        let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("fallback open");
+        assert_eq!(mgr.state().active_manifest_seq_id, Some(standby_mf));
+        assert_eq!(mgr.state().idx_segments.len(), 200);
+        assert_eq!(mgr.state().checkpoint_lsn, 3);
     }
 
     /// Test-only `PlatformFs` that fails manifest opens with a non-corruption error on demand.
