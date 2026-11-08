@@ -399,7 +399,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);
         buf_wal.set_cursor_after_recovery(rec.next_buf_sector_idx);
 
-        let had_recovered_batches = !rec.merged_batches.is_empty();
         let mut memtable = MemTable::new(config.memtable_capacity_bytes);
         for batch in rec.merged_batches {
             let batch_lsn = batch.lsn;
@@ -591,15 +590,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
         engine.reconcile_capped_tables_after_recovery()?;
 
-        if had_recovered_batches
-            || rec.next_sync_sector_idx > 0
-            || rec.next_buf_sector_idx > 0
-        {
-            if !engine.memtable.is_empty() {
-                engine.flush_memtable()?;
-            } else {
-                engine.rotate_wal_epochs_only()?;
-            }
+        // Always rotate both WAL epochs after recovery, even when nothing was recovered.
+        // Recovery halts at the first torn/old sector, but later sectors of the SAME epoch may
+        // already be on disk (write-back reordering before a crash). If we kept the epoch, new
+        // writes would restart at that halt point and a later recovery could run past the new
+        // data into those stale same-epoch sectors, replaying batches that were never recovered
+        // the first time (with colliding LSNs). A fresh epoch makes every pre-crash sector
+        // unreadable as part of the new stream. Cost: one boot_meta commit per open.
+        if !engine.memtable.is_empty() {
+            engine.flush_memtable()?;
+        } else {
+            engine.rotate_wal_epochs_only()?;
         }
 
         // Now that WAL recovery and the post-recovery checkpoint are complete, sweep any truly

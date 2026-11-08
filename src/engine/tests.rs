@@ -2471,3 +2471,61 @@ fn sync_point_seals_buf_wal_sector_so_it_is_never_rewritten() {
         }
     }
 }
+
+#[test]
+fn stale_same_epoch_wal_sectors_are_not_replayed_after_halt_at_sector_zero() {
+    let tmp = TempTestDir::new("stale_wal_sectors");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 8192;
+
+    let val = vec![0x77u8; 1500];
+    {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        // Each SyncTransactional write seals the open wal_buf sector first, so every buffered
+        // batch ends at a sector boundary and the next sector starts with a Full fragment.
+        for i in 0..6u8 {
+            engine
+                .put_row(1, &[b'b', i], &val, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            engine
+                .put_row(1, &[b'y', i], b"sync", &[], WriteDurability::SyncTransactional)
+                .unwrap();
+        }
+        // Dropped without flush_memtable(): simulates a crash with several wal_buf sectors.
+    }
+
+    // Tear sector 0 of both WALs so recovery halts there while later sectors of the same epoch
+    // stay on disk.
+    for name in ["wal_buf.db", "wal_sync.db"] {
+        let wal_path = tmp.path.join(name);
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        assert!(bytes.len() > 100);
+        bytes[100] ^= 0xFF;
+        std::fs::write(&wal_path, &bytes).unwrap();
+    }
+
+    {
+        let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+        engine
+            .put_row(1, b"new_key", b"new_val", &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(
+        engine.get_row(1, b"new_key").unwrap(),
+        Some(b"new_val".to_vec())
+    );
+    for i in 0..6u8 {
+        for prefix in *b"by" {
+            assert_eq!(
+                engine.get_row(1, &[prefix, i]).unwrap(),
+                None,
+                "stale pre-crash key {}{i} was resurrected",
+                prefix as char
+            );
+        }
+    }
+}
