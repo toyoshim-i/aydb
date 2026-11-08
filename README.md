@@ -81,21 +81,21 @@ All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Vir
 
 | Benchmark Workload | Workload & Durability / Scale Note | `aydb` (`4 MB` Default / `128 KB` SSTable) | Vanilla SQLite (`WAL`) | Speedup (`4 MB` / `SSTable`) |
 | :--- | :--- | ---: | ---: | ---: |
-| **`Speedtest1`-Style Suite** | Selected 5,000-row SQL workload (`Tests 100–240`, `BufferedImmediateOsCache` vs `NORMAL`, ~600 KB) | `67.55 ms` (`205.99 ms` SSTable) | `62.95 ms` (`64.13 ms`) | `0.93×` (`0.31×` SSTable) |
-| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s (`MemTable` `BTreeMap` vs SQLite `PCache`) | **`5.33 ms`** (`938K qps`) | `14.69 ms` (`340K qps`) | **`2.76×` faster** |
-| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE uval = ?`) | **`7.58 ms`** (`660K qps`) | `15.97 ms` (`313K qps`) | **`2.11×` faster** |
-| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`4.66 ms`** (`215K qps`) | `5.34 ms` (`187K qps`) | **`1.15×` faster** |
-| **YCSB-Style Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`299K`** / `85.9K ops/s` | `221K` / `155K ops/s` | **`1.35×`** / `0.55×` |
-| **YCSB-Style Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`362K`**] / `2 KB` WiscKey) | **`887K`** / `153K ops/s` | `291K` / `184K ops/s` | **`3.05×` [`1.24×` SST]** / `0.83×` |
-| **YCSB-Style Workload C** | 100% Point Read (`256 B` inline [SSTable: **`435K`**] / `2 KB` WiscKey) | **`1,208K`** / `188K ops/s` | `303K` / `192K ops/s` | **`3.98×` [`1.44×` SST]** / `0.98×` |
-| **YCSB-Style Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`890K` / `167K ops/s`** | `206K` / `105K ops/s` | **`4.32×` / `1.60×` faster** |
-| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey, lazy dereference) | `105K` / `17.1K ops/s` | `107K` / `42.8K ops/s` | `0.98×` / `0.39×` |
-| **YCSB-Style Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`264K`** / `70.0K ops/s` | `176K` / `121K ops/s` | **`1.50×`** / `0.58×` |
-| **TPC-B-Style (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` `WRITE_THROUGH` vs `synchronous=FULL`) | **`13,817 TPS`** (**`9,969`** SSTable) | `529 TPS` (`439` SST) | **`26.12×` (`22.73×` SSTable)** |
-| **TPC-B-Style (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`110,257 TPS`** (**`45,774`** SSTable) | `15,576 TPS` (`15,506` SST) | **`7.08×` (`2.95×` SSTable)** |
-| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates (`wal_sync.db` vs `synchronous=FULL`) | **`15,322 tx/s`** (`56.6 µs` P50) | `1,020 tx/s` (`978.6 µs` P50) | **`15.0×` faster** |
-| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`32.0 MB` written, `4.0 MB` Quota Enforcement) | **`154.6 MB/s`** (`3.98 MB` disk) | `86.5 MB/s` (`8.15 MB` disk) | **`1.79×` faster (`0.49×` space)** |
-| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking (`4 KB` blobs in `blob_lru_*.db`) | **`215,506 ops/s`** (`0.00 MB` RAM) | `27,376 ops/s` (`0.03 MB` WAL) | **`7.87×` faster** |
+| **`Speedtest1`-Style Suite** | Selected 5,000-row SQL workload (`Tests 100–240`, `BufferedImmediateOsCache` vs `NORMAL`, ~600 KB) | `74.60 ms` (**`99.57 ms`** SSTable) | `64.17 ms` (`60.80 ms`) | `0.86×` (**`0.61×`** SSTable) |
+| └─ *Speedtest1 Test 130* | 5,000 Primary Key Point `SELECT`s (`MemTable` `BTreeMap` vs SQLite `PCache`) | **`5.45 ms`** (`917K qps`) | `15.50 ms` (`323K qps`) | **`2.85×` faster** |
+| └─ *Speedtest1 Test 140* | 5,000 Secondary Index `SELECT`s (`WHERE uval = ?`) | **`8.65 ms`** (`578K qps`) | `16.41 ms` (`305K qps`) | **`1.90×` faster** |
+| └─ *Speedtest1 Test 160* | 1,000 PK Range Scans (`20` rows each) | **`5.41 ms`** (`185K qps`) | `5.47 ms` (`183K qps`) | **`1.01×` faster** |
+| **YCSB-Style Workload A** | 50% Read / 50% Update (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`286K`** / `95.2K ops/s` | `233K` / `157K ops/s` | **`1.23×`** / `0.61×` |
+| **YCSB-Style Workload B** | 95% Read / 5% Update (`256 B` inline [SSTable: **`672K`**] / `2 KB` WiscKey) | **`776K`** / **`269K ops/s`** | `289K` / `187K ops/s` | **`2.68×` [`2.34×` SST]** / **`1.44×`** |
+| **YCSB-Style Workload C** | 100% Point Read (`256 B` inline [SSTable: **`843K`**] / `2 KB` WiscKey) | **`974K`** / **`444K ops/s`** | `301K` / `199K ops/s` | **`3.24×` [`2.81×` SST]** / **`2.23×`** |
+| **YCSB-Style Workload D** | 95% Read Latest / 5% Insert (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`752K` / `278K ops/s`** | `197K` / `102K ops/s` | **`3.82×` / `2.73×` faster** |
+| **YCSB-Style Workload E** | 95% Short Range / 5% Insert (`256 B` inline / `2 KB` WiscKey, prefetch) | `48.4K` / `22.2K ops/s` | `102K` / `44.5K ops/s` | `0.48×` / `0.50×` |
+| **YCSB-Style Workload F** | 50% Read / 50% Read-Modify-Write (`256 B` inline / `2 KB` WiscKey `blob_std_*.db`) | **`243K`** / `88.9K ops/s` | `174K` / `124K ops/s` | **`1.39×`** / `0.72×` |
+| **TPC-B-Style (`FULL` Sync)** | 4-Table OLTP Debit/Credit (`wal_sync.db` `WRITE_THROUGH` vs `synchronous=FULL`) | **`15,629 TPS`** (**`12,119`** SSTable) | `523 TPS` (`530` SST) | **`29.86×` (`22.86×` SSTable)** |
+| **TPC-B-Style (`Buffered`)** | 4-Table OLTP Debit/Credit (`wal_buf.db` `ImmediateOsCache` vs `synchronous=NORMAL`) | **`103,299 TPS`** (**`61,125`** SSTable) | `14,987 TPS` (`10,274` SST) | **`6.89×` (`5.95×` SSTable)** |
+| **Hybrid Config Sync** | 300 Synchronous `128 B` Settings Updates (`wal_sync.db` vs `synchronous=FULL`) | **`15,665 tx/s`** (`50.4 µs` P50) | `1,008 tx/s` (`987.1 µs` P50) | **`15.5×` faster** |
+| **Bounded Blob Cache** | 2,000 × `16 KB` Churn (`32.0 MB` written, `4.0 MB` Quota Enforcement) | **`160.3 MB/s`** (`3.98 MB` disk) | `91.6 MB/s` (`8.15 MB` disk) | **`1.75×` faster (`0.49×` space)** |
+| **LRU Cache-Hit Reads** | 20,000 `SELECT`s with Active LRU Access Tracking (`4 KB` blobs in `blob_lru_*.db`) | **`616,120 ops/s`** (`0.00 MB` RAM) | `27,680 ops/s` (`0.03 MB` WAL) | **`22.26×` faster** |
 
 ---
 

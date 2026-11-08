@@ -1,6 +1,6 @@
 # aydb — Next-Step Architecture Proposals (Draft)
 
-*Status: proposal / not implemented. Builds on `docs/ARCHITECTURE.md` and the post-audit state of `main` (2026-11).*
+*Status: Implemented (Steps 1–6 complete: 3-way interleaved CRC32C, configurable inline threshold, bounded VerifiedBlockCache & VerifiedBlobCache, PlatformFile::read_many_at with range-scan blob prefetching, zero-alloc buffered commit coalescing, and reference-aware POSIX HandlePool).*
 
 This document collects design changes aimed at the workloads where `aydb` still trails vanilla SQLite (WAL mode), while keeping the core requirements of `ARCHITECTURE.md` §1: a bounded process heap, crash safety without random-I/O flushes, and Windows/SMB-friendly file handling.
 
