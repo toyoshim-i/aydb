@@ -246,8 +246,15 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
 fn resolve_pk_for_rowid(
     vtab: &AydbVTab,
     target_rid: i64,
+    row_exists: impl FnOnce(u16, &[u8]) -> io::Result<bool>,
     lookup: impl FnOnce(u16, i64) -> io::Result<Option<Vec<u8>>>,
 ) -> io::Result<Option<Vec<u8>>> {
+    if vtab.pk_affinity == ColumnAffinity::Integer {
+        let integer_pk = encode_i64_tagged_key(target_rid);
+        if row_exists(vtab.table_id, &integer_pk)? {
+            return Ok(Some(integer_pk.to_vec()));
+        }
+    }
     // A local cache may contain a deleted or reused identity from another connection.
     // Resolve against the same persisted read view used for the row itself.
     let found = lookup(vtab.table_id, target_rid)?;
@@ -481,6 +488,11 @@ fn max_integer_rowid(eng: &mut StorageEngine<OsFs>, table_id: u16) -> io::Result
     Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
 }
 
+fn integer_rowid_occupied(eng: &StorageEngine<OsFs>, table_id: u16, rowid: i64) -> io::Result<bool> {
+    Ok(eng.row_exists(table_id, &encode_i64_tagged_key(rowid))?
+        || eng.pk_for_rowid_view(crate::engine::ReadView::Owner, table_id, rowid)?.is_some())
+}
+
 unsafe extern "system" fn vtab_create_or_connect(
     db: *mut sqlite3,
     p_aux: *mut c_void,
@@ -568,12 +580,14 @@ unsafe extern "system" fn vtab_create_or_connect(
 
         // Older databases have no rowid index. Populate missing identities in key order once;
         // every pair is an atomic WAL batch, so a failed connection can resume safely.
-        if ddl.pk_affinity != ColumnAffinity::Integer {
+        {
             let mut eng = match aux.engine.write() {
                 Ok(eng) => eng,
                 Err(_) => return SQLITE_ERROR,
             };
-            if let Err(e) = rowid_map::ensure_persistent_rowids(&mut eng, table_id, ddl.durability) {
+            if let Err(e) = rowid_map::ensure_persistent_rowids(
+                &mut eng, table_id, ddl.durability, ddl.pk_affinity == ColumnAffinity::Integer,
+            ) {
                 eng.unregister_vtab(table_id, &ddl.table_name);
                 return io_err_to_sqlite_rc(&e);
             }
@@ -765,11 +779,9 @@ unsafe extern "system" fn vtab_best_index(
         let mut order_by_pk_reverse = false;
         if info.nOrderBy == 1 {
             let ob = &*info.aOrderBy;
-            let is_pk_order = if ob.iColumn == -1 {
-                vtab.pk_affinity == ColumnAffinity::Integer
-            } else {
-                ob.iColumn == vtab.pk_col_idx as i32
-            };
+            // Integer affinity also accepts REAL/TEXT/BLOB keys with synthetic rowids. Another
+            // connection can insert one after planning, so only PK order is guaranteed here.
+            let is_pk_order = ob.iColumn == vtab.pk_col_idx as i32;
             if is_pk_order {
                 order_by_pk_consumed = true;
                 order_by_pk_reverse = ob.desc != 0;
@@ -983,45 +995,29 @@ unsafe extern "system" fn vtab_filter(
                     cursor.keys_only = pt_keys_only;
                     if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
                         if let Some(rid) = extract_lossless_rowid_arg(val_ptr) {
-                            if vtab.pk_affinity == ColumnAffinity::Integer {
-                                let pk_arr = encode_i64_tagged_key(rid);
-                                match point_fetch(
-                                    eng,
-                                    vtab.table_id,
-                                    &pk_arr,
-                                    pt_keys_only,
-                                    &mut cursor.slab,
-                                    &mut cursor.spans,
-                                ) {
-                                    Ok(true) => {
-                                        cursor.pks.push(pk_arr.to_vec());
-                                        cursor.lazy_blobs.push(None);
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => return io_err_to_sqlite_rc(&e),
-                                }
-                            } else {
-                                match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid(t, rid)) {
-                                    Ok(Some(mapped_pk)) => {
-                                        match point_fetch(
-                                            eng,
-                                            vtab.table_id,
-                                            &mapped_pk,
-                                            pt_keys_only,
-                                            &mut cursor.slab,
-                                            &mut cursor.spans,
-                                        ) {
-                                            Ok(true) => {
-                                                cursor.pks.push(mapped_pk);
-                                                cursor.lazy_blobs.push(None);
-                                            }
-                                            Ok(false) => {}
-                                            Err(e) => return io_err_to_sqlite_rc(&e),
+                            match resolve_pk_for_rowid(
+                                vtab, rid, |t, pk| eng.row_exists(t, pk),
+                                |t, rid| eng.pk_for_rowid(t, rid),
+                            ) {
+                                Ok(Some(mapped_pk)) => {
+                                    match point_fetch(
+                                        eng,
+                                        vtab.table_id,
+                                        &mapped_pk,
+                                        pt_keys_only,
+                                        &mut cursor.slab,
+                                        &mut cursor.spans,
+                                    ) {
+                                        Ok(true) => {
+                                            cursor.pks.push(mapped_pk);
+                                            cursor.lazy_blobs.push(None);
                                         }
+                                        Ok(false) => {}
+                                        Err(e) => return io_err_to_sqlite_rc(&e),
                                     }
-                                    Ok(None) => {}
-                                    Err(e) => return io_err_to_sqlite_rc(&e),
                                 }
+                                Ok(None) => {}
+                                Err(e) => return io_err_to_sqlite_rc(&e),
                             }
                         }
                         return SQLITE_OK;
@@ -1668,27 +1664,22 @@ unsafe extern "system" fn vtab_update(
         if argc == 1 {
             let arg0 = *argv.offset(0);
             if let Some(rid) = extract_lossless_rowid_arg(arg0) {
-                if vtab.pk_affinity == ColumnAffinity::Integer {
-                    let old_pk = encode_i64_tagged_key(rid);
+                let old_pk_opt = match resolve_pk_for_rowid(
+                    vtab, rid, |t, pk| eng.row_exists(t, pk),
+                    |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
+                ) {
+                    Ok(opt) => opt,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
+                if let Some(old_pk) = old_pk_opt {
+                    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                        rmap.remove_by_rowid(rid);
+                    }
                     if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
                         return io_err_to_sqlite_rc(&e);
                     }
-                    return SQLITE_OK;
-                } else {
-                    let old_pk_opt = match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid)) {
-                        Ok(opt) => opt,
-                        Err(e) => return io_err_to_sqlite_rc(&e),
-                    };
-                    if let Some(old_pk) = old_pk_opt {
-                        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                            rmap.remove_by_rowid(rid);
-                        }
-                        if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
-                            return io_err_to_sqlite_rc(&e);
-                        }
-                    }
-                    return SQLITE_OK;
                 }
+                return SQLITE_OK;
             } else {
                 let old_pk = sqlite_value_to_key_bytes_with_schema(
                     arg0,
@@ -1729,8 +1720,7 @@ unsafe extern "system" fn vtab_update(
                 let mut found_free = None;
                 // 1. Bounded sequential probe using checked arithmetic
                 for _ in 0..1024 {
-                    let probe_key = encode_i64_tagged_key(candidate);
-                    match eng.row_exists(vtab.table_id, &probe_key) {
+                    match integer_rowid_occupied(&eng, vtab.table_id, candidate) {
                         Ok(false) => {
                             found_free = Some(candidate);
                             break;
@@ -1757,8 +1747,7 @@ unsafe extern "system" fn vtab_update(
                         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
                         z ^= z >> 31;
                         let rand_pos = ((z & 0x7FFF_FFFF_FFFF_FFFF) as i64).max(1);
-                        let probe_key = encode_i64_tagged_key(rand_pos);
-                        match eng.row_exists(vtab.table_id, &probe_key) {
+                        match integer_rowid_occupied(&eng, vtab.table_id, rand_pos) {
                             Ok(false) => {
                                 found_free = Some(rand_pos);
                                 break;
@@ -1813,16 +1802,15 @@ unsafe extern "system" fn vtab_update(
         let mut old_pk_opt: Option<(Vec<u8>, Option<i64>)> = None;
         if !is_insert {
             if let Some(rid) = extract_lossless_rowid_arg(arg0) {
-                if vtab.pk_affinity == ColumnAffinity::Integer {
-                    old_pk_opt = Some((encode_i64_tagged_key(rid).to_vec(), None));
-                } else {
-                    let mapped = match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid)) {
-                        Ok(opt) => opt,
-                        Err(e) => return io_err_to_sqlite_rc(&e),
-                    };
-                    if let Some(old_pk) = mapped {
-                        old_pk_opt = Some((old_pk, Some(rid)));
-                    }
+                let mapped = match resolve_pk_for_rowid(
+                    vtab, rid, |t, pk| eng.row_exists(t, pk),
+                    |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
+                ) {
+                    Ok(opt) => opt,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
+                if let Some(old_pk) = mapped {
+                    old_pk_opt = Some((old_pk, Some(rid)));
                 }
             } else {
                 old_pk_opt = Some((
@@ -1834,6 +1822,25 @@ unsafe extern "system" fn vtab_update(
                     ),
                     None,
                 ));
+            }
+        }
+
+        // Integer PK values use their exact i64 as rowid. A previously allocated synthetic
+        // identity owns that number until its row is deleted, just like an explicit rowid.
+        let rowid_conflict_pk = if let Some(rowid) = coerced_int_pk {
+            match eng.pk_for_rowid_view(crate::engine::ReadView::Owner, vtab.table_id, rowid) {
+                Ok(Some(pk)) if old_pk_opt.as_ref().is_none_or(|(old, _)| *old != pk) => Some(pk),
+                Ok(_) => None,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            }
+        } else {
+            None
+        };
+        if rowid_conflict_pk.is_some() {
+            match sqlite3_vtab_on_conflict(vtab.db) {
+                SQLITE_IGNORE => return SQLITE_OK,
+                SQLITE_REPLACE => {}
+                _ => return SQLITE_CONSTRAINT,
             }
         }
 
@@ -1883,6 +1890,12 @@ unsafe extern "system" fn vtab_update(
             }
         }
 
+        if let Some(conflict_pk) = rowid_conflict_pk {
+            if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability) {
+                return io_err_to_sqlite_rc(&e);
+            }
+        }
+
         // If UPDATE changed the physical PK bytes, delete the old PK row and clean up `RowidMap`
         if let Some((old_pk, mapped_rid)) = old_pk_opt {
             if old_pk.as_slice() != new_pk.as_slice() {
@@ -1921,8 +1934,9 @@ unsafe extern "system" fn vtab_update(
             int_id
         } else {
             vtab.has_non_int_pks.store(true, Ordering::Relaxed);
-            let rowid = match eng.assign_rowid(
-                vtab.table_id, &new_pk, hash_pk_to_rowid(&new_pk), vtab.durability,
+            let rowid = match rowid_map::assign_synthetic_rowid(
+                &mut eng, vtab.table_id, &new_pk, vtab.durability,
+                vtab.pk_affinity == ColumnAffinity::Integer,
             ) {
                 Ok(rowid) => rowid,
                 Err(e) => return io_err_to_sqlite_rc(&e),

@@ -85,16 +85,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         preferred: i64,
         durability: WriteDurability,
+        reserved: impl Fn(&Self, i64) -> io::Result<bool>,
     ) -> io::Result<i64> {
         if let Some(rowid) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             return Ok(rowid);
         }
         let mut rowid = preferred;
         loop {
-            match self.pk_for_rowid_view(ReadView::Owner, table_id, rowid)? {
-                Some(existing) if existing != pk => rowid = rowid.wrapping_add(1),
-                _ => break,
+            let existing = self.pk_for_rowid_view(ReadView::Owner, table_id, rowid)?;
+            if !reserved(self, rowid)? && existing.as_deref().is_none_or(|owner| owner == pk) {
+                break;
             }
+            rowid = rowid.wrapping_add(1);
             if rowid == preferred {
                 return Err(io::Error::other("SQLite rowid space exhausted"));
             }

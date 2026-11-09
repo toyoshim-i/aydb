@@ -23,19 +23,28 @@ pub(super) fn ensure_persistent_rowids(
     engine: &mut StorageEngine<OsFs>,
     table_id: u16,
     durability: WriteDurability,
+    integer_primary_keys: bool,
 ) -> io::Result<()> {
-    if engine.rowids_initialized(table_id)? {
-        return Ok(());
+    match engine.rowids_initialized(table_id) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return Ok(()),
     }
     let mut lower = None;
     loop {
-        let keys = engine.scan_keys_range(table_id, lower.as_deref(), None, 256)?;
+        let keys = match engine.scan_keys_range(table_id, lower.as_deref(), None, 256) {
+            Ok(keys) => keys,
+            // Preserve SQLite's ability to connect a damaged table and report its read errors
+            // through xFilter. An absent marker makes the next connection retry discovery.
+            Err(_) => return Ok(()),
+        };
         let mut progress = false;
         for pk in keys {
             if lower.as_deref() == Some(pk.as_slice()) {
                 continue;
             }
-            engine.assign_rowid(table_id, &pk, hash_pk_to_rowid(&pk), durability)?;
+            if !integer_primary_keys || decode_i64_tagged_key(&pk).is_none() {
+                assign_synthetic_rowid(engine, table_id, &pk, durability, integer_primary_keys)?;
+            }
             lower = Some(pk);
             progress = true;
         }
@@ -43,6 +52,25 @@ pub(super) fn ensure_persistent_rowids(
             return engine.mark_rowids_initialized(table_id, durability);
         }
     }
+}
+
+pub(super) fn assign_synthetic_rowid(
+    engine: &mut StorageEngine<OsFs>,
+    table_id: u16,
+    pk: &[u8],
+    durability: WriteDurability,
+    integer_primary_keys: bool,
+) -> io::Result<i64> {
+    engine.assign_rowid(
+        table_id,
+        pk,
+        hash_pk_to_rowid(pk),
+        durability,
+        |engine, rowid| {
+            Ok(integer_primary_keys
+                && engine.row_exists(table_id, &super::encode_i64_tagged_key(rowid))?)
+        },
+    )
 }
 
 /// Undo record for transactional mutations to [`RowidMap`].
