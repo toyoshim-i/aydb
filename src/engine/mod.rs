@@ -2625,10 +2625,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(lsn)
     }
 
-    /// Makes everything appended to `wal_buf.db` so far durable (flush, seal the open sector so it
-    /// is never rewritten in place after being synced, then sync) and advances
-    /// `last_buf_synced_lsn`. A failure leaves the durability outcome unknown and poisons the engine.
+    /// Makes everything appended to `wal_buf.db` so far durable and advances `last_buf_synced_lsn`.
+    ///
+    /// Write-Blob-Before-WAL: the active blob writers are flushed and synced first, because the
+    /// buffered batches may reference out-of-line values in them. This is the only place that
+    /// advances `last_buf_synced_lsn`, so no caller can report the buffered stream durable
+    /// without its blobs. Then the log is flushed, its open sector sealed (so it is never
+    /// rewritten in place after being synced) and synced. A blob sync failure or a WAL sync
+    /// failure leaves the durability outcome unknown and poisons the engine; a failed buffer
+    /// write stays retryable.
     pub(super) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
+        self.sync_active_blob_writers()?;
         self.buf_wal
             .make_durable_and_seal(durable)
             .map_err(|e| self.poison(e))?;
@@ -2654,7 +2661,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if durability == WriteDurability::SyncTransactional
             && self.last_buf_append_lsn > self.last_buf_synced_lsn
         {
-            self.sync_active_blob_writers()?;
             self.make_buf_wal_durable(true)?;
         }
 

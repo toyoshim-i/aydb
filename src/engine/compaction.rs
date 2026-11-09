@@ -819,6 +819,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // Ensure all buffered eviction `Delete` WAL records that killed these LRU blob segments
         // are durable on disk before removing the segments from `boot_meta.db` and unlinking them.
+        // This also syncs the active blob writers that the buffered batches may reference.
         self.make_buf_wal_durable(true)?;
 
         let mut deleted_files = Vec::with_capacity(dead_lru.len());

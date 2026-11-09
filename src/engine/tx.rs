@@ -466,9 +466,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 2. Flush/sync active blob writers (`Write-Blob-Before-WAL` & prefix durability).
         self.flush_active_blob_buffers()?;
         if effective_durability == WriteDurability::SyncTransactional {
-            self.sync_active_blob_writers()?;
             if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                // Syncs the active blob writers before the buffered log.
                 self.make_buf_wal_durable(true)?;
+            } else {
+                self.sync_active_blob_writers()?;
             }
         }
 

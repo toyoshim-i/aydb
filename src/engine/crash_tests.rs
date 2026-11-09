@@ -1564,18 +1564,16 @@ fn open_engine(fs: &Arc<CrashFs>, cfg: &EngineConfig) -> io::Result<Eng> {
     StorageEngine::open(Arc::clone(fs), cfg.clone())
 }
 
-/// `AYDB_CRASH_KNOWN_BUGS=1` makes the harness stop working around the two known engine bugs
-/// (see `docs/DEVELOPMENT.md`), so that long runs can show them again.
+/// `AYDB_CRASH_KNOWN_BUGS=1` makes the harness stop working around the known engine bug
+/// (see `docs/DEVELOPMENT.md`), so that long runs can show it again.
 fn known_bugs_enabled() -> bool {
     std::env::var("AYDB_CRASH_KNOWN_BUGS").is_ok_and(|v| v != "0")
 }
 
 /// Out-of-line values of capped tables live in LRU blob segments, and reclaiming such a segment
-/// after its rows were evicted has two known engine bugs (B: recovery drops the whole log
-/// batch, and in the buffered stream every later batch, that references the removed segment;
-/// C: the reclaim syncs `wal_buf.db` without syncing the standard blob writer, so a later
-/// synchronous commit skips that sync). Until they are fixed the workload keeps capped tables
-/// inline. `AYDB_CRASH_KNOWN_BUGS=1` brings the out-of-line values back.
+/// after its rows were evicted has a known engine bug (B: recovery drops the whole log
+/// batch, and in the buffered stream every later batch, that references the removed segment).
+/// Until it is fixed the workload keeps capped tables inline. `AYDB_CRASH_KNOWN_BUGS=1` brings the out-of-line values back.
 fn capped_inline_only(t: u16) -> bool {
     is_capped(t) && !known_bugs_enabled()
 }
@@ -2179,7 +2177,7 @@ fn crash_runs_are_reproducible() {
 // Minimal reproductions of engine bugs found by the seeded harness
 //
 // The `known_bug_*` tests fail today and are therefore ignored. Run them with `-- --ignored`.
-// The harness works around those bugs unless `AYDB_CRASH_KNOWN_BUGS=1` is set.
+// The harness works around that bug unless `AYDB_CRASH_KNOWN_BUGS=1` is set.
 // =============================================================================================
 
 fn repro_config() -> EngineConfig {
@@ -2266,13 +2264,12 @@ fn known_bug_reclaimed_lru_segment_discards_later_commits() {
     );
 }
 
-/// Bug C. Reclaiming an LRU blob segment syncs `wal_buf.db` and records that as "buffered
+/// Regression test for a fixed bug. Reclaiming an LRU blob segment syncs `wal_buf.db` and records that as "buffered
 /// commits are durable" without syncing the standard blob writer. A later synchronous commit
 /// then skips the blob sync, so a buffered row with an out-of-line value is lost to a power cut
 /// although the synchronous commit was acknowledged after it (prefix durability).
 #[test]
-#[ignore = "engine bug C: LRU reclaim marks buffered commits synced without syncing their blobs"]
-fn known_bug_lru_reclaim_skips_the_blob_sync_of_buffered_commits() {
+fn lru_reclaim_syncs_blobs_before_marking_buffered_commits_durable() {
     let cfg = repro_config();
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
     let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
