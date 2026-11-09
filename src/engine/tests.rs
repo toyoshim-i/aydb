@@ -289,7 +289,7 @@ fn blob_segments_and_coalesced_wal_survive_reopen_before_flush_memtable() {
 }
 
 #[test]
-fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
+fn flush_memtable_metadata_fault_preserves_entries_until_reopen() {
     use crate::pal::PreallocStrategy;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
@@ -386,7 +386,7 @@ fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
     fail_flag.store(true, Ordering::SeqCst);
     assert!(engine.flush_memtable().is_err());
 
-    // MemTable entries must remain intact in memory and survive subsequent retry
+    // The slot write may have reached disk, so reads remain available but mutations require reopen.
     fail_flag.store(false, Ordering::SeqCst);
     for i in 0..20u32 {
         let k = format!("k_{i:02}").into_bytes();
@@ -394,7 +394,8 @@ fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
         assert_eq!(engine.get_row(1, &k).unwrap(), Some(expected));
     }
 
-    engine.flush_memtable().unwrap();
+    assert!(engine.is_poisoned());
+    assert!(engine.flush_memtable().is_err());
     drop(engine);
 
     let mut reopened = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
@@ -421,11 +422,14 @@ fn flush_memtable_io_fault_preserves_memtable_entries_across_retry() {
             .unwrap()
             .contains("simulated boot_meta write failure")
     );
-    assert!(!engine.is_poisoned());
+    assert!(engine.is_poisoned());
     assert_eq!(engine.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
     fail_flag.store(false, Ordering::SeqCst);
-    engine.flush_memtable().unwrap();
-    assert_eq!(engine.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
+    assert!(engine.flush_memtable().is_err());
+    let fs = Arc::clone(&engine.fs);
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    assert_eq!(reopened.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
 }
 
 #[test]

@@ -464,6 +464,7 @@ pub struct BootMetaManager<F: PlatformFs> {
     active_slot: SlotIndex,
     state: BootMetaState,
     standby_manifest_id: Option<u64>,
+    uncertain_write: Option<String>,
 }
 
 impl<F: PlatformFs> BootMetaManager<F> {
@@ -537,6 +538,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 active_slot: SlotIndex::SlotB,
                 state: initial_state,
                 standby_manifest_id: None,
+                uncertain_write: None,
             };
             mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
             mgr.active_slot = SlotIndex::SlotA;
@@ -582,6 +584,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             active_slot: winning_slot,
             state: winning_state,
             standby_manifest_id,
+            uncertain_write: None,
         })
     }
 
@@ -608,6 +611,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// Sweeps any unreferenced `idx_*`, `blob_std_*`, `blob_lru_*`, or `manifest_*` files on disk
     /// and processes `pending_delete_files`.
     pub fn sweep_orphans(&mut self) -> io::Result<()> {
+        self.check_healthy()?;
         let standby_mf = self.standby_manifest_id;
         self.sweep_orphans_and_pending_deletes(standby_mf)
     }
@@ -627,14 +631,30 @@ impl<F: PlatformFs> BootMetaManager<F> {
         self.active_slot
     }
 
+    /// True after a slot write or flush failed with an unknown on-disk outcome.
+    pub fn is_poisoned(&self) -> bool {
+        self.uncertain_write.is_some()
+    }
+
+    pub(crate) fn check_healthy(&self) -> io::Result<()> {
+        match &self.uncertain_write {
+            Some(message) => Err(io::Error::other(format!(
+                "metadata is poisoned by an uncertain slot write and must be reopened: {message}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Atomically commits a mutated [`BootMetaState`] by incrementing `generation`,
     /// writing to the opposite ping-pong slot (and an external `manifest_<SeqID>.db` if
     /// the catalog payload exceeds 4028 bytes), flushing to non-volatile storage, and
     /// executing a deferred GC pass over `pending_delete_files`.
+    /// A slot write/flush error leaves its outcome unknown and disables updates and GC until reopen.
     pub fn commit_update<M>(&mut self, mutate: M) -> io::Result<()>
     where
         M: FnOnce(&mut BootMetaState),
     {
+        self.check_healthy()?;
         let mut next_state = self.state.clone();
         let prev_manifest_id = next_state.active_manifest_seq_id;
 
@@ -646,7 +666,21 @@ impl<F: PlatformFs> BootMetaManager<F> {
             .expect("64-bit generation overflow");
 
         let target_slot = self.active_slot.opposite();
-        Self::write_state_to_slot_internal(&self.fs, &self.file, target_slot, &mut next_state)?;
+        let mut slot_write_attempted = false;
+        if let Err(error) = Self::write_state_to_slot_internal(
+            &self.fs,
+            &self.file,
+            target_slot,
+            &mut next_state,
+            &mut slot_write_attempted,
+        ) {
+            if slot_write_attempted {
+                // A failed write or flush may already have made the new slot authoritative.
+                // Keep both generations' files until reopen determines which one survived.
+                self.uncertain_write = Some(error.to_string());
+            }
+            return Err(error);
+        }
 
         // The previous generation becomes the standby slot and may be the fallback at the next
         // open, so its external manifest is retained. The manifest that stops being referenced by
@@ -672,6 +706,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// Any file that fails deletion (e.g., due to `ERROR_SHARING_VIOLATION` from antivirus
     /// scanning or an open handle) remains in `pending_delete_files` for future retry.
     pub fn try_process_pending_deletes(&mut self) {
+        if self.is_poisoned() {
+            return;
+        }
         let mut remaining = Vec::new();
         for file_name in self.state.pending_delete_files.drain(..) {
             if self.fs.remove_file(&file_name).is_err() {
@@ -682,7 +719,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     }
 
     fn write_current_state_to_slot(&mut self, slot: SlotIndex) -> io::Result<()> {
-        Self::write_state_to_slot_internal(&self.fs, &self.file, slot, &mut self.state)
+        Self::write_state_to_slot_internal(&self.fs, &self.file, slot, &mut self.state, &mut false)
     }
 
     fn write_state_to_slot_internal(
@@ -690,6 +727,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         file: &Arc<F::File>,
         slot: SlotIndex,
         state: &mut BootMetaState,
+        slot_write_attempted: &mut bool,
     ) -> io::Result<()> {
         let catalog_bytes = state.encode_catalog_payload()?;
 
@@ -750,6 +788,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let trailer_crc = crc32c(&slot_buf[0..4092]);
         slot_buf[4092..4096].copy_from_slice(&trailer_crc.to_le_bytes());
 
+        *slot_write_attempted = true;
         file.write_all_at(&slot_buf, slot.byte_offset())?;
         file.sync_durable()?;
         Ok(())

@@ -266,7 +266,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }) {
             drop(new_reader);
-            let _ = self.fs.remove_file(&format_idx_file_name(new_seq_id));
+            if !self.meta_mgr.is_poisoned() {
+                let _ = self.fs.remove_file(&format_idx_file_name(new_seq_id));
+            }
             return Err(e);
         }
 
@@ -466,7 +468,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `true` when the segment count has reached `auto_compact_segment_threshold` (and the
     /// engine is healthy), i.e. a worker should run `prepare_compaction`.
     pub fn compaction_pending(&self) -> bool {
-        self.poisoned.is_none()
+        !self.is_poisoned()
             && self.config.auto_compact_segment_threshold > 1
             && self.idx_segments.len() >= self.config.auto_compact_segment_threshold
     }
@@ -639,7 +641,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 st.queue_pending_delete(fname.clone());
             }
         }) {
-            self.discard_compaction_output(out);
+            if !self.meta_mgr.is_poisoned() {
+                self.discard_compaction_output(out);
+            }
             return Err(e);
         }
 

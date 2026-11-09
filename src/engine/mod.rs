@@ -16,6 +16,8 @@ pub(crate) use tx::{CommitStep, GroupRole};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod metadata_failure_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -783,10 +785,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Returns the next LSN that will be assigned to a WAL batch.
-    /// Returns true if a WAL append/sync failure poisoned this engine. Reads keep working, but
+    /// Returns true if a WAL or metadata write/sync failure poisoned this engine. Reads keep working, but
     /// all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.is_some()
+        self.poisoned.is_some() || self.meta_mgr.is_poisoned()
     }
 
     /// Returns how many post-commit maintenance steps have failed. The writes that triggered them
@@ -815,8 +817,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
     }
 
-    /// Fails with an `io::ErrorKind::Other` error if a prior WAL I/O failure poisoned the engine.
+    /// Fails if a prior WAL or metadata I/O failure left the on-disk state uncertain.
     pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
+        self.meta_mgr.check_healthy()?;
         match &self.poisoned {
             None => Ok(()),
             Some(msg) => Err(io::Error::other(format!(

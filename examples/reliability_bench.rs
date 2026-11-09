@@ -783,8 +783,12 @@ fn bench_suite_5_io_fault_countdown() {
         // Arm deterministic fault on the `fault_step`-th I/O operation inside `flush_memtable()`
         fs.set_io_fault_step(fault_step);
         let flush_res = engine.flush_memtable();
-        // Disarm transient fault, write 1 more row, and retry `flush_memtable()`, then reopen DB!
+        // A failed metadata slot write has an unknown outcome and requires recovery before retry.
         fs.set_io_fault_step(0);
+        if engine.is_poisoned() {
+            drop(engine);
+            engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+        }
         engine
             .put_row(1, b"after_err", b"v", &[], WriteDurability::BufferedFast)
             .unwrap();

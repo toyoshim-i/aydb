@@ -21,6 +21,7 @@ use super::{StorageEngine, WriteDurability};
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Registers or updates a Capped Table with a strict `max_bytes` quota and automatic LRU eviction.
     pub fn register_capped_table(&mut self, table_id: u16, max_bytes: u64) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.table_has_row_meta.insert(table_id, true);
         let was_present = self.capped_tables.contains_key(&table_id);
         let entry = self
