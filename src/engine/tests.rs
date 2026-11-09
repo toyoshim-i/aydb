@@ -6690,3 +6690,12 @@ fn secondary_lookup_sees_the_owners_uncommitted_entries_and_tombstones() {
         assert_eq!(look(&engine, b"x"), vec![b"a".to_vec()]);
     }
 }
+
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Whether slot A and slot B of `boot_meta.db` carry the UNIQUE index downgrade guard.
+    pub(crate) fn test_unique_guard_in_slots(&self) -> (bool, bool) {
+        let mut bytes = [0u8; 8192];
+        self.meta_mgr.file().read_exact_at(&mut bytes, 0).unwrap();
+        (bytes[6] & 0x02 != 0, bytes[4096 + 6] & 0x02 != 0)
+    }
+}

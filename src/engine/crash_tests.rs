@@ -2684,8 +2684,16 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
         drop(lock);
         fs.crash(Crash::Power { keep, lose });
 
+        // What an older binary would see, before this one opens (and possibly rewrites) it.
+        let raw = content(&fs, "boot_meta.db").unwrap();
+        let guarded = raw[6] & 2 != 0 && raw[4096 + 6] & 2 != 0;
+
         let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
         let marked = e.unique_marker_view(ReadView::Owner, 1).unwrap().is_some();
+        assert!(
+            !marked || guarded,
+            "durable marker without the downgrade guard in both slots (seed {seed}, cut {cut:?})"
+        );
         assert!(
             marked || !acknowledged,
             "acknowledged migration lost (seed {seed}, cut {cut:?})"
@@ -2701,6 +2709,7 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
         let outcome = migrate(&lock, &params, &mut None);
         assert!(matches!(outcome, Outcome::Complete), "{outcome:?}");
         let mut e = lock.into_inner().unwrap();
+        assert_eq!(e.test_unique_guard_in_slots(), (true, true));
         exact(&mut e, &format!("after resume (seed {seed}, cut {cut:?})"));
         span
     };
