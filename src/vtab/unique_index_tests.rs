@@ -15,28 +15,28 @@ use std::collections::{BTreeMap, BTreeSet};
 const DECLARED_C: u16 = 1;
 const COLUMNS: &str = "columns='k TEXT PRIMARY KEY, a TEXT UNIQUE, b INTEGER UNIQUE, \
                        n TEXT UNIQUE COLLATE NOCASE, c TEXT', indexes='c'";
-type Engine = Arc<RwLock<StorageEngine<OsFs>>>;
+pub(super) type Engine = Arc<RwLock<StorageEngine<OsFs>>>;
 
-fn ddl(table_id: u16, extra: &str) -> String {
+pub(super) fn ddl(table_id: u16, extra: &str) -> String {
     format!("CREATE VIRTUAL TABLE t USING aydb(table_id={table_id}, {extra}{COLUMNS})")
 }
 
-struct Fx {
-    dir: TempTestDir,
-    engine: Engine,
-    conn: SqliteConnection,
-    table_id: u16,
-    capped: bool,
+pub(super) struct Fx {
+    pub(super) dir: TempTestDir,
+    pub(super) engine: Engine,
+    pub(super) conn: SqliteConnection,
+    pub(super) table_id: u16,
+    pub(super) capped: bool,
 }
 
-fn open_engine(dir: &TempTestDir) -> Engine {
+pub(super) fn open_engine(dir: &TempTestDir) -> Engine {
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
     Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ))
 }
 
-fn connect(engine: &Engine, table_id: u16, extra: &str) -> SqliteConnection {
+pub(super) fn connect(engine: &Engine, table_id: u16, extra: &str) -> SqliteConnection {
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module_with_options(engine.clone(), false)
         .unwrap();
@@ -44,7 +44,7 @@ fn connect(engine: &Engine, table_id: u16, extra: &str) -> SqliteConnection {
     conn
 }
 
-fn fixture(name: &str, extra: &str) -> Fx {
+pub(super) fn fixture(name: &str, extra: &str) -> Fx {
     let dir = TempTestDir::new(name);
     let engine = open_engine(&dir);
     let conn = connect(&engine, 1, extra);
@@ -84,12 +84,12 @@ fn expected_pairs(row: &[SqlValue]) -> Vec<(u16, Vec<u8>)> {
     pairs
 }
 
-fn rows_of(conn: &SqliteConnection) -> Vec<Vec<SqlValue>> {
+pub(super) fn rows_of(conn: &SqliteConnection) -> Vec<Vec<SqlValue>> {
     conn.query_all("SELECT k, a, b, n, c FROM t", &[]).unwrap()
 }
 
 /// Asserts that the engine holds exactly the `'i'` entries and `'t'` records the rows imply.
-fn assert_index(fx: &Fx, what: &str) {
+pub(super) fn assert_index(fx: &Fx, what: &str) {
     let rows = rows_of(&fx.conn);
     let tid = fx.table_id;
     let mut want_i = BTreeSet::new();
@@ -105,11 +105,7 @@ fn assert_index(fx: &Fx, what: &str) {
         }
     }
     let mut eng = fx.engine.write().unwrap();
-    let got_i: BTreeSet<Vec<u8>> = eng
-        .test_live_keys(tid, NS_SECONDARY_INDEX)
-        .unwrap()
-        .into_iter()
-        .collect();
+    let got_i: BTreeSet<Vec<u8>> = eng.test_live_entry_keys(tid).unwrap().into_iter().collect();
     assert_eq!(got_i, want_i, "{what}: 'i' entries");
     let got_t: BTreeSet<Vec<u8>> = eng
         .test_live_keys(tid, NS_ROW_META)
@@ -132,12 +128,29 @@ fn assert_index(fx: &Fx, what: &str) {
     }
 }
 
-fn run(fx: &Fx, sql: &str) {
+/// Writes a row the way a version without the UNIQUE index did: no entries, no `'t'` record.
+pub(super) fn put_legacy_row(fx: &Fx, k: &str, a: &str, b: i64, n: &str, c: &str) {
+    let row = encode_row(&[
+        SqlValue::Text(k.into()),
+        SqlValue::Text(a.into()),
+        SqlValue::Integer(b),
+        SqlValue::Text(n.into()),
+        SqlValue::Text(c.into()),
+    ]);
+    let mut eng = fx.engine.write().unwrap();
+    let pk = SqlValue::Text(k.into()).to_key_bytes();
+    eng.put_row(1, &pk, &row, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    rowid_map::assign_synthetic_rowid(&mut eng, 1, &pk, WriteDurability::BufferedFast, false)
+        .unwrap();
+}
+
+pub(super) fn run(fx: &Fx, sql: &str) {
     fx.conn.execute_batch(sql).unwrap();
     assert_index(fx, sql);
 }
 
-fn run_err(fx: &Fx, sql: &str) {
+pub(super) fn run_err(fx: &Fx, sql: &str) {
     assert!(fx.conn.execute_batch(sql).is_err(), "{sql} should fail");
     assert_index(fx, sql);
 }
@@ -233,7 +246,7 @@ fn long_values_use_the_digest_form() {
         let eng = fx.engine.read().unwrap();
         let prefix = [0u8, 1, b'i', 0x80, 0x01];
         let long_keys: Vec<Vec<u8>> = eng
-            .test_live_keys(1, NS_SECONDARY_INDEX)
+            .test_live_entry_keys(1)
             .unwrap()
             .into_iter()
             .filter(|k| k.starts_with(&prefix))
@@ -283,21 +296,6 @@ fn capped_eviction_removes_the_entries_of_evicted_rows() {
 #[test]
 fn overwriting_a_row_without_meta_leaves_a_correct_state() {
     // A row written before the UNIQUE index existed has neither entries nor a 't' record.
-    fn legacy(fx: &Fx, k: &str, a: &str, b: i64, n: &str, c: &str) {
-        let row = encode_row(&[
-            SqlValue::Text(k.into()),
-            SqlValue::Text(a.into()),
-            SqlValue::Integer(b),
-            SqlValue::Text(n.into()),
-            SqlValue::Text(c.into()),
-        ]);
-        let mut eng = fx.engine.write().unwrap();
-        let pk = SqlValue::Text(k.into()).to_key_bytes();
-        eng.put_row(1, &pk, &row, &[], WriteDurability::BufferedFast)
-            .unwrap();
-        rowid_map::assign_synthetic_rowid(&mut eng, 1, &pk, WriteDurability::BufferedFast, false)
-            .unwrap();
-    }
     for (i, sql) in [
         "UPDATE t SET a='new' WHERE k='L'",
         "UPDATE t SET c='new' WHERE k='L'",
@@ -310,7 +308,7 @@ fn overwriting_a_row_without_meta_leaves_a_correct_state() {
     .enumerate()
     {
         let fx = fixture(&format!("unique_index_legacy{i}"), "");
-        legacy(&fx, "L", "la", 7, "LN", "lc");
+        put_legacy_row(&fx, "L", "la", 7, "LN", "lc");
         run(&fx, sql);
     }
 }
@@ -524,11 +522,7 @@ fn a_unique_only_table_records_meta_only_for_rows_with_a_key_across_reopen() {
     conn.execute_batch("DELETE FROM u WHERE k='k2'").unwrap();
     {
         let eng = engine.read().unwrap();
-        assert!(
-            eng.test_live_keys(2, NS_SECONDARY_INDEX)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(eng.test_live_entry_keys(2).unwrap().is_empty());
         assert!(eng.test_live_keys(2, NS_ROW_META).unwrap().is_empty());
     }
     // Setting a key on a row that had none creates the record.
@@ -536,16 +530,12 @@ fn a_unique_only_table_records_meta_only_for_rows_with_a_key_across_reopen() {
         .unwrap();
     {
         let mut eng = engine.write().unwrap();
-        assert_eq!(eng.test_live_keys(2, NS_SECONDARY_INDEX).unwrap().len(), 1);
+        assert_eq!(eng.test_live_entry_keys(2).unwrap().len(), 1);
         assert!(eng.test_row_meta(2, &pk("k1")).unwrap().is_some());
     }
     conn.execute_batch("UPDATE u SET a=NULL WHERE k='k1'")
         .unwrap();
     let eng = engine.read().unwrap();
-    assert!(
-        eng.test_live_keys(2, NS_SECONDARY_INDEX)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(eng.test_live_entry_keys(2).unwrap().is_empty());
     assert!(eng.test_live_keys(2, NS_ROW_META).unwrap().is_empty());
 }

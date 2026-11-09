@@ -6627,3 +6627,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .map(|(m, _)| m))
     }
 }
+
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Live secondary index entries of `table_id`, without the UNIQUE index marker.
+    pub(crate) fn test_live_entry_keys(&self, table_id: u16) -> io::Result<Vec<Vec<u8>>> {
+        let marker = crate::index::encode_secondary_index_prefix(
+            table_id,
+            unique_index::UNIQUE_MARKER_INDEX_ID,
+        );
+        Ok(self
+            .test_live_keys(table_id, NS_SECONDARY_INDEX)?
+            .into_iter()
+            .filter(|k| k.as_slice() != marker)
+            .collect())
+    }
+}

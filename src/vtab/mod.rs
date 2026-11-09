@@ -25,7 +25,10 @@ mod snapshot_tests;
 mod tests;
 #[cfg(test)]
 mod unique_index_tests;
-mod unique_key;
+pub(crate) mod unique_key;
+pub(crate) mod unique_migration;
+#[cfg(test)]
+mod unique_migration_tests;
 
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;
@@ -399,6 +402,16 @@ pub(super) struct AydbVTab {
     durability: WriteDurability,
     /// Set once the rowid migration marker has been observed in the committed view.
     rowids_committed: AtomicBool,
+    /// The UNIQUE columns with the collation and affinity that shape their index keys.
+    unique_def: unique_key::UniqueDef,
+    /// Set once the UNIQUE index marker for `unique_def` has been observed in the committed
+    /// view (or at once for a table without UNIQUE columns). Only then may the conflict check
+    /// trust the index.
+    unique_ready: AtomicBool,
+    /// A migration attempt of this connection failed; it is not repeated until reconnect.
+    unique_migration_failed: AtomicBool,
+    /// Where the next `xBegin` resumes the UNIQUE index migration.
+    unique_cursor: std::sync::Mutex<Option<Vec<u8>>>,
     col_names: Vec<String>,
     col_affinities: Vec<ColumnAffinity>,
     col_not_null: Vec<bool>,
@@ -597,6 +610,7 @@ struct Connected {
     table_id: u16,
     initial_auto_rowid: i64,
     rowids_committed: bool,
+    unique_ready: bool,
 }
 
 /// Registers the table for a connection and prepares its runtime state, all under one engine
@@ -664,10 +678,22 @@ fn connect_table(
     let rowids_committed = eng
         .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
         .unwrap_or(false);
+    let unique_def = unique_key::UniqueDef::from_columns(
+        &ddl.col_unique,
+        &ddl.col_collations,
+        &ddl.col_affinities,
+    );
+    let unique_ready = unique_def.is_empty()
+        || eng
+            .unique_marker_view(crate::engine::ReadView::Committed, table_id)
+            .ok()
+            .flatten()
+            .is_some_and(|found| found == unique_def.marker_value());
     Ok(Some(Connected {
         table_id,
         initial_auto_rowid,
         rowids_committed,
+        unique_ready,
     }))
 }
 
@@ -762,6 +788,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             table_id,
             initial_auto_rowid,
             rowids_committed,
+            unique_ready,
         } = connected;
 
         let vtab = Box::new(AydbVTab {
@@ -777,6 +804,14 @@ unsafe extern "system" fn vtab_create_or_connect(
             table_name: ddl.table_name,
             durability: ddl.durability,
             rowids_committed: AtomicBool::new(rowids_committed),
+            unique_def: unique_key::UniqueDef::from_columns(
+                &ddl.col_unique,
+                &ddl.col_collations,
+                &ddl.col_affinities,
+            ),
+            unique_ready: AtomicBool::new(unique_ready),
+            unique_migration_failed: AtomicBool::new(false),
+            unique_cursor: std::sync::Mutex::new(None),
             col_names: ddl.col_names,
             col_affinities: ddl.col_affinities,
             col_not_null: ddl.col_not_null,
@@ -2195,9 +2230,61 @@ unsafe extern "system" fn vtab_update(
     .unwrap_or(SQLITE_ERROR)
 }
 
+/// Builds the UNIQUE index of a table written before it existed, a bounded amount per call
+/// (`unique_migration::ROWS_PER_BEGIN`). It runs from `xBegin` before the engine transaction
+/// starts and never fails the statement: with a transaction open, or after a failure, the
+/// conflict check simply keeps using the scan.
+///
+/// A connection that holds a read snapshot skips the migration too: its commits would make the
+/// snapshot stale and fail the write upgrade that follows. A failure (an unreadable row, an I/O
+/// error) is counted as a maintenance failure of the engine and stops further attempts by this
+/// connection: re-reading the table up to the bad row at every transaction would tax every
+/// write, and a reconnect tries again.
+fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
+    if vtab.unique_ready.load(Ordering::Acquire)
+        || vtab.unique_migration_failed.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    #[cfg(test)]
+    if UNIQUE_MIGRATION_DISABLED.with(|flag| flag.get()) {
+        return;
+    }
+    if vtab.read_session.current().is_some() {
+        return;
+    }
+    let Ok(mut cursor) = vtab.unique_cursor.lock() else {
+        return;
+    };
+    let params = unique_migration::Params {
+        table_id: vtab.table_id,
+        durability: vtab.durability,
+        def: &vtab.unique_def,
+        chunk_rows: unique_migration::CHUNK_ROWS,
+        budget_rows: unique_migration::ROWS_PER_BEGIN,
+    };
+    match unique_migration::migrate(&vtab.engine, &params, &mut cursor) {
+        unique_migration::Outcome::Complete => vtab.unique_ready.store(true, Ordering::Release),
+        unique_migration::Outcome::Incomplete | unique_migration::Outcome::Skipped => {}
+        unique_migration::Outcome::Failed(e) => {
+            vtab.unique_migration_failed.store(true, Ordering::Relaxed);
+            if let Ok(eng) = vtab.engine.read() {
+                eng.record_maintenance_failure(&e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: keeps `xBegin` from migrating, so a test can drive the chunks itself.
+    static UNIQUE_MIGRATION_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
+        migrate_unique_index_before_begin(vtab);
         // Wait for a transaction on another connection to end. The wait is bounded because that
         // connection may be held open by the same thread, which could never end it.
         let mut deadline = None;

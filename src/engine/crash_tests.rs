@@ -2610,3 +2610,106 @@ fn power_cut_during_rowid_migration_resumes_with_stable_rowids() {
         }
     }
 }
+
+/// A power cut at every operation of the UNIQUE index migration: whatever survives, a marker
+/// never outlives an entry, an acknowledged migration is not lost, and resuming gives an index
+/// that matches the rows exactly.
+#[test]
+fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
+    use crate::vtab::unique_key::UniqueDef;
+    use crate::vtab::unique_migration::{Outcome, Params, migrate};
+    use crate::vtab::{ColCollation, ColumnAffinity, SqlValue, encode_row};
+
+    const ROWS: usize = 12;
+    let sync = WriteDurability::SyncTransactional;
+    let def = UniqueDef::new(vec![(1, ColCollation::Binary, ColumnAffinity::Text)]);
+    let cfg = repro_config();
+    let pk_of = |i: usize| SqlValue::Text(format!("key{i:03}")).to_key_bytes();
+    // Values repeat (legacy duplicates are indexed for every row).
+    let component_of = |i: usize| SqlValue::Text(format!("a{}", i % 7)).to_key_bytes();
+
+    let exact = |e: &mut Eng, what: &str| {
+        let mut want_i = std::collections::BTreeSet::new();
+        let mut want_t = std::collections::BTreeSet::new();
+        for i in 0..ROWS {
+            want_i.insert(encode_secondary_index_key(
+                1,
+                0x8001,
+                &component_of(i),
+                &pk_of(i),
+            ));
+            want_t.insert(encode_row_meta_key(1, &pk_of(i)));
+            let meta = e.test_row_meta(1, &pk_of(i)).unwrap().expect(what);
+            assert_eq!(
+                meta.secondary_keys,
+                vec![(0x8001, component_of(i))],
+                "{what}"
+            );
+        }
+        let got_i: std::collections::BTreeSet<_> =
+            e.test_live_entry_keys(1).unwrap().into_iter().collect();
+        let got_t: std::collections::BTreeSet<_> = e
+            .test_live_keys(1, NS_ROW_META)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got_i, want_i, "{what}: entries");
+        assert_eq!(got_t, want_t, "{what}: 't' records");
+    };
+
+    // Returns the number of operations the migration issued when it ran to completion.
+    let scenario = |seed: u64, cut: Option<u64>, keep: u64, lose: u64| -> u64 {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, seed));
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for i in 0..ROWS {
+            let row = encode_row(&[
+                SqlValue::Text(format!("key{i:03}")),
+                SqlValue::Text(format!("a{}", i % 7)),
+            ]);
+            e.put_row(1, &pk_of(i), &row, &[], sync).unwrap();
+        }
+        let start = fs.op_stats().0;
+        fs.arm(cut.map(|c| start + c), None);
+        let params = Params {
+            table_id: 1,
+            durability: sync,
+            def: &def,
+            chunk_rows: 4,
+            budget_rows: usize::MAX,
+        };
+        let lock = std::sync::RwLock::new(e);
+        let acknowledged = matches!(migrate(&lock, &params, &mut None), Outcome::Complete);
+        let span = fs.op_stats().0 - start;
+        fs.cut_now();
+        drop(lock);
+        fs.crash(Crash::Power { keep, lose });
+
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let marked = e.unique_marker_view(ReadView::Owner, 1).unwrap().is_some();
+        assert!(
+            marked || !acknowledged,
+            "acknowledged migration lost (seed {seed}, cut {cut:?})"
+        );
+        if marked {
+            exact(
+                &mut e,
+                &format!("marker without its entries (seed {seed}, cut {cut:?})"),
+            );
+        }
+        // Resuming from nothing completes and leaves an exact index.
+        let lock = std::sync::RwLock::new(e);
+        let outcome = migrate(&lock, &params, &mut None);
+        assert!(matches!(outcome, Outcome::Complete), "{outcome:?}");
+        let mut e = lock.into_inner().unwrap();
+        exact(&mut e, &format!("after resume (seed {seed}, cut {cut:?})"));
+        span
+    };
+
+    for (seed, keep, lose) in [(1, 0, 100), (2, 50, 50), (4, 20, 40)] {
+        let span = scenario(seed, None, keep, lose);
+        assert!(span > 0);
+        for cut in 0..=span {
+            scenario(seed, Some(cut), keep, lose);
+        }
+    }
+}

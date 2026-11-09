@@ -9,7 +9,7 @@
 use std::io;
 
 use super::extract_column_key_bytes_with_collation;
-use super::row_codec::{ColCollation, KEY_TAG_INTEGER, KEY_TAG_NULL};
+use super::row_codec::{ColCollation, ColumnAffinity, KEY_TAG_INTEGER, KEY_TAG_NULL};
 use crate::index::BloomFilter;
 
 /// Longest canonical key stored verbatim in the index. Longer keys use the digest form.
@@ -29,6 +29,84 @@ pub(super) const UNIQUE_KEY_DIGEST_LEN: usize = 1 + 4 + UNIQUE_KEY_DIGEST_PREFIX
 /// positional ids of declared `indexes=`, which count up from 1.
 pub(super) fn unique_index_id(col_idx: usize) -> u16 {
     0x8000 | col_idx as u16
+}
+
+/// The UNIQUE columns of a table with the collation and affinity that shape their keys. Its
+/// serialization is the value of the index's completion marker: an index built for another
+/// definition is not trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UniqueDef {
+    cols: Vec<(usize, ColCollation, ColumnAffinity)>,
+}
+
+impl UniqueDef {
+    /// Marker format version.
+    const MARKER_VERSION: u8 = 1;
+
+    pub(crate) fn new(cols: Vec<(usize, ColCollation, ColumnAffinity)>) -> Self {
+        Self { cols }
+    }
+
+    pub(super) fn from_columns(
+        col_unique: &[bool],
+        collations: &[ColCollation],
+        affinities: &[ColumnAffinity],
+    ) -> Self {
+        Self::new(
+            col_unique
+                .iter()
+                .enumerate()
+                .filter(|(_, unique)| **unique)
+                .map(|(i, _)| (i, collations[i], affinities[i]))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cols.is_empty()
+    }
+
+    /// `[ver = 1][n u16 BE][(col_idx u16 BE, collation u8, affinity u8) * n]`.
+    pub(crate) fn marker_value(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 + self.cols.len() * 4);
+        out.push(Self::MARKER_VERSION);
+        out.extend_from_slice(&(self.cols.len() as u16).to_be_bytes());
+        for &(col, collation, affinity) in &self.cols {
+            out.extend_from_slice(&(col as u16).to_be_bytes());
+            out.push(match collation {
+                ColCollation::Binary => 0,
+                ColCollation::NoCase => 1,
+                ColCollation::RTrim => 2,
+            });
+            out.push(match affinity {
+                ColumnAffinity::Integer => 0,
+                ColumnAffinity::Text => 1,
+                ColumnAffinity::Blob => 2,
+                ColumnAffinity::Real => 3,
+                ColumnAffinity::Numeric => 4,
+            });
+        }
+        out
+    }
+
+    /// The `(index id, component)` pairs the finished row `row` must have, by column position.
+    /// NULL has no entry. A column that cannot be given an index id is rejected (SQLite's own
+    /// column limit is far lower).
+    pub(crate) fn entries(&self, row: &[u8]) -> io::Result<Vec<(u16, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(self.cols.len());
+        for &(col, collation, _) in &self.cols {
+            if col >= 0x7FFF {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many columns for a UNIQUE index",
+                ));
+            }
+            if let Some(key) = unique_key_of_row(row, col, collation)? {
+                out.push((unique_index_id(col), unique_index_component(&key)));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Maps a column key to the byte string whose equality is SQLite's equality for that column.

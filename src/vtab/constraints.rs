@@ -1,6 +1,5 @@
 //! Column uniqueness checks for virtual table writes.
 
-use super::unique_key::{unique_index_component, unique_index_id, unique_key_of_row};
 use super::*;
 
 /// Find all existing rows which conflict with the proposed row. Checks precede every
@@ -65,26 +64,12 @@ pub(super) fn find_unique_conflicts(
 }
 
 /// Adds the UNIQUE index entry of every `UNIQUE` column to `sec_keys`, derived from the finished
-/// row bytes. NULL has no entry. Columns past `0x7FFF` cannot be given an index id and are
-/// rejected (SQLite's own column limit is far lower).
+/// row bytes (`UniqueDef::entries`).
 pub(super) fn push_unique_entries(
     vtab: &AydbVTab,
     row: &[u8],
     sec_keys: &mut Vec<(u16, Vec<u8>)>,
 ) -> io::Result<()> {
-    for (index, &unique) in vtab.col_unique.iter().enumerate() {
-        if !unique {
-            continue;
-        }
-        if index >= 0x8000 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many columns for a UNIQUE index",
-            ));
-        }
-        if let Some(key) = unique_key_of_row(row, index, vtab.col_collations[index])? {
-            sec_keys.push((unique_index_id(index), unique_index_component(&key)));
-        }
-    }
+    sec_keys.extend(vtab.unique_def.entries(row)?);
     Ok(())
 }

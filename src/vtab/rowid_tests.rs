@@ -602,7 +602,7 @@ fn connecting_a_migrated_legacy_table_does_not_wait_for_another_transaction() {
 }
 
 /// Counts every device sync (`sync_barrier` and `sync_durable`) issued through the filesystem.
-mod sync_counting {
+pub(super) mod sync_counting {
     use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
     use std::io;
     use std::path::Path;

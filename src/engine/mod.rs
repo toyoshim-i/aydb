@@ -13,6 +13,7 @@ mod rowid;
 mod scan;
 mod snapshot;
 mod tx;
+mod unique_index;
 pub(crate) use snapshot::ReadSnapshotToken;
 
 pub(crate) use tx::{CommitStep, GroupRole};
@@ -851,7 +852,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Records a failure of a maintenance step that ran after its write was committed, so the
     /// caller still sees the commit as successful. WAL I/O failures have already poisoned the
     /// engine at their source.
-    pub(super) fn record_maintenance_failure(&self, e: &io::Error) {
+    pub(crate) fn record_maintenance_failure(&self, e: &io::Error) {
         self.maintenance_failures.fetch_add(1, Ordering::Relaxed);
         *self
             .last_maintenance_error
