@@ -20,9 +20,19 @@ fn rowid_key(table_id: u16, namespace: u8, suffix: &[u8]) -> Vec<u8> {
 
 impl<FS: PlatformFs> StorageEngine<FS> {
     pub(crate) fn rowids_initialized(&self, table_id: u16) -> io::Result<bool> {
+        self.rowids_initialized_view(ReadView::Owner, table_id)
+    }
+
+    /// Whether the migration marker is visible in `view`. A marker written inside an open
+    /// transaction is visible only to its owner, and disappears if that transaction rolls back.
+    pub(crate) fn rowids_initialized_view(
+        &self,
+        view: ReadView,
+        table_id: u16,
+    ) -> io::Result<bool> {
         let marker = rowid_key(table_id, NS_PK_BY_ROWID, &[]);
         Ok(
-            matches!(self.lookup_raw_entry(&marker)?, Some((_, IndexValue::Inline(value))) if value == [1]),
+            matches!(self.lookup_raw_entry_view(view, &marker)?, Some((_, IndexValue::Inline(value))) if value == [1]),
         )
     }
 
@@ -37,6 +47,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 value: vec![1],
             }],
             durability,
+        )?;
+        Ok(())
+    }
+
+    /// Test seam: removes the completion marker, as a lost migration would.
+    #[cfg(test)]
+    pub(crate) fn debug_remove_rowid_marker(&mut self, table_id: u16) -> io::Result<()> {
+        self.commit_wal_and_memtable(
+            vec![WalRecord::Delete {
+                key: rowid_key(table_id, NS_PK_BY_ROWID, &[]),
+            }],
+            WriteDurability::BufferedFast,
         )?;
         Ok(())
     }

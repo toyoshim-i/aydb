@@ -316,3 +316,234 @@ fn legacy_mixed_integer_table_migrates_nonintegers_without_reusing_integer_rowid
         .unwrap();
     assert_ne!(text_id, vec![vec![SqlValue::Integer(rowid)]]);
 }
+
+/// A schema file that already declares `t1` and `legacy`, plus an engine whose `legacy` table
+/// (id 2) holds rows written before persistent rowid mappings existed. Connections opened on the
+/// schema file connect `legacy` lazily, so the connect (and its migration) can land inside a
+/// user transaction.
+struct LegacyFixture {
+    _schema_dir: TempTestDir,
+    _engine_dir: TempTestDir,
+    schema_path: std::path::PathBuf,
+    engine: Arc<RwLock<StorageEngine<OsFs>>>,
+}
+
+fn legacy_fixture(name: &str) -> LegacyFixture {
+    let schema_dir = TempTestDir::new(&format!("{name}_schema"));
+    let schema_path = schema_dir.path.join("schema.db");
+    let columns = "columns='k TEXT PRIMARY KEY, v TEXT'";
+    {
+        let scratch_dir = TempTestDir::new(&format!("{name}_scratch"));
+        let fs = Arc::new(OsFs::open(&scratch_dir.path, true).unwrap());
+        let scratch = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_file(&schema_path).unwrap();
+        conn.register_aydb_module_with_options(scratch, false)
+            .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE t1 USING aydb(table_id=1, {columns});
+             CREATE VIRTUAL TABLE legacy USING aydb(table_id=2, {columns})"
+        ))
+        .unwrap();
+    }
+    let engine_dir = TempTestDir::new(&format!("{name}_engine"));
+    let fs = Arc::new(OsFs::open(&engine_dir.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    for key in ["a", "b"] {
+        let key = SqlValue::Text(key.into());
+        let pk = key.to_key_bytes();
+        let row = encode_row(&[key, SqlValue::Text("v".into())]);
+        engine
+            .put_row(2, &pk, &row, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    LegacyFixture {
+        _schema_dir: schema_dir,
+        _engine_dir: engine_dir,
+        schema_path,
+        engine: Arc::new(RwLock::new(engine)),
+    }
+}
+
+impl LegacyFixture {
+    fn open(&self) -> SqliteConnection {
+        let conn = SqliteConnection::open_file(&self.schema_path).unwrap();
+        conn.register_aydb_module_with_options(self.engine.clone(), false)
+            .unwrap();
+        conn
+    }
+
+    fn migrated(&self) -> bool {
+        self.engine.read().unwrap().rowids_initialized(2).unwrap()
+    }
+}
+
+fn text_rows(conn: &SqliteConnection, sql: &str) -> Vec<Vec<SqlValue>> {
+    conn.query_all(sql, &[]).unwrap()
+}
+
+fn assert_two_distinct_rowids(conn: &SqliteConnection) {
+    let rows = text_rows(conn, "SELECT rowid,k FROM legacy ORDER BY k");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], SqlValue::Text("a".into()));
+    assert_eq!(rows[1][1], SqlValue::Text("b".into()));
+    assert_ne!(rows[0][0], rows[1][0]);
+}
+
+/// Connects `legacy` for the first time inside a user transaction (migrating it there), then
+/// rolls the transaction back.
+fn connect_legacy_in_rolled_back_tx(fixture: &LegacyFixture) -> SqliteConnection {
+    let conn = fixture.open();
+    conn.execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+    assert_eq!(text_rows(&conn, "SELECT k FROM legacy").len(), 2);
+    assert!(fixture.migrated(), "migration is visible to its own tx");
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert!(!fixture.migrated(), "rollback must undo the migration");
+    conn
+}
+
+#[test]
+fn legacy_migration_rolled_back_with_the_user_tx_is_redone_for_rowid_select() {
+    let fixture = legacy_fixture("migration_rollback_select");
+    let conn = connect_legacy_in_rolled_back_tx(&fixture);
+    assert_two_distinct_rowids(&conn);
+    assert!(fixture.migrated());
+    let other = fixture.open();
+    assert_two_distinct_rowids(&other);
+}
+
+#[test]
+fn legacy_migration_rolled_back_with_the_user_tx_is_redone_for_update() {
+    let fixture = legacy_fixture("migration_rollback_update");
+    let conn = connect_legacy_in_rolled_back_tx(&fixture);
+    conn.execute_batch("UPDATE legacy SET v='n'").unwrap();
+    assert_eq!(
+        text_rows(&conn, "SELECT k,v FROM legacy ORDER BY k"),
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Text("n".into())],
+            vec![SqlValue::Text("b".into()), SqlValue::Text("n".into())],
+        ]
+    );
+    assert_two_distinct_rowids(&conn);
+}
+
+#[test]
+fn legacy_migration_rolled_back_with_the_user_tx_is_redone_for_delete() {
+    let fixture = legacy_fixture("migration_rollback_delete");
+    let conn = connect_legacy_in_rolled_back_tx(&fixture);
+    conn.execute_batch("DELETE FROM legacy WHERE k='a'")
+        .unwrap();
+    assert_eq!(
+        text_rows(&conn, "SELECT k FROM legacy"),
+        vec![vec![SqlValue::Text("b".into())]]
+    );
+    assert!(fixture.migrated());
+}
+
+#[test]
+fn legacy_migration_rolled_back_to_a_savepoint_is_redone() {
+    let fixture = legacy_fixture("migration_rollback_savepoint");
+    let conn = fixture.open();
+    conn.execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y'); SAVEPOINT s")
+        .unwrap();
+    assert_eq!(text_rows(&conn, "SELECT k FROM legacy").len(), 2);
+    assert!(fixture.migrated());
+    conn.execute_batch("ROLLBACK TO s").unwrap();
+    assert!(!fixture.migrated(), "rollback to s must undo the migration");
+    assert_two_distinct_rowids(&conn);
+    conn.execute_batch("UPDATE legacy SET v='n'; DELETE FROM legacy WHERE k='a'")
+        .unwrap();
+    conn.execute_batch("RELEASE s; COMMIT").unwrap();
+    assert!(fixture.migrated());
+    assert_eq!(
+        text_rows(&conn, "SELECT k,v FROM legacy"),
+        vec![vec![SqlValue::Text("b".into()), SqlValue::Text("n".into())]]
+    );
+    assert_eq!(
+        text_rows(&fixture.open(), "SELECT k,v FROM legacy"),
+        vec![vec![SqlValue::Text("b".into()), SqlValue::Text("n".into())]]
+    );
+}
+
+#[test]
+fn legacy_migration_rolled_back_by_one_connection_is_redone_for_a_second_connection() {
+    let fixture = legacy_fixture("migration_rollback_two_connections");
+    let first = fixture.open();
+    let second = fixture.open();
+    first
+        .execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+    assert_eq!(text_rows(&first, "SELECT k FROM legacy").len(), 2);
+    // The second connection cannot join the first one's transaction, and must not be told that
+    // the uncommitted migration is complete.
+    assert!(second.query_all("SELECT rowid,k FROM legacy", &[]).is_err());
+    first.execute_batch("ROLLBACK").unwrap();
+    assert!(!fixture.migrated());
+    assert_two_distinct_rowids(&second);
+    assert_two_distinct_rowids(&first);
+    assert_eq!(
+        text_rows(&first, "SELECT rowid FROM legacy ORDER BY k"),
+        text_rows(&second, "SELECT rowid FROM legacy ORDER BY k"),
+    );
+}
+
+#[test]
+fn legacy_migration_committed_with_the_user_tx_stays_complete() {
+    let fixture = legacy_fixture("migration_commit_control");
+    let conn = fixture.open();
+    conn.execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+    assert_eq!(text_rows(&conn, "SELECT k FROM legacy").len(), 2);
+    conn.execute_batch("COMMIT").unwrap();
+    assert!(fixture.migrated());
+    assert_two_distinct_rowids(&conn);
+    conn.execute_batch("UPDATE legacy SET v='n'; DELETE FROM legacy WHERE k='a'")
+        .unwrap();
+    assert_eq!(
+        text_rows(&fixture.open(), "SELECT k,v FROM legacy"),
+        vec![vec![SqlValue::Text("b".into()), SqlValue::Text("n".into())]]
+    );
+}
+
+#[test]
+fn committed_marker_latches_the_vtab_and_later_scans_do_not_recheck_it() {
+    let fixture = legacy_fixture("migration_latch");
+    let conn = fixture.open();
+    // Connecting outside a transaction migrates and commits, which latches the vtab.
+    assert_two_distinct_rowids(&conn);
+    assert!(fixture.migrated());
+    // Losing the marker behind the latched vtab's back is not noticed: no scan or write looks
+    // at the marker again, nor re-runs the migration.
+    fixture
+        .engine
+        .write()
+        .unwrap()
+        .debug_remove_rowid_marker(2)
+        .unwrap();
+    assert!(!fixture.migrated());
+    assert_two_distinct_rowids(&conn);
+    conn.execute_batch("UPDATE legacy SET v='n'").unwrap();
+    assert!(!fixture.migrated(), "a latched vtab must not re-check");
+    // A vtab that has not seen a committed marker does repair it.
+    let fresh = fixture.open();
+    assert_two_distinct_rowids(&fresh);
+    assert!(fixture.migrated());
+}
+
+#[test]
+fn marker_visible_only_in_the_open_tx_does_not_latch_a_vtab_that_scanned_it() {
+    let fixture = legacy_fixture("migration_no_latch_in_tx");
+    let conn = fixture.open();
+    conn.execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+    // Connects and scans inside the transaction, so the marker exists only in its overlay.
+    assert_two_distinct_rowids(&conn);
+    assert!(fixture.migrated());
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert!(!fixture.migrated());
+    // The same vtab instance scanned before the rollback and must still repair the mappings.
+    assert_two_distinct_rowids(&conn);
+    assert!(fixture.migrated());
+}

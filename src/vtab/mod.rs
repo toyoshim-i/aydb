@@ -202,6 +202,69 @@ fn io_err_to_sqlite_rc(err: &io::Error) -> c_int {
     }
 }
 
+/// Re-establishes the persistent rowid mappings if they are not visible to this connection.
+/// Connecting a legacy table migrates it inside whatever transaction is open at that moment; if
+/// that transaction (or a savepoint) rolls back, the mappings and their completion marker roll
+/// back with it while this vtab instance stays connected. The migration is resumable and runs
+/// only when a marker has been lost. Once the marker has been seen committed, `rowids_committed`
+/// latches and no further check is made: a committed marker is removed only by `DROP TABLE`,
+/// which destroys this vtab instance.
+fn ensure_rowids_for_conn(eng: &mut StorageEngine<OsFs>, vtab: &AydbVTab) -> std::io::Result<()> {
+    if vtab.rowids_committed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    rowid_map::ensure_persistent_rowids(
+        eng,
+        vtab.table_id,
+        vtab.durability,
+        vtab.pk_affinity == ColumnAffinity::Integer,
+    )?;
+    latch_if_marker_committed(eng, vtab);
+    Ok(())
+}
+
+/// Latches only on a marker visible in the committed view, never on one that exists solely in
+/// the owner's open transaction, which a rollback would remove.
+fn latch_if_marker_committed(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) {
+    if eng
+        .rowids_initialized_view(crate::engine::ReadView::Committed, vtab.table_id)
+        .unwrap_or(false)
+    {
+        vtab.rowids_committed.store(true, Ordering::Release);
+    }
+}
+
+/// Scan-side variant of [`ensure_rowids_for_conn`]: no lock at all once latched, a shared-lock
+/// marker check before that, and the writer lock only when the mappings must be rebuilt.
+fn ensure_rowids_before_scan(vtab: &AydbVTab) -> Result<(), c_int> {
+    if vtab.rowids_committed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let conn_id = vtab.db as usize;
+    {
+        let eng = vtab.engine.read().map_err(|_| SQLITE_ERROR)?;
+        if eng
+            .rowids_initialized_view(crate::engine::ReadView::Committed, vtab.table_id)
+            .unwrap_or(false)
+        {
+            vtab.rowids_committed.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let view = eng.read_view_for_conn(conn_id);
+        // An unreadable marker is left to the read itself to report.
+        if eng
+            .rowids_initialized_view(view, vtab.table_id)
+            .unwrap_or(true)
+        {
+            return Ok(());
+        }
+    }
+    let mut eng = vtab.engine.write().map_err(|_| SQLITE_ERROR)?;
+    eng.check_write_allowed_for_conn(conn_id)
+        .map_err(|e| io_err_to_sqlite_rc(&e))?;
+    ensure_rowids_for_conn(&mut eng, vtab).map_err(|e| io_err_to_sqlite_rc(&e))
+}
+
 unsafe fn constraint_matches_col_collation(
     p_info: *mut sqlite3_index_info,
     constraint_idx: usize,
@@ -332,6 +395,8 @@ pub(super) struct AydbVTab {
     table_id: u16,
     table_name: String,
     durability: WriteDurability,
+    /// Set once the rowid migration marker has been observed in the committed view.
+    rowids_committed: AtomicBool,
     col_names: Vec<String>,
     col_affinities: Vec<ColumnAffinity>,
     col_not_null: Vec<bool>,
@@ -611,6 +676,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             0
         };
 
+        let rowids_committed;
         // Older databases have no rowid index. Populate missing identities in key order once;
         // every pair is an atomic WAL batch, so a failed connection can resume safely.
         {
@@ -618,6 +684,12 @@ unsafe extern "system" fn vtab_create_or_connect(
                 Ok(eng) => eng,
                 Err(_) => return SQLITE_ERROR,
             };
+            // The write lock was released since the check above; do not join a transaction that
+            // another connection began in the meantime.
+            if let Err(e) = eng.check_write_allowed_for_conn(db as usize) {
+                eng.unregister_vtab(table_id, &ddl.table_name);
+                return io_err_to_sqlite_rc(&e);
+            }
             if let Err(e) = rowid_map::ensure_persistent_rowids(
                 &mut eng,
                 table_id,
@@ -627,6 +699,9 @@ unsafe extern "system" fn vtab_create_or_connect(
                 eng.unregister_vtab(table_id, &ddl.table_name);
                 return io_err_to_sqlite_rc(&e);
             }
+            rowids_committed = eng
+                .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
+                .unwrap_or(false);
         }
 
         let vtab = Box::new(AydbVTab {
@@ -641,6 +716,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             table_id,
             table_name: ddl.table_name,
             durability: ddl.durability,
+            rowids_committed: AtomicBool::new(rowids_committed),
             col_names: ddl.col_names,
             col_affinities: ddl.col_affinities,
             col_not_null: ddl.col_not_null,
@@ -1017,6 +1093,9 @@ unsafe extern "system" fn vtab_filter(
         cursor.stream_sec_prefix.clear();
 
         let conn_id = vtab.db as usize;
+        if let Err(rc) = ensure_rowids_before_scan(vtab) {
+            return rc;
+        }
         cursor.snapshot = match vtab.read_session.for_cursor(conn_id) {
             Ok(snapshot) => snapshot,
             Err(error) => return io_err_to_sqlite_rc(&error),
@@ -1729,6 +1808,9 @@ unsafe extern "system" fn vtab_update(
             Err(_) => return SQLITE_ERROR,
         };
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
+        }
+        if let Err(e) = ensure_rowids_for_conn(&mut eng, vtab) {
             return io_err_to_sqlite_rc(&e);
         }
 
