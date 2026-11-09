@@ -90,6 +90,8 @@ When a Capped Table (e.g., a virtual table declared with `max_bytes = 1073741824
 
 ## 4. Unified Phase 1 `StorageEngine` API (`src/engine/mod.rs`)
 
+This section explains engine coordination. Application callers should start with the [Native Storage Guide](../guides/NATIVE_STORAGE.md), then use the [API reference map](../reference/README.md) and [public API boundaries](../reference/PUBLIC_API.md) for contracts and supported entry points.
+
 `StorageEngine<FS: PlatformFs>` integrates all five Phase 1 subsystems behind one coordinator API. Callers that share it between threads wrap it in `Arc<RwLock<_>>`:
 
 | Method | Description |

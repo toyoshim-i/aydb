@@ -1,5 +1,7 @@
 # Chapter 2.1: SQLite Virtual Table Adapter (`sqlite3_module`), Row Codec, and Constraint Pushdown
 
+This chapter explains adapter internals. For application setup, persistent storage, SQL options, and limitations, start with the [SQLite Adapter Guide](../guides/SQLITE.md). The [API reference](../reference/README.md) and [public API boundaries](../reference/PUBLIC_API.md) distinguish the connection wrappers from FFI and implementation protocols.
+
 This chapter specifies the detailed design of **Step 2-1: Native SQLite FFI (`src/vtab/ffi.rs`), Multi-Column Binary Row Serialization (`src/vtab/row_codec.rs`), and the `aydb` Virtual Table Module (`src/vtab/mod.rs`)**.
 
 ---

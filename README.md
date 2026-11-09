@@ -82,12 +82,21 @@ All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Vir
 
 ---
 
-## Documentation: The `aydb` "Living Textbook" (`docs/`)
+## Documentation
+
+Start with the **[Documentation Guide](docs/README.md)**. Application documentation is separate from the design textbook:
+
+* **[Public API Boundaries](docs/reference/PUBLIC_API.md)** — Native storage and SQLite entry points, advanced integration surfaces, and implementation details.
+* **[Native Storage Guide](docs/guides/NATIVE_STORAGE.md)** — Open/reopen, byte rows, transactions, durability, quotas, and error recovery.
+* **[SQLite Adapter Guide](docs/guides/SQLITE.md)** — Persistent setup, parameterized SQL, adapter options, and limitations.
+* **[API Reference Guide](docs/reference/README.md)** — Method/configuration map and local Rustdoc generation.
+
+### Living Textbook (`docs/phase1/`, `docs/phase2/`)
 
 This repository is structured as a **"Build-to-Learn" Living Textbook**. Every subsystem is accompanied by a dedicated chapter in [`docs/`](docs/) featuring architectural motivation, Mermaid state and sequence diagrams, RFC-style ASCII byte layouts, crash-safety proofs, and reproducible empirical benchmarks.
 
 ### Master Architecture Specification
-* **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — High-level requirements, single-host exclusive SMB handle model (`dwShareMode = 0`), OS Cache Manager file segregation, WiscKey separation, crash recovery protocols, and 3-phase roadmap.
+* **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — High-level requirements, single-host exclusive SMB handle model (`dwShareMode = 0`), OS Cache Manager file segregation, WiscKey separation, crash recovery protocols, and the phased roadmap including planned search capabilities.
 
 ### Phase 1: Core Storage Engine & Ordered KV API (`docs/phase1/`)
 * **[Chapter 1.0: Phase 1 Architecture Overview](docs/phase1/00_OVERVIEW.md)** — Why B-Trees and classic LSM-Trees struggle on hybrid desktop workloads; memory hierarchy across Process Heap, OS Page Cache (256 KB VACBs), and Disk; end-to-end read, write, flush, and compaction walkthroughs.

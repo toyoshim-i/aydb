@@ -14,7 +14,7 @@ This document defines the workflow, conventions, and engineering standards for d
 
 ## 3. Design-First, Phase-by-Phase Workflow
 
-`aydb` is developed incrementally across three major phases (as outlined in [ARCHITECTURE.md](./ARCHITECTURE.md)). To maintain architectural integrity and ensure every subsystem is thoroughly understood before code is written:
+`aydb` is developed incrementally through the phases and future search milestones outlined in [ARCHITECTURE.md](./ARCHITECTURE.md). To maintain architectural integrity and ensure every subsystem is thoroughly understood before code is written:
 
 1. **No Premature Implementation:** Do not jump ahead into writing production code for a phase or subsystem before its detailed design has been discussed and agreed upon.
 2. **Subsystem Detailed Design First:** Each phase is broken down into concrete subsystems (e.g., in Phase 1: PAL/VFS, `boot_meta.db`, fixed-size WAL, MemTable & immutable `idx`/`blob` segments, crash recovery, and LRU eviction). Before implementing a subsystem, we first clarify and document:
@@ -25,6 +25,10 @@ This document defines the workflow, conventions, and engineering standards for d
 3. **Incremental Verification:** Each subsystem must be accompanied by deterministic unit tests and fault-injection / crash-recovery tests before moving on to the next layer.
 
 ## 4. Living Textbook Documentation ("Build-to-Learn" Philosophy)
+
+Documentation has three complementary layers, indexed by the [Documentation Guide](README.md): application usage guides, API references (including Rustdoc), and the design textbook. Follow [Public API Boundaries](reference/PUBLIC_API.md) when documenting new interfaces. A public Rust item is not automatically an application entry point. Keep application-facing operations separate from adapter protocols and implementation helpers; changes to code visibility or facade modules require explicit implementation and migration work.
+
+For application API changes, update Rustdoc contracts, the relevant usage guide, and the [reference map](reference/README.md) together. Explain arguments, return values, errors, ownership/lifetimes, durability, and relevant concurrency rules. Guides should contain complete practical examples; textbook chapters retain the internal rationale rather than serving as the only usage manual. Planned features must be marked as planned. The native SQL frontend will need a separate execution API reference and language manual; vector search extends the native backend reference.
 
 A core goal of the `aydb` project is to produce a **living, textbook-grade record of how a production-quality embedded database is designed and built from the ground up**. Design documents under `docs/` should read like chapters of a systems engineering textbook (in the spirit of *Database Internals* or *Designing Data-Intensive Applications*) rather than terse API notes:
 
