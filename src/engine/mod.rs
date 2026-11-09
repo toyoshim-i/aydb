@@ -258,8 +258,7 @@ pub(super) struct TrackedLruBlob<F: PlatformFile> {
 
 /// Unified Phase 1 Storage Engine.
 pub struct StorageEngine<FS: PlatformFs> {
-    read_snapshots: BTreeMap<u64, snapshot::ReadSnapshot<FS::File>>,
-    next_read_snapshot_id: u64,
+    read_snapshots: snapshot::SnapshotRegistry<FS::File>,
     pub(super) fs: Arc<FS>,
     pub(super) config: EngineConfig,
     pub(super) meta_mgr: BootMetaManager<FS>,
@@ -737,8 +736,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let mut engine = Self {
-            read_snapshots: BTreeMap::new(),
-            next_read_snapshot_id: 1,
+            read_snapshots: snapshot::SnapshotRegistry::new(),
             fs,
             config,
             meta_mgr,

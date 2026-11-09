@@ -34,24 +34,17 @@ impl ReadSession {
     }
 
     pub(super) fn for_cursor(&self, connection: usize) -> io::Result<Option<ReadSnapshotToken>> {
-        {
-            let engine = self
-                .engine
-                .read()
-                .map_err(|_| io::Error::other("engine lock poisoned"))?;
-            if engine.in_active_transaction()
-                && engine.read_view_for_conn(connection) == ReadView::Owner
-            {
-                return Ok(None);
-            }
-            if let Some(token) = self.current() {
-                return Ok(Some(token));
-            }
-        }
-        let mut engine = self
+        // Capturing only clones immutable sources into the snapshot registry, so it runs under
+        // the shared engine lock like the read it serves.
+        let engine = self
             .engine
-            .write()
+            .read()
             .map_err(|_| io::Error::other("engine lock poisoned"))?;
+        if engine.in_active_transaction()
+            && engine.read_view_for_conn(connection) == ReadView::Owner
+        {
+            return Ok(None);
+        }
         let mut token = self
             .token
             .lock()
@@ -65,8 +58,9 @@ impl ReadSession {
 
     fn end_transaction(&self) {
         let token = self.token.lock().ok().and_then(|mut token| token.take());
-        // SQLite can finish a nested statement while an engine callback holds this lock.
-        if let Ok(mut engine) = self.engine.try_write() {
+        // SQLite can finish a nested statement while an engine callback holds this lock; a
+        // writer then prunes the released snapshot at its next transaction or commit.
+        if let Ok(engine) = self.engine.try_read() {
             if let Some(token) = token {
                 engine.release_read_snapshot(token);
             } else {
@@ -141,4 +135,41 @@ pub(super) unsafe extern "system" fn trace_reads(
         }
     }));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::util::test_util::TempTestDir;
+
+    #[test]
+    fn cursor_snapshot_capture_and_release_run_under_the_shared_engine_lock() {
+        let tmp = TempTestDir::new("vtab_snapshot_shared_lock");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let session = Arc::new(ReadSession::new(engine.clone()));
+        let shared = engine.read().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let token = session.for_cursor(1).unwrap();
+                let again = session.for_cursor(1).unwrap();
+                session.end_transaction();
+                sender.send((token.is_some(), again.is_some())).unwrap();
+            })
+        };
+        // With the engine's shared lock held here, an exclusive acquisition would never finish.
+        let captured = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("snapshot capture or release waited for the exclusive engine lock");
+        assert_eq!(captured, (true, true));
+        worker.join().unwrap();
+        assert!(session.current().is_none());
+        session.end_transaction();
+        assert_eq!(shared.live_read_snapshots(), 0);
+    }
 }

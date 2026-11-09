@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use crate::blob::BlobSegmentReader;
 use crate::index::IdxSegmentReader;
@@ -27,18 +28,75 @@ pub(super) struct ReadSnapshot<F: PlatformFile> {
     lru_blobs: BTreeMap<(u16, u64), BlobSegmentReader<F>>,
 }
 
+/// Registry of live read snapshots, mutable through a shared engine reference.
+///
+/// Captures and releases only touch this registry and clone immutable sources, so they run under
+/// the shared engine lock and concurrent readers do not serialize on the exclusive lock. The
+/// engine publishes a commit under the exclusive lock, so a capture under the shared lock sees
+/// either all of a commit or none of it.
+pub(super) struct SnapshotRegistry<F: PlatformFile> {
+    snapshots: RwLock<BTreeMap<u64, Arc<ReadSnapshot<F>>>>,
+    next_id: AtomicU64,
+}
+
+impl<F: PlatformFile> SnapshotRegistry<F> {
+    pub(super) fn new() -> Self {
+        Self {
+            snapshots: RwLock::new(BTreeMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, BTreeMap<u64, Arc<ReadSnapshot<F>>>> {
+        self.snapshots
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<u64, Arc<ReadSnapshot<F>>>> {
+        self.snapshots
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    fn prune(&self) {
+        // Skip the exclusive registry lock when nothing is dead; the common release path of a
+        // statement that shares a still-live snapshot then only takes the shared lock.
+        if self
+            .read()
+            .values()
+            .all(|snapshot| snapshot.token.strong_count() > 0)
+        {
+            return;
+        }
+        self.write()
+            .retain(|_, snapshot| snapshot.token.strong_count() > 0);
+    }
+}
+
 impl<FS: PlatformFs> StorageEngine<FS> {
-    pub(crate) fn capture_read_snapshot(&mut self) -> ReadSnapshotToken {
-        self.cleanup_read_snapshots();
+    /// Captures the committed sources. Runs under the shared engine lock: every source is
+    /// mutated only through `&mut self`, so the captured memtable, segment list and blob maps
+    /// belong to one consistent published state.
+    pub(crate) fn capture_read_snapshot(&self) -> ReadSnapshotToken {
+        let registry = &self.read_snapshots;
+        let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id != u64::MAX, "read snapshot identifier overflow");
         let token = ReadSnapshotToken {
-            id: self.next_read_snapshot_id,
+            id,
             keep_alive: Arc::new(()),
         };
-        self.next_read_snapshot_id = self
-            .next_read_snapshot_id
-            .checked_add(1)
-            .expect("read snapshot identifier overflow");
-        let snapshot = ReadSnapshot {
+        let snapshot = Arc::new(ReadSnapshot {
             token: Arc::downgrade(&token.keep_alive),
             memtable: self.memtable.clone(),
             idx_segments: self.idx_segments.clone(),
@@ -52,22 +110,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .iter()
                 .map(|(&id, b)| (id, b.reader.clone()))
                 .collect(),
-        };
-        self.read_snapshots.insert(token.id, snapshot);
+        });
+        registry.prune();
+        registry.write().insert(id, snapshot);
         token
     }
 
-    pub(crate) fn release_read_snapshot(&mut self, token: ReadSnapshotToken) {
+    pub(crate) fn release_read_snapshot(&self, token: ReadSnapshotToken) {
         drop(token);
         self.cleanup_read_snapshots();
     }
 
-    pub(crate) fn cleanup_read_snapshots(&mut self) {
-        self.read_snapshots
-            .retain(|_, snapshot| snapshot.token.strong_count() > 0);
+    #[cfg(test)]
+    pub(crate) fn live_read_snapshots(&self) -> usize {
+        self.read_snapshots.len()
     }
 
-    pub(crate) fn reader_for_snapshot(&self, token: &ReadSnapshotToken) -> EngineReader<'_, FS> {
+    pub(crate) fn cleanup_read_snapshots(&self) {
+        self.read_snapshots.prune();
+    }
+
+    /// The reader borrows `token`, which keeps the snapshot registered while it is in use.
+    pub(crate) fn reader_for_snapshot<'a>(
+        &'a self,
+        token: &'a ReadSnapshotToken,
+    ) -> EngineReader<'a, FS> {
         EngineReader {
             eng: self,
             cx: CxRef::Owned(ReadCtx::new(ReadView::Snapshot(token.id), false)),
@@ -79,9 +146,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// checkpoint LSN equal an in-flight transaction's LSN and hide its later publication.
     pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken) -> bool {
         self.pending_group.is_empty()
-            && self.read_snapshots.get(&token.id).is_some_and(|snapshot| {
-                snapshot.memtable.generation() == self.memtable.generation()
-            })
+            && self
+                .read_snapshots
+                .read()
+                .get(&token.id)
+                .is_some_and(|snapshot| {
+                    snapshot.memtable.generation() == self.memtable.generation()
+                })
     }
 
     pub(crate) fn check_snapshot_write_upgrade(
@@ -100,14 +171,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn snapshot_for_view(&self, view: ReadView) -> Option<&ReadSnapshot<FS::File>> {
-        match view {
-            ReadView::Snapshot(id) => Some(
-                self.read_snapshots
-                    .get(&id)
-                    .expect("live read snapshot token must retain its sources"),
-            ),
-            _ => None,
-        }
+        let ReadView::Snapshot(id) = view else {
+            return None;
+        };
+        let snapshot = Arc::as_ptr(
+            self.read_snapshots
+                .read()
+                .get(&id)
+                .expect("live read snapshot token must retain its sources"),
+        );
+        // SAFETY: the registry drops an entry only after the last `ReadSnapshotToken` of the
+        // snapshot is gone, and a `ReadView::Snapshot` is only handed out by
+        // `reader_for_snapshot`, whose reader borrows a token. The `Arc` allocation therefore
+        // outlives every reference returned here, even though the registry lock is released.
+        Some(unsafe { &*snapshot })
     }
 
     pub(super) fn memtable_for_view(&self, view: ReadView) -> &MemTable {
@@ -398,5 +475,118 @@ mod tests {
             .put_row(1, b"key", b"value", &[], WriteDurability::BufferedFast)
             .unwrap();
         assert!(engine.read_snapshots.is_empty());
+    }
+
+    #[test]
+    fn capture_and_release_need_only_a_shared_engine_reference() {
+        fn capture_cycle(engine: &StorageEngine<OsFs>) -> usize {
+            let token = engine.capture_read_snapshot();
+            let live = engine.read_snapshots.len();
+            engine.release_read_snapshot(token);
+            live
+        }
+
+        let tmp = TempTestDir::new("read_snapshot_shared_lock");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(std::sync::RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        // Captures from several threads must proceed while every one of them holds the shared
+        // lock; with an exclusive lock the barrier below could never be passed.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let guard = engine.read().unwrap();
+                    let token = guard.capture_read_snapshot();
+                    barrier.wait();
+                    assert!(guard.snapshot_is_current(&token));
+                    guard.release_read_snapshot(token);
+                    for _ in 0..100 {
+                        capture_cycle(&guard);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let guard = engine.read().unwrap();
+        guard.cleanup_read_snapshots();
+        assert!(guard.read_snapshots.is_empty());
+    }
+
+    #[test]
+    fn snapshot_captured_concurrently_with_commits_is_never_torn() {
+        let tmp = TempTestDir::new("read_snapshot_not_torn");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut config = EngineConfig::default();
+        config.inline_threshold_bytes = 64;
+        config.max_blob_segment_bytes = 16 * 1024;
+        let engine = Arc::new(std::sync::RwLock::new(
+            StorageEngine::open(fs, config).unwrap(),
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (engine, stop) = (Arc::clone(&engine), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut checked = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        let guard = engine.read().unwrap();
+                        let token = guard.capture_read_snapshot();
+                        let reader = guard.reader_for_snapshot(&token);
+                        // Every commit writes the same generation to an inline row, a blob row
+                        // and a row that moves between memtable and segments.
+                        let a = reader.get_row(1, b"a").unwrap();
+                        let b = reader.get_row(1, b"b").unwrap();
+                        let c = reader.get_row(1, b"c").unwrap();
+                        match (a, b, c) {
+                            (None, None, None) => {}
+                            (Some(a), Some(b), Some(c)) => {
+                                assert_eq!(a[..4], b[..4], "torn snapshot");
+                                assert_eq!(a[..4], c[..4], "torn snapshot");
+                            }
+                            other => panic!("torn snapshot: {other:?}"),
+                        }
+                        checked += 1;
+                        guard.release_read_snapshot(token);
+                    }
+                    checked
+                })
+            })
+            .collect();
+        let sync = WriteDurability::BufferedFast;
+        for i in 0..300u32 {
+            let tag = i.to_le_bytes();
+            let mut big = tag.to_vec();
+            big.resize(1024, 0xAB);
+            let mut mid = tag.to_vec();
+            mid.resize(16, 0xCD);
+            let mut small = tag.to_vec();
+            small.resize(8, 0xEF);
+            let mut guard = engine.write().unwrap();
+            guard.begin_transaction();
+            guard.put_row(1, b"a", &small, &[], sync).unwrap();
+            guard.put_row(1, b"b", &big, &[], sync).unwrap();
+            guard.put_row(1, b"c", &mid, &[], sync).unwrap();
+            guard.commit_transaction().unwrap();
+            if i % 25 == 0 {
+                guard.flush_memtable().unwrap();
+            }
+            if i % 100 == 99 {
+                guard.compact().unwrap();
+            }
+            drop(guard);
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let checked: u32 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(checked > 0);
+        let guard = engine.read().unwrap();
+        guard.cleanup_read_snapshots();
+        assert!(guard.read_snapshots.is_empty());
     }
 }

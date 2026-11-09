@@ -1032,7 +1032,7 @@ unsafe extern "system" fn vtab_close(p_cursor: *mut sqlite3_vtab_cursor) -> c_in
                 drop(cursor);
                 if !p_vtab.is_null() {
                     let vtab = &*(p_vtab as *const AydbVTab);
-                    if let Ok(mut engine) = vtab.engine.try_write() {
+                    if let Ok(engine) = vtab.engine.try_read() {
                         engine.cleanup_read_snapshots();
                     }
                 }
