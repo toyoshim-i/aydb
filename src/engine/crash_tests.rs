@@ -284,10 +284,6 @@ struct SimState {
     events: Option<Vec<String>>,
     /// Every `remove_file` of a file whose name starts with this fails (repro tests).
     fail_remove_prefix: Option<&'static str>,
-    /// Set by the harness while `StorageEngine::open` runs.
-    in_open: bool,
-    /// Files the engine removed while it was opening (recovery or pending-delete processing).
-    removed_in_open: std::collections::HashSet<String>,
 }
 
 impl SimState {
@@ -473,8 +469,6 @@ impl CrashFs {
                 dir_synced: 0,
                 events: env_u64("AYDB_CRASH_SEED").map(|_| Vec::new()),
                 fail_remove_prefix: None,
-                in_open: false,
-                removed_in_open: std::collections::HashSet::new(),
             })),
             root: PathBuf::from("/sim/crash"),
         }
@@ -710,9 +704,6 @@ impl PlatformFs for CrashFs {
             return Err(f.err);
         }
         let seq = st.dir_op(true);
-        if st.in_open {
-            st.removed_in_open.insert(rel_name.to_string());
-        }
         st.note(|| format!("      fs: remove {rel_name} (dir op {seq})"));
         st.dir.remove(rel_name);
         let ino = &mut st.inodes[id];
@@ -872,8 +863,6 @@ struct Coverage {
     poisoned: AtomicU64,
     /// Recoveries whose result changed at the next, immediate crash.
     unstable_recovery: AtomicU64,
-    /// Cases cut short because they reached known engine bug A.
-    known_bug_a: AtomicU64,
     manifests_seen: AtomicU64,
     blob_segments_seen: AtomicU64,
     fail_by_kind: [AtomicU64; KIND_COUNT],
@@ -893,7 +882,7 @@ impl Coverage {
         format!(
             "cases={} crashes={} (process={}) cut_tripped={} failure_fired={} [{}] \
              recovery_crashes={} lost_buffered_tail={} dropped_inflight={} wal_rotations={} \
-             maintenance_failures={} poisoned={} unstable_recovery={} known_bug_a={} \
+             maintenance_failures={} poisoned={} unstable_recovery={} \
              manifests_seen={} blob_segments_seen={}",
             g(&self.cases),
             g(&self.crashes),
@@ -908,7 +897,6 @@ impl Coverage {
             g(&self.maintenance_failures),
             g(&self.poisoned),
             g(&self.unstable_recovery),
-            g(&self.known_bug_a),
             g(&self.manifests_seen),
             g(&self.blob_segments_seen),
         )
@@ -1298,26 +1286,9 @@ impl<'a> Harness<'a> {
         Ok(k)
     }
 
-    /// Known bug A (see `known_bug_pending_delete_of_adopted_blob_segment`): the open fails
-    /// because the catalog lists a segment that an earlier open removed.
-    fn is_known_bug_a(&self, e: &io::Error) -> bool {
-        e.kind() == io::ErrorKind::NotFound
-            && !known_bugs_enabled()
-            && self
-                .fs
-                .st()
-                .removed_in_open
-                .iter()
-                .any(|n| e.to_string().contains(n.as_str()))
-    }
-
     fn open(&mut self, what: &str) -> Result<Eng, String> {
-        let e = open_engine(&self.fs, &self.cfg).map_err(|e| {
-            if self.is_known_bug_a(&e) {
-                return KNOWN_BUG_A.to_string();
-            }
-            self.fail(format!("reopen failed ({what}): {e}"))
-        })?;
+        let e = open_engine(&self.fs, &self.cfg)
+            .map_err(|e| self.fail(format!("reopen failed ({what}): {e}")))?;
         if self.fs.st().events.is_some() {
             let st = e.meta_mgr.state();
             self.log(format!(
@@ -1590,14 +1561,8 @@ impl<'a> Harness<'a> {
 
 /// Opens the engine, telling the filesystem that removals now happen as part of recovery.
 fn open_engine(fs: &Arc<CrashFs>, cfg: &EngineConfig) -> io::Result<Eng> {
-    fs.st().in_open = true;
-    let r = StorageEngine::open(Arc::clone(fs), cfg.clone());
-    fs.st().in_open = false;
-    r
+    StorageEngine::open(Arc::clone(fs), cfg.clone())
 }
-
-/// Marker error: the case hit known engine bug A and ends early.
-const KNOWN_BUG_A: &str = "known engine bug A";
 
 /// `AYDB_CRASH_KNOWN_BUGS=1` makes the harness stop working around the two known engine bugs
 /// (see `docs/DEVELOPMENT.md`), so that long runs can show them again.
@@ -1681,13 +1646,7 @@ fn run_case(
     plan: Option<&[EpochStat]>,
     cov: &Coverage,
 ) -> Result<Vec<EpochStat>, String> {
-    match run_case_inner(seed, plan, cov) {
-        Err(m) if m == KNOWN_BUG_A => {
-            Coverage::bump(&cov.known_bug_a);
-            Ok(Vec::new())
-        }
-        other => other,
-    }
+    run_case_inner(seed, plan, cov)
 }
 
 fn run_case_inner(
@@ -1833,9 +1792,6 @@ fn run_case_inner(
             fs.arm(Some(master.below(80)), None);
             let r = open_engine(&fs, &h.cfg);
             if let Err(err) = &r {
-                if h.is_known_bug_a(err) {
-                    return Err(KNOWN_BUG_A.to_string());
-                }
                 if !fs.fault_happened() {
                     return Err(h.fail(format!("recovery failed without any fault: {err}")));
                 }
@@ -2222,8 +2178,8 @@ fn crash_runs_are_reproducible() {
 // =============================================================================================
 // Minimal reproductions of engine bugs found by the seeded harness
 //
-// Each test fails today and is therefore ignored. Run them with `-- --ignored`. The harness works
-// around the bugs unless `AYDB_CRASH_KNOWN_BUGS=1` is set.
+// The `known_bug_*` tests fail today and are therefore ignored. Run them with `-- --ignored`.
+// The harness works around those bugs unless `AYDB_CRASH_KNOWN_BUGS=1` is set.
 // =============================================================================================
 
 fn repro_config() -> EngineConfig {
@@ -2239,16 +2195,15 @@ fn row_is(e: &mut Eng, table: u16, key: &[u8], want: &[u8]) -> bool {
     e.get_row(table, key).unwrap().as_deref() == Some(want)
 }
 
-/// Bug A. A fully dead standard blob segment is dropped from the catalog and queued in
-/// `pending_delete_files`; its unlink fails (or the process stops before it). At the next open
-/// the segment is still on disk, an older `idx` segment still holds a stale pointer into it, and
-/// because another segment has a tail beyond its cataloged length, recovery scans the `idx`
-/// segments, counts the stale pointer as live and catalogs the segment again. The same commit
-/// then processes `pending_delete_files` and unlinks it. The next open fails with `NotFound`
-/// for good.
+/// Regression test for a fixed bug. A fully dead standard blob segment is dropped from the
+/// catalog and queued in `pending_delete_files`; its unlink fails (or the process stops before
+/// it). At the next open the segment is still on disk, an older `idx` segment still holds a stale
+/// pointer into it, and because another segment has a tail beyond its cataloged length, recovery
+/// scans the `idx` segments. It used to count the stale pointer as live, catalog the segment
+/// again and then unlink it in the same commit, so the next open failed with `NotFound` for
+/// good. A file queued for deletion is now never adopted.
 #[test]
-#[ignore = "engine bug A: recovery re-catalogs a segment that is queued for deletion and then deletes it"]
-fn known_bug_pending_delete_of_adopted_blob_segment() {
+fn pending_delete_of_dead_blob_segment_is_not_adopted() {
     let mut cfg = repro_config();
     cfg.max_blob_segment_bytes = 3200;
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));

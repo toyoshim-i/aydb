@@ -429,7 +429,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // Also discover any uncataloged `blob_std_*` or `blob_lru_*` created during the active epoch
         // before a crash so `Write-Blob-Before-WAL` validation can verify their records!
+        //
+        // A file queued in `pending_delete_files` was dropped from the catalog because it held no
+        // live data, and only its unlink is outstanding. It must never be adopted: a stale pointer
+        // in an older `idx` segment (counted by the scan below) would catalog it again, and the
+        // pending delete of the same commit would then unlink a cataloged file. Such a pointer
+        // behaves like any other pointer into a dropped segment: it is dead.
         for fname in fs.list_files()? {
+            if state_snapshot.pending_delete_files.contains(&fname) {
+                continue;
+            }
             if let Some(hex) = fname
                 .strip_prefix("blob_std_")
                 .and_then(|s| s.strip_suffix(".db"))

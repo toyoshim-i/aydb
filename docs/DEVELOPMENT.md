@@ -66,8 +66,10 @@ The regular test runs 1,000 seeds (about 10 seconds in a debug build, on four th
 * `AYDB_CRASH_SEEDS=<n>`: number of seeds (for example 2000 or more for a long run).
 * `AYDB_CRASH_SEED_START=<n>`: first seed.
 * `AYDB_CRASH_SEED=<n>`: replay one seed with the complete operation and filesystem trace in the failure report.
-* `AYDB_CRASH_KNOWN_BUGS=1`: stop working around the open engine bugs listed below.
+* `AYDB_CRASH_KNOWN_BUGS=1`: stop working around the open engine bugs listed below (B and C).
 
 Each seed runs twice: once clean, which also measures the operation counts, and once with crash points and failures drawn from those counts.
 
-**Open engine bugs found by the harness.** The workload avoids them by default, and each has an ignored reproduction (`cargo test --lib known_bug -- --ignored`): (A) a recovery can catalog a blob segment that is queued in `pending_delete_files` and then delete it, so the next open fails with `NotFound` (cases that reach it end early); (B) reclaiming an LRU blob segment makes recovery drop whole log batches that reference it, and in the buffered stream every later batch; (C) reclaiming an LRU blob segment syncs `wal_buf.db` without syncing the standard blob writer, so a later synchronous commit skips that sync. B and C are why capped tables hold inline values only in the default workload.
+**Open engine bugs found by the harness.** The workload avoids them by default, and each has an ignored reproduction (`cargo test --lib known_bug -- --ignored`): (B) reclaiming an LRU blob segment makes recovery drop whole log batches that reference it, and in the buffered stream every later batch; (C) reclaiming an LRU blob segment syncs `wal_buf.db` without syncing the standard blob writer, so a later synchronous commit skips that sync. B and C are why capped tables hold inline values only in the default workload.
+
+A third bug found by the harness is fixed: recovery used to adopt a blob segment that was queued in `pending_delete_files` when a stale pointer in an older `idx` segment referenced it, and then unlinked it in the same commit, so the next open failed with `NotFound`. Recovery now never adopts a file that is queued for deletion (regression test `pending_delete_of_dead_blob_segment_is_not_adopted`).
