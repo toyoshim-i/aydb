@@ -14,6 +14,12 @@ use crate::wal::{WalBatch, WalRecord};
 use super::reader::CxRef;
 use super::{EngineReader, StorageEngine, WriteDurability};
 
+/// Savepoint id of the engine savepoint that makes one `xUpdate` call atomic. SQLite numbers its
+/// savepoints from -1 (the savepoint that started the transaction, when there was no `BEGIN`)
+/// upwards, so this id never collides with one of them. It is opened and closed within one
+/// call, so it is never open while SQLite addresses a savepoint.
+pub(crate) const STATEMENT_SAVEPOINT: i32 = i32::MIN;
+
 /// Transactions larger than this are split into several WAL batches.
 const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
 
@@ -813,7 +819,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.rollback_transaction()
     }
 
-    /// Opens or updates a transaction savepoint (`xSavepoint`).
+    /// Opens a transaction savepoint (`xSavepoint`).
+    ///
+    /// SQLite announces a savepoint to a virtual table only once the table has joined the
+    /// transaction, and then only the innermost open one (and none at all when the only open
+    /// savepoint is the one that started the transaction). The savepoints below it were opened
+    /// before the table had any state in the transaction, so each of them stands for the
+    /// transaction's start (see [`Self::rollback_to_savepoint`]).
     pub fn savepoint(&mut self, sp_id: i32) {
         self.tx_prepared = false;
         let mut implicit_tx = false;
@@ -821,12 +833,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.begin_transaction();
             implicit_tx = true;
         }
-        if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
-            implicit_tx = self.savepoints[pos].implicit_tx;
-            self.savepoints.truncate(pos);
-            if self.savepoints.is_empty() {
-                self.tx_overlay.undo.clear();
-            }
+        // Every table of the engine that joins the transaction is announced the innermost open
+        // savepoint, so a savepoint can arrive again, now with the changes other tables made
+        // since it was opened. The marker taken when it first arrived is the right one.
+        if self.savepoints.iter().any(|s| s.sp_id == sp_id) {
+            return;
         }
         let buf_offset = if self.pending_tx_record_count == 0 {
             0
@@ -846,7 +857,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         });
     }
 
-    /// Opens or updates a transaction savepoint for SQLite connection `conn_id`.
+    /// Opens a transaction savepoint for SQLite connection `conn_id`.
     pub fn savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
         self.check_write_allowed_for_conn(conn_id)?;
         let was_zero = self.tx_depth == 0;
@@ -858,8 +869,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Releases savepoints `>= sp_id` (`xRelease`).
+    ///
+    /// A release of an id the engine never saw (a savepoint opened before the table joined the
+    /// transaction) removes every savepoint it knows with a higher id.
     pub fn release_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
-        if let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) {
+        let pos = self
+            .savepoints
+            .iter()
+            .position(|s| s.sp_id == sp_id)
+            .or_else(|| self.savepoints.iter().position(|s| s.sp_id > sp_id));
+        if let Some(pos) = pos {
             let implicit_tx = self.savepoints[pos].implicit_tx;
             self.savepoints.truncate(pos);
             if self.savepoints.is_empty() {
@@ -879,10 +898,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Rolls back all mutations since savepoint `sp_id` (`xRollbackTo`) in
-    /// $O(\text{mutations since savepoint})$ time via the undo log.
+    /// $O(\text{mutations since savepoint})$ time via the undo log. The savepoint stays open and
+    /// every savepoint above it is discarded.
+    ///
+    /// An id the engine was never told about belongs to a savepoint that SQLite opened before the
+    /// table joined the transaction. It is then below every savepoint the engine knows, and its
+    /// state is the start of the transaction: everything is undone and the savepoint stays
+    /// open. An unknown id above a known one cannot come from SQLite, which announces every
+    /// savepoint opened after the table joined; it is an error, so that a rollback is never
+    /// silently skipped.
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
         self.tx_prepared = false;
         let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
+            if self.savepoints.iter().any(|s| s.sp_id < sp_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot roll back to unknown savepoint {sp_id}"),
+                ));
+            }
+            if self.tx_depth > 0 {
+                self.rollback_to_transaction_start();
+            }
             return Ok(());
         };
         let marker = self.savepoints[pos].clone();
@@ -897,6 +933,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.pending_tx_sync = marker.pending_tx_sync;
         self.restore_tx_state(marker.undo_len, &marker.meta_snapshot);
         Ok(())
+    }
+
+    /// Undoes everything the active transaction did while keeping it open. No undo log is
+    /// needed: the overlay is rebuilt from the state the transaction started with.
+    fn rollback_to_transaction_start(&mut self) {
+        self.savepoints.clear();
+        self.pending_tx_record_count = 0;
+        self.pending_tx_bytes = 0;
+        self.pending_tx_buf.clear();
+        self.pending_tx_sync = false;
+        self.tx_overlay.clear();
+        self.seed_overlay_from_pending();
+        let snap = core::mem::take(&mut self.tx_start_meta);
+        self.restore_tx_state(0, &snap);
+        self.tx_start_meta = snap;
     }
 
     /// Rolls back to savepoint `sp_id` for SQLite connection `conn_id`.

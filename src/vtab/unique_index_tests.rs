@@ -396,7 +396,8 @@ pub(super) fn sorted_rows(conn: &SqliteConnection) -> Vec<String> {
 /// (over 256 byte) strings.
 pub(super) struct StatementGen {
     rng: Rng,
-    savepoints: u32,
+    /// Names of the open savepoints, outermost first. A name can be open more than once.
+    savepoints: Vec<u32>,
     pub(super) in_tx: bool,
     a_pool: Vec<String>,
 }
@@ -407,7 +408,7 @@ impl StatementGen {
         let long2 = format!("{}z", "w".repeat(299));
         Self {
             rng: Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xA5A5),
-            savepoints: 0,
+            savepoints: Vec::new(),
             in_tx: false,
             a_pool: ["x", "y", "z", "X", "", &long, &long2]
                 .iter()
@@ -457,24 +458,26 @@ impl StatementGen {
                 self.in_tx = true;
                 "BEGIN".to_string()
             }
-            // Savepoints are not nested: rolling back to an outer savepoint while an inner one
-            // exists does not undo the statements after the inner one was created (an existing
-            // bug, present before the UNIQUE index).
-            11 if self.savepoints == 0 => {
-                self.savepoints = 1;
-                "SAVEPOINT s1".to_string()
+            11 if self.savepoints.len() < 4 => {
+                let name = self.rng.below(3) as u32;
+                self.savepoints.push(name);
+                format!("SAVEPOINT s{name}")
             }
-            12 if self.in_tx && self.savepoints > 0 => {
+            12 if self.in_tx && !self.savepoints.is_empty() => {
+                // SQLite looks a name up from the innermost savepoint outwards.
+                let name = self.savepoints[self.rng.below(self.savepoints.len() as u64) as usize];
+                let at = self.savepoints.iter().rposition(|n| *n == name).unwrap();
                 if self.rng.below(2) == 0 {
-                    "ROLLBACK TO s1".to_string()
+                    self.savepoints.truncate(at + 1);
+                    format!("ROLLBACK TO s{name}")
                 } else {
-                    self.savepoints = 0;
-                    "RELEASE s1".to_string()
+                    self.savepoints.truncate(at);
+                    format!("RELEASE s{name}")
                 }
             }
             13 if self.in_tx => {
                 self.in_tx = false;
-                self.savepoints = 0;
+                self.savepoints.clear();
                 if self.rng.below(2) == 0 {
                     "COMMIT"
                 } else {

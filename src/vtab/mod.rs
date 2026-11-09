@@ -18,6 +18,8 @@ pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
 mod rowid_tests;
+#[cfg(test)]
+mod savepoint_tests;
 mod snapshot;
 #[cfg(test)]
 mod snapshot_tests;
@@ -41,7 +43,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::engine::LazyBlob;
-use crate::engine::{CommitStep, EngineReader, GroupRole, StorageEngine, WriteDurability};
+use crate::engine::{
+    CommitStep, EngineReader, GroupRole, STATEMENT_SAVEPOINT, StorageEngine, WriteDurability,
+};
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::{ParsedVtabDdl, parse_vtab_ddl};
@@ -1878,10 +1882,6 @@ unsafe extern "system" fn vtab_rowid(
     }))
     .unwrap_or(SQLITE_ERROR)
 }
-
-/// Savepoint id of the engine savepoint that makes one `xUpdate` call atomic. SQLite numbers its
-/// own savepoints from zero, so a negative id never collides with one of them.
-const STATEMENT_SAVEPOINT: c_int = -1;
 
 unsafe extern "system" fn vtab_update(
     p_vtab: *mut sqlite3_vtab,

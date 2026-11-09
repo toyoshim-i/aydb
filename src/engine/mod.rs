@@ -18,7 +18,7 @@ mod unique_index;
 pub(crate) use scan::TABLE_SCAN_ENTRIES_COPIED;
 pub(crate) use snapshot::ReadSnapshotToken;
 
-pub(crate) use tx::{CommitStep, GroupRole};
+pub(crate) use tx::{CommitStep, GroupRole, STATEMENT_SAVEPOINT};
 
 #[cfg(test)]
 mod blob_recovery_tests;
