@@ -5023,3 +5023,411 @@ fn buffered_commit_is_not_deferred() {
     ));
     assert_eq!(engine.get_row(1, b"k").unwrap(), Some(b"v".to_vec()));
 }
+
+/// In-memory filesystem whose power loss reverts every file to its last `sync_durable` /
+/// `sync_barrier` image, except `MutableSyncLog` files, which are write-through.
+struct PowerLossFs {
+    files: std::sync::Mutex<HashMap<String, Arc<PowerLossFile>>>,
+    root: PathBuf,
+}
+
+struct PowerLossFile {
+    durable: std::sync::Mutex<Vec<u8>>,
+    cache: std::sync::Mutex<Vec<u8>>,
+    write_through: bool,
+}
+
+impl PowerLossFs {
+    fn new() -> Self {
+        Self {
+            files: std::sync::Mutex::new(HashMap::new()),
+            root: PathBuf::from("/sim/power_loss"),
+        }
+    }
+
+    fn power_loss(&self) {
+        for f in self.files.lock().unwrap().values() {
+            let d = f.durable.lock().unwrap().clone();
+            *f.cache.lock().unwrap() = d;
+        }
+    }
+}
+
+impl PlatformFile for PowerLossFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let c = self.cache.lock().unwrap();
+        let off = offset as usize;
+        if off >= c.len() {
+            return Ok(0);
+        }
+        let n = (c.len() - off).min(buf.len());
+        buf[..n].copy_from_slice(&c[off..off + n]);
+        Ok(n)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        if self.read_at(buf, offset)? < buf.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+        }
+        Ok(())
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let end = offset as usize + buf.len();
+        let mut images = vec![self.cache.lock().unwrap()];
+        if self.write_through {
+            images.push(self.durable.lock().unwrap());
+        }
+        for img in &mut images {
+            if end > img.len() {
+                img.resize(end, 0);
+            }
+            img[offset as usize..end].copy_from_slice(buf);
+        }
+        Ok(())
+    }
+    fn file_len(&self) -> io::Result<u64> {
+        Ok(self.cache.lock().unwrap().len() as u64)
+    }
+    fn preallocate(
+        &self,
+        target_len: u64,
+        _strategy: crate::pal::PreallocStrategy,
+    ) -> io::Result<()> {
+        let len = target_len as usize;
+        for img in [&self.cache, &self.durable] {
+            let mut img = img.lock().unwrap();
+            if len > img.len() {
+                img.resize(len, 0);
+            }
+        }
+        Ok(())
+    }
+    fn sync_barrier(&self) -> io::Result<()> {
+        self.sync_durable()
+    }
+    fn sync_durable(&self) -> io::Result<()> {
+        let c = self.cache.lock().unwrap().clone();
+        *self.durable.lock().unwrap() = c;
+        Ok(())
+    }
+    fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl PlatformFs for PowerLossFs {
+    type File = PowerLossFile;
+    fn open_file(
+        &self,
+        rel_name: &str,
+        create: bool,
+        _writable: bool,
+        hint: OpenHint,
+    ) -> io::Result<Arc<Self::File>> {
+        let mut files = self.files.lock().unwrap();
+        if let Some(f) = files.get(rel_name) {
+            return Ok(Arc::clone(f));
+        }
+        if !create {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
+        }
+        let f = Arc::new(PowerLossFile {
+            durable: std::sync::Mutex::new(Vec::new()),
+            cache: std::sync::Mutex::new(Vec::new()),
+            write_through: hint == OpenHint::MutableSyncLog,
+        });
+        files.insert(rel_name.to_string(), Arc::clone(&f));
+        Ok(f)
+    }
+    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+        self.files
+            .lock()
+            .unwrap()
+            .remove(rel_name)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
+    }
+    fn list_files(&self) -> io::Result<Vec<String>> {
+        Ok(self.files.lock().unwrap().keys().cloned().collect())
+    }
+    fn root_path(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
+fn ring_full_config() -> EngineConfig {
+    let mut c = EngineConfig::default();
+    c.sync_wal_size_bytes = 16 * 4096;
+    c.buf_wal_size_bytes = 16 * 4096;
+    c.max_blob_segment_bytes = 2048;
+    c.blob_cache_bytes = 0;
+    c.block_cache_bytes = 0;
+    c
+}
+
+/// Opens an engine whose table 1 evicts corrupt rows, flushes one blob row ("victim") into a
+/// blob segment, optionally corrupts that blob on disk, and fills the sync WAL to the brim so the
+/// next sizeable batch of the given durability hits `WalAppendOutcome::RingFull`.
+fn ring_full_setup(
+    corrupt: bool,
+    durability: WriteDurability,
+) -> (Arc<PowerLossFs>, StorageEngine<PowerLossFs>) {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut e = StorageEngine::open(Arc::clone(&fs), ring_full_config()).unwrap();
+    e.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+    e.put_row(
+        1,
+        b"victim",
+        &[1u8; 1500],
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    e.flush_memtable().unwrap();
+    if corrupt {
+        let name = fs
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.starts_with("blob_std_"))
+            .unwrap();
+        let f = fs
+            .open_file(&name, false, true, OpenHint::ImmutableSequential)
+            .unwrap();
+        f.write_all_at(&[0xEE; 32], 64).unwrap();
+        f.sync_durable().unwrap();
+    }
+    // Fill the chosen WAL until only its last sector is left.
+    let mut i = 0;
+    loop {
+        let (idx, total) = match durability {
+            WriteDurability::SyncTransactional => {
+                (e.sync_wal.current_sector_idx(), e.sync_wal.total_sectors())
+            }
+            WriteDurability::BufferedFast => {
+                (e.buf_wal.current_sector_idx(), e.buf_wal.total_sectors())
+            }
+        };
+        if idx + 2 >= total {
+            break;
+        }
+        let k = format!("fill{i:04}");
+        e.put_row(2, k.as_bytes(), &[7u8; 1000], &[], durability)
+            .unwrap();
+        i += 1;
+    }
+    (fs, e)
+}
+
+fn wal_epoch(e: &StorageEngine<PowerLossFs>, durability: WriteDurability) -> u64 {
+    match durability {
+        WriteDurability::SyncTransactional => e.sync_wal.active_epoch(),
+        WriteDurability::BufferedFast => e.buf_wal.active_epoch(),
+    }
+}
+
+fn count_tx_rows(e: &mut StorageEngine<PowerLossFs>) -> usize {
+    (0..12)
+        .filter(|i| {
+            e.get_row(3, format!("tx{i:04}").as_bytes())
+                .unwrap()
+                .is_some()
+        })
+        .count()
+}
+
+/// Commits a 12-row transaction that rotates the full WAL, after the transaction itself read
+/// the corrupt row (queueing its eviction). Returns the number of rows that survive a power loss.
+fn ring_full_commit_survivors(corrupt: bool, durability: WriteDurability) -> usize {
+    let (fs, mut e) = ring_full_setup(corrupt, durability);
+    let epoch = wal_epoch(&e, durability);
+    e.begin_transaction();
+    let seen = e.get_row(1, b"victim").unwrap();
+    assert_eq!(seen.is_none(), corrupt);
+    assert_eq!(e.has_pending_corrupt_evictions(), corrupt);
+    for i in 0..12 {
+        let k = format!("tx{i:04}");
+        e.put_row(3, k.as_bytes(), &[9u8; 900], &[], durability)
+            .unwrap();
+    }
+    e.commit_transaction().unwrap();
+    assert!(
+        wal_epoch(&e, durability) > epoch,
+        "the commit must have rotated the full WAL"
+    );
+    // The queued eviction is not lost: it is carried out after the commit.
+    if corrupt {
+        assert_eq!(e.get_row(1, b"victim").unwrap(), None);
+        assert!(!e.has_pending_corrupt_evictions());
+    }
+    // A buffered commit only becomes durable with the next synchronous commit (prefix durability).
+    e.put_row(2, b"marker", b"v", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+    count_tx_rows(&mut e)
+}
+
+#[test]
+fn ring_full_sync_commit_survives_power_loss_without_corruption() {
+    assert_eq!(
+        ring_full_commit_survivors(false, WriteDurability::SyncTransactional),
+        12
+    );
+}
+
+#[test]
+fn ring_full_sync_commit_with_queued_eviction_survives_power_loss() {
+    assert_eq!(
+        ring_full_commit_survivors(true, WriteDurability::SyncTransactional),
+        12
+    );
+}
+
+#[test]
+fn ring_full_buffered_commit_with_queued_eviction_survives_power_loss() {
+    assert_eq!(
+        ring_full_commit_survivors(true, WriteDurability::BufferedFast),
+        12
+    );
+}
+
+#[test]
+fn ring_full_non_transaction_write_with_queued_eviction_survives_power_loss() {
+    for durability in [
+        WriteDurability::SyncTransactional,
+        WriteDurability::BufferedFast,
+    ] {
+        let (fs, mut e) = ring_full_setup(true, durability);
+        let epoch = wal_epoch(&e, durability);
+        // Reading the corrupt row queues its eviction; the next write drains it first, so the
+        // full-WAL rotation then sees an empty queue. The writes must survive either way.
+        assert_eq!(e.get_row(1, b"victim").unwrap(), None);
+        assert!(e.has_pending_corrupt_evictions());
+        for i in 0..12 {
+            let k = format!("tx{i:04}");
+            e.put_row(3, k.as_bytes(), &[9u8; 900], &[], durability)
+                .unwrap();
+        }
+        assert!(wal_epoch(&e, durability) > epoch);
+        assert_eq!(e.get_row(1, b"victim").unwrap(), None);
+        assert!(!e.has_pending_corrupt_evictions());
+        e.put_row(2, b"marker", b"v", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        fs.power_loss();
+        std::mem::forget(e);
+        let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+        assert_eq!(count_tx_rows(&mut e), 12, "{durability:?}");
+    }
+}
+
+/// WAL small enough that every flush is forced by a full ring, with a MemTable that never
+/// reaches `should_flush()` on its own.
+fn ring_only_flush_config(background: bool) -> EngineConfig {
+    let mut c = ring_full_config();
+    c.auto_compact_segment_threshold = 4;
+    c.background_compaction = background;
+    c
+}
+
+const RING_ONLY_SEGMENT_BOUND: usize = 8;
+
+fn ring_only_workload(background: bool, in_tx: bool) -> (StorageEngine<PowerLossFs>, usize) {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut e = StorageEngine::open(fs, ring_only_flush_config(background)).unwrap();
+    let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hc = Arc::clone(&hook_calls);
+    e.set_compaction_hook(Some(Arc::new(move || {
+        hc.fetch_add(1, Ordering::SeqCst);
+    })));
+    for i in 0..300 {
+        let k = format!("k{i:05}");
+        if in_tx {
+            e.begin_transaction();
+        }
+        e.put_row(
+            1,
+            k.as_bytes(),
+            b"v",
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+        if in_tx {
+            e.commit_transaction().unwrap();
+        }
+        assert!(
+            e.active_idx_segment_count() <= RING_ONLY_SEGMENT_BOUND,
+            "segments grew without bound at write {i}: {}",
+            e.active_idx_segment_count()
+        );
+    }
+    assert!(!e.memtable.should_flush());
+    (e, hook_calls.load(Ordering::SeqCst))
+}
+
+#[test]
+fn ring_full_flushes_still_trigger_inline_compaction_outside_transactions() {
+    ring_only_workload(false, false);
+}
+
+#[test]
+fn ring_full_flushes_still_trigger_inline_compaction_for_transactions() {
+    ring_only_workload(false, true);
+}
+
+#[test]
+fn ring_full_flushes_still_wake_background_compaction_outside_transactions() {
+    let (_e, hooks) = ring_only_workload(true, false);
+    assert!(hooks > 0, "background compaction hook never fired");
+}
+
+#[test]
+fn ring_full_flushes_still_wake_background_compaction_for_transactions() {
+    let (_e, hooks) = ring_only_workload(true, true);
+    assert!(hooks > 0, "background compaction hook never fired");
+}
+
+/// Auto compaction relocates live blobs out of fragmented segments by writing to the WAL. A
+/// full-WAL rotation must not run it while its own batch holds an unappended LSN: the relocation
+/// batch would take that LSN and the checkpoint would cover the batch, losing it on recovery.
+#[test]
+fn ring_full_rotation_does_not_relocate_blobs_under_the_held_lsn() {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut cfg = ring_full_config();
+    cfg.auto_compact_segment_threshold = 1000;
+    cfg.max_blob_segment_bytes = 4096;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    // Two blobs share the first blob segment, the third seals it; overwriting one leaves it
+    // half dead, so a full compaction would relocate the other.
+    e.put_row(1, b"a", &[1u8; 1500], &[], sync).unwrap();
+    e.put_row(1, b"b", &[2u8; 1500], &[], sync).unwrap();
+    e.put_row(1, b"c", &[3u8; 1500], &[], sync).unwrap();
+    e.put_row(1, b"a", b"x", &[], sync).unwrap();
+    e.flush_memtable().unwrap();
+    let epoch = e.sync_wal.active_epoch();
+    e.config.auto_compact_segment_threshold = 2;
+    let mut i = 0;
+    while e.sync_wal.current_sector_idx() + 2 < e.sync_wal.total_sectors() {
+        let k = format!("fill{i:04}");
+        e.put_row(2, k.as_bytes(), b"v", &[], sync).unwrap();
+        i += 1;
+    }
+    assert_eq!(e.sync_wal.active_epoch(), epoch);
+    // Keep writing until one write has to rotate the ring.
+    let mut last = Vec::new();
+    while e.sync_wal.active_epoch() == epoch {
+        let k = format!("last{}", last.len());
+        e.put_row(3, k.as_bytes(), b"v", &[], sync).unwrap();
+        last.push(k);
+        assert!(last.len() < 8, "the ring never rotated");
+    }
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, cfg).unwrap();
+    for k in &last {
+        assert_eq!(e.get_row(3, k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+    }
+    assert_eq!(e.get_row(1, b"b").unwrap(), Some(vec![2u8; 1500]));
+}

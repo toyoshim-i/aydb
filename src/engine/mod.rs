@@ -294,6 +294,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
     pub(super) deferred_compact_on_commit: bool,
+    /// Set when a full-WAL rotation flushed the MemTable without auto compaction; consumed by
+    /// `run_due_auto_compaction` at the next point where no batch holds an unappended LSN.
+    pub(super) auto_compaction_due: bool,
     /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
     /// compaction pending in background mode.
     pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -739,6 +742,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_group: std::collections::VecDeque::new(),
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
+            auto_compaction_due: false,
             compaction_hook: None,
             tx_prepared: false,
             tx_preparing: false,
@@ -2586,6 +2590,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.record_maintenance_failure(&e);
             }
         }
+        // Safe point: the batch is appended and `next_lsn` has advanced.
+        self.run_due_auto_compaction();
         Ok(lsn)
     }
 
@@ -2631,12 +2637,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let outcome = r.map_err(|e| self.poison(e))?;
 
         if outcome == WalAppendOutcome::RingFull {
+            // The batch already holds `batch_lsn` but is not in the log yet, and the checkpoint
+            // LSN is derived from `next_lsn - 1`. The rotation must therefore not allocate LSNs
+            // or write anything else: a delete (a drained corrupt-row eviction) or a blob
+            // relocation (auto compaction) would take `batch_lsn`, the checkpoint would then
+            // cover the batch, and recovery would discard it as already checkpointed. Hence no
+            // `flush_memtable` here: queued evictions stay queued for the next drain point, and
+            // auto compaction is only marked due (`auto_compaction_due`) and runs at the next
+            // safe point, once this batch is appended and `next_lsn` has advanced.
             self.drain_pending_durable()?;
             if self.memtable.is_empty() {
                 self.rotate_wal_epochs_only()?;
             } else {
-                self.flush_memtable()?;
+                self.flush_memtable_no_auto_compact()?;
+                self.auto_compaction_due = true;
             }
+            debug_assert!(
+                self.next_lsn <= batch_lsn && self.meta_mgr.state().checkpoint_lsn < batch_lsn,
+                "WAL rotation must not consume the LSN of the batch being appended"
+            );
             let r = match durability {
                 WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded),
                 WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded),

@@ -99,6 +99,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.drain_corrupt_evictions()?;
         self.flush_memtable_no_auto_compact()?;
+        // This flush also covers any compaction owed by an earlier full-WAL rotation.
+        self.auto_compaction_due = false;
+        self.run_auto_compaction()
+    }
+
+    /// Runs or schedules automatic compaction when the segment count calls for it (see
+    /// [`Self::flush_memtable`]). Callers guarantee `tx_depth == 0` and that no batch holds an
+    /// unappended LSN, because compaction may relocate blobs and so write to the WAL.
+    fn run_auto_compaction(&mut self) -> io::Result<()> {
         if self.tx_depth == 0 && self.compaction_pending() {
             // Background mode only marks compaction as pending (observable through
             // `compaction_pending()`); the merge runs outside the engine. The inline fallback
@@ -115,6 +124,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
         Ok(())
+    }
+
+    /// Carries out the automatic compaction that a full-WAL rotation had to skip (it flushes with
+    /// [`Self::flush_memtable_no_auto_compact`] because its batch already holds an LSN). Call it
+    /// only at points where no batch holds an unappended LSN. While a transaction is active or a
+    /// group commit is still unpublished the flag stays set for the next safe point. A failure
+    /// is recorded as maintenance failure and never fails the write that triggered it.
+    pub(super) fn run_due_auto_compaction(&mut self) {
+        if !self.auto_compaction_due
+            || self.tx_depth > 0
+            || !self.pending_group.is_empty()
+            || self.poisoned.is_some()
+        {
+            return;
+        }
+        self.auto_compaction_due = false;
+        if let Err(e) = self.run_auto_compaction() {
+            self.record_maintenance_failure(&e);
+        }
     }
 
     /// Brings the persisted state up to date so that the next `open` has no replay work.

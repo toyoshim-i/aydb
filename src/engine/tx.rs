@@ -643,6 +643,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             Ok(()) => {
                 self.absorb_durable_through(target);
                 self.commit_gate.mark_durable(target, true);
+                // Safe point unless another transaction is active (checked by the callee).
+                self.run_due_auto_compaction();
                 Ok(())
             }
             Err(e) => {
@@ -748,6 +750,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let maintenance = if do_compact {
+            self.auto_compaction_due = false;
             self.compact()
         } else if do_flush || self.memtable.should_flush() {
             self.flush_memtable()
@@ -757,6 +760,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Err(e) = maintenance {
             self.record_maintenance_failure(&e);
         }
+        // Safe point: the commit's batch is appended and `next_lsn` has advanced.
+        self.run_due_auto_compaction();
 
         // The transaction is durable at this point; remove rows queued by `Evict`-policy
         // reads. Best effort: a failure here must not turn a successful commit into an error
