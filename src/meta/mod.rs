@@ -707,6 +707,13 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 // A failed write or flush may already have made the new slot authoritative.
                 // Keep both generations' files until reopen determines which one survived.
                 self.uncertain_write = Some(error.to_string());
+            } else {
+                // The failed attempt may have left a partially or fully written manifest file
+                // under the SeqID it allocated. Consume that SeqID so a retry never reuses the
+                // name: a shorter retry would otherwise keep the stale tail, and a slot would
+                // reference a manifest with more bytes than it describes. A crash instead of an
+                // error is covered by `reserve_seq_ids_above_existing_files` at the next open.
+                self.state.next_seq_id = self.state.next_seq_id.max(next_state.next_seq_id);
             }
             return Err(error);
         }
