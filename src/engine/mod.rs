@@ -292,6 +292,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// readers see them only after they move to the `MemTable`.
     pub(super) pending_group:
         std::collections::VecDeque<(u64, BTreeMap<Vec<u8>, crate::memtable::MemEntry>)>,
+    /// Fully dead `blob_lru` segments that were dropped from the catalog but not yet queued for
+    /// deletion, because a WAL batch of the current epoch may still carry a pointer into them.
+    /// They are queued in the commit that rotates the WAL epochs (see
+    /// [`Self::release_unlinkable_blob_files`]). A crash before that leaves them as uncataloged
+    /// files, which recovery adopts if a batch references them and sweeps otherwise.
+    pub(super) unlink_after_wal_rotation: Vec<String>,
     /// True if `flush_memtable()` was requested during an active transaction.
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
@@ -751,6 +757,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_owner_conn: None,
             commit_gate: Arc::new(tx::CommitGate::default()),
             pending_group: std::collections::VecDeque::new(),
+            unlink_after_wal_rotation: Vec::new(),
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
             auto_compaction_due: false,

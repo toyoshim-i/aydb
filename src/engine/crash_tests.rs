@@ -768,10 +768,8 @@ fn small_value_len(rng: &mut Rng) -> usize {
     4 + rng.below(180) as usize
 }
 
-/// `inline_only` keeps the value below the inline threshold.
-fn make_value(rng: &mut Rng, t: u16, k: u8, inline_only: bool) -> Vec<u8> {
+fn make_value(rng: &mut Rng, t: u16, k: u8) -> Vec<u8> {
     let blob_pct = match t {
-        _ if inline_only => 0,
         1 => 50,
         2 => 8,
         3 => 15,
@@ -1365,8 +1363,7 @@ impl<'a> Harness<'a> {
         let k = self.rng.below(KEYS as u64) as u8;
         let d = pick_durability(&mut self.rng);
         let sync = d == WriteDurability::SyncTransactional;
-        // Known bugs B and C: capped tables keep their values inline (see `capped_inline_only`).
-        let v = make_value(&mut self.rng, t, k, capped_inline_only(t));
+        let v = make_value(&mut self.rng, t, k);
         let mut ns = self.last().clone();
         ns.insert((t, k), v.clone());
         let what = format!("put t{t}/key{k:02} {} {}", short(&v), describe(d));
@@ -1442,7 +1439,7 @@ impl<'a> Harness<'a> {
             if r < 60 {
                 let t = TABLES[self.rng.below(4) as usize];
                 let k = self.rng.below(KEYS as u64) as u8;
-                let v = make_value(&mut self.rng, t, k, capped_inline_only(t));
+                let v = make_value(&mut self.rng, t, k);
                 let d = pick_durability(&mut self.rng);
                 let res = e.put_row(t, &key_bytes(k), &v, &[], d);
                 self.log(format!(
@@ -1562,20 +1559,6 @@ impl<'a> Harness<'a> {
 /// Opens the engine, telling the filesystem that removals now happen as part of recovery.
 fn open_engine(fs: &Arc<CrashFs>, cfg: &EngineConfig) -> io::Result<Eng> {
     StorageEngine::open(Arc::clone(fs), cfg.clone())
-}
-
-/// `AYDB_CRASH_KNOWN_BUGS=1` makes the harness stop working around the known engine bug
-/// (see `docs/DEVELOPMENT.md`), so that long runs can show it again.
-fn known_bugs_enabled() -> bool {
-    std::env::var("AYDB_CRASH_KNOWN_BUGS").is_ok_and(|v| v != "0")
-}
-
-/// Out-of-line values of capped tables live in LRU blob segments, and reclaiming such a segment
-/// after its rows were evicted has a known engine bug (B: recovery drops the whole log
-/// batch, and in the buffered stream every later batch, that references the removed segment).
-/// Until it is fixed the workload keeps capped tables inline. `AYDB_CRASH_KNOWN_BUGS=1` brings the out-of-line values back.
-fn capped_inline_only(t: u16) -> bool {
-    is_capped(t) && !known_bugs_enabled()
 }
 
 fn engine_config(rng: &mut Rng) -> EngineConfig {
@@ -2175,9 +2158,6 @@ fn crash_runs_are_reproducible() {
 
 // =============================================================================================
 // Minimal reproductions of engine bugs found by the seeded harness
-//
-// The `known_bug_*` tests fail today and are therefore ignored. Run them with `-- --ignored`.
-// The harness works around that bug unless `AYDB_CRASH_KNOWN_BUGS=1` is set.
 // =============================================================================================
 
 fn repro_config() -> EngineConfig {
@@ -2232,13 +2212,13 @@ fn pending_delete_of_dead_blob_segment_is_not_adopted() {
     assert!(second.is_ok(), "reopen failed: {:?}", second.err());
 }
 
-/// Bug B. A transaction in `wal_buf.db` or `wal_sync.db` holds a row of a capped table with an
-/// out-of-line value next to other rows. Later commits evict that row and reclaim its LRU blob
-/// segment. At recovery the batch no longer verifies, so the whole batch is dropped, including
-/// the other rows, although a later synchronous commit made it durable.
+/// Regression test for a fixed bug. A transaction in `wal_buf.db` or `wal_sync.db` holds a row of
+/// a capped table with an out-of-line value next to other rows. Later commits evict that row and
+/// reclaim its LRU blob segment. The segment used to be unlinked at once, so at recovery the
+/// batch no longer verified and was dropped with the other rows, although a later synchronous
+/// commit made it durable. The file now stays until the WAL epoch has been rotated.
 #[test]
-#[ignore = "engine bug B: a reclaimed LRU segment makes recovery drop whole committed batches"]
-fn known_bug_reclaimed_lru_segment_discards_later_commits() {
+fn reclaimed_lru_segment_keeps_batches_that_reference_it() {
     let cfg = repro_config();
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
     let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
@@ -2288,4 +2268,62 @@ fn lru_reclaim_syncs_blobs_before_marking_buffered_commits_durable() {
     let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
     assert!(row_is(&mut e, 2, b"s", b"small"));
     assert!(row_is(&mut e, 2, b"b", &[3u8; 1500]), "buffered blob row b");
+}
+
+/// A reclaimed LRU segment leaves the catalog at once but is unlinked only after the WAL epoch
+/// rotated, on a flush as well as on a checkpoint with an empty `MemTable`. The capped table's
+/// byte accounting is unaffected by the lingering file, also across a crash and reopen.
+#[test]
+fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
+    let cfg = repro_config();
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let lru_files = |fs: &Arc<CrashFs>| {
+        fs.list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with("blob_lru_"))
+            .count()
+    };
+    let sync = WriteDurability::SyncTransactional;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(1, 3300).unwrap();
+    for (k, fill) in [(b"x", 1u8), (b"y", 2), (b"z", 3)] {
+        e.put_row(1, k, &[fill; 1500], &[], sync).unwrap();
+    }
+    assert!(e.get_row(1, b"x").unwrap().is_none());
+    let logical = e.capped_tables[&1].current_logical_bytes;
+    assert!(logical <= 3300, "quota exceeded: {logical}");
+    // x's segment left the catalog but its file lingers while the WAL may mention it.
+    assert!(e.lru_blobs.keys().all(|&(_, seq)| {
+        e.meta_mgr
+            .state()
+            .lru_blob_segments
+            .iter()
+            .any(|m| m.seq_id == seq)
+    }));
+    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
+    assert_eq!(lru_files(&fs), e.lru_blobs.len() + 1);
+    // A flush rotates the WAL: the file is queued and unlinked.
+    e.flush_memtable().unwrap();
+    assert!(e.unlink_after_wal_rotation.is_empty());
+    assert_eq!(lru_files(&fs), e.lru_blobs.len());
+    assert!(e.meta_mgr.state().pending_delete_files.is_empty());
+    assert_eq!(e.capped_tables[&1].current_logical_bytes, logical);
+
+    // A crash while the file still lingers, then a checkpoint after the reopen.
+    e.put_row(1, b"w", &[4u8; 1500], &[], sync).unwrap();
+    assert!(e.get_row(1, b"y").unwrap().is_none());
+    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
+    let logical = e.capped_tables[&1].current_logical_bytes;
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Process);
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert!(row_is(&mut e, 1, b"w", &[4u8; 1500]));
+    assert!(row_is(&mut e, 1, b"z", &[3u8; 1500]));
+    assert!(e.get_row(1, b"y").unwrap().is_none());
+    assert_eq!(e.capped_tables[&1].current_logical_bytes, logical);
+    e.checkpoint().unwrap();
+    assert!(e.unlink_after_wal_rotation.is_empty());
+    assert_eq!(lru_files(&fs), e.lru_blobs.len());
 }

@@ -5561,14 +5561,15 @@ fn ring_full_commit_keeps_blob_segment_of_a_transaction_lost_by_power_loss() {
 }
 
 /// A capped table reclaims its `blob_lru` segments right after the commit, which first makes the
-/// buffered log durable. So the commit survives and the old segment may be gone, but the rotation
-/// inside the commit must not have emptied the segment of a row that is not yet replaced.
+/// buffered log durable. So the commit survives and the old segment has left the catalog, but its
+/// file stays until the next WAL rotation, and the rotation inside the commit must not have
+/// emptied the segment of a row that is not yet replaced.
 #[test]
 fn ring_full_commit_on_capped_table_never_loses_the_row_it_overwrote() {
     let durability = WriteDurability::BufferedFast;
     let (fs, mut e) = dead_blob_setup(durability, true, true);
     assert!(commit_overwrite_of_r1(&mut e, durability));
-    assert_eq!(blob_file_count(&fs), 1);
+    assert_eq!(blob_file_count(&fs), 2);
     fs.power_loss();
     std::mem::forget(e);
     let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
@@ -5632,14 +5633,10 @@ fn ring_full_commit_still_reclaims_the_overwritten_blob_segment_at_a_later_check
         ] {
             let (fs, mut e) = dead_blob_setup(durability, capped, true);
             assert!(commit_overwrite_of_r1(&mut e, durability));
-            // Not reclaimed by the rotation inside the commit (a capped table reclaims right
-            // after the commit, which is safe because it first makes the log durable) ...
-            let after_commit = if capped { 1 } else { 2 };
-            assert_eq!(
-                blob_file_count(&fs),
-                after_commit,
-                "{durability:?} capped={capped}"
-            );
+            // Not reclaimed by the rotation inside the commit. A capped table drops the segment
+            // from the catalog right after the commit, but its file lingers until the WAL is
+            // rotated again, because a logged batch may still point into it ...
+            assert_eq!(blob_file_count(&fs), 2, "{durability:?} capped={capped}");
             // ... but by the next flush, which persists the dead bytes and unlinks the segment.
             e.flush_memtable().unwrap();
             assert_eq!(blob_file_count(&fs), 1, "{durability:?} capped={capped}");

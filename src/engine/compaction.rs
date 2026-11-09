@@ -171,6 +171,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.buf_wal.flush_buffered_to_os()?;
         self.sync_active_blob_writers()?;
+        self.release_unlinkable_blob_files()?;
 
         let std_metas: Vec<StdBlobSegmentMeta> = self
             .std_blobs
@@ -222,7 +223,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
-            return Ok(());
+            return self.release_unlinkable_blob_files();
         }
 
         // Ensure all active blob segments are durably flushed before checkpointing `boot_meta.db`
@@ -277,6 +278,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             })
             .collect();
         let quota_metas = self.build_quota_metas();
+        // The commit rotates the WAL epochs, so no batch can reference these segments any more.
+        let lingering = self.unlink_after_wal_rotation.clone();
 
         if let Err(e) = self.meta_mgr.commit_update(|st| {
             let allocated = st.allocate_seq_id();
@@ -288,7 +291,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             st.checkpoint_lsn = new_checkpoint_lsn;
             st.sync_wal_epoch = new_sync_epoch;
             st.buf_wal_epoch = new_buf_epoch;
-            for fname in &dead_blob_files {
+            for fname in dead_blob_files.iter().chain(&lingering) {
                 st.queue_pending_delete(fname.clone());
             }
         }) {
@@ -309,7 +312,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
-        if !dead_blob_files.is_empty() {
+        self.unlink_after_wal_rotation.clear();
+        if !dead_blob_files.is_empty() || !lingering.is_empty() {
             self.meta_mgr.try_process_pending_deletes();
         }
 
@@ -320,17 +324,47 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Queues the segments in `unlink_after_wal_rotation` for deletion when no logged batch can
+    /// still reference them: the `MemTable` is empty, so every logged batch is at or below
+    /// `checkpoint_lsn` and recovery skips it before verifying its blobs. A non-empty `MemTable`
+    /// leaves the list for the flush that rotates the WAL.
+    pub(super) fn release_unlinkable_blob_files(&mut self) -> io::Result<()> {
+        if self.unlink_after_wal_rotation.is_empty()
+            || !self.memtable.is_empty()
+            || !self.pending_group.is_empty()
+            || self.tx_depth > 0
+            || self.pending_tx_record_count > 0
+        {
+            return Ok(());
+        }
+        let lingering = self.unlink_after_wal_rotation.clone();
+        self.meta_mgr.commit_update(|st| {
+            for fname in &lingering {
+                st.queue_pending_delete(fname.clone());
+            }
+        })?;
+        self.unlink_after_wal_rotation.clear();
+        self.meta_mgr.try_process_pending_deletes();
+        Ok(())
+    }
+
     pub(super) fn rotate_wal_epochs_only(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.buf_wal.flush_buffered_to_os()?;
         let new_sync_epoch = self.sync_wal.active_epoch() + 1;
         let new_buf_epoch = self.buf_wal.active_epoch() + 1;
         let new_checkpoint_lsn = self.next_lsn.saturating_sub(1);
+        let lingering = self.unlink_after_wal_rotation.clone();
         self.meta_mgr.commit_update(|st| {
             st.checkpoint_lsn = new_checkpoint_lsn;
             st.sync_wal_epoch = new_sync_epoch;
             st.buf_wal_epoch = new_buf_epoch;
+            for fname in &lingering {
+                st.queue_pending_delete(fname.clone());
+            }
         })?;
+        self.unlink_after_wal_rotation.clear();
+        self.meta_mgr.try_process_pending_deletes();
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
         Ok(())
@@ -798,7 +832,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Reclaims any sealed `blob_lru` segment belonging to `table_id` where `dead_bytes >= file_len`,
-    /// syncing `buf_wal` first so the eviction WAL records are durable before unlinking.
+    /// syncing `buf_wal` first so the eviction WAL records are durable before the segments leave
+    /// the catalog. The files themselves are unlinked only after the WAL epochs that may still
+    /// mention them have been rotated away (see `unlink_after_wal_rotation`).
     pub(super) fn reclaim_fully_dead_lru_blob_segments(&mut self, table_id: u16) -> io::Result<()> {
         let active_seq = self.active_lru_writers.get(&table_id).map(|w| w.seq_id());
         let dead_lru: Vec<(u16, u64)> = self
@@ -833,12 +869,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lru_metas = self.build_checkpointed_lru_blob_metas();
         self.meta_mgr.commit_update(|st| {
             st.lru_blob_segments = lru_metas;
-            for fname in &deleted_files {
-                st.queue_pending_delete(fname.clone());
-            }
         })?;
-        self.meta_mgr.try_process_pending_deletes();
-        Ok(())
+        // The files are not queued for deletion yet: the evicted rows' `Put` batches may still be
+        // in the WAL, and recovery must be able to verify their blobs. If the unlink happened
+        // here, it would drop each such batch (and in `wal_buf.db` every later one) although a
+        // later synchronous commit made it durable. The next WAL rotation queues them.
+        self.unlink_after_wal_rotation.extend(deleted_files);
+        self.release_unlinkable_blob_files()
     }
 
     /// Reclaims any sealed `blob_std` or `blob_lru` segment where `dead_bytes >= file_len`

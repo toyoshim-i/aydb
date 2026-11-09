@@ -83,7 +83,8 @@ When a Capped Table (e.g., a virtual table declared with `max_bytes = 1073741824
    * The engine tracks `{ file_len, dead_bytes }` per blob segment. Whenever a row referencing `blob_lru_<TblID>_<SeqID>.db` is overwritten, deleted, or LRU-evicted, its framed blob length is added to `dead_bytes`.
 3. **$O(1)$ Copy-less Segment Deletion:**
    * Because LRU eviction retires entries in chronological `AccessTick` order, older `blob_lru_<TblID>_<SeqID>.db` segments naturally become fully dead.
-   * The moment a sealed `blob_lru_<TblID>_<SeqID>.db` segment is fully dead, the engine drops its reader handle and **deletes the entire physical file via `remove_file`** (or leaves it in `pending_delete_files` if it cannot be removed yet)—reclaiming tens of megabytes of disk space in $O(1)$ time with **zero blob-to-blob copying**!
+   * The moment a sealed `blob_lru_<TblID>_<SeqID>.db` segment is fully dead, the engine drops its reader handle, removes it from the `boot_meta.db` catalog, and **deletes the entire physical file via `remove_file`** (or leaves it in `pending_delete_files` if it cannot be removed yet)—reclaiming tens of megabytes of disk space in $O(1)$ time with **zero blob-to-blob copying**!
+   * The unlink is deferred to the next WAL epoch rotation (flush or checkpoint). A batch that put the evicted row may still be in the WAL, and recovery drops a batch whose blob does not verify (and, in `wal_buf.db`, every later batch). The file therefore stays on disk, uncataloged, until a commit rotates both WAL epochs; that commit queues it in `pending_delete_files`. A crash in between leaves a normal uncataloged blob file: recovery adopts it if a batch references it and the orphan sweep removes it otherwise. The delay costs disk space only; the quota counts logical bytes, which the lingering file does not change.
 
 ---
 
