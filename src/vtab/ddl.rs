@@ -21,6 +21,8 @@ pub(super) struct ParsedVtabDdl {
     pub(super) col_names: Vec<String>,
     pub(super) col_affinities: Vec<ColumnAffinity>,
     pub(super) col_collations: Vec<ColCollation>,
+    pub(super) col_not_null: Vec<bool>,
+    pub(super) col_unique: Vec<bool>,
     pub(super) pk_col_idx: usize,
     pub(super) pk_affinity: ColumnAffinity,
     pub(super) pk_collation: ColCollation,
@@ -33,8 +35,22 @@ pub(super) fn split_top_level_commas(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
-    for (idx, ch) in input.char_indices() {
+    let mut quote = None;
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(end) = quote {
+            if ch == end {
+                if end != ']' && chars.peek().is_some_and(|(_, next)| *next == end) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '[' => quote = Some(']'),
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -69,6 +85,54 @@ fn is_table_constraint(tokens: &[&str]) -> bool {
         "CONSTRAINT" => tokens.len() > 2,
         _ => false,
     }
+}
+
+/// Split a column definition without splitting quoted values or parenthesized expressions.
+fn column_tokens(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' | b'"' | b'`' | b'[' => {
+                    let end = if bytes[i] == b'[' { b']' } else { bytes[i] };
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == end {
+                            i += 1;
+                            if end != b']' && bytes.get(i) == Some(&end) {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'(' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+                b if b.is_ascii_whitespace() && depth == 0 => break,
+                _ => i += 1,
+            }
+        }
+        if start < i {
+            tokens.push(&input[start..i]);
+        }
+    }
+    tokens
 }
 
 /// Parses `CREATE VIRTUAL TABLE` module arguments (`argc`, `argv`) into a [`ParsedVtabDdl`].
@@ -155,10 +219,22 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_names = Vec::new();
         let mut col_affinities = Vec::new();
         let mut col_collations = Vec::new();
+        let mut col_not_null = Vec::new();
+        let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
         for (idx, col_def) in split_top_level_commas(&columns_spec).into_iter().enumerate() {
             let trimmed = col_def.trim();
-            let raw_tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            // The parser does not support comments or per-constraint conflict policies.
+            // Reject them rather than silently misinterpret a constraint.
+            if trimmed.contains("/*") || trimmed.contains("--") {
+                return Err(SQLITE_ERROR);
+            }
+            let raw_tokens = column_tokens(trimmed);
+            if raw_tokens.windows(2).any(|pair| {
+                pair[0].eq_ignore_ascii_case("ON") && pair[1].eq_ignore_ascii_case("CONFLICT")
+            }) {
+                return Err(SQLITE_ERROR);
+            }
             if raw_tokens.is_empty() {
                 continue;
             }
@@ -168,10 +244,20 @@ pub(super) unsafe fn parse_vtab_ddl(
             col_names.push(raw_tokens[0].to_string());
 
             let mut collation = ColCollation::Binary;
+            let mut not_null = false;
+            let mut unique = false;
             let mut type_tokens = Vec::new();
             let mut t_idx = 1usize;
             while t_idx < raw_tokens.len() {
                 let tok_upper = raw_tokens[t_idx].to_ascii_uppercase();
+                if tok_upper.strip_prefix("DEFAULT").is_some_and(|suffix| {
+                    suffix.is_empty()
+                        || suffix.as_bytes().first().is_some_and(|byte| {
+                            !byte.is_ascii_alphanumeric() && *byte != b'_'
+                        })
+                }) {
+                    return Err(SQLITE_ERROR);
+                }
                 if tok_upper == "COLLATE" {
                     if t_idx + 1 >= raw_tokens.len() {
                         return Err(SQLITE_ERROR);
@@ -197,10 +283,12 @@ pub(super) unsafe fn parse_vtab_ddl(
                     && t_idx + 1 < raw_tokens.len()
                     && raw_tokens[t_idx + 1].eq_ignore_ascii_case("NULL")
                 {
+                    not_null = true;
                     t_idx += 2;
                     continue;
                 }
                 if tok_upper == "UNIQUE" {
+                    unique = true;
                     t_idx += 1;
                     continue;
                 }
@@ -210,6 +298,8 @@ pub(super) unsafe fn parse_vtab_ddl(
             let type_part = type_tokens.join(" ");
             col_affinities.push(ColumnAffinity::from_type_str(&type_part));
             col_collations.push(collation);
+            col_not_null.push(not_null);
+            col_unique.push(unique);
         }
         if col_names.is_empty() {
             return Err(SQLITE_ERROR);
@@ -252,6 +342,8 @@ pub(super) unsafe fn parse_vtab_ddl(
             col_names,
             col_affinities,
             col_collations,
+            col_not_null,
+            col_unique,
             pk_col_idx,
             pk_affinity,
             pk_collation,

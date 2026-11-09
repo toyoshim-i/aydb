@@ -289,6 +289,8 @@ pub trait PlatformFile: Send + Sync {
 * Enable immediate execution of full SQL queries via SQLite's battle-tested SQL frontend.
 * **Benchmark Evaluation:** Run comparative benchmarks against vanilla SQLite (standard B-Tree in WAL mode) under identical hybrid workloads (random small configuration updates + high-churn multi-KB/MB HTTP cache replacements over both local NTFS and SMB), quantifying improvements in write amplification, file fragmentation, and P99 latency.
 
+Column `NOT NULL` and `UNIQUE` constraints are enforced by the adapter. Unique checks scan existing rows in batches and respect the column's supported collation. `DEFAULT` declarations, SQL comments in column definitions, and per-column `ON CONFLICT` policies are rejected: SQLite's virtual table declaration does not retain column defaults for omitted values, and the adapter does not implement column-specific conflict policies. Existing virtual tables containing these unsupported declarations will fail to reconnect until their schema is changed; underlying rows are not automatically migrated or removed.
+
 ### Phase 3: Native Lightweight SQL Frontend (RBO + Iterator Execution)
 * Remove the SQLite dependency to deliver a self-contained single-library SQL engine.
 * Parse SQL into an AST (using `sqlparser-rs` or a lightweight PEG parser) and lower it through a **deterministic Rule-Based Optimizer (RBO)** without cost-based optimizer (CBO) overhead:

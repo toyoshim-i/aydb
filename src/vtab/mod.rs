@@ -8,6 +8,7 @@
 pub mod connection;
 mod compaction_worker;
 mod ddl;
+mod constraints;
 pub mod ffi;
 pub mod row_codec;
 pub mod rowid_map;
@@ -15,6 +16,8 @@ pub mod rowid_map;
 mod tests;
 #[cfg(test)]
 mod rowid_tests;
+#[cfg(test)]
+mod constraint_tests;
 
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;
@@ -309,6 +312,8 @@ pub(super) struct AydbVTab {
     durability: WriteDurability,
     col_names: Vec<String>,
     col_affinities: Vec<ColumnAffinity>,
+    col_not_null: Vec<bool>,
+    col_unique: Vec<bool>,
     col_collations: Vec<ColCollation>,
     pub(super) pk_col_idx: usize,
     pub(super) pk_affinity: ColumnAffinity,
@@ -606,6 +611,8 @@ unsafe extern "system" fn vtab_create_or_connect(
             durability: ddl.durability,
             col_names: ddl.col_names,
             col_affinities: ddl.col_affinities,
+            col_not_null: ddl.col_not_null,
+            col_unique: ddl.col_unique,
             col_collations: ddl.col_collations,
             pk_col_idx: ddl.pk_col_idx,
             pk_affinity: ddl.pk_affinity,
@@ -1707,6 +1714,19 @@ unsafe extern "system" fn vtab_update(
 
         let arg0 = *argv.offset(0);
         let is_insert = sqlite3_value_type(arg0) == SQLITE_NULL;
+        for (idx, &not_null) in vtab.col_not_null.iter().enumerate() {
+            if not_null
+                && !(idx == vtab.pk_col_idx
+                    && is_insert
+                    && vtab.pk_affinity == ColumnAffinity::Integer)
+                && sqlite3_value_type(*argv.offset(2 + idx as isize)) == SQLITE_NULL
+            {
+                match sqlite3_vtab_on_conflict(vtab.db) {
+                    SQLITE_IGNORE => return SQLITE_OK,
+                    _ => return SQLITE_CONSTRAINT,
+                }
+            }
+        }
         let pk_val_ptr = *argv.offset(2 + vtab.pk_col_idx as isize);
         let pk_val_type = sqlite3_value_type(pk_val_ptr);
 
@@ -1854,6 +1874,22 @@ unsafe extern "system" fn vtab_update(
             None => false,
         };
         let mut known_absent = pk_override.is_some();
+        let unique_conflicts = match constraints::find_unique_conflicts(
+            &mut eng,
+            vtab,
+            &row_bytes,
+            old_pk_opt.as_ref().map(|(pk, _)| pk.as_slice()),
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(e) => return io_err_to_sqlite_rc(&e),
+        };
+        if !unique_conflicts.is_empty() {
+            match sqlite3_vtab_on_conflict(vtab.db) {
+                SQLITE_IGNORE => return SQLITE_OK,
+                SQLITE_REPLACE => {}
+                _ => return SQLITE_CONSTRAINT,
+            }
+        }
         if (is_insert || !same_pk) && pk_override.is_none() {
             let existing_conflict = match find_existing_pk_or_numeric_alt(
                 &mut eng,
@@ -1887,6 +1923,17 @@ unsafe extern "system" fn vtab_update(
                 }
             } else {
                 known_absent = true;
+            }
+        }
+
+        for conflict_pk in unique_conflicts {
+            if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                    rmap.remove_by_pk(&conflict_pk);
+                }
+            }
+            if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability) {
+                return io_err_to_sqlite_rc(&e);
             }
         }
 
