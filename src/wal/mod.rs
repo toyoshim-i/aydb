@@ -475,6 +475,9 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// failed multi-sector batch are `Middle`/`Last` fragments without a preceding `First`, which
     /// recovery rejects. The on-disk outcome of the failed batch is nevertheless *unknown*, so
     /// callers should treat the stream as poisoned (see `StorageEngine::is_poisoned`).
+    ///
+    /// A failed write can also tear the open buffered sector that earlier batches share, so
+    /// the error path rewrites that sector's last good image (best effort).
     pub fn append_raw_batch(&mut self, remaining: &[u8]) -> io::Result<WalAppendOutcome> {
         let saved_idx = self.current_sector_idx;
         let saved_valid = self.current_valid_bytes;
@@ -493,6 +496,13 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                 self.sector_buf.fill(0);
             }
             self.multi_sector_buf.clear();
+            if saved_valid > 0 {
+                // The failed write may have left a torn copy of the open sector in the file,
+                // which would invalidate its CRC and destroy the batches packed before this
+                // one. Put the last good image back, best effort: if this write fails too the
+                // caller already treats the stream as poisoned. Only the error path pays.
+                let _ = self.seal_and_write_current_sector();
+            }
         }
         res
     }
@@ -1644,12 +1654,14 @@ mod tests {
 
     // ---- Fault-injection helpers ----
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FailFile {
         inner: Arc<<OsFs as PlatformFs>::File>,
         fail_write: Arc<AtomicBool>,
         fail_sync: Arc<AtomicBool>,
+        /// Bytes that reach the file before an injected write failure; 0 means one full sector.
+        tear_len: Arc<AtomicUsize>,
     }
 
     impl PlatformFile for FailFile {
@@ -1662,7 +1674,12 @@ mod tests {
         fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
             if self.fail_write.swap(false, Ordering::SeqCst) {
                 // Simulate a partial write: first sector lands, then error.
-                let n = buf.len().min(WAL_SECTOR_SIZE);
+                let torn = self.tear_len.load(Ordering::SeqCst);
+                let n = if torn == 0 {
+                    buf.len().min(WAL_SECTOR_SIZE)
+                } else {
+                    buf.len().min(torn)
+                };
                 let _ = self.inner.write_all_at(&buf[..n], offset);
                 return Err(io::Error::other("injected write failure"));
             }
@@ -1692,6 +1709,7 @@ mod tests {
         inner: OsFs,
         fail_write: Arc<AtomicBool>,
         fail_sync: Arc<AtomicBool>,
+        tear_len: Arc<AtomicUsize>,
     }
 
     impl PlatformFs for FailFs {
@@ -1707,6 +1725,7 @@ mod tests {
                 inner: self.inner.open_file(rel_name, create, writable, hint)?,
                 fail_write: self.fail_write.clone(),
                 fail_sync: self.fail_sync.clone(),
+                tear_len: self.tear_len.clone(),
             }))
         }
         fn remove_file(&self, n: &str) -> io::Result<()> {
@@ -1738,6 +1757,7 @@ mod tests {
             inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
             fail_write: w.clone(),
             fail_sync: s.clone(),
+            tear_len: Arc::new(AtomicUsize::new(0)),
         };
         (tmp, fs, w, s)
     }
@@ -1875,6 +1895,29 @@ mod tests {
             w.append_batch(&put_batch(2, b"b", 10)).unwrap(),
             WalAppendOutcome::RingFull
         );
+        drop(w);
+        assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1]);
+    }
+
+    #[test]
+    fn torn_buffered_append_keeps_earlier_batches_in_the_open_sector() {
+        let (_tmp, fs, fail_w, _) = fail_fs("wal_fail_buffered_torn");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        // The failed append rewrites the open sector and only half of it reaches the file.
+        w.file()
+            .tear_len
+            .store(WAL_SECTOR_SIZE / 2, Ordering::SeqCst);
+        fail_w.store(true, Ordering::SeqCst);
+        assert!(w.append_batch(&put_batch(2, b"torn", 3000)).is_err());
+        // Dropping flushes nothing: the open sector was already written by each append.
         drop(w);
         assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1]);
     }
