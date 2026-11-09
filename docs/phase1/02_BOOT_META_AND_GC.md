@@ -88,7 +88,7 @@ Each of the two slots (`Slot A` at offset `0`, `Slot B` at offset `4096`) is exa
 | :--- | :--- | :--- | :--- | :--- |
 | `0..4` | 4 B | `magic` | `[u8; 4]` | Constant ASCII `"AYDB"` (`[0x41, 0x59, 0x44, 0x42]`). |
 | `4..6` | 2 B | `format_version` | `u16` | Binary format version (`1`). |
-| `6..8` | 2 B | `flags` | `u16` | Bit `0` (`0x0001`): `FLAG_EXTERNAL_MANIFEST`. `0` = inline payload; `1` = external `manifest_<SeqID>.db`. Bits `1..15` must be `0`. |
+| `6..8` | 2 B | `flags` | `u16` | Bit `0` (`0x0001`): `FLAG_EXTERNAL_MANIFEST`. `0` = inline payload; `1` = external `manifest_<SeqID>.db`. Bit `1` (`0x0002`): `FLAG_UNIQUE_INDEX`, set in both slots by the first completed `UNIQUE` index and never cleared (see [ARCHITECTURE.md](../ARCHITECTURE.md) section 5.3). Bits `2..15` must be `0`. |
 | `8..16` | 8 B | `generation` | `u64` | Strictly monotonic slot commit number (`1, 2, 3, ...`). |
 | `16..24` | 8 B | `next_seq_id` | `u64` | Next available segment sequence ID (`>= 1`). |
 | `24..32` | 8 B | `checkpoint_lsn` | `u64` | Highest `LSN` already flushed into immutable segments (`WAL` records with `lsn <= checkpoint_lsn` have already been persisted). |
@@ -191,7 +191,7 @@ flowchart TD
 ```
 
 ### Handling Fallback When an External Manifest Is Missing
-If the higher-generation slot has `FLAG_EXTERNAL_MANIFEST = 1`, `BootMetaManager` also verifies that the referenced `manifest_<SeqID>.db` exists and matches `manifest_payload_crc32c`. If a disk fault corrupted the new manifest file, the manager falls back to the other slot if that older slot is completely valid. This fallback applies only to genuine corruption (CRC / format failure, missing manifest); a transient I/O error fails the open rather than booting from an older generation.
+If the higher-generation slot has `FLAG_EXTERNAL_MANIFEST = 1`, `BootMetaManager` also verifies that the referenced `manifest_<SeqID>.db` exists and matches `manifest_payload_crc32c`. If a disk fault corrupted the new manifest file, the manager falls back to the other slot if that older slot is completely valid. This fallback applies only to genuine corruption (CRC / format failure, missing manifest); a transient I/O error fails the open rather than booting from an older generation. A slot with `FLAG_UNIQUE_INDEX` set that a binary does not know is rejected like any other unknown flag; the engine sets the bit in both slots before the index marker exists, so the fallback can never select a slot without the bit once the marker is durable.
 
 ---
 

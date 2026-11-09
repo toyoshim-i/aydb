@@ -110,10 +110,11 @@ To support both fast random updates of small configuration records and zero writ
 
 * Fixed 8 KB file size: `Offset 0..4096` is **Slot A**, and `Offset 4096..8192` is **Slot B** (if the catalog payload exceeds 4,028 bytes it is written to an immutable overflow file `manifest_<SeqID>.db`, and the slot stores a 20-byte pointer to it: `[SeqID (8B) | FileLen (8B) | PayloadCRC32C (4B)]`).
 * Layout of each 4 KB slot (64-byte fixed header + variable payload + 4-byte slot trailer):
-  `[Header(64B): Magic "AYDB"(4B) | Version(2B) | Flags(2B) | Generation(8B) | NextSeqID(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | PayloadLen(4B) | PayloadCRC32C(4B) | Reserved(4B) | HeaderCRC32C(4B)] + [Payload: CatalogPayload, or the external manifest pointer when `Flags` bit 0 is set] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
+  `[Header(64B): Magic "AYDB"(4B) | Version(2B) | Flags(2B) | Generation(8B) | NextSeqID(8B) | CheckpointLSN(8B) | SyncWalEpoch(8B) | BufWalEpoch(8B) | PayloadLen(4B) | PayloadCRC32C(4B) | Reserved(4B) | HeaderCRC32C(4B)] + [Payload: CatalogPayload, or the external manifest pointer when `Flags` bit 0 is set; `Flags` bit 1 marks a database with a `UNIQUE` index] + [ZeroPadding] + [SlotCRC32C(4B at offset 4092..4096)]`
   The header offsets are `0..4` magic, `4..6` version, `6..8` flags, `8..16` generation, `16..24` next sequence ID, `24..32` checkpoint LSN, `32..40` sync WAL epoch, `40..48` buffered WAL epoch, `48..52` payload length, `52..56` payload CRC32C, `56..60` reserved, `60..64` header CRC32C (over bytes `0..60`). The trailer CRC32C covers bytes `0..4092`. The segment counts are not part of the header: the catalog payload is a sequence of length-prefixed lists (index segments, standard blob segments, LRU blob segments, table quotas, pending deletes). The overflow file starts with its own magic `AYMF` and carries a payload CRC32C. See [phase1/02_BOOT_META_AND_GC.md](./phase1/02_BOOT_META_AND_GC.md) for the field-level specification.
 * A manifest file referenced by a valid slot always holds exactly the bytes that slot describes, because a manifest file name (its SeqID) is never reused. If a commit fails after writing the manifest but before touching any slot, the failure is retryable, yet the SeqID that attempt consumed stays consumed: the retry writes a fresh `manifest_<SeqID>.db` instead of overwriting the failed one (a shorter retry would keep the stale tail of the longer file). A crash during the failed attempt is covered at open, which durably advances `NextSeqID` past every `manifest_*`, `idx_*` and `blob_*` file found on disk before any SeqID is allocated.
 * When updating metadata, the engine overwrites whichever slot has the older `Generation` in a single 4 KB aligned write and invokes `sync_barrier()` / `sync_durable()`. Upon startup after a crash, both slots are read, and the slot with valid CRCs and the higher `Generation` is selected. Fallback to the other slot happens only on genuine corruption (CRC / format failure or a missing external manifest); a transient I/O error fails the open instead of silently booting from an older generation.
+* **Downgrade guard.** The first time the `UNIQUE` index of a table is completed (section 5.3), the engine sets `Flags` bit 1 (`0x0002`) in both slots, with one metadata commit that changes nothing else, before it writes the index marker. A binary that does not know the bit treats such a slot as invalid and, because the other slot carries the bit too, refuses to open instead of falling back to a slot without it and writing rows without index entries. The bit is never cleared. A database with no completed `UNIQUE` index is not flagged and stays openable by older binaries. `FORMAT_VERSION` is not changed.
 
 ### 4.2 Pre-Allocated Fixed-Size WAL and Physical Two-Stream Commit
 
@@ -175,10 +176,11 @@ SQL tables, primary rows, and secondary indexes are mapped into a single ordered
 * **Secondary Index:**
   * Key: `[TableID (2B) | 'i' (1B) | IndexID (2B) | EncodedIndexColumns | EncodedPrimaryKey]`
   * Value: `Empty`
+  * `IndexID` values `1, 2, ...` belong to the declared `indexes`. The ids `0x8000 | column_index` hold the entries of `UNIQUE` columns, and `0xFFFF` is a completion marker without a primary-key part (section 5.3).
 * **System-Managed LRU Tracking Index:**
   * Key: `[TableID (2B) | 'l' (1B) | AccessTick (8B, Big-Endian) | EncodedPrimaryKey]`
   * Value: `Empty`
-* **Row Metadata (capped tables and tables with secondary indexes):**
+* **Row Metadata (capped tables, tables with secondary indexes, and rows with `UNIQUE` entries):**
   * Key: `[TableID (2B) | 't' (1B) | EncodedPrimaryKey]`
   * Value: `RowMetaRecord`: the recorded `AccessTick`, the logical size, and the secondary index values of the row.
 
@@ -196,6 +198,72 @@ Automatic eviction mechanism for tables declared with size bounds (e.g., a virtu
    * Fetches the primary row `[TableID | 'r' | PK]` and deletes the primary row, all associated secondary index entries `[TableID | 'i' | ...]`, and the system LRU entry.
    * If the row contains blob pointers, increments the `DeadBytes` counter of the corresponding `blob_lru_<TblID>_<SeqID>.db` segment and decrements `CurrentLogicalBytes`.
    * When the live data ratio of a `blob_lru` segment drops to 0% (all blobs in that generation have been evicted), the segment file is immediately closed and deleted without copying a single byte (Copy-less Eviction).
+
+### 5.3 Persistent `UNIQUE` Index
+
+A `UNIQUE` column promises that no two rows hold an equal value, so every `INSERT`, `UPDATE` and `REPLACE` must ask "does a row with this value exist?" before it writes. The first implementation answered by scanning the table in batches: correct, with no extra state to keep consistent, but linear in the table size for every statement, and a single unreadable row made every insert into the table fail because the scan had to read it. A native SQLite table answers the question with one probe of a B-tree per unique column. The question is a point lookup, and an LSM tree with a bloom filter and a block cache answers point lookups well, so the adapter keeps the equivalent structure: an ordered index from column value to primary key.
+
+Alternatives considered:
+
+* **A hash table per column in memory.** Cheap to probe, but it must be rebuilt by a scan at every start, it competes with the bounded process heap (section 3.2), and it cannot be shared by connections without its own locking.
+* **A bloom filter.** It can prove that a value is absent, but never that a conflict exists, so a positive answer still needs the scan.
+* **A separate index file.** It would need its own durability protocol and its own recovery. Entries that live in the same ordered key space as the rows ride on the row's WAL batch and are covered by the existing crash tests.
+
+`aydb` therefore stores the entries in the `'i'` namespace (section 5.1) and records them in the row's `'t'` record. Because the `'t'` record lists the entries, overwrite, `DELETE`, capped-table eviction and `drop_table` remove them with the code that already removes declared secondary indexes. The index costs one extra key per row and unique column, written in the same atomic WAL batch as the row.
+
+```text
+Unique index entry (the value is empty)
+
+  0       2   3        5                              n
+  +-------+---+--------+------------------------------+----------+
+  |TableID|'i'| 0x8000 | Escaped(component)           |    pk    |
+  | u16 BE|   | | col  | (0x00 -> 0x00 0xFF,          |   raw    |
+  |       |   | u16 BE | terminator 0x00 0x01)        |  bytes   |
+  +-------+---+--------+------------------------------+----------+
+
+Completion marker (one per table; the key has no primary-key part)
+
+  key:    +-------+---+--------+
+          |TableID|'i'| 0xFFFF |
+          +-------+---+--------+
+  value:  +-----+--------+---------------------------------------+
+          | ver | n      | n x ( column | collation | affinity ) |
+          |  1  | u16 BE |       u16 BE |    u8     |    u8     |
+          +-----+--------+---------------------------------------+
+
+Digest component (used only when the canonical key is longer than 256 bytes)
+
+  +------+--------------+--------------------+-------------------+
+  | 0xFE | key length   | first 64 key bytes | 64-bit hash of    |
+  |      | u32 BE       |                    | the whole key     |
+  +------+--------------+--------------------+-------------------+
+```
+
+The index id has the high bit set so that it can never collide with the ids `1, 2, ...` of declared `indexes`, and `0xFFFF` is reserved for the marker. The marker key has no primary-key part, so the orphan scan that looks for entries by primary key never matches it.
+
+**Canonical keys.** SQLite compares `1` and `1.0` as equal, but the column key (section 5.1) stores an integer as 9 bytes and an exact-integer float as 17 bytes with an all-zero remainder. The index stores the *canonical* key: the 17-byte shape is mapped to the 9-byte one, and every other key is unchanged. Equality of canonical keys is then exactly SQLite's equality under the column's collation (`BINARY`, `NOCASE`, `RTRIM`) and affinity. A test compares this with a native SQLite `UNIQUE` column over every pair of a pool of values (integers around 2^53 and at the `i64` limits, `-0.0`, large floats, case and trailing-space variants, blobs and strings over 256 bytes) for all five affinities and three collations. The key is always computed from the finished row bytes, after affinity has been applied, so `INSERT`, `UPDATE` and the migration derive the same bytes.
+
+**Long values.** A value is never rejected for its length. A canonical key of up to 256 bytes is stored as it is. A longer key is replaced by a fixed 77-byte digest: its length, its first 64 bytes and a 64-bit hash. The hash is only a filter. A hit on a digest is a *candidate*, and the check reads that row and compares the real key before it reports a conflict. This keeps the index entry within one 4 KB block (section 3.2) however large the value is, and it keeps the common case, a hit on a full key, free of any row read. An unreadable candidate follows the table's corruption policy: it fails the statement under `on_corrupt=error` and counts as no conflict under `evict`.
+
+**The check.** One probe per non-`NULL` unique column of the new row, in the writer's own view, so it sees the entries and tombstones of its own open transaction and savepoint. The union of the primary keys found is deduplicated, the row being updated is excluded, and a hit whose row no longer exists is ignored. Hits on full keys are exact, so no row is read: an insert costs a few index probes, independent of the table size, and one corrupt row no longer fails unrelated inserts. A real conflict with the corrupt row's value is still reported, and `REPLACE` deletes that row without reading its value.
+
+**Trusting the index: the marker and the latch.** Tables written before the index existed have rows without entries, so the check may use the index only when every row has its entries. The completion marker says so. It records the definition the index was built for (the unique columns with their collation and affinity); a marker for a different definition means "not migrated". An in-memory latch per connection is set only when the marker is seen in the committed view. The marker is written outside any transaction, so a rollback can never remove it. Until the latch is set the check scans, which is correct at every stage. Once it is set the common path costs one atomic load per transaction, and a table without unique columns pays nothing.
+
+**Migration.** Every write maintains its own entries from the first run of a version that has the index. The entries of older rows are built by a migration that runs in `xBegin`, before the engine transaction of the triggering statement starts. It never runs at connect (connecting must not write) and never in `xUpdate` (which already runs inside the engine transaction and cannot release the engine lock). It works in chunks of 512 rows. Each chunk reads its rows and reconciles their entries under one hold of the engine lock, so an entry is never derived from a value that another connection replaced in between; the lock is free between chunks. One `xBegin` processes at most eight chunks (4096 rows), and the following transactions resume from an in-memory key cursor, so the first write after an upgrade waits for a bounded amount of work. Reconciling a row writes its missing entries and rewrites its `'t'` record in one WAL batch and keeps the row value, blob pointer and recorded tick, so the migration is idempotent and a crash at any point resumes. Chunks are buffered writes; the marker is the only write that waits for the device (once, with the table's durability), and the prefix rule of the WAL makes every earlier chunk durable no later than the marker. The migration stands aside whenever a transaction is open, whether its own connection's or another's, or when the connection holds a read snapshot (its commits would make that snapshot stale), and it never fails the statement that triggered it. A failure, such as an unreadable row under `on_corrupt=error`, writes no marker, is counted as a maintenance failure of the engine, and is not retried by that connection until it reconnects. Rows with equal values in legacy data get entries for each row; no conflict is reported for them. When the definition of a table changes, the old marker is removed first and the reconciliation of each row deletes the entries of the old definition. A table that no longer has any unique column is not visited, so its old entries disappear only when their rows are rewritten or deleted.
+
+**Downgrade guard.** A version without the index would write rows without entries into a database that has a marker, and the next version that trusts the marker would then miss conflicts silently. The first time a marker is written, the engine therefore sets bit 1 (`0x0002`) of the `boot_meta` slot flags (section 4.1) in both slots before the marker is written. A version that does not know the bit refuses to open the database. Both slots are needed because an older version treats a slot with an unknown flag as invalid and falls back to the other one. The flag is never cleared. A database that was only opened and read by the new version, or that has no unique table, stays openable by older versions. `FORMAT_VERSION` does not change.
+
+**Measured cost.** All figures below are from a release build on Windows with the default buffered durability, one thread, and short rows (an integer primary key and two short text columns, one of them `UNIQUE`). Each is tied to the commit that was measured.
+
+| Quantity | Commit | Result |
+|---|---|---|
+| Writing the entries: one transaction loading 16,000 rows, conflict check disabled in both builds | `0bce75e` | 1.3 us per row without entries, 3.2 to 3.6 us per row with them |
+| Insert on a migrated table, autocommit and inside one transaction | `5a6d60e` | 1,000 rows: 6.4 to 6.8 us and 3.1 to 3.2 us. 16,000 rows: 10.3 to 10.5 us and 6.7 to 7.0 us. 100,000 rows: 10.3 to 11.2 us and 6.8 to 7.5 us. 1,000,000 rows: 10.8 to 11.1 us and 7.2 to 7.4 us |
+| The same insert with the scan check, before that commit | `eda13f5` | 1,000 rows: 207 to 210 us and 338 to 345 us. 16,000 rows: 2.65 to 2.71 ms and 2.94 to 3.01 ms. 100,000 rows: 30.3 to 31.4 ms and 31.0 to 31.8 ms |
+| Migration of 100,000 rows (one unique text column), synchronous and buffered marker alike | `eda13f5` | 0.646 to 0.656 s in total; each chunk of 512 rows held the engine lock for a median of 2.8 ms, 13 to 18 ms at the 99th percentile, and 68 to 73 ms at the maximum (a memtable flush or compaction triggered inside a commit) |
+| Migration of 1,000,000 rows | `5a6d60e` | 6.64 to 6.70 s |
+
+Each insert figure is the mean over 1,000 inserts (300 at 100,000 rows); the ranges are the lowest and highest of three runs. The cost with the index is flat from 16,000 to 1,000,000 rows, as expected from a probe whose work does not depend on the table size, whereas the scan grows linearly. The first marker of a database adds two `boot_meta` commits (section 4.1), also for a buffered table.
 
 ---
 
@@ -298,7 +366,7 @@ Phases 1 and 2 describe the existing storage engine and SQLite integration, with
 * Enable immediate execution of full SQL queries via SQLite's battle-tested SQL frontend.
 * **Benchmark Evaluation:** Run comparative benchmarks against vanilla SQLite (standard B-Tree in WAL mode) under identical hybrid workloads (random small configuration updates + high-churn multi-KB/MB HTTP cache replacements over both local NTFS and SMB), quantifying improvements in write amplification, file fragmentation, and P99 latency.
 
-Column `NOT NULL` and `UNIQUE` constraints are enforced by the adapter. Unique checks scan existing rows in batches and respect the column's supported collation. `DEFAULT` declarations, SQL comments in column definitions, and per-column `ON CONFLICT` policies are rejected because SQLite's virtual table declaration does not retain column defaults for omitted values, and the adapter does not implement column-specific conflict policies. Existing virtual tables containing these unsupported declarations will fail to reconnect until their schema is changed.
+Column `NOT NULL` and `UNIQUE` constraints are enforced by the adapter. A `UNIQUE` column is checked through a persistent index (section 5.3): one index probe per column of the new row, using the column's supported collation and affinity. A table that has not been migrated to the index yet is checked by scanning its rows in batches. `DEFAULT` declarations, SQL comments in column definitions, and per-column `ON CONFLICT` policies are rejected because SQLite's virtual table declaration does not retain column defaults for omitted values, and the adapter does not implement column-specific conflict policies. Existing virtual tables containing these unsupported declarations will fail to reconnect until their schema is changed.
 
 SQL read transactions retain a committed MemTable version and immutable index/blob readers across statements. MemTable versions share entries until a writer changes them. A long reader can therefore retain a MemTable budget per distinct version and delay reclamation of old files and handles. A stale read transaction must restart before becoming a writer, reported as `SQLITE_BUSY`. The adapter chapter describes statement and cursor lifetimes in detail.
 
@@ -353,7 +421,7 @@ Measured figures are in the phase chapters, each labelled with the commit it was
 * **Point reads** served from the MemTable or the verified caches avoid a system call, and are where `aydb` is strongest. Reads also continue at nearly full speed during synchronous commits (§4.5).
 * **Buffered commits** are faster because each one coalesces into a single WAL batch in the OS cache.
 * **Concurrent synchronous writers** share device flushes (§4.5; measured in phase 2, Chapter 2.2 §4). A single synchronous writer is about level with SQLite, because the device flush dominates the commit once both engines flush the device.
-* **Bulk writes inside one transaction** are slower through the SQLite virtual table: each row crosses the `sqlite3_module` boundary and checks primary key uniqueness.
+* **Bulk writes inside one transaction** are slower through the SQLite virtual table: each row crosses the `sqlite3_module` boundary and checks primary key uniqueness. A `UNIQUE` column adds one index entry per row.
 * **Updates to values stored out of line** cost at least two writes per buffered commit (blob append and WAL sector).
 * **Short range scans** are slower: rows of a B-tree are clustered in leaf pages, while `aydb` needs a blob read per out-of-line row, and merges several sorted sources.
 * **SSTable mode with a small MemTable** pays LSM read amplification: several segments can be probed per lookup. The block cache reduces this but does not remove it.
