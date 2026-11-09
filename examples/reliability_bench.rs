@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use aydb::engine::{EngineConfig, StorageEngine, WriteDurability};
 use aydb::pal::{OpenHint, OsFs, PlatformFile, PlatformFs, PreallocStrategy};
-use aydb::vtab::row_codec::SqlValue;
 use aydb::vtab::SqliteConnection;
+use aydb::vtab::row_codec::SqlValue;
 use aydb::wal::WalStreamMode;
 
 // ============================================================================
@@ -322,9 +322,15 @@ impl PlatformFs for FaultInjectingFs {
 // ============================================================================
 
 fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
-    println!("==========================================================================================");
-    println!("SUITE 1: Power-Loss Sync Commit Durability & 512 B Torn-Write Resilience (wal_sync.db)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "SUITE 1: Power-Loss Sync Commit Durability & 512 B Torn-Write Resilience (wal_sync.db)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<48} | {:>14} | {:>14} | {:>10}",
         "Power-Loss Hardware / OS Model", "Committed", "Survived", "Survival %"
@@ -361,10 +367,7 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
     let pct_strict = (survived_strict as f64) * 100.0 / (COMMITS as f64);
     println!(
         "{:<48} | {:>14} | {:>14} | {:>9.1}%",
-        "1A. Volatile Drive Cache / Unix PAL (No fsync)",
-        COMMITS,
-        survived_strict,
-        pct_strict
+        "1A. Volatile Drive Cache / Unix PAL (No fsync)", COMMITS, survived_strict, pct_strict
     );
 
     // Model 1B: FUA Write-Through + 512 B Sub-Sector Torn Write on the 201st in-flight commit
@@ -400,10 +403,7 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
     let pct_fua = (survived_fua_torn as f64) * 100.0 / (COMMITS as f64);
     println!(
         "{:<48} | {:>14} | {:>14} | {:>9.1}%",
-        "1B. FUA Write-Through + 512B Torn Tail Sector",
-        COMMITS,
-        survived_fua_torn,
-        pct_fua
+        "1B. FUA Write-Through + 512B Torn Tail Sector", COMMITS, survived_fua_torn, pct_fua
     );
 
     (pct_strict, pct_fua)
@@ -414,9 +414,13 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
 // ============================================================================
 
 fn bench_suite_2_process_crash_wal_modes() {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 2: Sudden Process Crash (`kill -9` / No Drop) Across Buffered WAL Modes");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<44} | {:>12} | {:>12} | {:>10} | {:>12}",
         "Buffered WAL Stream Mode", "Committed", "Recovered", "Survival %", "Rec Time(ms)"
@@ -477,9 +481,13 @@ fn bench_suite_2_process_crash_wal_modes() {
 // ============================================================================
 
 fn bench_suite_3_transaction_rollback_invariants() {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 3: Transaction Rollback & Quota Invariants vs. Reference BTreeMap Oracle");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Scenario", "Status", "Observed Behavior"
@@ -535,7 +543,13 @@ fn bench_suite_3_transaction_rollback_invariants() {
         // Begin tx, overwrite k1 (causing seg 1 to reach 100% dead_bytes and be unlinked!), then ROLLBACK
         engine.begin_transaction();
         engine
-            .put_row(1, b"k1", &vec![0x99u8; 4096], &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                b"k1",
+                &vec![0x99u8; 4096],
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
         engine.rollback_transaction().unwrap();
 
@@ -548,9 +562,7 @@ fn bench_suite_3_transaction_rollback_invariants() {
         };
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "3B. Sealed Blob Overwrite + Rollback",
-            status,
-            note
+            "3B. Sealed Blob Overwrite + Rollback", status, note
         );
     }
 
@@ -634,9 +646,13 @@ fn bench_suite_3_transaction_rollback_invariants() {
 // ============================================================================
 
 fn bench_suite_4_post_crash_blob_leak() {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 4: Post-Crash Blob GC & Recovery Consistency");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Crash Scenario", "Status", "Post-Recovery State"
@@ -680,9 +696,7 @@ fn bench_suite_4_post_crash_blob_leak() {
         };
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "4A. Delete Full Sealed Blob Seg + Crash Before Flush",
-            status,
-            detail
+            "4A. Delete Full Sealed Blob Seg + Crash Before Flush", status, detail
         );
     }
 
@@ -740,11 +754,7 @@ fn bench_suite_4_post_crash_blob_leak() {
         println!(
             "{:<54} | {:>14} | {:>20}",
             "4B. Partial Blob Delete + Crash + Delete Rest (GC)",
-            if leaked_sealed == 0 {
-                "PASS"
-            } else {
-                "FAIL"
-            },
+            if leaked_sealed == 0 { "PASS" } else { "FAIL" },
             format!("{leaked_sealed} Segs Leaked Forever")
         );
     }
@@ -755,9 +765,13 @@ fn bench_suite_4_post_crash_blob_leak() {
 // ============================================================================
 
 fn bench_suite_5_io_fault_countdown() {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 5: Deterministic I/O Fault Injection (`StorageFull` During `flush_memtable`)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<14} | {:>24} | {:>22} | {:>20}",
         "Fault Step #", "flush_memtable() Result", "Surviving After Retry", "Status"
@@ -827,9 +841,13 @@ fn bench_suite_5_io_fault_countdown() {
 // ============================================================================
 
 fn bench_suite_6_vtab_key_and_rowid_integrity() {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 6: SQLite VTab Key Encoding & Rowid Integrity");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "VTab Correctness Scenario", "Status", "Observed Result"
@@ -905,10 +923,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
     .unwrap();
     // Query Alice's rowid, then delete by that rowid; Bob happens to overwrite `rowid_to_pk[rid]` on INSERT!
     let r1 = conn
-        .query_all(
-            &format!("SELECT rowid FROM users_t WHERE id = '{k1}'"),
-            &[],
-        )
+        .query_all(&format!("SELECT rowid FROM users_t WHERE id = '{k1}'"), &[])
         .unwrap();
     let rid1 = match r1[0][0] {
         SqlValue::Integer(v) => v,
@@ -949,17 +964,18 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
         let fs_r = Arc::new(FaultInjectingFs::new());
         let mut eng_r = StorageEngine::open(fs_r, EngineConfig::default()).unwrap();
         eng_r
-            .put_row(1, &[0x80, 0, 0, 0, 0, 0, 0, 5], b"v", &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                &[0x80, 0, 0, 0, 0, 0, 0, 5],
+                b"v",
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
         let lower = [0x80u8, 0, 0, 0, 0, 0, 0, 10];
         let upper = [0x80u8, 0, 0, 0, 0, 0, 0, 5];
         eng_r
-            .scan_table_range(
-                1,
-                Some((&lower[..], true)),
-                Some((&upper[..], true)),
-                100,
-            )
+            .scan_table_range(1, Some((&lower[..], true)), Some((&upper[..], true)), 100)
             .unwrap()
     });
     std::panic::set_hook(prev_hook);
@@ -984,9 +1000,13 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
 // ============================================================================
 
 pub fn suite_7_audit_regressions(base_dir: &Path) {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 7: Technical Architecture & Edge-Case Regressions");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Technical Regression Scenario", "Status", "Observed Result"
@@ -1080,10 +1100,11 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
 
         // Oversized PK (> 2048 B) must be rejected with InvalidInput
         let oversized_pk = vec![b'x'; 5000];
-        let pk_rejected = match eng.put_row(1, &oversized_pk, b"v", &[], WriteDurability::BufferedFast) {
-            Err(e) => e.kind() == io::ErrorKind::InvalidInput,
-            Ok(()) => false,
-        };
+        let pk_rejected =
+            match eng.put_row(1, &oversized_pk, b"v", &[], WriteDurability::BufferedFast) {
+                Err(e) => e.kind() == io::ErrorKind::InvalidInput,
+                Ok(()) => false,
+            };
 
         // Row with large PK (1500 B) + value (3000 B) + secondary keys whose combined size > 4 KB block
         let pk = vec![b'k'; 1500];
@@ -1184,8 +1205,14 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
         let fs = Arc::new(FaultInjectingFs::new());
         {
             let mut eng = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
-            eng.put_row(1, b"baseline", b"intact", &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                1,
+                b"baseline",
+                b"intact",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
 
             eng.begin_transaction();
             let payload = vec![0x55u8; 900];
@@ -1265,9 +1292,13 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
 // ============================================================================
 
 pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 8: Transaction Isolation, 2PC & Engine Boundary Regressions");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Boundary Regression Scenario", "Status", "Observed Result"
@@ -1305,9 +1336,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
             .execute_batch("BEGIN; INSERT INTO t VALUES (3, 'uncommitted');")
             .unwrap();
         // Connection B must read the committed snapshot `[]` for id=3
-        let b_sees_uncommitted = conn_b
-            .query_all("SELECT * FROM t WHERE id=3", &[])
-            .unwrap();
+        let b_sees_uncommitted = conn_b.query_all("SELECT * FROM t WHERE id=3", &[]).unwrap();
         // Connection B's concurrent write must return SQLITE_BUSY (Err) instead of joining Connection A's tx
         let b_concurrent_write_busy = conn_b
             .execute_batch("INSERT INTO t VALUES (4, 'other committed');")
@@ -1325,11 +1354,23 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let two_phase_ok = {
             let mut eng = shared.write().unwrap();
             eng.register_capped_table(9, 300).unwrap();
-            eng.put_row(9, b"r1", &vec![0x11u8; 150], &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                9,
+                b"r1",
+                &vec![0x11u8; 150],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
             eng.begin_transaction();
-            eng.put_row(9, b"r2", &vec![0x22u8; 200], &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                9,
+                b"r2",
+                &vec![0x22u8; 200],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
             eng.prepare_commit_transaction(WriteDurability::BufferedFast)
                 .unwrap();
             eng.rollback_transaction().unwrap();
@@ -1353,9 +1394,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         assert!(ok, "8A cross-connection isolation regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8A. Cross-Conn Isolation & 2PC Prepare",
-            "PASS",
-            "Isolated & 2PC Safe"
+            "8A. Cross-Conn Isolation & 2PC Prepare", "PASS", "Isolated & 2PC Safe"
         );
     }
 
@@ -1432,7 +1471,8 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
                 ],
             ))
             .unwrap();
-            let rec = recover_two_streams(&**sync.file(), 1, &**buf.file(), 1, 0, |_| Ok(false)).unwrap();
+            let rec =
+                recover_two_streams(&**sync.file(), 1, &**buf.file(), 1, 0, |_| Ok(false)).unwrap();
             let lsns: Vec<u64> = rec.merged_batches.iter().map(|b| b.lsn).collect();
             drop(buf);
             drop(sync);
@@ -1440,15 +1480,12 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
             lsns
         };
 
-        let ok = in_mem_after_rollback.is_none()
-            && after_reopen.is_none()
-            && recovered_lsns.is_empty();
+        let ok =
+            in_mem_after_rollback.is_none() && after_reopen.is_none() && recovered_lsns.is_empty();
         assert!(ok, "8B deferred tx flush regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8B. Deferred Tx Flush & Atomic Multi-Chunk WAL",
-            "PASS",
-            "0 Leaked / 0 Partial"
+            "8B. Deferred Tx Flush & Atomic Multi-Chunk WAL", "PASS", "0 Leaked / 0 Partial"
         );
     }
 
@@ -1469,8 +1506,12 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
              INSERT INTO t VALUES (1, 'one'), (2, 'two');",
         )
         .unwrap();
-        let q_float = conn.query_all("SELECT id FROM t WHERE id=1.0", &[]).unwrap();
-        let q_text = conn.query_all("SELECT id FROM t WHERE id='1'", &[]).unwrap();
+        let q_float = conn
+            .query_all("SELECT id FROM t WHERE id=1.0", &[])
+            .unwrap();
+        let q_text = conn
+            .query_all("SELECT id FROM t WHERE id='1'", &[])
+            .unwrap();
         let q_scan = conn
             .query_all("SELECT id FROM t WHERE +id=1.0", &[])
             .unwrap();
@@ -1498,11 +1539,8 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         )
         .unwrap();
         let mixed_order = conn.query_all("SELECT k FROM m ORDER BY k", &[]).unwrap();
-        let numeric_order_ok = mixed_order
-            == vec![
-                vec![SqlValue::Float(1.5)],
-                vec![SqlValue::Integer(10)],
-            ];
+        let numeric_order_ok =
+            mixed_order == vec![vec![SqlValue::Float(1.5)], vec![SqlValue::Integer(10)]];
 
         conn.execute_batch(
             "CREATE VIRTUAL TABLE max_r USING aydb(table_id=4, columns='id INTEGER PRIMARY KEY, v TEXT');
@@ -1510,9 +1548,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
              INSERT INTO max_r VALUES (NULL, 'auto_after_max');",
         )
         .unwrap();
-        let max_rows = conn
-            .query_all("SELECT COUNT(*) FROM max_r", &[])
-            .unwrap();
+        let max_rows = conn.query_all("SELECT COUNT(*) FROM max_r", &[]).unwrap();
         let max_rowid_ok = max_rows == vec![vec![SqlValue::Integer(2)]];
 
         drop(conn);
@@ -1522,9 +1558,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         assert!(ok, "8C affinity, collation & rowid regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8C. Affinity, Collation, Numeric Order & Rowid",
-            "PASS",
-            "100% SQLite-Aligned"
+            "8C. Affinity, Collation, Numeric Order & Rowid", "PASS", "100% SQLite-Aligned"
         );
     }
 
@@ -1633,9 +1667,9 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
             let meta_len =
                 u32::from_le_bytes(bytes[flen - 16..flen - 12].try_into().unwrap()) as usize;
             // Bloom filter header is at `meta_offset`: `[num_probes: u8, 0, 0, 0, bit_bytes_len: u32 LE, bits...]`
-            let bloom_byte_len = u32::from_le_bytes(
-                bytes[meta_offset + 4..meta_offset + 8].try_into().unwrap(),
-            ) as usize;
+            let bloom_byte_len =
+                u32::from_le_bytes(bytes[meta_offset + 4..meta_offset + 8].try_into().unwrap())
+                    as usize;
             let fp_count_pos = meta_offset + 8 + bloom_byte_len;
             // Inflate `fp_count` to `u32::MAX` and recompute both `meta_crc` and `footer_crc`
             bytes[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1657,9 +1691,7 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         assert!(ok, "8D tiered compaction regression check failed");
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "8D. Tiered Compaction, Zero-Blob & Bounds",
-            "PASS",
-            "Bounded & Verified"
+            "8D. Tiered Compaction, Zero-Blob & Bounds", "PASS", "Bounded & Verified"
         );
     }
 }
@@ -1670,11 +1702,13 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
 
 pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
     println!();
-    println!("==========================================================================================");
     println!(
-        "SUITE 9: Reliability, Compatibility & Platform Regressions"
+        "=========================================================================================="
     );
-    println!("==========================================================================================");
+    println!("SUITE 9: Reliability, Compatibility & Platform Regressions");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Edge-Case Regression Scenario", "Status", "Observed Result"
@@ -1699,7 +1733,13 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             let fs = Arc::new(OsFs::open(&sub, true).unwrap());
             let mut engine = StorageEngine::open(fs.clone(), EngineConfig::default()).unwrap();
             engine
-                .put_row(1, b"r01_k", &blob_r01, &[], WriteDurability::SyncTransactional)
+                .put_row(
+                    1,
+                    b"r01_k",
+                    &blob_r01,
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
                 .unwrap();
             let _ = fs
                 .open_file(&orphan_blob, true, true, OpenHint::ImmutableSequential)
@@ -1808,7 +1848,9 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                 .open_file(&lru_fname, false, true, OpenHint::ImmutableSequential)
                 .unwrap();
             let valid_len = lru_file.file_len().unwrap();
-            lru_file.write_all_at(&vec![0xEEu8; 4096], valid_len).unwrap();
+            lru_file
+                .write_all_at(&vec![0xEEu8; 4096], valid_len)
+                .unwrap();
             lru_file.sync_durable().unwrap();
             drop(lru_file);
 
@@ -1829,9 +1871,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9A. Recovery Sweep & Dead-Byte Dedupe",
-            "PASS",
-            "Cataloged & Reclaimed"
+            "9A. Recovery Sweep & Dead-Byte Dedupe", "PASS", "Cataloged & Reclaimed"
         );
     }
 
@@ -1851,7 +1891,9 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let mut cfg = EngineConfig::default();
         cfg.lru_read_tracking = LruReadTrackingMode::EagerWriteOnRead;
 
-        let engine = Arc::new(RwLock::new(StorageEngine::open(fs.clone(), cfg.clone()).unwrap()));
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs.clone(), cfg.clone()).unwrap(),
+        ));
 
         // Exact 4 KB block boundary: 100-byte PK -> row_key.len() == 103.
         // 15 + 103 + 3970 == 4088 (fits inline in 4 KB block) vs 3971 -> 4089 (spills to blob).
@@ -1894,9 +1936,17 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                 .unwrap();
             eng.rollback_transaction().unwrap();
             let lsn_after = eng.next_lsn();
-            eng.put_row(2, b"after_r05", b"ok", &[], WriteDurability::SyncTransactional)
-                .unwrap();
-            tid == 55 && lsn_after == lsn_before && eng.get_row(0, b"r05_aborted").unwrap().is_none()
+            eng.put_row(
+                2,
+                b"after_r05",
+                b"ok",
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+            tid == 55
+                && lsn_after == lsn_before
+                && eng.get_row(0, b"r05_aborted").unwrap().is_none()
         };
 
         // Committed DROP: DROP TABLE of a capped table inside a committed transaction must reclaim
@@ -1925,11 +1975,23 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let r07_ok = {
             let mut eng = engine.write().unwrap();
             eng.register_capped_table(57, 100_000).unwrap();
-            eng.put_row(57, b"shared_k", b"committed_v1", &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                57,
+                b"shared_k",
+                b"committed_v1",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
             eng.begin_transaction_for_conn(101).unwrap();
-            eng.put_row(57, b"shared_k", b"uncommitted_v2", &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                57,
+                b"shared_k",
+                b"uncommitted_v2",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
             let reader_val = eng
                 .with_committed_read_for_conn(202, |e| e.get_row(57, b"shared_k"))
                 .unwrap();
@@ -1954,9 +2016,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9B. 4KB Bound, DDL Tx & Eager Read Guard",
-            "PASS",
-            "Isolated & Reclaimed"
+            "9B. 4KB Bound, DDL Tx & Eager Read Guard", "PASS", "Isolated & Reclaimed"
         );
     }
 
@@ -1984,8 +2044,12 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
 
         let sub_ulp_floats = [-1e-17_f64, -1e-20, -1e-300, -f64::MIN_POSITIVE];
         {
-            let mut ins_r = conn.prepare("INSERT INTO c01_real VALUES (?1, ?2)").unwrap();
-            let mut ins_b = conn.prepare("INSERT INTO c01_blob VALUES (?1, ?2)").unwrap();
+            let mut ins_r = conn
+                .prepare("INSERT INTO c01_real VALUES (?1, ?2)")
+                .unwrap();
+            let mut ins_b = conn
+                .prepare("INSERT INTO c01_blob VALUES (?1, ?2)")
+                .unwrap();
             for (i, &f) in sub_ulp_floats.iter().enumerate() {
                 ins_r
                     .execute(&[SqlValue::Float(f), SqlValue::Text(format!("r_{i}"))])
@@ -2033,7 +2097,9 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         )
         .unwrap();
         {
-            let mut ins = conn.prepare("INSERT INTO c03_scan VALUES (?1, ?2)").unwrap();
+            let mut ins = conn
+                .prepare("INSERT INTO c03_scan VALUES (?1, ?2)")
+                .unwrap();
             for i in 1..=600i64 {
                 let text = if i >= 590 {
                     format!("row_{i}_target_hit")
@@ -2104,9 +2170,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9C. Sub-ULP Float, Numeric PK & LIKE LIMIT",
-            "PASS",
-            "Lossless & Complete"
+            "9C. Sub-ULP Float, Numeric PK & LIKE LIMIT", "PASS", "Lossless & Complete"
         );
     }
 
@@ -2177,8 +2241,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         assert!(deep_dir.as_os_str().len() > 280);
         let o02_ok = {
             let fs_long = Arc::new(OsFs::open(&deep_dir, true).unwrap());
-            let mut eng_long =
-                StorageEngine::open(fs_long, EngineConfig::default()).unwrap();
+            let mut eng_long = StorageEngine::open(fs_long, EngineConfig::default()).unwrap();
             eng_long
                 .put_row(
                     1,
@@ -2198,9 +2261,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9D. Reverse Stream & >260-Char Path",
-            "PASS",
-            "Streamed & Long-Path"
+            "9D. Reverse Stream & >260-Char Path", "PASS", "Streamed & Long-Path"
         );
     }
 
@@ -2315,25 +2376,30 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
                     ]
         };
         let _ = std::fs::remove_dir_all(&sub);
-        assert!(n01_to_n04_ok, "9E rowid undo, tx quota & sync catalog check failed");
+        assert!(
+            n01_to_n04_ok,
+            "9E rowid undo, tx quota & sync catalog check failed"
+        );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9E. RowidMap Undo, Tx Quota & Sync Catalog",
-            "PASS",
-            "Restored & Durable"
+            "9E. RowidMap Undo, Tx Quota & Sync Catalog", "PASS", "Restored & Durable"
         );
     }
 }
 
 pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
-    println!("\n=== SUITE 10: Collation Overrides, Synthetic rowid Order & Cross-Conn Resolution ===");
+    println!(
+        "\n=== SUITE 10: Collation Overrides, Synthetic rowid Order & Cross-Conn Resolution ==="
+    );
 
     // 10A: Query Collation Override on Primary Key and Secondary Index
     {
         let sub = base_dir.join("s10_collation");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 
@@ -2378,9 +2444,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "10A. Query Collation Overrides (F1)",
-            "PASS",
-            "VDBE Evaluation"
+            "10A. Query Collation Overrides (F1)", "PASS", "VDBE Evaluation"
         );
     }
 
@@ -2389,7 +2453,9 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_rowid_order");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 
@@ -2410,9 +2476,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "10B. Synthetic rowid ORDER BY (F2)",
-            "PASS",
-            "VDBE Rowid Sort"
+            "10B. Synthetic rowid ORDER BY (F2)", "PASS", "VDBE Rowid Sort"
         );
     }
 
@@ -2421,7 +2485,9 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_cross_conn");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
 
         let conn1 = SqliteConnection::open_in_memory().unwrap();
         conn1.register_aydb_module(eng.clone()).unwrap();
@@ -2450,7 +2516,10 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
             .unwrap();
 
         let hit = conn2
-            .query_all("SELECT value FROM t WHERE rowid = ?", &[SqlValue::Integer(rid)])
+            .query_all(
+                "SELECT value FROM t WHERE rowid = ?",
+                &[SqlValue::Integer(rid)],
+            )
             .unwrap();
         assert_eq!(hit, vec![vec![SqlValue::Text("first".into())]]);
 
@@ -2468,9 +2537,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "10C. Cross-Connection rowid Resolution (F3)",
-            "PASS",
-            "Cache-Miss Scanned"
+            "10C. Cross-Connection rowid Resolution (F3)", "PASS", "Cache-Miss Scanned"
         );
     }
 
@@ -2479,7 +2546,9 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("s10_numeric_rowid");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let eng = Arc::new(RwLock::new(StorageEngine::open(fs, EngineConfig::default()).unwrap()));
+        let eng = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(eng).unwrap();
 
@@ -2518,9 +2587,7 @@ pub fn suite_10_collation_rowid_cross_conn_audit_regressions(base_dir: &Path) {
         let _ = std::fs::remove_dir_all(&sub);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "10D. Lossless Numeric rowid Coercion (F4)",
-            "PASS",
-            "Lossless Converted"
+            "10D. Lossless Numeric rowid Coercion (F4)", "PASS", "Lossless Converted"
         );
     }
 }

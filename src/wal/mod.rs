@@ -226,9 +226,12 @@ impl WalBatch {
             ));
         }
         let mut records = Vec::new();
-        records
-            .try_reserve_exact(record_count)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WalBatch records allocation overflow"))?;
+        records.try_reserve_exact(record_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WalBatch records allocation overflow",
+            )
+        })?;
         for _ in 0..record_count {
             let op = r.read_u8()?;
             match op {
@@ -354,18 +357,20 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         mode: WalStreamMode,
     ) -> io::Result<Self> {
         assert!(
-            target_size >= WAL_SECTOR_SIZE as u64 && target_size.is_multiple_of(WAL_SECTOR_SIZE as u64),
+            target_size >= WAL_SECTOR_SIZE as u64
+                && target_size.is_multiple_of(WAL_SECTOR_SIZE as u64),
             "WAL size must be a positive multiple of 4096 bytes"
         );
         let (hint, prealloc) = match mode {
             WalStreamMode::SyncSectorIsolated => {
                 (OpenHint::MutableSyncLog, PreallocStrategy::PhysicalZeroFill)
             }
-            WalStreamMode::BufferedImmediateOsCache
-            | WalStreamMode::BufferedUserSpaceCoalesced => (
-                OpenHint::MutableBufferedLog,
-                PreallocStrategy::LogicalExtendOnly,
-            ),
+            WalStreamMode::BufferedImmediateOsCache | WalStreamMode::BufferedUserSpaceCoalesced => {
+                (
+                    OpenHint::MutableBufferedLog,
+                    PreallocStrategy::LogicalExtendOnly,
+                )
+            }
         };
 
         let file = fs.open_file(file_name, true, true, hint)?;
@@ -983,65 +988,64 @@ where
     // or transaction group whose blob validation returned `Ok(false)`, so no later batch is
     // replayed past a rolled-back one. Remaining batches are still scanned for the highest LSN so
     // that `next_lsn` never reuses a logged LSN.
-    let mut filter_committed_stream =
-        |batches: Vec<WalBatch>,
-         validate_blob: &mut V,
-         prefix_only: bool|
-         -> io::Result<Vec<WalBatch>> {
-            let mut out = Vec::with_capacity(batches.len());
-            let mut pending_tx: Option<Vec<WalBatch>> = None;
-            let mut truncated = false;
+    let mut filter_committed_stream = |batches: Vec<WalBatch>,
+                                       validate_blob: &mut V,
+                                       prefix_only: bool|
+     -> io::Result<Vec<WalBatch>> {
+        let mut out = Vec::with_capacity(batches.len());
+        let mut pending_tx: Option<Vec<WalBatch>> = None;
+        let mut truncated = false;
 
-            for mut b in batches {
-                if b.lsn > max_lsn {
-                    max_lsn = b.lsn;
-                }
-                if b.lsn <= checkpoint_lsn || truncated {
-                    continue;
-                }
-                let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
-                let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
-                b.records
-                    .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
+        for mut b in batches {
+            if b.lsn > max_lsn {
+                max_lsn = b.lsn;
+            }
+            if b.lsn <= checkpoint_lsn || truncated {
+                continue;
+            }
+            let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
+            let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
+            b.records
+                .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
 
-                if has_begin {
-                    // Start of a new multi-chunk transaction; discard any prior incomplete one.
-                    let mut tx_vec = Vec::new();
-                    if !b.records.is_empty() {
-                        tx_vec.push(b);
+            if has_begin {
+                // Start of a new multi-chunk transaction; discard any prior incomplete one.
+                let mut tx_vec = Vec::new();
+                if !b.records.is_empty() {
+                    tx_vec.push(b);
+                }
+                if has_commit {
+                    if batches_blobs_valid(&tx_vec, validate_blob)? {
+                        out.extend(tx_vec);
+                    } else if prefix_only {
+                        truncated = true;
                     }
-                    if has_commit {
-                        if batches_blobs_valid(&tx_vec, validate_blob)? {
-                            out.extend(tx_vec);
-                        } else if prefix_only {
-                            truncated = true;
-                        }
-                        pending_tx = None;
-                    } else {
-                        pending_tx = Some(tx_vec);
-                    }
-                } else if let Some(ref mut tx_vec) = pending_tx {
-                    if !b.records.is_empty() {
-                        tx_vec.push(b);
-                    }
-                    if has_commit {
-                        let completed_tx = pending_tx.take().unwrap();
-                        if batches_blobs_valid(&completed_tx, validate_blob)? {
-                            out.extend(completed_tx);
-                        } else if prefix_only {
-                            truncated = true;
-                        }
-                    }
-                } else if !b.records.is_empty() {
-                    if batches_blobs_valid(core::slice::from_ref(&b), validate_blob)? {
-                        out.push(b);
+                    pending_tx = None;
+                } else {
+                    pending_tx = Some(tx_vec);
+                }
+            } else if let Some(ref mut tx_vec) = pending_tx {
+                if !b.records.is_empty() {
+                    tx_vec.push(b);
+                }
+                if has_commit {
+                    let completed_tx = pending_tx.take().unwrap();
+                    if batches_blobs_valid(&completed_tx, validate_blob)? {
+                        out.extend(completed_tx);
                     } else if prefix_only {
                         truncated = true;
                     }
                 }
+            } else if !b.records.is_empty() {
+                if batches_blobs_valid(core::slice::from_ref(&b), validate_blob)? {
+                    out.push(b);
+                } else if prefix_only {
+                    truncated = true;
+                }
             }
-            Ok(out)
-        };
+        }
+        Ok(out)
+    };
 
     // Sync-stream blobs are synced before the WAL record, so an invalid blob there is isolated.
     // Buffered-stream blobs and records are flushed independently, so power loss can drop an
@@ -1144,15 +1148,13 @@ mod tests {
         // Corrupt the Last sector of Batch 3 to simulate power failure before the final sector landed!
         {
             let f = fs
-                .open_file(
-                    WAL_BUF_FILE_NAME,
-                    false,
-                    true,
-                    OpenHint::MutableBufferedLog,
-                )
+                .open_file(WAL_BUF_FILE_NAME, false, true, OpenHint::MutableBufferedLog)
                 .unwrap();
-            f.write_all_at(&[0xFF, 0xFF], (last_written_sector * WAL_SECTOR_SIZE) as u64)
-                .unwrap();
+            f.write_all_at(
+                &[0xFF, 0xFF],
+                (last_written_sector * WAL_SECTOR_SIZE) as u64,
+            )
+            .unwrap();
         }
 
         // Recovery must return Batch 1 and Batch 2 intact, and cleanly discard incomplete Batch 3!
@@ -1212,7 +1214,10 @@ mod tests {
                 value: b"v".to_vec(),
             }],
         );
-        assert_eq!(writer.append_batch(&b5).unwrap(), WalAppendOutcome::RingFull);
+        assert_eq!(
+            writer.append_batch(&b5).unwrap(),
+            WalAppendOutcome::RingFull
+        );
 
         // Now rotate to Epoch 2 WITHOUT zero-filling the file, and write only 2 batches (Sectors 0 and 1).
         // Sectors 2 and 3 on disk still contain valid sectors from Epoch 1!
@@ -1571,14 +1576,9 @@ mod tests {
             ))
             .unwrap();
 
-        let recovered = recover_two_streams(
-            &**sync_w.file(),
-            1,
-            &**buf_w.file(),
-            1,
-            0,
-            |ptr| Ok(ptr.seg_id == 7),
-        )
+        let recovered = recover_two_streams(&**sync_w.file(), 1, &**buf_w.file(), 1, 0, |ptr| {
+            Ok(ptr.seg_id == 7)
+        })
         .unwrap();
 
         let recovered_lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
@@ -1633,14 +1633,9 @@ mod tests {
         sync_w.append_batch(&blob(4, 1)).unwrap();
         buf_w.append_batch(&blob(5, 1)).unwrap();
 
-        let recovered = recover_two_streams(
-            &**sync_w.file(),
-            1,
-            &**buf_w.file(),
-            1,
-            0,
-            |ptr| Ok(ptr.seg_id == 1),
-        )
+        let recovered = recover_two_streams(&**sync_w.file(), 1, &**buf_w.file(), 1, 0, |ptr| {
+            Ok(ptr.seg_id == 1)
+        })
         .unwrap();
         let lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
         assert_eq!(lsns, vec![1, 4]);
@@ -1808,8 +1803,7 @@ mod tests {
             WalStreamMode::BufferedUserSpaceCoalesced,
         ] {
             let (_tmp, fs, _, _) = fail_fs("wal_seal_torn");
-            let mut w =
-                WalStreamWriter::open(&fs, WAL_BUF_FILE_NAME, 64 * 1024, 1, mode).unwrap();
+            let mut w = WalStreamWriter::open(&fs, WAL_BUF_FILE_NAME, 64 * 1024, 1, mode).unwrap();
             w.append_batch(&put_batch(1, b"a", 10)).unwrap();
             w.make_durable_and_seal(false).unwrap();
             assert_eq!(w.current_sector_idx(), 1);

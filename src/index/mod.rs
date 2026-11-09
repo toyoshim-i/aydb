@@ -1138,10 +1138,8 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         block_buf: &'b mut [u8; IDX_BLOCK_SIZE],
         populate_cache: bool,
     ) -> io::Result<IdxBlockReader<'b>> {
-        self.file.read_exact_at(
-            block_buf,
-            (block_idx as u64) * (IDX_BLOCK_SIZE as u64),
-        )?;
+        self.file
+            .read_exact_at(block_buf, (block_idx as u64) * (IDX_BLOCK_SIZE as u64))?;
         let reader = IdxBlockReader::open_verified(block_buf)?;
         if populate_cache {
             if let Some(cache) = &self.block_cache {
@@ -1317,7 +1315,10 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 
     /// Creates a bounded-memory streaming cursor over all entries in this segment with explicit cache policy.
-    pub fn cursor_all_with_cache(&self, populate_cache: bool) -> io::Result<IdxSegmentCursor<'_, F>> {
+    pub fn cursor_all_with_cache(
+        &self,
+        populate_cache: bool,
+    ) -> io::Result<IdxSegmentCursor<'_, F>> {
         IdxSegmentCursor::new_all(self, populate_cache)
     }
 
@@ -1492,7 +1493,9 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
                 return Ok(());
             };
             self.next_block_idx = b.checked_sub(1);
-            let reader = self.seg.read_block(b, &mut self.block_buf, self.populate_cache)?;
+            let reader = self
+                .seg
+                .read_block(b, &mut self.block_buf, self.populate_cache)?;
             self.num_entries_in_block = reader.num_entries();
             self.entry_idx = self.num_entries_in_block;
         }
@@ -1640,7 +1643,9 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             }
             let b = self.next_block_idx;
             self.next_block_idx += 1;
-            let reader = self.seg.read_block(b, &mut self.block_buf, self.populate_cache)?;
+            let reader = self
+                .seg
+                .read_block(b, &mut self.block_buf, self.populate_cache)?;
             self.num_entries_in_block = reader.num_entries();
             self.entry_idx = 0;
         }
@@ -1720,12 +1725,10 @@ pub fn compact_idx_segments<F: PlatformFile>(
                                 let k = winning_val_buf[0];
                                 let tid =
                                     u16::from_le_bytes([winning_val_buf[1], winning_val_buf[2]]);
-                                let sid = u64::from_le_bytes(
-                                    winning_val_buf[3..11].try_into().unwrap(),
-                                );
-                                let blen = u32::from_le_bytes(
-                                    winning_val_buf[15..19].try_into().unwrap(),
-                                );
+                                let sid =
+                                    u64::from_le_bytes(winning_val_buf[3..11].try_into().unwrap());
+                                let blen =
+                                    u32::from_le_bytes(winning_val_buf[15..19].try_into().unwrap());
                                 *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
                             }
                             *win_lsn = raw.lsn;
@@ -1735,8 +1738,7 @@ pub fn compact_idx_segments<F: PlatformFile>(
                         } else if raw.val_type == 2 && raw.val_bytes.len() == BLOB_PTR_ENCODED_LEN {
                             let k = raw.val_bytes[0];
                             let tid = u16::from_le_bytes([raw.val_bytes[1], raw.val_bytes[2]]);
-                            let sid =
-                                u64::from_le_bytes(raw.val_bytes[3..11].try_into().unwrap());
+                            let sid = u64::from_le_bytes(raw.val_bytes[3..11].try_into().unwrap());
                             let blen =
                                 u32::from_le_bytes(raw.val_bytes[15..19].try_into().unwrap());
                             *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
@@ -1862,28 +1864,36 @@ mod tests {
         drop(comp);
         let seg_fname = crate::meta::format_idx_file_name(3);
         let seg_file = fs
-            .open_file(&seg_fname, false, true, crate::pal::OpenHint::ImmutableRandom)
+            .open_file(
+                &seg_fname,
+                false,
+                true,
+                crate::pal::OpenHint::ImmutableRandom,
+            )
             .unwrap();
         let flen = seg_file.file_len().unwrap() as usize;
         let mut raw_seg = vec![0u8; flen];
         seg_file.read_exact_at(&mut raw_seg, 0).unwrap();
 
         let footer_start = flen - 48;
-        let meta_offset =
-            u64::from_le_bytes(raw_seg[footer_start + 24..footer_start + 32].try_into().unwrap())
-                as usize;
+        let meta_offset = u64::from_le_bytes(
+            raw_seg[footer_start + 24..footer_start + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         // `meta_buf` starts with `[num_probes: u8 | reserved: [u8; 3] | bit_bytes_len: u32 LE | bits...]`,
         // followed by `fp_count: u32`.
-        let bloom_byte_len =
-            u32::from_le_bytes(raw_seg[meta_offset + 4..meta_offset + 8].try_into().unwrap())
-                as usize;
+        let bloom_byte_len = u32::from_le_bytes(
+            raw_seg[meta_offset + 4..meta_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         let fp_count_pos = meta_offset + 8 + bloom_byte_len;
         // Overwrite `fp_count` with `u32::MAX` and recompute both `meta_crc` and `footer_crc32c`
         raw_seg[fp_count_pos..fp_count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let new_meta_crc = crate::util::crc32c::crc32c(&raw_seg[meta_offset..footer_start]);
         raw_seg[footer_start + 36..footer_start + 40].copy_from_slice(&new_meta_crc.to_le_bytes());
-        let new_footer_crc =
-            crate::util::crc32c::crc32c(&raw_seg[footer_start..footer_start + 44]);
+        let new_footer_crc = crate::util::crc32c::crc32c(&raw_seg[footer_start..footer_start + 44]);
         raw_seg[footer_start + 44..footer_start + 48]
             .copy_from_slice(&new_footer_crc.to_le_bytes());
         seg_file.write_all_at(&raw_seg, 0).unwrap();
@@ -1914,13 +1924,21 @@ mod tests {
 
         // The first lookup reads the block from disk and populates the cache; later lookups of
         // keys in the same block are served from it. Each lookup counts exactly one hit or miss.
-        let expect = |i: u32| Some(((i + 1) as u64, IndexValue::Inline(format!("val_{i}").into_bytes())));
+        let expect = |i: u32| {
+            Some((
+                (i + 1) as u64,
+                IndexValue::Inline(format!("val_{i}").into_bytes()),
+            ))
+        };
         assert_eq!(seg.get(b"key_00007").unwrap(), expect(7));
         assert_eq!((cache.hits(), cache.misses()), (0, 1));
         assert_eq!(seg.get(b"key_00007").unwrap(), expect(7));
         assert_eq!((cache.hits(), cache.misses()), (1, 1));
         for i in 0..200u32 {
-            assert_eq!(seg.get(format!("key_{i:05}").as_bytes()).unwrap(), expect(i));
+            assert_eq!(
+                seg.get(format!("key_{i:05}").as_bytes()).unwrap(),
+                expect(i)
+            );
         }
         assert_eq!(cache.hits() + cache.misses(), 202);
         assert!(cache.hits() > 190);

@@ -669,7 +669,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn absorb_durable_through(&mut self, target: u64) {
-        while self.pending_group.front().is_some_and(|(lsn, _)| *lsn <= target) {
+        while self
+            .pending_group
+            .front()
+            .is_some_and(|(lsn, _)| *lsn <= target)
+        {
             if let Some((_, entries)) = self.pending_group.pop_front() {
                 self.memtable.absorb(entries);
             }
@@ -994,25 +998,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             cursor += 1;
             match op {
                 1 => {
-                    let klen =
-                        u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                            as usize;
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
                     cursor += 4 + klen;
-                    let vlen =
-                        u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                            as usize;
+                    let vlen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
                     cursor += 4 + vlen;
                 }
                 2 => {
-                    let klen =
-                        u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                            as usize;
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
                     cursor += 4 + klen + 23;
                 }
                 3 => {
-                    let klen =
-                        u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                            as usize;
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
                     cursor += 4 + klen;
                 }
                 4 | 5 => {}

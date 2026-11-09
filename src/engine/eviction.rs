@@ -151,8 +151,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             old_m_ptr = m_ptr;
                             mrec.recorded_tick = hot_tick;
                             let meta_bytes = mrec.to_bytes();
-                            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len())
-                            {
+                            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
                                 let ptr = self.append_to_blob_segment(
                                     BlobKind::Standard,
                                     0,

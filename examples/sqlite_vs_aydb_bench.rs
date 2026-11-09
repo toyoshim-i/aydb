@@ -72,16 +72,18 @@ fn percentile_us(sorted_ns: &[u64], pct: f64) -> f64 {
 }
 
 fn bench_small_sync_config_updates(root: &PathBuf) {
-    println!("==========================================================================================");
-    println!("BENCHMARK 1 (Phase 2): Small Synchronous Config Updates via SQL (300 Commits, 128B Value)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 1 (Phase 2): Small Synchronous Config Updates via SQL (300 Commits, 128B Value)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<34} | {:>12} | {:>12} | {:>12} | {:>12}",
-        "SQL Engine & Mode",
-        "Throughput",
-        "P50 Lat(us)",
-        "P99 Lat(us)",
-        "Disk Writes"
+        "SQL Engine & Mode", "Throughput", "P50 Lat(us)", "P99 Lat(us)", "Disk Writes"
     );
     println!("{}", "-".repeat(90));
 
@@ -186,17 +188,21 @@ fn bench_small_sync_config_updates(root: &PathBuf) {
 }
 
 fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
-    println!("\n==========================================================================================");
-    println!("BENCHMARK 2 (Phase 2): High-Churn HTTP Blob Cache via SQL (16 KB Blobs, 4.0 MB Quota)");
-    println!("  Writing 2,000 x 16 KB Blobs (32.0 MB Total) with Continuous LRU Eviction at 4.0 MB Cap");
-    println!("==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 2 (Phase 2): High-Churn HTTP Blob Cache via SQL (16 KB Blobs, 4.0 MB Quota)"
+    );
+    println!(
+        "  Writing 2,000 x 16 KB Blobs (32.0 MB Total) with Continuous LRU Eviction at 4.0 MB Cap"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<34} | {:>12} | {:>12} | {:>12} | {:>14}",
-        "SQL Engine & Mode",
-        "Write Speed",
-        "P50 Lat(us)",
-        "P99 Lat(us)",
-        "Data Footprint"
+        "SQL Engine & Mode", "Write Speed", "P50 Lat(us)", "P99 Lat(us)", "Data Footprint"
     );
     println!("{}", "-".repeat(90));
 
@@ -327,15 +333,18 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
 }
 
 fn bench_read_heavy_cache_lru_tracking(root: &PathBuf) {
-    println!("\n==========================================================================================");
-    println!("BENCHMARK 3 (Phase 2): Read-Heavy Cache Hits with LRU Timestamp Tracking (20,000 SELECTs)");
-    println!("==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 3 (Phase 2): Read-Heavy Cache Hits with LRU Timestamp Tracking (20,000 SELECTs)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<38} | {:>14} | {:>14} | {:>16}",
-        "SQL Read + LRU Tracking Strategy",
-        "Read Ops/sec",
-        "Avg Latency",
-        "Disk Write I/O"
+        "SQL Read + LRU Tracking Strategy", "Read Ops/sec", "Avg Latency", "Disk Write I/O"
     );
     println!("{}", "-".repeat(90));
 

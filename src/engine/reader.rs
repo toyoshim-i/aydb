@@ -100,7 +100,8 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
         slab: &mut Vec<u8>,
         spans: &mut Vec<(usize, usize)>,
     ) -> io::Result<bool> {
-        self.eng.get_row_into_cx(&self.cx, table_id, pk, slab, spans)
+        self.eng
+            .get_row_into_cx(&self.cx, table_id, pk, slab, spans)
     }
 
     /// See [`StorageEngine::get_row_into_lazy`].

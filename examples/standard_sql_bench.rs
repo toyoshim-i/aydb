@@ -117,9 +117,15 @@ impl ZipfRng {
 // =========================================================================
 
 fn verify_differential_sql_equivalence(root: &PathBuf) {
-    println!("==========================================================================================");
-    println!("PRE-BENCHMARK DIFFERENTIAL SQL EQUIVALENCE VERIFICATION (Native SQLite vs. aydb VTab)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "PRE-BENCHMARK DIFFERENTIAL SQL EQUIVALENCE VERIFICATION (Native SQLite vs. aydb VTab)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<54} | {:>14} | {:>20}",
         "Differential SQL Equivalence Check", "Status", "Verification Detail"
@@ -140,9 +146,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
     let ay_conn = SqliteConnection::open_in_memory().unwrap();
-    ay_conn
-        .register_aydb_module(shared_engine.clone())
-        .unwrap();
+    ay_conn.register_aydb_module(shared_engine.clone()).unwrap();
 
     // 1. Mixed numeric types & exact unified numeric ORDER BY on BLOB PRIMARY KEY
     {
@@ -170,9 +174,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         }
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0A. Mixed Numeric Types & Unified ORDER BY",
-            "PASS",
-            "100% State Match"
+            "0A. Mixed Numeric Types & Unified ORDER BY", "PASS", "100% State Match"
         );
     }
 
@@ -208,21 +210,23 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         }
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0B. Column Affinity & NOCASE/RTRIM Collations",
-            "PASS",
-            "100% State Match"
+            "0B. Column Affinity & NOCASE/RTRIM Collations", "PASS", "100% State Match"
         );
     }
 
     // 3. Failed UNIQUE Constraint Statements & Nested SAVEPOINT / ROLLBACK TO
     {
         // Both engines must reject duplicate PK INSERT and preserve existing state
-        assert!(sq_conn
-            .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
-            .is_err());
-        assert!(ay_conn
-            .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
-            .is_err());
+        assert!(
+            sq_conn
+                .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
+                .is_err()
+        );
+        assert!(
+            ay_conn
+                .execute_batch("INSERT INTO t_aff VALUES (1, 999, 'Dup', 'dup');")
+                .is_err()
+        );
 
         let tx_script = "BEGIN;
                          INSERT INTO t_aff VALUES (3, 300, 'Charlie', 'mod');
@@ -244,9 +248,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         assert_eq!(sq_state, ay_state);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0C. Failed UNIQUE Statements & Nested SAVEPOINTs",
-            "PASS",
-            "100% State Match"
+            "0C. Failed UNIQUE Statements & Nested SAVEPOINTs", "PASS", "100% State Match"
         );
     }
 
@@ -277,24 +279,32 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
             .unwrap();
 
         // Connection 2 must not see uncommitted row 10 and must receive SQLITE_BUSY on write
-        assert!(ay_conn2
-            .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
-            .unwrap()
-            .is_empty());
-        assert!(ay_conn2
-            .execute_batch("INSERT INTO t_aff VALUES (11, 1100, 'Busy', 'busy');")
-            .is_err());
+        assert!(
+            ay_conn2
+                .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ay_conn2
+                .execute_batch("INSERT INTO t_aff VALUES (11, 1100, 'Busy', 'busy');")
+                .is_err()
+        );
 
         // Roll back the mixed transaction on Connection 1 -> both native_audit and t_aff roll back
         ay_conn.execute_batch("ROLLBACK;").unwrap();
-        assert!(ay_conn
-            .query_all("SELECT * FROM native_audit", &[])
-            .unwrap()
-            .is_empty());
-        assert!(ay_conn
-            .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            ay_conn
+                .query_all("SELECT * FROM native_audit", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ay_conn
+                .query_all("SELECT * FROM t_aff WHERE id = 10", &[])
+                .unwrap()
+                .is_empty()
+        );
 
         // Now commit a mixed native + aydb transaction across both stores
         ay_conn
@@ -318,9 +328,7 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
         assert_eq!(sq_final, ay_final);
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "0D. Cross-Conn Isolation & Mixed SQLite+aydb 2PC Tx",
-            "PASS",
-            "100% State Match"
+            "0D. Cross-Conn Isolation & Mixed SQLite+aydb 2PC Tx", "PASS", "100% State Match"
         );
     }
 
@@ -384,13 +392,14 @@ fn verify_differential_sql_equivalence(root: &PathBuf) {
             .unwrap();
         let sq_left = sq_conn.query_all("SELECT * FROM t_ci", &[]).unwrap();
         let ay_left = ay_conn.query_all("SELECT * FROM t_ci", &[]).unwrap();
-        assert_eq!(sq_left, ay_left, "differential mismatch on DELETE with COLLATE BINARY");
+        assert_eq!(
+            sq_left, ay_left,
+            "differential mismatch on DELETE with COLLATE BINARY"
+        );
 
         println!(
             "{:<54} | {:>14} | {:>20}\n",
-            "0E. Query Collation Overrides & Rowid Equivalence",
-            "PASS",
-            "100% State Match"
+            "0E. Query Collation Overrides & Rowid Equivalence", "PASS", "100% State Match"
         );
     }
 
@@ -481,7 +490,10 @@ fn run_speedtest1_on_connection(conn: &SqliteConnection) -> SpeedtestTimings {
         for _ in 0..N_RANGE {
             let start_id = (rng.next_usize(N_ROWS - 25) + 1) as i64;
             let rows = sel_rng
-                .query(&[SqlValue::Integer(start_id), SqlValue::Integer(start_id + 20)])
+                .query(&[
+                    SqlValue::Integer(start_id),
+                    SqlValue::Integer(start_id + 20),
+                ])
                 .unwrap();
             black_box(rows);
         }
@@ -556,15 +568,18 @@ fn run_speedtest1_on_connection(conn: &SqliteConnection) -> SpeedtestTimings {
 }
 
 fn bench_speedtest1_suite(root: &PathBuf) {
-    println!("==========================================================================================");
-    println!("SUITE 1: SQLite \"Speedtest1\"-Style Workload (Selected Tests 100-240, 5,000 Rows, 120B)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "SUITE 1: SQLite \"Speedtest1\"-Style Workload (Selected Tests 100-240, 5,000 Rows, 120B)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<40} | {:>16} | {:>16} | {:>12}",
-        "Speedtest1 Sub-Benchmark",
-        "Vanilla SQLite",
-        "aydb VTab",
-        "Speedup"
+        "Speedtest1 Sub-Benchmark", "Vanilla SQLite", "aydb VTab", "Speedup"
     );
     println!("{}", "-".repeat(90));
 
@@ -684,10 +699,7 @@ fn bench_speedtest1_suite(root: &PathBuf) {
 // SUITE 2: YCSB-Style Workloads A through F
 // =========================================================================
 
-fn run_ycsb_on_connection(
-    conn: &SqliteConnection,
-    val_size: usize,
-) -> [(String, f64); 6] {
+fn run_ycsb_on_connection(conn: &SqliteConnection, val_size: usize) -> [(String, f64); 6] {
     const INITIAL_RECORDS: usize = 4_000;
     const OPS_PER_WORKLOAD: usize = 5_000;
 
@@ -826,7 +838,9 @@ fn run_ycsb_on_connection(
 
 fn bench_ycsb_suite(root: &PathBuf) {
     for &val_size in &[256usize, 2048] {
-        println!("\n==========================================================================================");
+        println!(
+            "\n=========================================================================================="
+        );
         println!(
             "SUITE 2: YCSB-Style Workloads A-F (Zipfian theta=0.99, Value Size = {} B — {})",
             val_size,
@@ -836,13 +850,12 @@ fn bench_ycsb_suite(root: &PathBuf) {
                 "WiscKey Separated Blob Storage"
             }
         );
-        println!("==========================================================================================");
+        println!(
+            "=========================================================================================="
+        );
         println!(
             "{:<34} | {:>18} | {:>18} | {:>12}",
-            "YCSB Workload",
-            "Vanilla SQLite(WAL)",
-            "aydb VTab",
-            "Ratio"
+            "YCSB Workload", "Vanilla SQLite(WAL)", "aydb VTab", "Ratio"
         );
         println!("{}", "-".repeat(90));
 
@@ -994,15 +1007,16 @@ fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
 }
 
 fn bench_tpcb_suite(root: &PathBuf) {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("SUITE 3: TPC-B-Style (pgbench-like) 4-Table OLTP Workload (5 SQL Statements per Tx)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<34} | {:>18} | {:>18} | {:>12}",
-        "Durability Mode",
-        "Vanilla SQLite(WAL)",
-        "aydb VTab",
-        "Ratio"
+        "Durability Mode", "Vanilla SQLite(WAL)", "aydb VTab", "Ratio"
     );
     println!("{}", "-".repeat(90));
 
@@ -1126,15 +1140,18 @@ fn bench_tpcb_suite(root: &PathBuf) {
 // =========================================================================
 
 fn bench_on_disk_sstable_suite(root: &PathBuf) {
-    println!("\n==========================================================================================");
-    println!("SUITE 4: On-Disk SSTable Evaluation (memtable_capacity_bytes = 128 KB, idx_*.db SSTables)");
-    println!("==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
+    println!(
+        "SUITE 4: On-Disk SSTable Evaluation (memtable_capacity_bytes = 128 KB, idx_*.db SSTables)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<44} | {:>16} | {:>16} | {:>10}",
-        "On-Disk SSTable Workload (128 KB MemTable)",
-        "Vanilla SQLite",
-        "aydb (SSTables)",
-        "Ratio"
+        "On-Disk SSTable Workload (128 KB MemTable)", "Vanilla SQLite", "aydb (SSTables)", "Ratio"
     );
     println!("{}", "-".repeat(94));
 

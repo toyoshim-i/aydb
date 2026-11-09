@@ -15,7 +15,10 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create bench dir");
 
-    println!("{:<14} | {:>16} | {:>16}", "uncommitted", "non-owner us/read", "owner us/read");
+    println!(
+        "{:<14} | {:>16} | {:>16}",
+        "uncommitted", "non-owner us/read", "owner us/read"
+    );
     for n in [0usize, 10_000, 50_000] {
         let sub = dir.join(format!("n{n}"));
         std::fs::create_dir_all(&sub).unwrap();
@@ -23,14 +26,26 @@ fn main() {
         let mut eng = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
         for i in 0..100u32 {
             let k = format!("c{i:06}");
-            eng.put_row(1, k.as_bytes(), b"committed", &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                1,
+                k.as_bytes(),
+                b"committed",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
         }
         eng.begin_transaction_for_conn(1).unwrap();
         for i in 0..n {
             let k = format!("u{i:08}");
-            eng.put_row(1, k.as_bytes(), b"uncommitted", &[], WriteDurability::BufferedFast)
-                .unwrap();
+            eng.put_row(
+                1,
+                k.as_bytes(),
+                b"uncommitted",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
         }
         let t = Instant::now();
         for i in 0..READS {

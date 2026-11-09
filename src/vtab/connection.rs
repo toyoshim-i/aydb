@@ -13,17 +13,17 @@ use std::sync::{Arc, RwLock};
 use crate::engine::StorageEngine;
 use crate::pal::OsFs;
 use crate::vtab::ffi::{
-    SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
-    SQLITE_TEXT, sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double,
-    sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_clear_bindings,
-    sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count,
-    sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text, sqlite3_column_type,
-    sqlite3_create_module_v2, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open,
-    sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt,
+    SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW, SQLITE_TEXT,
+    sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64,
+    sqlite3_bind_null, sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close,
+    sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double,
+    sqlite3_column_int64, sqlite3_column_text, sqlite3_column_type, sqlite3_create_module_v2,
+    sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open, sqlite3_prepare_v2,
+    sqlite3_reset, sqlite3_step, sqlite3_stmt,
 };
 use crate::vtab::row_codec::SqlValue;
-use crate::vtab::{AYDB_VTAB_MODULE, ModuleAuxContext, destroy_aux_context};
 use crate::vtab::snapshot::{ReadSession, ReadTrace, TRACE_PROFILE, TRACE_STATEMENT, trace_reads};
+use crate::vtab::{AYDB_VTAB_MODULE, ModuleAuxContext, destroy_aux_context};
 
 /// Safe, ergonomic wrapper around a native `sqlite3*` database connection with `aydb`
 /// Virtual Table registration support.
@@ -54,7 +54,9 @@ impl SqliteConnection {
                     sqlite3_close(db);
                 }
             }
-            return Err(io::Error::other(format!("sqlite3_open failed with rc={rc}")));
+            return Err(io::Error::other(format!(
+                "sqlite3_open failed with rc={rc}"
+            )));
         }
         let mut read_trace = Box::new(ReadTrace::new(db));
         let rc = unsafe {
@@ -66,8 +68,12 @@ impl SqliteConnection {
             )
         };
         if rc != SQLITE_OK {
-            unsafe { sqlite3_close(db); }
-            return Err(io::Error::other("could not register SQLite read lifecycle trace"));
+            unsafe {
+                sqlite3_close(db);
+            }
+            return Err(io::Error::other(
+                "could not register SQLite read lifecycle trace",
+            ));
         }
         Ok(Self { db, read_trace })
     }
@@ -78,10 +84,7 @@ impl SqliteConnection {
     /// mutex released) so other connections are not blocked behind a long merge. The thread is
     /// joined when the module registration is dropped (connection close). Use
     /// [`Self::register_aydb_module_with_options`] to keep compaction inline instead.
-    pub fn register_aydb_module(
-        &self,
-        engine: Arc<RwLock<StorageEngine<OsFs>>>,
-    ) -> io::Result<()> {
+    pub fn register_aydb_module(&self, engine: Arc<RwLock<StorageEngine<OsFs>>>) -> io::Result<()> {
         self.register_aydb_module_with_options(engine, true)
     }
 

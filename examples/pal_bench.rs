@@ -29,10 +29,10 @@ use std::time::Instant;
 
 use aydb::pal::{OpenHint, OsFs, PlatformFile, PlatformFs, PreallocStrategy};
 
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 fn percentile_us(sorted_ns: &[u64], pct: f64) -> f64 {
     if sorted_ns.is_empty() {
@@ -48,8 +48,16 @@ fn bench_wal_prealloc_and_epochs(root: &PathBuf) {
     println!("========================================================================");
 
     for (label, hint, file_size_mb) in [
-        ("wal_sync.db (durable per write, 2 MB)", OpenHint::MutableSyncLog, 2usize),
-        ("wal_buf.db  (Buffered,     16 MB)", OpenHint::MutableBufferedLog, 16usize),
+        (
+            "wal_sync.db (durable per write, 2 MB)",
+            OpenHint::MutableSyncLog,
+            2usize,
+        ),
+        (
+            "wal_buf.db  (Buffered,     16 MB)",
+            OpenHint::MutableBufferedLog,
+            16usize,
+        ),
     ] {
         let total_bytes = (file_size_mb * 1024 * 1024) as u64;
         let num_sectors = (total_bytes / 4096) as usize;
@@ -78,7 +86,8 @@ fn bench_wal_prealloc_and_epochs(root: &PathBuf) {
 
             let t0 = Instant::now();
             let file = fs.open_file(&fname, true, true, hint).expect("open wal");
-            file.preallocate(total_bytes, strategy).expect("preallocate");
+            file.preallocate(total_bytes, strategy)
+                .expect("preallocate");
             let prealloc_ms = t0.elapsed().as_secs_f64() * 1_000.0;
 
             let sector_buf = [0x5Au8; 4096];
@@ -194,7 +203,8 @@ fn bench_concurrent_reads(root: &PathBuf) {
                         #[cfg(windows)]
                         f.seek_read(&mut buf, blk * 4096).expect("seek_read");
                         #[cfg(unix)]
-                        f.read_exact_at(&mut buf, blk * 4096).expect("read_exact_at");
+                        f.read_exact_at(&mut buf, blk * 4096)
+                            .expect("read_exact_at");
                     }
                 }));
             }
@@ -246,7 +256,9 @@ fn bench_concurrent_reads(root: &PathBuf) {
         );
     }
 
-    println!("\n--- Part 2B: Head-of-Line Blocking Under Concurrent Flush/Disk Stall (8 Readers) ---");
+    println!(
+        "\n--- Part 2B: Head-of-Line Blocking Under Concurrent Flush/Disk Stall (8 Readers) ---"
+    );
     println!(
         "{:<28} | {:>14} | {:>14} | {:>14}",
         "Handle Implementation", "Throughput(K/s)", "P50 Lat (us)", "P99 Lat (us)"
@@ -301,7 +313,8 @@ fn bench_concurrent_reads(root: &PathBuf) {
                     #[cfg(windows)]
                     f.seek_read(&mut buf, blk * 4096).expect("seek_read");
                     #[cfg(unix)]
-                    f.read_exact_at(&mut buf, blk * 4096).expect("read_exact_at");
+                    f.read_exact_at(&mut buf, blk * 4096)
+                        .expect("read_exact_at");
                     lats.push(t0.elapsed().as_nanos() as u64);
                 }
                 lats

@@ -62,7 +62,13 @@ fn run(background: bool) -> (Vec<Duration>, usize) {
         engine
             .write()
             .unwrap()
-            .put_row(1, key.as_bytes(), &payload, &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                key.as_bytes(),
+                &payload,
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
         lat.push(t.elapsed());
     }
@@ -82,7 +88,10 @@ fn pct(sorted: &[Duration], p: f64) -> Duration {
 
 fn main() {
     println!("{ROWS} sustained inserts, 128 KB MemTable, threshold 8");
-    println!("{:<12} {:>10} {:>10} {:>10} {:>12} {:>5}", "mode", "p50", "p99", "p99.9", "max", "segs");
+    println!(
+        "{:<12} {:>10} {:>10} {:>10} {:>12} {:>5}",
+        "mode", "p50", "p99", "p99.9", "max", "segs"
+    );
     for (name, bg) in [("inline", false), ("background", true)] {
         let (mut lat, segs) = run(bg);
         lat.sort();

@@ -369,9 +369,8 @@ impl PlatformFile for WinPlatformFile {
             }
 
             // Slow path: wait on the thread-local manual-reset event, then reset it.
-            let wait_res = unsafe {
-                GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 1)
-            };
+            let wait_res =
+                unsafe { GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 1) };
             let wait_err = if wait_res == FALSE {
                 unsafe { GetLastError() }
             } else {

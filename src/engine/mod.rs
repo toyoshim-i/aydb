@@ -18,9 +18,9 @@ pub(crate) use snapshot::ReadSnapshotToken;
 pub(crate) use tx::{CommitStep, GroupRole};
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod metadata_failure_tests;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -28,17 +28,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::blob::{
-    BLOB_RECORD_HEADER_LEN, BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_BLOB_SEGMENT_SIZE,
+    BLOB_RECORD_HEADER_LEN, BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD,
+    DEFAULT_MAX_BLOB_SEGMENT_SIZE,
 };
 use crate::cache::{BlobCacheKey, VerifiedBlobCache, VerifiedBlockCache};
 use crate::index::{
-    BloomFilter, DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue,
-    RawIdxEntry, decode_lru_queue_key, decode_secondary_index_pk_slice,
+    BloomFilter, DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, RawIdxEntry,
+    decode_lru_queue_key, decode_secondary_index_pk_slice,
 };
 use crate::lru::{
-    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META,
-    NS_SECONDARY_INDEX, RowMetaRecord, encode_lru_queue_key, encode_namespace_prefix,
-    encode_primary_row_key, encode_row_meta_key, encode_secondary_index_key,
+    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX,
+    RowMetaRecord, encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key,
+    encode_row_meta_key, encode_secondary_index_key,
 };
 use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
 use crate::meta::{
@@ -52,8 +53,8 @@ use crate::wal::{
     recover_two_streams,
 };
 
-pub use self::reader::{EngineReader, ReadView};
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx};
+pub use self::reader::{EngineReader, ReadView};
 use self::tx::{SavepointMarker, TxMetaSnapshot};
 
 /// Result of a policy-free `'t'` row-meta lookup.
@@ -287,7 +288,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Committed batches written to `wal_sync.db` whose device flush has not finished, in LSN
     /// order, as `(batch LSN, entries)`. The next writer's overlay starts from these entries;
     /// readers see them only after they move to the `MemTable`.
-    pub(super) pending_group: std::collections::VecDeque<(u64, BTreeMap<Vec<u8>, crate::memtable::MemEntry>)>,
+    pub(super) pending_group:
+        std::collections::VecDeque<(u64, BTreeMap<Vec<u8>, crate::memtable::MemEntry>)>,
     /// True if `flush_memtable()` was requested during an active transaction.
     pub(super) deferred_flush_on_commit: bool,
     /// True if `compact()` was requested during an active transaction.
@@ -494,8 +496,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 }
                             }
                             BlobKind::Lru => {
-                                if let Some(ve) =
-                                    lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id))
+                                if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id))
                                 {
                                     *ve = (*ve).max(end);
                                 }
@@ -960,7 +961,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if owner != &norm_name {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("table_id {id} is already persisted for virtual table '{owner}'"),
+                            format!(
+                                "table_id {id} is already persisted for virtual table '{owner}'"
+                            ),
                         ));
                     }
                 }
@@ -1047,8 +1050,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut records = Vec::new();
         let mut dead_ptrs = Vec::new();
 
-        for ns in [NS_PRIMARY_ROW, NS_SECONDARY_INDEX, NS_ROW_META, NS_LRU_QUEUE,
-            rowid::NS_ROWID_BY_PK, rowid::NS_PK_BY_ROWID] {
+        for ns in [
+            NS_PRIMARY_ROW,
+            NS_SECONDARY_INDEX,
+            NS_ROW_META,
+            NS_LRU_QUEUE,
+            rowid::NS_ROWID_BY_PK,
+            rowid::NS_PK_BY_ROWID,
+        ] {
             let prefix = encode_namespace_prefix(table_id, ns);
             let entries = self.scan_merged_prefix(&prefix)?;
             for entry in entries {
@@ -1067,7 +1076,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if internal_tx {
             self.begin_transaction();
         }
-        let removed_name = self.active_vtab_ids.remove(&table_id).map(|s| s.to_string());
+        let removed_name = self
+            .active_vtab_ids
+            .remove(&table_id)
+            .map(|s| s.to_string());
         let name_to_clean = table_name
             .map(|s| s.trim().to_ascii_lowercase())
             .or(removed_name);
@@ -1236,12 +1248,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
                         records.push(WalRecord::Delete {
-                            key: encode_secondary_index_key(
-                                table_id,
-                                *old_idx_id,
-                                old_col_val,
-                                pk,
-                            ),
+                            key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
                         });
                     }
                 }
@@ -1263,13 +1270,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let inline_thresh = self.effective_inline_threshold(table_id);
         let store_as_blob = value.len() >= inline_thresh
             || !IndexEntry::inline_fits_in_block(row_key.len(), value.len());
-        if self.tx_depth > 0
-            && !self.tx_preparing
-            && self.config.max_transaction_bytes > 0
-        {
-            let est_row_bytes = (if store_as_blob { 28 } else { 9 })
-                + row_key.len()
-                + value.len();
+        if self.tx_depth > 0 && !self.tx_preparing && self.config.max_transaction_bytes > 0 {
+            let est_row_bytes = (if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len();
             if self.pending_tx_bytes.saturating_add(est_row_bytes)
                 > self.config.max_transaction_bytes
             {
@@ -1644,12 +1646,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
                         records.push(WalRecord::Delete {
-                            key: encode_secondary_index_key(
-                                table_id,
-                                *old_idx_id,
-                                old_col_val,
-                                pk,
-                            ),
+                            key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
                         });
                     }
                     records.push(WalRecord::Delete { key: meta_key });
@@ -1742,7 +1739,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let hash = BloomFilter::hash_pair(row_key);
             for seg in self.idx_segments_for_view(cx.view).iter().rev() {
                 let start = slab.len();
-                let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
+                let probe =
+                    seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
                 if let Some(probe) = probe {
                     match probe {
                         SegProbe::Inline => {
@@ -1843,7 +1841,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let hash = BloomFilter::hash_pair(row_key);
             for seg in self.idx_segments_for_view(cx.view).iter().rev() {
                 let start = slab.len();
-                let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
+                let probe =
+                    seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
                 if let Some(probe) = probe {
                     match probe {
                         SegProbe::Inline => {
@@ -1856,7 +1855,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 spans.push((0, 0));
                                 lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
                                 hit = true;
-                            } else if self.read_flushed_blob_append_into_view(cx.view, &ptr, row_key, slab)? {
+                            } else if self
+                                .read_flushed_blob_append_into_view(cx.view, &ptr, row_key, slab)?
+                            {
                                 spans.push((start, slab.len()));
                                 lazy_blobs.push(None);
                                 hit = true;
@@ -1916,7 +1917,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return thresh;
         }
         if self.capped_tables.contains_key(&table_id) {
-            self.config.inline_threshold_bytes.min(DEFAULT_INLINE_THRESHOLD)
+            self.config
+                .inline_threshold_bytes
+                .min(DEFAULT_INLINE_THRESHOLD)
         } else {
             self.config.inline_threshold_bytes
         }
@@ -2254,8 +2257,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                     }
                     let seq_id = self.meta_mgr.state().next_seq_id;
-                    let writer =
-                        BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
+                    let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
                     self.std_blobs.insert(
                         seq_id,
                         TrackedStdBlob {
@@ -2503,7 +2505,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let reader = self.blob_reader_for_view(view, ptr);
         let ok = match reader {
-            Some(reader) if out.is_empty() => reader.read_blob_into(ptr, Some(expected_key), out)?,
+            Some(reader) if out.is_empty() => {
+                reader.read_blob_into(ptr, Some(expected_key), out)?
+            }
             Some(reader) => reader.append_blob_into(ptr, Some(expected_key), out)?,
             None => false,
         };

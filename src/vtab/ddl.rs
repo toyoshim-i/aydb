@@ -74,7 +74,11 @@ pub(super) fn split_top_level_commas(input: &str) -> Vec<&str> {
 /// rather than a column definition. These are not supported and must not be mistaken for a column.
 fn is_table_constraint(tokens: &[&str]) -> bool {
     let first = tokens[0];
-    let word = first.split('(').next().unwrap_or(first).to_ascii_uppercase();
+    let word = first
+        .split('(')
+        .next()
+        .unwrap_or(first)
+        .to_ascii_uppercase();
     let has_paren = first.contains('(') || tokens.get(1).is_some_and(|t| t.starts_with('('));
     let second_is_key = tokens
         .get(1)
@@ -222,7 +226,10 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_not_null = Vec::new();
         let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
-        for (idx, col_def) in split_top_level_commas(&columns_spec).into_iter().enumerate() {
+        for (idx, col_def) in split_top_level_commas(&columns_spec)
+            .into_iter()
+            .enumerate()
+        {
             let trimmed = col_def.trim();
             // The parser does not support comments or per-constraint conflict policies.
             // Reject them rather than silently misinterpret a constraint.
@@ -252,9 +259,10 @@ pub(super) unsafe fn parse_vtab_ddl(
                 let tok_upper = raw_tokens[t_idx].to_ascii_uppercase();
                 if tok_upper.strip_prefix("DEFAULT").is_some_and(|suffix| {
                     suffix.is_empty()
-                        || suffix.as_bytes().first().is_some_and(|byte| {
-                            !byte.is_ascii_alphanumeric() && *byte != b'_'
-                        })
+                        || suffix
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
                 }) {
                     return Err(SQLITE_ERROR);
                 }
@@ -379,7 +387,9 @@ mod tests {
             Some(CorruptPolicy::Evict)
         );
         assert_eq!(
-            parse(&["max_bytes=10", "ON_CORRUPT=Evict"]).unwrap().on_corrupt,
+            parse(&["max_bytes=10", "ON_CORRUPT=Evict"])
+                .unwrap()
+                .on_corrupt,
             Some(CorruptPolicy::Evict)
         );
         assert_eq!(parse(&["on_corrupt=ignore"]).err(), Some(SQLITE_ERROR));
@@ -389,18 +399,9 @@ mod tests {
     #[test]
     fn inline_max_option_parsing() {
         assert_eq!(parse(&[]).unwrap().inline_max, None);
-        assert_eq!(
-            parse(&["inline_max=2048"]).unwrap().inline_max,
-            Some(2048)
-        );
-        assert_eq!(
-            parse(&["inline_max=0"]).unwrap().inline_max,
-            Some(0)
-        );
-        assert_eq!(
-            parse(&["INLINE_MAX=4096"]).unwrap().inline_max,
-            Some(4096)
-        );
+        assert_eq!(parse(&["inline_max=2048"]).unwrap().inline_max, Some(2048));
+        assert_eq!(parse(&["inline_max=0"]).unwrap().inline_max, Some(0));
+        assert_eq!(parse(&["INLINE_MAX=4096"]).unwrap().inline_max, Some(4096));
         assert_eq!(
             parse(&["inline_max = '3500'"]).unwrap().inline_max,
             Some(3500)
@@ -451,7 +452,10 @@ mod tests {
         let ok = parse(&[cols, "indexes='name, TAG'"]).unwrap();
         assert_eq!(ok.secondary_indexes, vec![(1, 1), (2, 2)]);
         assert_eq!(parse(&[cols, "indexes='nme'"]).err(), Some(SQLITE_ERROR));
-        assert_eq!(parse(&[cols, "indexes='name,missing'"]).err(), Some(SQLITE_ERROR));
+        assert_eq!(
+            parse(&[cols, "indexes='name,missing'"]).err(),
+            Some(SQLITE_ERROR)
+        );
     }
 
     #[test]
@@ -466,8 +470,8 @@ mod tests {
         ] {
             assert_eq!(parse(&[spec]).err(), Some(SQLITE_ERROR), "{spec}");
         }
-        let ok = parse(&["columns='a TEXT PRIMARY KEY, check_v INT UNIQUE, primary_x TEXT'"])
-            .unwrap();
+        let ok =
+            parse(&["columns='a TEXT PRIMARY KEY, check_v INT UNIQUE, primary_x TEXT'"]).unwrap();
         assert_eq!(ok.col_names, vec!["a", "check_v", "primary_x"]);
     }
 }

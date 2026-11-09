@@ -71,16 +71,28 @@ fn main() {
         e.begin_transaction();
         for i in 0..ROWS {
             let k = format!("k{i:08}");
-            e.put_row(2, k.as_bytes(), &value_for(i), &[], WriteDurability::BufferedFast)
-                .unwrap();
+            e.put_row(
+                2,
+                k.as_bytes(),
+                &value_for(i),
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
         }
         e.commit_transaction().unwrap();
         e.flush_memtable().unwrap();
         // leave a tail in the memtable
         for i in ROWS..ROWS + 1000 {
             let k = format!("k{i:08}");
-            e.put_row(2, k.as_bytes(), &value_for(i), &[], WriteDurability::BufferedFast)
-                .unwrap();
+            e.put_row(
+                2,
+                k.as_bytes(),
+                &value_for(i),
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
         }
     }
     let setup = SqliteConnection::open_in_memory().unwrap();
@@ -99,7 +111,10 @@ fn main() {
         setup.execute_batch("COMMIT;").unwrap();
     }
 
-    println!("{:<28} | {:>8} | {:>14} | {:>8}", "workload", "threads", "reads/s", "speedup");
+    println!(
+        "{:<28} | {:>8} | {:>14} | {:>8}",
+        "workload", "threads", "reads/s", "speedup"
+    );
     println!("{}", "-".repeat(68));
 
     let mut base = 0.0;
@@ -128,7 +143,13 @@ fn main() {
         if threads == 1 {
             base = rate;
         }
-        println!("{:<28} | {:>8} | {:>14.0} | {:>7.2}x", "engine get_row_into", threads, rate, rate / base);
+        println!(
+            "{:<28} | {:>8} | {:>14.0} | {:>7.2}x",
+            "engine get_row_into",
+            threads,
+            rate,
+            rate / base
+        );
     }
 
     let mut base = 0.0;
@@ -136,7 +157,8 @@ fn main() {
         let eng = engine.clone();
         let rate = run_threads(threads, move |t, stop| {
             let conn = SqliteConnection::open_in_memory().unwrap();
-            conn.register_aydb_module_with_options(eng.clone(), false).unwrap();
+            conn.register_aydb_module_with_options(eng.clone(), false)
+                .unwrap();
             conn.execute_batch("CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v BLOB');")
                 .unwrap();
             let mut st = conn.prepare("SELECT v FROM t WHERE id = ?").unwrap();
@@ -153,7 +175,13 @@ fn main() {
         if threads == 1 {
             base = rate;
         }
-        println!("{:<28} | {:>8} | {:>14.0} | {:>7.2}x", "sql SELECT by pk", threads, rate, rate / base);
+        println!(
+            "{:<28} | {:>8} | {:>14.0} | {:>7.2}x",
+            "sql SELECT by pk",
+            threads,
+            rate,
+            rate / base
+        );
     }
 
     drop(setup);

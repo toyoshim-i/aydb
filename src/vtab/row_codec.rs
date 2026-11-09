@@ -5,11 +5,11 @@ use std::io::{self, ErrorKind};
 
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::vtab::ffi::{
-    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
-    sqlite3_context, sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error_toobig,
-    sqlite3_result_int64, sqlite3_result_null, sqlite3_result_text, sqlite3_value,
-    sqlite3_value_blob, sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64,
-    sqlite3_value_text, sqlite3_value_type,
+    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient, sqlite3_context,
+    sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error_toobig, sqlite3_result_int64,
+    sqlite3_result_null, sqlite3_result_text, sqlite3_value, sqlite3_value_blob,
+    sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
+    sqlite3_value_type,
 };
 
 /// 1-byte key storage-class type tags ordered according to SQLite's comparison rules:
@@ -410,9 +410,7 @@ impl SqlValue {
                     Some(Self::Float(decode_f64_memcomparable(r_arr)))
                 }
             }
-            KEY_TAG_FLOAT_LT_I64_MIN
-            | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1
-            | LEGACY_KEY_TAG_FLOAT
+            KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 | LEGACY_KEY_TAG_FLOAT
                 if payload.len() == 8 =>
             {
                 let arr: [u8; 8] = payload.try_into().ok()?;
@@ -759,7 +757,12 @@ pub unsafe fn encode_sqlite_values_direct(
 #[inline]
 pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
     unsafe {
-        sqlite_value_to_key_bytes_with_schema(vptr, ColumnAffinity::Blob, ColCollation::Binary, false)
+        sqlite_value_to_key_bytes_with_schema(
+            vptr,
+            ColumnAffinity::Blob,
+            ColCollation::Binary,
+            false,
+        )
     }
 }
 
@@ -1103,44 +1106,67 @@ pub fn decode_column_at(row_bytes: &[u8], col_idx: usize) -> io::Result<SqlValue
         ));
     }
     let type_tag = row_bytes[dir_pos];
-    let offset = u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
+    let offset =
+        u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
 
     match type_tag {
         0 => Ok(SqlValue::Null),
         1 => {
             if offset + 8 > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Integer column"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Integer column",
+                ));
             }
             let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
             Ok(SqlValue::Integer(v))
         }
         2 => {
             if offset + 8 > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Float column"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Float column",
+                ));
             }
             let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
             Ok(SqlValue::Float(v))
         }
         3 => {
             if offset + 4 > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text length"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Text length",
+                ));
             }
-            let len = u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
             if offset + 4 + len > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text payload"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Text payload",
+                ));
             }
             let s = String::from_utf8_lossy(&row_bytes[offset + 4..offset + 4 + len]).into_owned();
             Ok(SqlValue::Text(s))
         }
         4 => {
             if offset + 4 > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob length"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Blob length",
+                ));
             }
-            let len = u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
             if offset + 4 + len > row_bytes.len() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob payload"));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Blob payload",
+                ));
             }
-            Ok(SqlValue::Blob(row_bytes[offset + 4..offset + 4 + len].to_vec()))
+            Ok(SqlValue::Blob(
+                row_bytes[offset + 4..offset + 4 + len].to_vec(),
+            ))
         }
         other => Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -1175,7 +1201,10 @@ mod tests {
             encode_f64_memcomparable(-0.0),
             encode_f64_memcomparable(0.0)
         );
-        assert_eq!(decode_f64_memcomparable(encode_f64_memcomparable(-0.0)), 0.0);
+        assert_eq!(
+            decode_f64_memcomparable(encode_f64_memcomparable(-0.0)),
+            0.0
+        );
 
         let vals = [
             f64::NEG_INFINITY,
@@ -1211,12 +1240,8 @@ mod tests {
             extract_column_key_bytes(&row, 1).unwrap(),
             SqlValue::Float(2.5).to_key_bytes()
         );
-        assert!(
-            SqlValue::Float(-2.5).to_key_bytes() < SqlValue::Float(-1.0).to_key_bytes()
-        );
-        assert!(
-            SqlValue::Float(-1.0).to_key_bytes() < SqlValue::Float(0.0).to_key_bytes()
-        );
+        assert!(SqlValue::Float(-2.5).to_key_bytes() < SqlValue::Float(-1.0).to_key_bytes());
+        assert!(SqlValue::Float(-1.0).to_key_bytes() < SqlValue::Float(0.0).to_key_bytes());
 
         // Verify unified cross-type key ordering (`NULL < Number (INTEGER & REAL) < TEXT < BLOB`)
         // including exact 64-bit integer precision at 2^53, negative floats, signed zero, and infinities

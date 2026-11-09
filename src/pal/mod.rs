@@ -243,10 +243,22 @@ mod tests {
         }
 
         // Reject path traversal and invalid names
-        assert!(fs.open_file("", true, true, OpenHint::MutableBufferedLog).is_err());
-        assert!(fs.open_file("../escape.db", true, true, OpenHint::MutableBufferedLog).is_err());
-        assert!(fs.open_file("sub/file.db", true, true, OpenHint::MutableBufferedLog).is_err());
-        assert!(fs.open_file(r"sub\file.db", true, true, OpenHint::MutableBufferedLog).is_err());
+        assert!(
+            fs.open_file("", true, true, OpenHint::MutableBufferedLog)
+                .is_err()
+        );
+        assert!(
+            fs.open_file("../escape.db", true, true, OpenHint::MutableBufferedLog)
+                .is_err()
+        );
+        assert!(
+            fs.open_file("sub/file.db", true, true, OpenHint::MutableBufferedLog)
+                .is_err()
+        );
+        assert!(
+            fs.open_file(r"sub\file.db", true, true, OpenHint::MutableBufferedLog)
+                .is_err()
+        );
     }
 
     #[test]
@@ -261,7 +273,10 @@ mod tests {
 
         // Attempting to open a second handle to the same file must fail with SHARING_VIOLATION (32)
         let second = fs.open_file("wal_sync.db", false, false, OpenHint::ImmutableRandom);
-        assert!(second.is_err(), "second open must fail due to dwShareMode = 0");
+        assert!(
+            second.is_err(),
+            "second open must fail due to dwShareMode = 0"
+        );
         assert_eq!(second.unwrap_err().raw_os_error(), Some(32));
 
         // Dropping the first handle immediately releases the kernel lock, allowing re-open and delete.
@@ -349,7 +364,8 @@ mod tests {
                     let offset = (block_idx * BLOCK_SIZE) as u64;
                     let tag = ((tid as u8) << 4) | ((b as u8) & 0x0F);
                     let write_buf = [tag; BLOCK_SIZE];
-                    f.write_all_at(&write_buf, offset).expect("concurrent write");
+                    f.write_all_at(&write_buf, offset)
+                        .expect("concurrent write");
 
                     let mut read_buf = [0u8; BLOCK_SIZE];
                     f.read_exact_at(&mut read_buf, offset)

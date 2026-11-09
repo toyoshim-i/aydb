@@ -32,17 +32,18 @@ use aydb::pal::OsFs;
 use aydb::wal::BlobKind;
 
 fn bench_wisckey_vs_inline(root: &PathBuf) {
-    println!("==========================================================================================");
-    println!("BENCHMARK 1 (Step 1-4): WiscKey KV Separation vs. Inline Storage (4 Segments x 1,500 Keys)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 1 (Step 1-4): WiscKey KV Separation vs. Inline Storage (4 Segments x 1,500 Keys)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<10} | {:<10} | {:>12} | {:>14} | {:>15} | {:>12}",
-        "Val Size",
-        "Mode",
-        "Read Lat(us)",
-        "Compact(ms)",
-        "Compact Write",
-        "Heap Idx(KB)"
+        "Val Size", "Mode", "Read Lat(us)", "Compact(ms)", "Compact Write", "Heap Idx(KB)"
     );
     println!("{}", "-".repeat(90));
 
@@ -138,9 +139,7 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
             for i in 0..READ_SAMPLES {
                 let key = format!("key_{:06}", (i * 37) % TOTAL_KEYS);
                 for seg in segs.iter().rev() {
-                    if let Some((_lsn, IndexValue::Blob(ptr))) =
-                        seg.get(key.as_bytes()).unwrap()
-                    {
+                    if let Some((_lsn, IndexValue::Blob(ptr))) = seg.get(key.as_bytes()).unwrap() {
                         let val = blob_reader
                             .read_blob(&ptr, Some(key.as_bytes()))
                             .unwrap()
@@ -180,16 +179,16 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
 }
 
 fn bench_bloom_filter_scaling(root: &PathBuf) {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("BENCHMARK 2 (Step 1-4): Bloom Filter Bits/Key Trade-off Across 10 Active Segments");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<14} | {:>14} | {:>16} | {:>18} | {:>18}",
-        "Bits / Key",
-        "Bloom RAM (KB)",
-        "False Pos Rate",
-        "Miss Latency (us)",
-        "Oldest Hit (us)"
+        "Bits / Key", "Bloom RAM (KB)", "False Pos Rate", "Miss Latency (us)", "Oldest Hit (us)"
     );
     println!("{}", "-".repeat(90));
 
@@ -276,9 +275,15 @@ fn bench_bloom_filter_scaling(root: &PathBuf) {
 }
 
 fn bench_block_offset_directory() {
-    println!("\n==========================================================================================");
-    println!("BENCHMARK 3 (Step 1-4): 4 KB Index Block Lookup — Offset Binary Search vs. Linear Scan");
-    println!("==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 3 (Step 1-4): 4 KB Index Block Lookup — Offset Binary Search vs. Linear Scan"
+    );
+    println!(
+        "=========================================================================================="
+    );
 
     let mut builder = IdxBlockBuilder::new();
     let mut keys = Vec::new();
@@ -313,9 +318,7 @@ fn bench_block_offset_directory() {
     }
     let bin_ns = (t_bin.elapsed().as_secs_f64() * 1e9) / (ITERS as f64);
 
-    println!(
-        "Entries Packed in Single 4 KB Data Block : {count} entries"
-    );
+    println!("Entries Packed in Single 4 KB Data Block : {count} entries");
     println!(
         "O(K) Linear Scan Lookup                  : {:>7.1} ns / lookup",
         lin_ns

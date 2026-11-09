@@ -204,7 +204,7 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::_mm_crc32_u8;
     #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
 
     let mut c = !crc;
 
@@ -221,8 +221,16 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
             let mut offset = 0;
             while offset < 1024 {
                 let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-                let w1 = unsafe { (ptr.add(1024 + offset) as *const u64).read_unaligned().to_le() };
-                let w2 = unsafe { (ptr.add(2048 + offset) as *const u64).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(1024 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(2048 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
                 c0 = _mm_crc32_u64(c0, w0);
                 c1 = _mm_crc32_u64(c1, w1);
                 c2 = _mm_crc32_u64(c2, w2);
@@ -245,8 +253,16 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
             let mut offset = 0;
             while offset < 128 {
                 let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-                let w1 = unsafe { (ptr.add(128 + offset) as *const u64).read_unaligned().to_le() };
-                let w2 = unsafe { (ptr.add(256 + offset) as *const u64).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(128 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(256 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
                 c0 = _mm_crc32_u64(c0, w0);
                 c1 = _mm_crc32_u64(c1, w1);
                 c2 = _mm_crc32_u64(c2, w2);
@@ -269,8 +285,16 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
             let mut offset = 0;
             while offset < 64 {
                 let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-                let w1 = unsafe { (ptr.add(64 + offset) as *const u64).read_unaligned().to_le() };
-                let w2 = unsafe { (ptr.add(128 + offset) as *const u64).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(64 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(128 + offset) as *const u64)
+                        .read_unaligned()
+                        .to_le()
+                };
                 c0 = _mm_crc32_u64(c0, w0);
                 c1 = _mm_crc32_u64(c1, w1);
                 c2 = _mm_crc32_u64(c2, w2);
@@ -317,17 +341,23 @@ unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
         let mut offset = 0;
         while offset < 1024 {
             let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-            let w1 = unsafe { (ptr.add(1024 + offset) as *const u64).read_unaligned().to_le() };
-            let w2 = unsafe { (ptr.add(2048 + offset) as *const u64).read_unaligned().to_le() };
+            let w1 = unsafe {
+                (ptr.add(1024 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
+            let w2 = unsafe {
+                (ptr.add(2048 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
             c0 = __crc32cd(c0, w0);
             c1 = __crc32cd(c1, w1);
             c2 = __crc32cd(c2, w2);
             offset += 8;
         }
 
-        c = apply_nibble_table(&TBL_2048, c0)
-            ^ apply_nibble_table(&TBL_1024, c1)
-            ^ c2;
+        c = apply_nibble_table(&TBL_2048, c0) ^ apply_nibble_table(&TBL_1024, c1) ^ c2;
         data = &data[3072..];
     }
 
@@ -341,17 +371,23 @@ unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
         let mut offset = 0;
         while offset < 128 {
             let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-            let w1 = unsafe { (ptr.add(128 + offset) as *const u64).read_unaligned().to_le() };
-            let w2 = unsafe { (ptr.add(256 + offset) as *const u64).read_unaligned().to_le() };
+            let w1 = unsafe {
+                (ptr.add(128 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
+            let w2 = unsafe {
+                (ptr.add(256 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
             c0 = __crc32cd(c0, w0);
             c1 = __crc32cd(c1, w1);
             c2 = __crc32cd(c2, w2);
             offset += 8;
         }
 
-        c = apply_nibble_table(&TBL_256, c0)
-            ^ apply_nibble_table(&TBL_128, c1)
-            ^ c2;
+        c = apply_nibble_table(&TBL_256, c0) ^ apply_nibble_table(&TBL_128, c1) ^ c2;
         data = &data[384..];
     }
 
@@ -365,17 +401,23 @@ unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
         let mut offset = 0;
         while offset < 64 {
             let w0 = unsafe { (ptr.add(offset) as *const u64).read_unaligned().to_le() };
-            let w1 = unsafe { (ptr.add(64 + offset) as *const u64).read_unaligned().to_le() };
-            let w2 = unsafe { (ptr.add(128 + offset) as *const u64).read_unaligned().to_le() };
+            let w1 = unsafe {
+                (ptr.add(64 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
+            let w2 = unsafe {
+                (ptr.add(128 + offset) as *const u64)
+                    .read_unaligned()
+                    .to_le()
+            };
             c0 = __crc32cd(c0, w0);
             c1 = __crc32cd(c1, w1);
             c2 = __crc32cd(c2, w2);
             offset += 8;
         }
 
-        c = apply_nibble_table(&TBL_128, c0)
-            ^ apply_nibble_table(&TBL_64, c1)
-            ^ c2;
+        c = apply_nibble_table(&TBL_128, c0) ^ apply_nibble_table(&TBL_64, c1) ^ c2;
         data = &data[192..];
     }
 

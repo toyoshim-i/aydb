@@ -23,7 +23,7 @@ use aydb::meta::{BootMetaManager, IdxSegmentMeta, format_idx_file_name};
 use aydb::pal::{OpenHint, OsFs, PlatformFs};
 use aydb::util::crc32c::{crc32c, crc32c_software};
 use aydb::wal::{
-     DEFAULT_BUF_WAL_SIZE, WAL_BUF_FILE_NAME, WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch,
+    DEFAULT_BUF_WAL_SIZE, WAL_BUF_FILE_NAME, WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch,
     WalRecord, WalStreamMode, WalStreamWriter, recover_single_wal_stream,
 };
 

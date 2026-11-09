@@ -297,9 +297,12 @@ impl BootMetaState {
             ));
         }
         let mut idx_segments = Vec::new();
-        idx_segments
-            .try_reserve_exact(num_idx)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "idx_segments allocation overflow"))?;
+        idx_segments.try_reserve_exact(num_idx).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idx_segments allocation overflow",
+            )
+        })?;
         for _ in 0..num_idx {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
@@ -316,7 +319,10 @@ impl BootMetaState {
 
         // 2. Standard blob segments
         let num_std_blob = r.read_u32_le()? as usize;
-        if num_std_blob.checked_mul(24).is_none_or(|b| b > r.remaining()) {
+        if num_std_blob
+            .checked_mul(24)
+            .is_none_or(|b| b > r.remaining())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted std_blob_segments count",
@@ -325,7 +331,12 @@ impl BootMetaState {
         let mut std_blob_segments = Vec::new();
         std_blob_segments
             .try_reserve_exact(num_std_blob)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "std_blob_segments allocation overflow"))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "std_blob_segments allocation overflow",
+                )
+            })?;
         for _ in 0..num_std_blob {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
@@ -339,7 +350,10 @@ impl BootMetaState {
 
         // 3. LRU blob segments
         let num_lru_blob = r.read_u32_le()? as usize;
-        if num_lru_blob.checked_mul(32).is_none_or(|b| b > r.remaining()) {
+        if num_lru_blob
+            .checked_mul(32)
+            .is_none_or(|b| b > r.remaining())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted lru_blob_segments count",
@@ -348,7 +362,12 @@ impl BootMetaState {
         let mut lru_blob_segments = Vec::new();
         lru_blob_segments
             .try_reserve_exact(num_lru_blob)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lru_blob_segments allocation overflow"))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lru_blob_segments allocation overflow",
+                )
+            })?;
         for _ in 0..num_lru_blob {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
@@ -372,9 +391,12 @@ impl BootMetaState {
             ));
         }
         let mut table_quotas = Vec::new();
-        table_quotas
-            .try_reserve_exact(num_quotas)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "table_quotas allocation overflow"))?;
+        table_quotas.try_reserve_exact(num_quotas).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table_quotas allocation overflow",
+            )
+        })?;
         for _ in 0..num_quotas {
             let table_id = r.read_u16_le()?;
             let policy_byte = r.read_u8()?;
@@ -401,7 +423,12 @@ impl BootMetaState {
         let mut pending_delete_files = Vec::new();
         pending_delete_files
             .try_reserve_exact(num_deletes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pending_delete_files allocation overflow"))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending_delete_files allocation overflow",
+                )
+            })?;
         for _ in 0..num_deletes {
             let name_len = r.read_u16_le()? as usize;
             let name_bytes = r.read_bytes(name_len)?;
@@ -573,7 +600,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 // Case 4: Both slots contain non-zero bytes and both failed validation.
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("boot_meta.db corruption: both Slot A and Slot B are invalid ({err_a})"),
+                    format!(
+                        "boot_meta.db corruption: both Slot A and Slot B are invalid ({err_a})"
+                    ),
                 ));
             }
         };
@@ -822,10 +851,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         }
     }
 
-    fn parse_and_load_slot(
-        fs: &Arc<F>,
-        slot_buf: &[u8; SLOT_SIZE],
-    ) -> io::Result<BootMetaState> {
+    fn parse_and_load_slot(fs: &Arc<F>, slot_buf: &[u8; SLOT_SIZE]) -> io::Result<BootMetaState> {
         if &slot_buf[0..4] != BOOT_META_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -833,12 +859,8 @@ impl<F: PlatformFs> BootMetaManager<F> {
             ));
         }
 
-        let expected_header_crc = u32::from_le_bytes([
-            slot_buf[60],
-            slot_buf[61],
-            slot_buf[62],
-            slot_buf[63],
-        ]);
+        let expected_header_crc =
+            u32::from_le_bytes([slot_buf[60], slot_buf[61], slot_buf[62], slot_buf[63]]);
         let actual_header_crc = crc32c(&slot_buf[0..60]);
         if actual_header_crc != expected_header_crc {
             return Err(io::Error::new(
@@ -935,12 +957,18 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 ));
             }
             let mf_len_usize = usize::try_from(mf_file_len).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "external manifest length overflow")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "external manifest length overflow",
+                )
             })?;
             let mut mf_buf = Vec::new();
-            mf_buf
-                .try_reserve_exact(mf_len_usize)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "external manifest allocation overflow"))?;
+            mf_buf.try_reserve_exact(mf_len_usize).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "external manifest allocation overflow",
+                )
+            })?;
             mf_buf.resize(mf_len_usize, 0u8);
             mf_file.read_exact_at(&mut mf_buf, 0)?;
 
@@ -1255,14 +1283,14 @@ mod tests {
                 let cur = mgr.state().active_manifest_seq_id.unwrap();
                 assert_ne!(prev, cur);
                 // Exactly the active and the standby manifests exist after every commit.
-                assert_eq!(
-                    manifests(&fs),
-                    {
-                        let mut v = vec![format_manifest_file_name(prev), format_manifest_file_name(cur)];
-                        v.sort();
-                        v
-                    }
-                );
+                assert_eq!(manifests(&fs), {
+                    let mut v = vec![
+                        format_manifest_file_name(prev),
+                        format_manifest_file_name(cur),
+                    ];
+                    v.sort();
+                    v
+                });
             }
             active_mf = mgr.state().active_manifest_seq_id.unwrap();
             standby_mf = mgr.standby_manifest_id.unwrap();
@@ -1376,7 +1404,11 @@ mod tests {
             res.err().expect("transient error must fail open").kind(),
             io::ErrorKind::PermissionDenied
         );
-        assert_eq!(fs.list_files().unwrap(), files_before, "nothing may be swept");
+        assert_eq!(
+            fs.list_files().unwrap(),
+            files_before,
+            "nothing may be swept"
+        );
 
         fs.fail_manifest_open.store(false, Ordering::SeqCst);
         let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen after clear");
@@ -1420,7 +1452,8 @@ mod tests {
         drop(_orphan);
 
         {
-            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen with orphan");
+            let mut mgr =
+                BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen with orphan");
             // Orphan `idx_99` should have been swept immediately on startup!
             assert!(!fs.list_files().unwrap().contains(&orphan_idx_name));
 

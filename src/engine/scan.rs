@@ -4,11 +4,11 @@ use std::io;
 use std::ops::Bound;
 
 use crate::index::{IndexEntry, IndexValue};
-use crate::memtable::MemEntry;
 use crate::lru::{
     NS_PRIMARY_ROW, decode_primary_row_key, decode_secondary_index_pk_slice,
     encode_namespace_prefix, encode_primary_row_key, encode_secondary_index_exact_prefix,
 };
+use crate::memtable::MemEntry;
 use crate::pal::PlatformFs;
 use crate::wal::BlobPtr;
 
@@ -87,9 +87,7 @@ impl<'a> PreparedPrefixRange<'a> {
             Some((ub, true)) => Bound::Included(ub),
             Some((ub, false)) => Bound::Excluded(ub),
             None => match &self.prefix_succ_opt {
-                Some(succ) if succ.as_slice() > self.eff_lo_key => {
-                    Bound::Excluded(succ.as_slice())
-                }
+                Some(succ) if succ.as_slice() > self.eff_lo_key => Bound::Excluded(succ.as_slice()),
                 _ => Bound::Unbounded,
             },
         }
@@ -361,54 +359,53 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let mut last_pk_buf: Vec<u8> = Vec::new();
-        let mut emit_entry =
-            |key: &[u8], _lsn: u64, val: MergedValueRef<'_>| -> io::Result<bool> {
-                if key.len() < 3 || !key.starts_with(&prefix) {
-                    return Ok(false);
-                }
-                if keys_only {
-                    pks_out.push(key[3..].to_vec());
-                    return Ok(true);
-                }
-                match val {
-                    MergedValueRef::Inline(v) => {
-                        let start = slab_out.len();
-                        slab_out.extend_from_slice(v);
-                        spans_out.push((start, slab_out.len()));
-                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                            lazy_blobs.push(None);
-                            pks_out.push(key[3..].to_vec());
-                        } else {
-                            last_pk_buf.clear();
-                            last_pk_buf.extend_from_slice(&key[3..]);
-                        }
-                        Ok(true)
+        let mut emit_entry = |key: &[u8], _lsn: u64, val: MergedValueRef<'_>| -> io::Result<bool> {
+            if key.len() < 3 || !key.starts_with(&prefix) {
+                return Ok(false);
+            }
+            if keys_only {
+                pks_out.push(key[3..].to_vec());
+                return Ok(true);
+            }
+            match val {
+                MergedValueRef::Inline(v) => {
+                    let start = slab_out.len();
+                    slab_out.extend_from_slice(v);
+                    spans_out.push((start, slab_out.len()));
+                    if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                        lazy_blobs.push(None);
+                        pks_out.push(key[3..].to_vec());
+                    } else {
+                        last_pk_buf.clear();
+                        last_pk_buf.extend_from_slice(&key[3..]);
                     }
-                    MergedValueRef::Blob(ptr) => {
-                        if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
-                            spans_out.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
-                            pks_out.push(key[3..].to_vec());
+                    Ok(true)
+                }
+                MergedValueRef::Blob(ptr) => {
+                    if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
+                        spans_out.push((0, 0));
+                        lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
+                        pks_out.push(key[3..].to_vec());
+                        Ok(true)
+                    } else {
+                        let start = slab_out.len();
+                        if self.read_flushed_blob_append_into_view(cx.view, &ptr, key, slab_out)? {
+                            spans_out.push((start, slab_out.len()));
+                            if let Some(lazy_blobs) = &mut lazy_blobs_out {
+                                lazy_blobs.push(None);
+                                pks_out.push(key[3..].to_vec());
+                            } else {
+                                last_pk_buf.clear();
+                                last_pk_buf.extend_from_slice(&key[3..]);
+                            }
                             Ok(true)
                         } else {
-                            let start = slab_out.len();
-                            if self.read_flushed_blob_append_into_view(cx.view, &ptr, key, slab_out)? {
-                                spans_out.push((start, slab_out.len()));
-                                if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                                    lazy_blobs.push(None);
-                                    pks_out.push(key[3..].to_vec());
-                                } else {
-                                    last_pk_buf.clear();
-                                    last_pk_buf.extend_from_slice(&key[3..]);
-                                }
-                                Ok(true)
-                            } else {
-                                Ok(false)
-                            }
+                            Ok(false)
                         }
                     }
                 }
-            };
+            }
+        };
 
         if reverse {
             self.visit_merged_prefix_range_reverse_view(
@@ -694,7 +691,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             } else {
                 self.visit_merged_prefix_range_view(
-                cx.view,
+                    cx.view,
                     prefix,
                     seek_slice,
                     cur_inc,
@@ -755,7 +752,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             } else {
                 self.visit_merged_prefix_range_view(
-                cx.view,
+                    cx.view,
                     prefix,
                     active_seek,
                     cur_inc,
@@ -780,7 +777,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let scanned_count = batch_pks.len();
             for pk in &batch_pks {
                 if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                    if self.get_row_into_lazy_cx(cx, table_id, pk, slab_out, spans_out, lazy_blobs)? {
+                    if self
+                        .get_row_into_lazy_cx(cx, table_id, pk, slab_out, spans_out, lazy_blobs)?
+                    {
                         pks_out.push(pk.clone());
                     }
                 } else {
@@ -904,7 +903,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable_for_view(view).iter_range(range.lo_bound(), range.hi_bound()),
+            self.memtable_for_view(view)
+                .iter_range(range.lo_bound(), range.hi_bound()),
             self.visible_overlay(view)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             false,
@@ -921,10 +921,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
-            if !prefix.is_empty()
-                && seg.min_key() > prefix
-                && !seg.min_key().starts_with(prefix)
-            {
+            if !prefix.is_empty() && seg.min_key() > prefix && !seg.min_key().starts_with(prefix) {
                 continue;
             }
             seg_cursors.push(seg.cursor_from_with_cache(
@@ -985,8 +982,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem =
-                        best_mem_entry.is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
+                    let beats_mem = best_mem_entry
+                        .is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
                     if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
@@ -999,7 +996,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Some((seg_lsn, val_type)) = best_seg_meta {
                 match val_type {
                     1 => {
-                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Inline(&best_val_buf))? {
+                        if on_live(
+                            &target_key_buf,
+                            seg_lsn,
+                            MergedValueRef::Inline(&best_val_buf),
+                        )? {
                             emitted += 1;
                         }
                     }
@@ -1020,7 +1021,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
                 match mem_val {
                     IndexValue::Inline(v) => {
-                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
+                        if on_live(
+                            &target_key_buf,
+                            mem_lsn,
+                            MergedValueRef::Inline(v.as_slice()),
+                        )? {
                             emitted += 1;
                         }
                     }
@@ -1064,7 +1069,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable_for_view(view).iter_range(range.lo_bound(), range.hi_bound()),
+            self.memtable_for_view(view)
+                .iter_range(range.lo_bound(), range.hi_bound()),
             self.visible_overlay(view)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             true,
@@ -1082,10 +1088,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
-            if !prefix.is_empty()
-                && seg.min_key() > prefix
-                && !seg.min_key().starts_with(prefix)
-            {
+            if !prefix.is_empty() && seg.min_key() > prefix && !seg.min_key().starts_with(prefix) {
                 continue;
             }
             seg_cursors.push(seg.cursor_reverse_from_with_cache(seg_upper_arg, populate_cache)?);
@@ -1142,8 +1145,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             for cur in &mut seg_cursors {
                 while cur.current_key() == Some(target_key_buf.as_slice()) {
                     let raw = cur.peek_raw().unwrap();
-                    let beats_mem =
-                        best_mem_entry.is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
+                    let beats_mem = best_mem_entry
+                        .is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
                     if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
                         best_val_buf.clear();
@@ -1156,7 +1159,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Some((seg_lsn, val_type)) = best_seg_meta {
                 match val_type {
                     1 => {
-                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Inline(&best_val_buf))? {
+                        if on_live(
+                            &target_key_buf,
+                            seg_lsn,
+                            MergedValueRef::Inline(&best_val_buf),
+                        )? {
                             emitted += 1;
                         }
                     }
@@ -1177,7 +1184,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
                 match mem_val {
                     IndexValue::Inline(v) => {
-                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(v.as_slice()))? {
+                        if on_live(
+                            &target_key_buf,
+                            mem_lsn,
+                            MergedValueRef::Inline(v.as_slice()),
+                        )? {
                             emitted += 1;
                         }
                     }
@@ -1250,14 +1261,26 @@ impl<'a> MemView<'a> {
         let from_overlay = self.overlay_first()?;
         if from_overlay {
             let (k, e) = self.ov_head.take()?;
-            self.ov_head = if self.reverse { self.ov.next_back() } else { self.ov.next() };
+            self.ov_head = if self.reverse {
+                self.ov.next_back()
+            } else {
+                self.ov.next()
+            };
             if self.mem_head.is_some_and(|(mk, _)| mk == k) {
-                self.mem_head = if self.reverse { self.mem.next_back() } else { self.mem.next() };
+                self.mem_head = if self.reverse {
+                    self.mem.next_back()
+                } else {
+                    self.mem.next()
+                };
             }
             Some((k, e, true))
         } else {
             let (k, e) = self.mem_head.take()?;
-            self.mem_head = if self.reverse { self.mem.next_back() } else { self.mem.next() };
+            self.mem_head = if self.reverse {
+                self.mem.next_back()
+            } else {
+                self.mem.next()
+            };
             Some((k, e, false))
         }
     }

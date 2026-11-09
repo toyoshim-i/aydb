@@ -28,9 +28,15 @@ use aydb::engine::{EngineConfig, LruReadTrackingMode, StorageEngine, WriteDurabi
 use aydb::pal::OsFs;
 
 fn bench_lru_read_tracking(root: &PathBuf) {
-    println!("==========================================================================================");
-    println!("BENCHMARK 1 (Step 1-5): Capped Table Read-Path LRU Tracking (50,000 Cache Hit Reads)");
-    println!("==========================================================================================");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "BENCHMARK 1 (Step 1-5): Capped Table Read-Path LRU Tracking (50,000 Cache Hit Reads)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<26} | {:>14} | {:>14} | {:>16} | {:>12}",
         "LRU Read Tracking Mode",
@@ -115,10 +121,16 @@ fn bench_lru_read_tracking(root: &PathBuf) {
 }
 
 fn bench_steady_state_capped_eviction(root: &PathBuf) {
-    println!("\n==========================================================================================");
+    println!(
+        "\n=========================================================================================="
+    );
     println!("BENCHMARK 2 (Step 1-5): Capped Table Steady-State Eviction & O(1) Copy-less Blob GC");
-    println!("  (Writing 16.0 MB of 4 KB Blobs into MAX_BYTES = 2.0 MB Capped Table, 512 KB Blob Segs)");
-    println!("==========================================================================================");
+    println!(
+        "  (Writing 16.0 MB of 4 KB Blobs into MAX_BYTES = 2.0 MB Capped Table, 512 KB Blob Segs)"
+    );
+    println!(
+        "=========================================================================================="
+    );
     println!(
         "{:<16} | {:>16} | {:>16} | {:>16} | {:>16}",
         "Written So Far",

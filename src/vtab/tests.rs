@@ -316,10 +316,16 @@ fn sqlite_vtab_real_pk_8byte_text_pk_crc_collision_and_limit_pushdown() {
     ))
     .unwrap();
     let k1_rows = conn
-        .query_all(&format!("SELECT name FROM crc_users WHERE id = '{k1}'"), &[])
+        .query_all(
+            &format!("SELECT name FROM crc_users WHERE id = '{k1}'"),
+            &[],
+        )
         .unwrap();
     let k2_rows = conn
-        .query_all(&format!("SELECT name FROM crc_users WHERE id = '{k2}'"), &[])
+        .query_all(
+            &format!("SELECT name FROM crc_users WHERE id = '{k2}'"),
+            &[],
+        )
         .unwrap();
     assert!(k1_rows.is_empty());
     assert_eq!(k2_rows, vec![vec![SqlValue::Text("BobUpdated".into())]]);
@@ -485,8 +491,12 @@ fn pk_uniqueness_on_conflict_and_table_id_registry() {
          INSERT INTO auto_b VALUES (1, 'from_b');",
     )
     .unwrap();
-    let rows_a = conn.query_all("SELECT v FROM auto_a WHERE k = 1", &[]).unwrap();
-    let rows_b = conn.query_all("SELECT v FROM auto_b WHERE k = 1", &[]).unwrap();
+    let rows_a = conn
+        .query_all("SELECT v FROM auto_a WHERE k = 1", &[])
+        .unwrap();
+    let rows_b = conn
+        .query_all("SELECT v FROM auto_b WHERE k = 1", &[])
+        .unwrap();
     assert_eq!(rows_a, vec![vec![SqlValue::Text("from_a".into())]]);
     assert_eq!(rows_b, vec![vec![SqlValue::Text("from_b".into())]]);
 
@@ -798,7 +808,10 @@ fn savepoints_drop_table_paren_columns_and_panic_safety() {
     )
     .unwrap();
     let prod_rows = conn
-        .query_all("SELECT id, price, weight, name FROM products WHERE name = 'Widget'", &[])
+        .query_all(
+            "SELECT id, price, weight, name FROM products WHERE name = 'Widget'",
+            &[],
+        )
         .unwrap();
     assert_eq!(
         prod_rows,
@@ -1136,7 +1149,10 @@ fn affinity_collation_unified_numeric_sorting_and_max_rowid() {
     assert_eq!(rows_after_max.len(), 3);
     assert_eq!(
         rows_after_max[2],
-        vec![SqlValue::Integer(i64::MAX), SqlValue::Text("max_int".into())]
+        vec![
+            SqlValue::Integer(i64::MAX),
+            SqlValue::Text("max_int".into())
+        ]
     );
     // Both auto-generated IDs must be valid positive integers < i64::MAX and distinct
     let id1 = match rows_after_max[0][0] {
@@ -1218,8 +1234,11 @@ fn vtab_keys_only_projection_and_tx_budget() {
     // `SELECT id FROM docs WHERE id >= 2 AND id <= 4` (`colUsed == (1 << pk_col_idx)`)
     // must also succeed via `RANGE_FLAG_KEYS_ONLY` without touching `blob_std_*.db`!
     assert_eq!(
-        conn.query_all("SELECT id FROM docs WHERE id >= 2 AND id <= 4 ORDER BY id", &[])
-            .unwrap(),
+        conn.query_all(
+            "SELECT id FROM docs WHERE id >= 2 AND id <= 4 ORDER BY id",
+            &[]
+        )
+        .unwrap(),
         vec![
             vec![SqlValue::Integer(2)],
             vec![SqlValue::Integer(3)],
@@ -1367,7 +1386,10 @@ fn sub_ulp_float_keys_numeric_duals_like_limit_and_statement_rebind() {
     .unwrap();
     assert_eq!(
         conn.query_all("SELECT pk, v FROM c02_blob", &[]).unwrap(),
-        vec![vec![SqlValue::Integer(10), SqlValue::Text("int_ten".into())]]
+        vec![vec![
+            SqlValue::Integer(10),
+            SqlValue::Text("int_ten".into())
+        ]]
     );
 
     // INSERT OR REPLACE of 10.0 must replace the existing 10 row so only 1 row remains!
@@ -1626,10 +1648,7 @@ fn chunked_streaming_cursor_and_order_by_pk_desc_pushdown() {
     );
 
     let top5_desc = conn
-        .query_all(
-            "SELECT id FROM p01_stream ORDER BY id DESC LIMIT 5",
-            &[],
-        )
+        .query_all("SELECT id FROM p01_stream ORDER BY id DESC LIMIT 5", &[])
         .unwrap();
     assert_eq!(
         top5_desc,
@@ -1859,7 +1878,10 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
 
     // Verify full multi-chunk `PLAN_SECONDARY_EQ` scan across all 650 rows (3 chunks of 256)
     let all_hot = conn
-        .query_all("SELECT count(*), sum(id) FROM sec_items WHERE category = 'hot'", &[])
+        .query_all(
+            "SELECT count(*), sum(id) FROM sec_items WHERE category = 'hot'",
+            &[],
+        )
         .unwrap();
     assert_eq!(
         all_hot,
@@ -1879,10 +1901,7 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
         .unwrap();
     assert_eq!(
         neg_range,
-        vec![
-            vec![SqlValue::Integer(1003)],
-            vec![SqlValue::Integer(1004)],
-        ]
+        vec![vec![SqlValue::Integer(1003)], vec![SqlValue::Integer(1004)],]
     );
 
     //    - Upper-only bound `< 2.0` must exclude `NULL` (id 1001) and include -20.5, -10.0, -9.5, 0.5, 1.0, 1.5
@@ -2038,7 +2057,10 @@ fn test_f1_through_f4_audit_regressions() {
     // ------------------------------------------------------------------------
     // F3: Synthetic rowid cross-connection lookup
     // ------------------------------------------------------------------------
-    let rid = match conn.query_all("SELECT rowid FROM t WHERE id = 'a'", &[]).unwrap()[0][0] {
+    let rid = match conn
+        .query_all("SELECT rowid FROM t WHERE id = 'a'", &[])
+        .unwrap()[0][0]
+    {
         SqlValue::Integer(v) => v,
         _ => unreachable!(),
     };
@@ -2053,13 +2075,18 @@ fn test_f1_through_f4_audit_regressions() {
 
     // Connection 2's cache is empty; must resolve via fallback scan
     let res_other_rid = conn2
-        .query_all("SELECT id FROM t WHERE rowid = ?", &[SqlValue::Integer(rid)])
+        .query_all(
+            "SELECT id FROM t WHERE rowid = ?",
+            &[SqlValue::Integer(rid)],
+        )
         .unwrap();
     assert_eq!(res_other_rid, vec![vec![SqlValue::Text("a".into())]]);
 
     // Update via rowid from connection 2
     conn2
-        .execute_batch(&format!("UPDATE t SET value = 'UpdatedHello' WHERE rowid = {rid}"))
+        .execute_batch(&format!(
+            "UPDATE t SET value = 'UpdatedHello' WHERE rowid = {rid}"
+        ))
         .unwrap();
     let res_after_update = conn
         .query_all("SELECT value FROM t WHERE id = 'a'", &[])
@@ -2357,7 +2384,10 @@ fn corrupt_third_blob_row(dir: &std::path::Path, table_opts: &str) {
     std::fs::write(&path, &bytes).unwrap();
 }
 
-fn reopen_docs(dir: &std::path::Path, table_opts: &str) -> (SqliteConnection, Arc<RwLock<StorageEngine<OsFs>>>) {
+fn reopen_docs(
+    dir: &std::path::Path,
+    table_opts: &str,
+) -> (SqliteConnection, Arc<RwLock<StorageEngine<OsFs>>>) {
     let fs = Arc::new(OsFs::open(dir, false).unwrap());
     let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
@@ -2395,21 +2425,31 @@ fn vtab_corrupt_blob_default_error_mode_select_fails_but_pk_and_delete_work() {
         err.to_string().contains("malformed"),
         "expected SQLITE_CORRUPT, got: {err}"
     );
-    assert!(conn.query_all("SELECT body FROM docs WHERE id = 3", &[]).is_err());
+    assert!(
+        conn.query_all("SELECT body FROM docs WHERE id = 3", &[])
+            .is_err()
+    );
     assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
 
     // PK-only queries never dereference blobs, so users can locate the bad rows.
     assert_eq!(
-        ids(conn.query_all("SELECT id FROM docs ORDER BY id", &[]).unwrap()),
+        ids(conn
+            .query_all("SELECT id FROM docs ORDER BY id", &[])
+            .unwrap()),
         vec![1, 2, 3, 4, 5]
     );
     assert_eq!(
-        ids(conn.query_all("SELECT id FROM docs WHERE id = 3", &[]).unwrap()),
+        ids(conn
+            .query_all("SELECT id FROM docs WHERE id = 3", &[])
+            .unwrap()),
         vec![3]
     );
 
-    conn.execute_batch("DELETE FROM docs WHERE id = 3;").unwrap();
-    let rows = conn.query_all("SELECT id, length(body) FROM docs ORDER BY id", &[]).unwrap();
+    conn.execute_batch("DELETE FROM docs WHERE id = 3;")
+        .unwrap();
+    let rows = conn
+        .query_all("SELECT id, length(body) FROM docs ORDER BY id", &[])
+        .unwrap();
     assert_eq!(ids(rows.clone()), vec![1, 2, 4, 5]);
     assert!(rows.iter().all(|r| r[1] == SqlValue::Integer(4096)));
 }
@@ -2420,20 +2460,33 @@ fn vtab_corrupt_blob_on_corrupt_evict_hides_row_and_removes_it() {
     corrupt_third_blob_row(&tmp.path, "on_corrupt = 'EVICT',");
     let (conn, engine) = reopen_docs(&tmp.path, "on_corrupt = 'EVICT',");
 
-    let rows = conn.query_all("SELECT * FROM docs ORDER BY id", &[]).unwrap();
+    let rows = conn
+        .query_all("SELECT * FROM docs ORDER BY id", &[])
+        .unwrap();
     assert_eq!(ids(rows), vec![1, 2, 4, 5]);
     assert_eq!(
-        ids(conn.query_all("SELECT id FROM docs WHERE id < 100 ORDER BY id", &[]).unwrap()),
+        ids(conn
+            .query_all("SELECT id FROM docs WHERE id < 100 ORDER BY id", &[])
+            .unwrap()),
         vec![1, 2, 3, 4, 5],
         "keys-only scans never verify blobs"
     );
     assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
-    assert!(engine.write().unwrap().row_exists(90, &crate::vtab::row_codec::encode_i64_tagged_key(3)).unwrap());
+    assert!(
+        engine
+            .write()
+            .unwrap()
+            .row_exists(90, &crate::vtab::row_codec::encode_i64_tagged_key(3))
+            .unwrap()
+    );
 
     // The next write removes the corrupt row physically.
-    conn.execute_batch("INSERT INTO docs VALUES (6, x'00');").unwrap();
+    conn.execute_batch("INSERT INTO docs VALUES (6, x'00');")
+        .unwrap();
     assert_eq!(
-        ids(conn.query_all("SELECT id FROM docs ORDER BY id", &[]).unwrap()),
+        ids(conn
+            .query_all("SELECT id FROM docs ORDER BY id", &[])
+            .unwrap()),
         vec![1, 2, 4, 5, 6]
     );
 }
@@ -2462,8 +2515,11 @@ fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
         .unwrap();
         let mut ins = conn.prepare("INSERT INTO bgc VALUES (?1, ?2)").unwrap();
         for i in 0..2_000i64 {
-            ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![(i % 251) as u8; 100])])
-                .unwrap();
+            ins.execute(&[
+                SqlValue::Integer(i),
+                SqlValue::Blob(vec![(i % 251) as u8; 100]),
+            ])
+            .unwrap();
         }
         drop(ins);
 
@@ -2485,14 +2541,23 @@ fn background_compaction_worker_compacts_and_shuts_down_cleanly() {
 
         let rows = conn.query_all("SELECT count(*) FROM bgc", &[]).unwrap();
         assert_eq!(rows[0][0], SqlValue::Integer(2_000));
-        let row = conn.query_all("SELECT body FROM bgc WHERE id = 1234", &[]).unwrap();
+        let row = conn
+            .query_all("SELECT body FROM bgc WHERE id = 1234", &[])
+            .unwrap();
         assert_eq!(row[0][0], SqlValue::Blob(vec![(1234 % 251) as u8; 100]));
-        assert!(Arc::strong_count(&engine) > 1, "worker holds an engine handle while registered");
+        assert!(
+            Arc::strong_count(&engine) > 1,
+            "worker holds an engine handle while registered"
+        );
     }
 
     // Connection closed: the module aux context was dropped, the worker joined (it owned an
     // engine Arc clone) and the engine is back to inline compaction.
-    assert_eq!(Arc::strong_count(&engine), 1, "worker thread must be joined on drop");
+    assert_eq!(
+        Arc::strong_count(&engine),
+        1,
+        "worker thread must be joined on drop"
+    );
     let eng = engine.write().unwrap();
     assert!(!eng.compaction_pending() || eng.active_idx_segment_count() >= 4);
 }
@@ -2531,12 +2596,16 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
         .unwrap();
     let mut ins = conn2.prepare("INSERT INTO shared VALUES (?1, ?2)").unwrap();
     for i in 0..2_000i64 {
-        ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![7u8; 100])]).unwrap();
+        ins.execute(&[SqlValue::Integer(i), SqlValue::Blob(vec![7u8; 100])])
+            .unwrap();
     }
     drop(ins);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while engine.write().unwrap().compaction_pending() {
-        assert!(std::time::Instant::now() < deadline, "no compaction progress");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no compaction progress"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
@@ -2579,7 +2648,9 @@ fn concurrent_sql_readers_see_only_committed_atomic_pairs() {
         ));
         const DDL: &str = "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');";
         let writer = SqliteConnection::open_in_memory().unwrap();
-        writer.register_aydb_module_with_options(engine.clone(), false).unwrap();
+        writer
+            .register_aydb_module_with_options(engine.clone(), false)
+            .unwrap();
         writer.execute_batch(DDL).unwrap();
         writer
             .execute_batch(&format!(
@@ -2597,10 +2668,13 @@ fn concurrent_sql_readers_see_only_committed_atomic_pairs() {
                 let (engine, stop, ready) = (engine.clone(), stop.clone(), ready.clone());
                 std::thread::spawn(move || {
                     let conn = SqliteConnection::open_in_memory().unwrap();
-                    conn.register_aydb_module_with_options(engine, false).unwrap();
+                    conn.register_aydb_module_with_options(engine, false)
+                        .unwrap();
                     conn.execute_batch(DDL).unwrap();
                     ready.wait();
-                    let mut st = conn.prepare("SELECT v FROM t WHERE id BETWEEN 1 AND 2 ORDER BY id").unwrap();
+                    let mut st = conn
+                        .prepare("SELECT v FROM t WHERE id BETWEEN 1 AND 2 ORDER BY id")
+                        .unwrap();
                     let mut n = 0u64;
                     while !stop.load(Ordering::Relaxed) {
                         let rows = st.query(&[]).unwrap();
@@ -2619,7 +2693,8 @@ fn concurrent_sql_readers_see_only_committed_atomic_pairs() {
         for n in 1..=150u32 {
             writer.execute_batch("BEGIN;").unwrap();
             for id in [1i64, 2] {
-                upd.execute(&[SqlValue::Text(pair_text(n)), SqlValue::Integer(id)]).unwrap();
+                upd.execute(&[SqlValue::Text(pair_text(n)), SqlValue::Integer(id)])
+                    .unwrap();
             }
             // The owner reads its own uncommitted value (exclusive path) mid-transaction.
             let rows = sel.query(&[]).unwrap();
@@ -2643,11 +2718,13 @@ fn owner_reads_own_uncommitted_blob_while_other_connection_reads_committed() {
         ));
         const DDL: &str = "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');";
         let a = SqliteConnection::open_in_memory().unwrap();
-        a.register_aydb_module_with_options(engine.clone(), false).unwrap();
+        a.register_aydb_module_with_options(engine.clone(), false)
+            .unwrap();
         a.execute_batch(DDL).unwrap();
         let old = pair_text(1);
         let new = pair_text(3);
-        a.execute_batch(&format!("INSERT INTO t VALUES (1, '{old}');")).unwrap();
+        a.execute_batch(&format!("INSERT INTO t VALUES (1, '{old}');"))
+            .unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(std::sync::Barrier::new(2));
@@ -2670,7 +2747,8 @@ fn owner_reads_own_uncommitted_blob_while_other_connection_reads_committed() {
         };
         ready.wait();
         a.execute_batch("BEGIN;").unwrap();
-        a.execute_batch(&format!("UPDATE t SET v = '{new}' WHERE id = 1;")).unwrap();
+        a.execute_batch(&format!("UPDATE t SET v = '{new}' WHERE id = 1;"))
+            .unwrap();
         for _ in 0..200 {
             let rows = a.query_all("SELECT v FROM t WHERE id = 1", &[]).unwrap();
             assert_eq!(rows[0][0], SqlValue::Text(new.clone()));
@@ -2775,8 +2853,10 @@ fn rollback_across_two_vtabs_keeps_committed_rows_and_lsn() {
     drop(ins);
     let lsn_before = engine.read().unwrap().next_lsn();
 
-    conn.execute_batch("BEGIN; INSERT INTO a VALUES (1000, 'x'); INSERT INTO b VALUES (1, 'y'); ROLLBACK;")
-        .unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO a VALUES (1000, 'x'); INSERT INTO b VALUES (1, 'y'); ROLLBACK;",
+    )
+    .unwrap();
 
     assert_eq!(engine.read().unwrap().next_lsn(), lsn_before);
     engine.write().unwrap().flush_memtable().unwrap();
@@ -2810,7 +2890,8 @@ fn auto_rowid_continues_after_max_rowid_on_reconnect() {
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.register_aydb_module(engine.clone()).unwrap();
     conn.execute_batch(ddl).unwrap();
-    conn.execute_batch("INSERT INTO t VALUES (NULL, 'y')").unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (NULL, 'y')")
+        .unwrap();
     let rows = conn.query_all("SELECT max(id) FROM t", &[]).unwrap();
     assert_eq!(rows, vec![vec![SqlValue::Integer(1101)]]);
 }
@@ -2879,8 +2960,7 @@ fn lazy_blob_scan_prefetches_each_window_and_survives_chunk_reloads() {
 fn concurrent_sync_writers_queue_without_busy_or_lost_updates() {
     const WRITERS: usize = 4;
     const INCREMENTS: i64 = 50;
-    const DDL: &str =
-        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, durability='sync', columns='id INTEGER PRIMARY KEY, n INTEGER')";
+    const DDL: &str = "CREATE VIRTUAL TABLE t USING aydb(table_id=1, durability='sync', columns='id INTEGER PRIMARY KEY, n INTEGER')";
 
     let tmp = TempTestDir::new("vtab_group_commit");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
@@ -2898,11 +2978,13 @@ fn concurrent_sync_writers_queue_without_busy_or_lost_updates() {
             let (shared, ready) = (Arc::clone(&shared), Arc::clone(&ready));
             std::thread::spawn(move || {
                 let conn = SqliteConnection::open_in_memory().unwrap();
-                conn.register_aydb_module_with_options(shared, false).unwrap();
+                conn.register_aydb_module_with_options(shared, false)
+                    .unwrap();
                 conn.execute_batch(DDL).unwrap();
                 ready.wait();
                 for _ in 0..INCREMENTS {
-                    conn.execute_batch("UPDATE t SET n = n + 1 WHERE id = 1;").unwrap();
+                    conn.execute_batch("UPDATE t SET n = n + 1 WHERE id = 1;")
+                        .unwrap();
                 }
             })
         })
@@ -2912,7 +2994,9 @@ fn concurrent_sync_writers_queue_without_busy_or_lost_updates() {
     }
 
     assert_eq!(
-        setup.query_all("SELECT n FROM t WHERE id = 1", &[]).unwrap(),
+        setup
+            .query_all("SELECT n FROM t WHERE id = 1", &[])
+            .unwrap(),
         vec![vec![SqlValue::Integer(WRITERS as i64 * INCREMENTS)]]
     );
 }

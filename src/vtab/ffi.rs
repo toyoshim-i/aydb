@@ -204,18 +204,13 @@ pub struct sqlite3_module {
             nArg: c_int,
             zName: *const c_char,
             pxFunc: *mut Option<
-                unsafe extern "system" fn(
-                    *mut sqlite3_context,
-                    c_int,
-                    *mut *mut sqlite3_value,
-                ),
+                unsafe extern "system" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value),
             >,
             ppArg: *mut *mut c_void,
         ) -> c_int,
     >,
-    pub xRename: Option<
-        unsafe extern "system" fn(pVTab: *mut sqlite3_vtab, zNew: *const c_char) -> c_int,
-    >,
+    pub xRename:
+        Option<unsafe extern "system" fn(pVTab: *mut sqlite3_vtab, zNew: *const c_char) -> c_int>,
     pub xSavepoint:
         Option<unsafe extern "system" fn(pVTab: *mut sqlite3_vtab, iSavepoint: c_int) -> c_int>,
     pub xRelease:
@@ -271,7 +266,14 @@ unsafe extern "system" {
     pub fn sqlite3_trace_v2(
         db: *mut sqlite3,
         mask: core::ffi::c_uint,
-        callback: Option<unsafe extern "system" fn(core::ffi::c_uint, *mut c_void, *mut c_void, *mut c_void) -> c_int>,
+        callback: Option<
+            unsafe extern "system" fn(
+                core::ffi::c_uint,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> c_int,
+        >,
         context: *mut c_void,
     ) -> c_int;
     pub fn sqlite3_reset(pStmt: *mut sqlite3_stmt) -> c_int;
@@ -279,11 +281,7 @@ unsafe extern "system" {
     pub fn sqlite3_finalize(pStmt: *mut sqlite3_stmt) -> c_int;
 
     pub fn sqlite3_bind_null(pStmt: *mut sqlite3_stmt, idx: c_int) -> c_int;
-    pub fn sqlite3_bind_int64(
-        pStmt: *mut sqlite3_stmt,
-        idx: c_int,
-        val: sqlite3_int64,
-    ) -> c_int;
+    pub fn sqlite3_bind_int64(pStmt: *mut sqlite3_stmt, idx: c_int, val: sqlite3_int64) -> c_int;
     pub fn sqlite3_bind_double(pStmt: *mut sqlite3_stmt, idx: c_int, val: c_double) -> c_int;
     pub fn sqlite3_bind_text(
         pStmt: *mut sqlite3_stmt,

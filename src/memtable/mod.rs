@@ -329,22 +329,46 @@ mod tests {
         let after_upsert = original.clone();
         let after_upsert_bytes = original.approximate_bytes();
         original.absorb(BTreeMap::from([
-            (b"a".to_vec(), MemEntry { lsn: 5, value: IndexValue::Inline(b"merged".to_vec()) }),
-            (b"c".to_vec(), MemEntry { lsn: 6, value: IndexValue::Inline(b"added".to_vec()) }),
+            (
+                b"a".to_vec(),
+                MemEntry {
+                    lsn: 5,
+                    value: IndexValue::Inline(b"merged".to_vec()),
+                },
+            ),
+            (
+                b"c".to_vec(),
+                MemEntry {
+                    lsn: 6,
+                    value: IndexValue::Inline(b"added".to_vec()),
+                },
+            ),
         ]));
         let before_clear = original.clone();
         original.clear();
 
         assert!(original.is_empty());
         assert_eq!(original.approximate_bytes(), 0);
-        assert_eq!(snapshot.get(b"a").unwrap().value, IndexValue::Inline(b"original".to_vec()));
-        assert_eq!(snapshot.get(b"b").unwrap().value, IndexValue::Inline(b"retained".to_vec()));
+        assert_eq!(
+            snapshot.get(b"a").unwrap().value,
+            IndexValue::Inline(b"original".to_vec())
+        );
+        assert_eq!(
+            snapshot.get(b"b").unwrap().value,
+            IndexValue::Inline(b"retained".to_vec())
+        );
         assert_eq!(snapshot.approximate_bytes(), snapshot_bytes);
         assert_eq!(snapshot.highest_lsn(), 2);
-        assert_eq!(after_upsert.get(b"a").unwrap().value, IndexValue::Inline(b"changed".to_vec()));
+        assert_eq!(
+            after_upsert.get(b"a").unwrap().value,
+            IndexValue::Inline(b"changed".to_vec())
+        );
         assert_eq!(after_upsert.get(b"b").unwrap().value, IndexValue::Tombstone);
         assert_eq!(after_upsert.approximate_bytes(), after_upsert_bytes);
-        assert_eq!(before_clear.get(b"a").unwrap().value, IndexValue::Inline(b"merged".to_vec()));
+        assert_eq!(
+            before_clear.get(b"a").unwrap().value,
+            IndexValue::Inline(b"merged".to_vec())
+        );
         assert_eq!(before_clear.len(), 3);
         assert_eq!(before_clear.highest_lsn(), 6);
     }
@@ -426,9 +450,7 @@ mod tests {
         }
         assert_eq!(count_fwd, total_keys);
 
-        let mut rev = reopened
-            .cursor_reverse_from(None)
-            .expect("reverse cursor");
+        let mut rev = reopened.cursor_reverse_from(None).expect("reverse cursor");
         let mut count_rev = total_keys;
         while let Some(raw) = rev.peek_raw() {
             count_rev -= 1;

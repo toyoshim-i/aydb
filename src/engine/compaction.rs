@@ -85,7 +85,6 @@ impl<FS: PlatformFs> CompactionOutput<FS> {
     }
 }
 
-
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
     /// WAL streams to `epoch + 1` in $O(1)$ without zero-filling, atomically commits `boot_meta.db`,
@@ -273,11 +272,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std_seqs {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
         if !dead_blob_files.is_empty() {
@@ -311,7 +312,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `dead_bytes / file_len >= dead_ratio_threshold`, appending them to the active `blob_std`
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
     /// and can be reclaimed in $O(1)$.
-    pub fn relocate_fragmented_std_blobs(&mut self, dead_ratio_threshold: f64) -> io::Result<usize> {
+    pub fn relocate_fragmented_std_blobs(
+        &mut self,
+        dead_ratio_threshold: f64,
+    ) -> io::Result<usize> {
         self.check_not_poisoned()?;
         if self.tx_depth > 0 {
             return Ok(0);
@@ -359,7 +363,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if old_ptr.kind == BlobKind::Standard
                         && fragmented_seqs.contains(&old_ptr.seg_id)
                     {
-                        if let Some(payload) = self.dereference_blob_lenient(&old_ptr, &entry.key)? {
+                        if let Some(payload) =
+                            self.dereference_blob_lenient(&old_ptr, &entry.key)?
+                        {
                             let new_ptr = self.append_to_blob_segment(
                                 BlobKind::Standard,
                                 0,
@@ -456,7 +462,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut start_idx = (n / 2).min(n - 2);
         for i in 0..(n - 1) {
             let curr_bytes = self.idx_segments[i].file_len();
-            let newer_bytes: u64 = self.idx_segments[i + 1..].iter().map(|s| s.file_len()).sum();
+            let newer_bytes: u64 = self.idx_segments[i + 1..]
+                .iter()
+                .map(|s| s.file_len())
+                .sum();
             if curr_bytes <= newer_bytes.saturating_mul(2) {
                 start_idx = i;
                 break;
@@ -515,7 +524,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
         Ok(Some(CompactionJob {
             fs: Arc::clone(&self.fs),
-            inputs: self.idx_segments[start_idx..].iter().rev().cloned().collect(),
+            inputs: self.idx_segments[start_idx..]
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
             out_seq_id,
             level,
             bloom_bits: self.config.bloom_bits_per_key,
@@ -648,16 +661,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std_seqs {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
 
         let CompactionOutput {
-            mut new_segment, inputs, ..
+            mut new_segment,
+            inputs,
+            ..
         } = out;
         if let Some(r) = Arc::get_mut(&mut new_segment) {
             r.set_block_cache(Some(Arc::clone(&self.block_cache)));
@@ -745,7 +762,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut deleted_files = Vec::with_capacity(dead_lru.len());
         for &(tid, seq) in &dead_lru {
             deleted_files.push(format_lru_blob_file_name(tid, seq));
-            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
             self.lru_blobs.remove(&(tid, seq));
         }
 
@@ -769,11 +787,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         for seq in dead_std {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru {
-            self.blob_cache.invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
+            self.blob_cache
+                .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
 

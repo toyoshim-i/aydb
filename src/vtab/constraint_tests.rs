@@ -143,7 +143,10 @@ fn uniqueness_survives_flush_reopen_and_multiple_scan_batches() {
         conn.execute_batch("INSERT INTO t VALUES (262, 'new', 42.0)")
             .is_err()
     );
-    assert!(conn.execute_batch("INSERT INTO t VALUES (262, NULL, NULL)").is_err());
+    assert!(
+        conn.execute_batch("INSERT INTO t VALUES (262, NULL, NULL)")
+            .is_err()
+    );
     conn.execute_batch("INSERT INTO t VALUES (262, 'new', NULL)")
         .unwrap();
 }

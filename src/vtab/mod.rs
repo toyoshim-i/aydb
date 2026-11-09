@@ -5,33 +5,33 @@
 //! lookups (Plan 2), primary-key range scans (Plan 3), secondary index range scans (Plan 4),
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
-pub mod connection;
 mod compaction_worker;
-mod snapshot;
+pub mod connection;
 #[cfg(test)]
-mod snapshot_tests;
-mod ddl;
+mod constraint_tests;
 mod constraints;
+mod ddl;
 pub mod ffi;
 pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod rowid_tests;
+mod snapshot;
 #[cfg(test)]
-mod constraint_tests;
+mod snapshot_tests;
+#[cfg(test)]
+mod tests;
 
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;
 use std::io;
-use std::time::Instant;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
-use crate::engine::{CommitStep, EngineReader, GroupRole, StorageEngine, WriteDurability};
 use crate::engine::LazyBlob;
+use crate::engine::{CommitStep, EngineReader, GroupRole, StorageEngine, WriteDurability};
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::parse_vtab_ddl;
@@ -56,10 +56,8 @@ pub use crate::vtab::row_codec::{
     parse_sqlite_numeric_str, project_column_zero_copy, sqlite_value_to_key_bytes,
     sqlite_value_to_key_bytes_with_schema,
 };
-use crate::vtab::rowid_map::{
-    RowidMap, extract_rowid_from_pk_bytes, extract_rowid_from_row,
-};
 pub use crate::vtab::rowid_map::hash_pk_to_rowid;
+use crate::vtab::rowid_map::{RowidMap, extract_rowid_from_pk_bytes, extract_rowid_from_row};
 
 const PLAN_FULL_SCAN: c_int = 0;
 const PLAN_PK_POINT: c_int = 1;
@@ -119,7 +117,10 @@ fn find_existing_pk_or_numeric_alt(
     if eng.row_exists(table_id, pk)? {
         return Ok(Some(pk.to_vec()));
     }
-    if !matches!(pk_affinity, ColumnAffinity::Integer | ColumnAffinity::Numeric) {
+    if !matches!(
+        pk_affinity,
+        ColumnAffinity::Integer | ColumnAffinity::Numeric
+    ) {
         if let Some(alt) = build_numeric_alt_key(pk) {
             if eng.row_exists(table_id, &alt)? {
                 return Ok(Some(alt));
@@ -415,9 +416,8 @@ unsafe fn pk_range_bound_to_key(
         }
     }
 
-    let key = unsafe {
-        sqlite_value_to_key_bytes_with_schema(val_ptr, pk_affinity, pk_collation, false)
-    };
+    let key =
+        unsafe { sqlite_value_to_key_bytes_with_schema(val_ptr, pk_affinity, pk_collation, false) };
 
     // If the bound is an exact integer `q` (either `9`-byte `[0x10, q]` or `17`-byte `[0x10, q, 0..0]`),
     // ensure both `9`-byte `Integer(q)` and `17`-byte `Float(q.0)` are handled identically:
@@ -515,9 +515,15 @@ fn max_integer_rowid(eng: &mut StorageEngine<OsFs>, table_id: u16) -> io::Result
     Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
 }
 
-fn integer_rowid_occupied(eng: &StorageEngine<OsFs>, table_id: u16, rowid: i64) -> io::Result<bool> {
+fn integer_rowid_occupied(
+    eng: &StorageEngine<OsFs>,
+    table_id: u16,
+    rowid: i64,
+) -> io::Result<bool> {
     Ok(eng.row_exists(table_id, &encode_i64_tagged_key(rowid))?
-        || eng.pk_for_rowid_view(crate::engine::ReadView::Owner, table_id, rowid)?.is_some())
+        || eng
+            .pk_for_rowid_view(crate::engine::ReadView::Owner, table_id, rowid)?
+            .is_some())
 }
 
 unsafe extern "system" fn vtab_create_or_connect(
@@ -613,7 +619,10 @@ unsafe extern "system" fn vtab_create_or_connect(
                 Err(_) => return SQLITE_ERROR,
             };
             if let Err(e) = rowid_map::ensure_persistent_rowids(
-                &mut eng, table_id, ddl.durability, ddl.pk_affinity == ColumnAffinity::Integer,
+                &mut eng,
+                table_id,
+                ddl.durability,
+                ddl.pk_affinity == ColumnAffinity::Integer,
             ) {
                 eng.unregister_vtab(table_id, &ddl.table_name);
                 return io_err_to_sqlite_rc(&e);
@@ -856,11 +865,7 @@ unsafe extern "system" fn vtab_best_index(
                 if constraints[i].usable == 0 || constraints[i].iColumn != sec_col_idx as i32 {
                     continue;
                 }
-                if !constraint_matches_col_collation(
-                    p_info,
-                    i,
-                    vtab.col_collations[sec_col_idx],
-                ) {
+                if !constraint_matches_col_collation(p_info, i, vtab.col_collations[sec_col_idx]) {
                     continue;
                 }
                 match constraints[i].op {
@@ -1017,371 +1022,378 @@ unsafe extern "system" fn vtab_filter(
             Err(error) => return io_err_to_sqlite_rc(&error),
         };
 
-        with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
-            let base_plan = idx_num & 0xFF;
-            match base_plan {
-                PLAN_PK_POINT => {
-                    if argc < 1 {
-                        return SQLITE_ERROR;
-                    }
-                    let val_ptr = *argv.offset(0);
-                    if sqlite3_value_type(val_ptr) == SQLITE_NULL {
-                        return SQLITE_OK;
-                    }
-                    let pt_flags = (idx_num >> 8) & 0xFF;
-                    let pt_keys_only = (pt_flags & POINT_FLAG_KEYS_ONLY) != 0;
-                    cursor.keys_only = pt_keys_only;
-                    if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
-                        if let Some(rid) = extract_lossless_rowid_arg(val_ptr) {
-                            match resolve_pk_for_rowid(
-                                vtab, rid, |t, pk| eng.row_exists(t, pk),
-                                |t, rid| eng.pk_for_rowid(t, rid),
+        with_snapshot_read_access(
+            &vtab.engine,
+            conn_id,
+            vtab.table_id,
+            cursor.snapshot.as_ref(),
+            |eng| {
+                let base_plan = idx_num & 0xFF;
+                match base_plan {
+                    PLAN_PK_POINT => {
+                        if argc < 1 {
+                            return SQLITE_ERROR;
+                        }
+                        let val_ptr = *argv.offset(0);
+                        if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                            return SQLITE_OK;
+                        }
+                        let pt_flags = (idx_num >> 8) & 0xFF;
+                        let pt_keys_only = (pt_flags & POINT_FLAG_KEYS_ONLY) != 0;
+                        cursor.keys_only = pt_keys_only;
+                        if (pt_flags & POINT_FLAG_BY_ROWID) != 0 {
+                            if let Some(rid) = extract_lossless_rowid_arg(val_ptr) {
+                                match resolve_pk_for_rowid(
+                                    vtab,
+                                    rid,
+                                    |t, pk| eng.row_exists(t, pk),
+                                    |t, rid| eng.pk_for_rowid(t, rid),
+                                ) {
+                                    Ok(Some(mapped_pk)) => {
+                                        match point_fetch(
+                                            eng,
+                                            vtab.table_id,
+                                            &mapped_pk,
+                                            pt_keys_only,
+                                            &mut cursor.slab,
+                                            &mut cursor.spans,
+                                        ) {
+                                            Ok(true) => {
+                                                cursor.pks.push(mapped_pk);
+                                                cursor.lazy_blobs.push(None);
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => return io_err_to_sqlite_rc(&e),
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => return io_err_to_sqlite_rc(&e),
+                                }
+                            }
+                            return SQLITE_OK;
+                        } else {
+                            let pk_bytes = sqlite_value_to_key_bytes_with_schema(
+                                val_ptr,
+                                vtab.pk_affinity,
+                                vtab.pk_collation,
+                                false,
+                            );
+                            let found = match point_fetch(
+                                eng,
+                                vtab.table_id,
+                                &pk_bytes,
+                                pt_keys_only,
+                                &mut cursor.slab,
+                                &mut cursor.spans,
                             ) {
-                                Ok(Some(mapped_pk)) => {
+                                Ok(b) => b,
+                                Err(e) => return io_err_to_sqlite_rc(&e),
+                            };
+                            if found {
+                                cursor.pks.push(pk_bytes);
+                                cursor.lazy_blobs.push(None);
+                            } else if !matches!(
+                                vtab.pk_affinity,
+                                ColumnAffinity::Integer | ColumnAffinity::Numeric
+                            ) {
+                                if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
                                     match point_fetch(
                                         eng,
                                         vtab.table_id,
-                                        &mapped_pk,
+                                        &alt,
                                         pt_keys_only,
                                         &mut cursor.slab,
                                         &mut cursor.spans,
                                     ) {
                                         Ok(true) => {
-                                            cursor.pks.push(mapped_pk);
+                                            cursor.pks.push(alt);
                                             cursor.lazy_blobs.push(None);
                                         }
                                         Ok(false) => {}
                                         Err(e) => return io_err_to_sqlite_rc(&e),
                                     }
                                 }
-                                Ok(None) => {}
-                                Err(e) => return io_err_to_sqlite_rc(&e),
                             }
                         }
-                        return SQLITE_OK;
-                    } else {
-                        let pk_bytes = sqlite_value_to_key_bytes_with_schema(
-                            val_ptr,
-                            vtab.pk_affinity,
-                            vtab.pk_collation,
-                            false,
-                        );
-                        let found = match point_fetch(
-                            eng,
+                    }
+                    PLAN_SECONDARY_EQ => {
+                        if argc < 1 {
+                            return SQLITE_ERROR;
+                        }
+                        let val_ptr = *argv.offset(0);
+                        if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                            return SQLITE_OK;
+                        }
+                        let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
+                        let flags = (idx_num >> 24) & 0x7F;
+                        let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                        cursor.keys_only = keys_only;
+                        let sec_col_idx = vtab
+                            .secondary_indexes
+                            .iter()
+                            .find(|&&(_, id)| id == index_id)
+                            .map(|&(c, _)| c)
+                            .unwrap_or(0);
+                        let sec_aff = vtab
+                            .col_affinities
+                            .get(sec_col_idx)
+                            .copied()
+                            .unwrap_or(ColumnAffinity::Blob);
+                        let sec_coll = vtab
+                            .col_collations
+                            .get(sec_col_idx)
+                            .copied()
+                            .unwrap_or(ColCollation::Binary);
+                        let col_val =
+                            sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
+                        let prefix = crate::lru::encode_secondary_index_exact_prefix(
                             vtab.table_id,
-                            &pk_bytes,
-                            pt_keys_only,
+                            index_id,
+                            &col_val,
+                        );
+                        let next_last_sec = match eng.scan_secondary_index_into_slab(
+                            vtab.table_id,
+                            index_id,
+                            &prefix,
+                            (&prefix, true),
+                            None,
+                            CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                            &mut cursor.pks,
                             &mut cursor.slab,
                             &mut cursor.spans,
+                            Some(&mut cursor.lazy_blobs),
                         ) {
-                            Ok(b) => b,
+                            Ok(last_opt) => last_opt,
                             Err(e) => return io_err_to_sqlite_rc(&e),
                         };
-                        if found {
-                            cursor.pks.push(pk_bytes);
-                            cursor.lazy_blobs.push(None);
-                        } else if !matches!(
-                            vtab.pk_affinity,
-                            ColumnAffinity::Integer | ColumnAffinity::Numeric
+                        if let Some(last_sec_key) = next_last_sec {
+                            cursor.streaming_active = true;
+                            cursor.stream_sec_index_id = Some(index_id);
+                            cursor.stream_sec_prefix = prefix;
+                            cursor.stream_upper = None;
+                            cursor.stream_last_pk = Some(last_sec_key);
+                        }
+                    }
+                    PLAN_SECONDARY_RANGE => {
+                        let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
+                        let flags = (idx_num >> 24) & 0x7F;
+                        let sec_col_idx = vtab
+                            .secondary_indexes
+                            .iter()
+                            .find(|&&(_, id)| id == index_id)
+                            .map(|&(c, _)| c)
+                            .unwrap_or(0);
+                        let sec_aff = vtab
+                            .col_affinities
+                            .get(sec_col_idx)
+                            .copied()
+                            .unwrap_or(ColumnAffinity::Blob);
+                        let sec_coll = vtab
+                            .col_collations
+                            .get(sec_col_idx)
+                            .copied()
+                            .unwrap_or(ColCollation::Binary);
+
+                        let mut arg_pos = 0;
+                        let lower_bound = if (flags
+                            & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
+                            != 0
+                            && arg_pos < argc
+                        {
+                            let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
+                            let val_ptr = *argv.offset(arg_pos as isize);
+                            arg_pos += 1;
+                            match sec_range_bound_to_key(
+                                val_ptr,
+                                vtab.table_id,
+                                index_id,
+                                sec_aff,
+                                sec_coll,
+                                true,
+                                inc,
+                            ) {
+                                Ok(bound) => bound,
+                                Err(()) => return SQLITE_OK,
+                            }
+                        } else {
+                            let mut min_non_null = Vec::with_capacity(6);
+                            min_non_null.extend_from_slice(
+                                &crate::lru::encode_secondary_index_prefix(vtab.table_id, index_id),
+                            );
+                            min_non_null.push(KEY_TAG_NULL + 1);
+                            Some((min_non_null, true))
+                        };
+                        let upper_bound = if (flags
+                            & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
+                            != 0
+                            && arg_pos < argc
+                        {
+                            let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
+                            let val_ptr = *argv.offset(arg_pos as isize);
+                            match sec_range_bound_to_key(
+                                val_ptr,
+                                vtab.table_id,
+                                index_id,
+                                sec_aff,
+                                sec_coll,
+                                false,
+                                inc,
+                            ) {
+                                Ok(bound) => bound,
+                                Err(()) => return SQLITE_OK,
+                            }
+                        } else {
+                            None
+                        };
+
+                        let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                        cursor.keys_only = keys_only;
+                        let idx_prefix =
+                            crate::lru::encode_secondary_index_prefix(vtab.table_id, index_id);
+                        let (lo_slice, lo_inc) = lower_bound
+                            .as_ref()
+                            .map(|(b, inc)| (b.as_slice(), *inc))
+                            .unwrap_or((&idx_prefix, true));
+                        let next_last_sec = match eng.scan_secondary_index_into_slab(
+                            vtab.table_id,
+                            index_id,
+                            &idx_prefix,
+                            (lo_slice, lo_inc),
+                            upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                            CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                            &mut cursor.pks,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                            Some(&mut cursor.lazy_blobs),
                         ) {
-                            if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
-                                match point_fetch(
-                                    eng,
-                                    vtab.table_id,
-                                    &alt,
-                                    pt_keys_only,
-                                    &mut cursor.slab,
-                                    &mut cursor.spans,
-                                ) {
-                                    Ok(true) => {
-                                        cursor.pks.push(alt);
-                                        cursor.lazy_blobs.push(None);
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => return io_err_to_sqlite_rc(&e),
-                                }
+                            Ok(last_opt) => last_opt,
+                            Err(e) => return io_err_to_sqlite_rc(&e),
+                        };
+                        if let Some(last_sec_key) = next_last_sec {
+                            cursor.streaming_active = true;
+                            cursor.stream_sec_index_id = Some(index_id);
+                            cursor.stream_sec_prefix.extend_from_slice(&idx_prefix);
+                            cursor.stream_upper = upper_bound;
+                            cursor.stream_last_pk = Some(last_sec_key);
+                        }
+                    }
+                    PLAN_PK_RANGE => {
+                        let flags = idx_num >> 8;
+                        let mut arg_pos = 0;
+                        let lower_bound = if (flags
+                            & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
+                            != 0
+                            && arg_pos < argc
+                        {
+                            let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
+                            let val_ptr = *argv.offset(arg_pos as isize);
+                            arg_pos += 1;
+                            match pk_range_bound_to_key(
+                                val_ptr,
+                                vtab.pk_affinity,
+                                vtab.pk_collation,
+                                true,
+                                inc,
+                            ) {
+                                Ok(bound) => bound,
+                                Err(()) => return SQLITE_OK,
+                            }
+                        } else {
+                            None
+                        };
+                        let upper_bound = if (flags
+                            & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
+                            != 0
+                            && arg_pos < argc
+                        {
+                            let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
+                            let val_ptr = *argv.offset(arg_pos as isize);
+                            match pk_range_bound_to_key(
+                                val_ptr,
+                                vtab.pk_affinity,
+                                vtab.pk_collation,
+                                false,
+                                inc,
+                            ) {
+                                Ok(bound) => bound,
+                                Err(()) => return SQLITE_OK,
+                            }
+                        } else {
+                            None
+                        };
+                        let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                        let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
+                        cursor.keys_only = keys_only;
+                        if let Err(e) = eng.scan_range_into_slab(
+                            vtab.table_id,
+                            lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                            upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                            reverse,
+                            CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                            &mut cursor.pks,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                            Some(&mut cursor.lazy_blobs),
+                        ) {
+                            return io_err_to_sqlite_rc(&e);
+                        }
+                        let fetched_rows = if keys_only {
+                            cursor.pks.len()
+                        } else {
+                            cursor.spans.len()
+                        };
+                        if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+                            if let Some(last_pk) = cursor.pks.last().cloned() {
+                                cursor.streaming_active = true;
+                                cursor.stream_lower = lower_bound;
+                                cursor.stream_upper = upper_bound;
+                                cursor.stream_reverse = reverse;
+                                cursor.stream_last_pk = Some(last_pk);
+                            }
+                        }
+                    }
+                    _ => {
+                        let flags = idx_num >> 8;
+                        let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                        let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
+                        cursor.keys_only = keys_only;
+                        if let Err(e) = eng.scan_range_into_slab(
+                            vtab.table_id,
+                            None,
+                            None,
+                            reverse,
+                            CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                            &mut cursor.pks,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                            Some(&mut cursor.lazy_blobs),
+                        ) {
+                            return io_err_to_sqlite_rc(&e);
+                        }
+                        let fetched_rows = if keys_only {
+                            cursor.pks.len()
+                        } else {
+                            cursor.spans.len()
+                        };
+                        if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+                            if let Some(last_pk) = cursor.pks.last().cloned() {
+                                cursor.streaming_active = true;
+                                cursor.stream_lower = None;
+                                cursor.stream_upper = None;
+                                cursor.stream_reverse = reverse;
+                                cursor.stream_last_pk = Some(last_pk);
                             }
                         }
                     }
                 }
-                PLAN_SECONDARY_EQ => {
-                    if argc < 1 {
-                        return SQLITE_ERROR;
-                    }
-                    let val_ptr = *argv.offset(0);
-                    if sqlite3_value_type(val_ptr) == SQLITE_NULL {
-                        return SQLITE_OK;
-                    }
-                    let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
-                    let flags = (idx_num >> 24) & 0x7F;
-                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                    cursor.keys_only = keys_only;
-                    let sec_col_idx = vtab
-                        .secondary_indexes
-                        .iter()
-                        .find(|&&(_, id)| id == index_id)
-                        .map(|&(c, _)| c)
-                        .unwrap_or(0);
-                    let sec_aff = vtab
-                        .col_affinities
-                        .get(sec_col_idx)
-                        .copied()
-                        .unwrap_or(ColumnAffinity::Blob);
-                    let sec_coll = vtab
-                        .col_collations
-                        .get(sec_col_idx)
-                        .copied()
-                        .unwrap_or(ColCollation::Binary);
-                    let col_val =
-                        sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
-                    let prefix = crate::lru::encode_secondary_index_exact_prefix(
-                        vtab.table_id,
-                        index_id,
-                        &col_val,
-                    );
-                    let next_last_sec = match eng.scan_secondary_index_into_slab(
-                        vtab.table_id,
-                        index_id,
-                        &prefix,
-                        (&prefix, true),
-                        None,
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
-                    ) {
-                        Ok(last_opt) => last_opt,
-                        Err(e) => return io_err_to_sqlite_rc(&e),
-                    };
-                    if let Some(last_sec_key) = next_last_sec {
-                        cursor.streaming_active = true;
-                        cursor.stream_sec_index_id = Some(index_id);
-                        cursor.stream_sec_prefix = prefix;
-                        cursor.stream_upper = None;
-                        cursor.stream_last_pk = Some(last_sec_key);
-                    }
-                }
-                PLAN_SECONDARY_RANGE => {
-                    let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
-                    let flags = (idx_num >> 24) & 0x7F;
-                    let sec_col_idx = vtab
-                        .secondary_indexes
-                        .iter()
-                        .find(|&&(_, id)| id == index_id)
-                        .map(|&(c, _)| c)
-                        .unwrap_or(0);
-                    let sec_aff = vtab
-                        .col_affinities
-                        .get(sec_col_idx)
-                        .copied()
-                        .unwrap_or(ColumnAffinity::Blob);
-                    let sec_coll = vtab
-                        .col_collations
-                        .get(sec_col_idx)
-                        .copied()
-                        .unwrap_or(ColCollation::Binary);
 
-                    let mut arg_pos = 0;
-                    let lower_bound = if (flags
-                        & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
-                        != 0
-                        && arg_pos < argc
-                    {
-                        let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
-                        let val_ptr = *argv.offset(arg_pos as isize);
-                        arg_pos += 1;
-                        match sec_range_bound_to_key(
-                            val_ptr,
-                            vtab.table_id,
-                            index_id,
-                            sec_aff,
-                            sec_coll,
-                            true,
-                            inc,
-                        ) {
-                            Ok(bound) => bound,
-                            Err(()) => return SQLITE_OK,
-                        }
-                    } else {
-                        let mut min_non_null = Vec::with_capacity(6);
-                        min_non_null.extend_from_slice(&crate::lru::encode_secondary_index_prefix(
-                            vtab.table_id,
-                            index_id,
-                        ));
-                        min_non_null.push(KEY_TAG_NULL + 1);
-                        Some((min_non_null, true))
-                    };
-                    let upper_bound = if (flags
-                        & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
-                        != 0
-                        && arg_pos < argc
-                    {
-                        let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
-                        let val_ptr = *argv.offset(arg_pos as isize);
-                        match sec_range_bound_to_key(
-                            val_ptr,
-                            vtab.table_id,
-                            index_id,
-                            sec_aff,
-                            sec_coll,
-                            false,
-                            inc,
-                        ) {
-                            Ok(bound) => bound,
-                            Err(()) => return SQLITE_OK,
-                        }
-                    } else {
-                        None
-                    };
-
-                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                    cursor.keys_only = keys_only;
-                    let idx_prefix =
-                        crate::lru::encode_secondary_index_prefix(vtab.table_id, index_id);
-                    let (lo_slice, lo_inc) = lower_bound
-                        .as_ref()
-                        .map(|(b, inc)| (b.as_slice(), *inc))
-                        .unwrap_or((&idx_prefix, true));
-                    let next_last_sec = match eng.scan_secondary_index_into_slab(
-                        vtab.table_id,
-                        index_id,
-                        &idx_prefix,
-                        (lo_slice, lo_inc),
-                        upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
-                    ) {
-                        Ok(last_opt) => last_opt,
-                        Err(e) => return io_err_to_sqlite_rc(&e),
-                    };
-                    if let Some(last_sec_key) = next_last_sec {
-                        cursor.streaming_active = true;
-                        cursor.stream_sec_index_id = Some(index_id);
-                        cursor.stream_sec_prefix.extend_from_slice(&idx_prefix);
-                        cursor.stream_upper = upper_bound;
-                        cursor.stream_last_pk = Some(last_sec_key);
-                    }
-                }
-                PLAN_PK_RANGE => {
-                    let flags = idx_num >> 8;
-                    let mut arg_pos = 0;
-                    let lower_bound = if (flags
-                        & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
-                        != 0
-                        && arg_pos < argc
-                    {
-                        let inc = (flags & RANGE_FLAG_LOWER_INCLUSIVE) != 0;
-                        let val_ptr = *argv.offset(arg_pos as isize);
-                        arg_pos += 1;
-                        match pk_range_bound_to_key(
-                            val_ptr,
-                            vtab.pk_affinity,
-                            vtab.pk_collation,
-                            true,
-                            inc,
-                        ) {
-                            Ok(bound) => bound,
-                            Err(()) => return SQLITE_OK,
-                        }
-                    } else {
-                        None
-                    };
-                    let upper_bound = if (flags
-                        & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
-                        != 0
-                        && arg_pos < argc
-                    {
-                        let inc = (flags & RANGE_FLAG_UPPER_INCLUSIVE) != 0;
-                        let val_ptr = *argv.offset(arg_pos as isize);
-                        match pk_range_bound_to_key(
-                            val_ptr,
-                            vtab.pk_affinity,
-                            vtab.pk_collation,
-                            false,
-                            inc,
-                        ) {
-                            Ok(bound) => bound,
-                            Err(()) => return SQLITE_OK,
-                        }
-                    } else {
-                        None
-                    };
-                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                    let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
-                    cursor.keys_only = keys_only;
-                    if let Err(e) = eng.scan_range_into_slab(
-                        vtab.table_id,
-                        lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                        upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                        reverse,
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
-                    ) {
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                    let fetched_rows = if keys_only {
-                        cursor.pks.len()
-                    } else {
-                        cursor.spans.len()
-                    };
-                    if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
-                        if let Some(last_pk) = cursor.pks.last().cloned() {
-                            cursor.streaming_active = true;
-                            cursor.stream_lower = lower_bound;
-                            cursor.stream_upper = upper_bound;
-                            cursor.stream_reverse = reverse;
-                            cursor.stream_last_pk = Some(last_pk);
-                        }
-                    }
-                }
-                _ => {
-                    let flags = idx_num >> 8;
-                    let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                    let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
-                    cursor.keys_only = keys_only;
-                    if let Err(e) = eng.scan_range_into_slab(
-                        vtab.table_id,
-                        None,
-                        None,
-                        reverse,
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
-                    ) {
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                    let fetched_rows = if keys_only {
-                        cursor.pks.len()
-                    } else {
-                        cursor.spans.len()
-                    };
-                    if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
-                        if let Some(last_pk) = cursor.pks.last().cloned() {
-                            cursor.streaming_active = true;
-                            cursor.stream_lower = None;
-                            cursor.stream_upper = None;
-                            cursor.stream_reverse = reverse;
-                            cursor.stream_last_pk = Some(last_pk);
-                        }
-                    }
-                }
-            }
-
-            SQLITE_OK
-        })
+                SQLITE_OK
+            },
+        )
         .unwrap_or(SQLITE_ERROR)
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -1418,8 +1430,12 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .as_ref()
                     .map(|(b, inc)| (b.as_slice(), *inc));
                 let mut next_last_sec: Option<Vec<u8>> = None;
-                let rc = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
-                    match eng.scan_secondary_index_into_slab(
+                let rc = with_snapshot_read_access(
+                    &vtab.engine,
+                    conn_id,
+                    vtab.table_id,
+                    cursor.snapshot.as_ref(),
+                    |eng| match eng.scan_secondary_index_into_slab(
                         vtab.table_id,
                         sec_index_id,
                         &cursor.stream_sec_prefix,
@@ -1437,8 +1453,8 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                             SQLITE_OK
                         }
                         Err(e) => io_err_to_sqlite_rc(&e),
-                    }
-                })
+                    },
+                )
                 .unwrap_or(SQLITE_ERROR);
                 if rc != SQLITE_OK {
                     cursor.streaming_active = false;
@@ -1470,23 +1486,29 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .map(|(b, inc)| (b.as_slice(), *inc))
             };
 
-            let rc = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
-                if let Err(e) = eng.scan_range_into_slab(
-                    vtab.table_id,
-                    lower_ref,
-                    upper_ref,
-                    reverse,
-                    CURSOR_STREAM_CHUNK_ROWS,
-                    keys_only,
-                    &mut cursor.pks,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                    Some(&mut cursor.lazy_blobs),
-                ) {
-                    return io_err_to_sqlite_rc(&e);
-                }
-                SQLITE_OK
-            })
+            let rc = with_snapshot_read_access(
+                &vtab.engine,
+                conn_id,
+                vtab.table_id,
+                cursor.snapshot.as_ref(),
+                |eng| {
+                    if let Err(e) = eng.scan_range_into_slab(
+                        vtab.table_id,
+                        lower_ref,
+                        upper_ref,
+                        reverse,
+                        CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                        &mut cursor.pks,
+                        &mut cursor.slab,
+                        &mut cursor.spans,
+                        Some(&mut cursor.lazy_blobs),
+                    ) {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                    SQLITE_OK
+                },
+            )
             .unwrap_or(SQLITE_ERROR);
             if rc != SQLITE_OK {
                 cursor.streaming_active = false;
@@ -1520,11 +1542,7 @@ unsafe extern "system" fn vtab_eof(p_cursor: *mut sqlite3_vtab_cursor) -> c_int 
         } else {
             cursor.spans.len()
         };
-        if cursor.pos >= len {
-            1
-        } else {
-            0
-        }
+        if cursor.pos >= len { 1 } else { 0 }
     }))
     .unwrap_or(1)
 }
@@ -1543,10 +1561,11 @@ unsafe extern "system" fn vtab_column(
             }
             let pk_bytes = &cursor.pks[cursor.pos];
             if i_col < 0 {
-                let rid = match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
-                    Ok(rid) => rid,
-                    Err(e) => return io_err_to_sqlite_rc(&e),
-                };
+                let rid =
+                    match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
+                        Ok(rid) => rid,
+                        Err(e) => return io_err_to_sqlite_rc(&e),
+                    };
                 sqlite3_result_int64(p_ctx, rid);
                 return SQLITE_OK;
             }
@@ -1610,12 +1629,23 @@ unsafe extern "system" fn vtab_column(
                 cursor.prefetch_end = end;
             }
 
-            let Some(deref_res) = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
-                if upcoming.len() > 1 {
-                    let _ = eng.prefetch_lazy_blobs(vtab.table_id, &upcoming);
-                }
-                eng.dereference_lazy_blob_into(vtab.table_id, pk_bytes, &lazy_blob, &mut cursor.slab)
-            }) else {
+            let Some(deref_res) = with_snapshot_read_access(
+                &vtab.engine,
+                conn_id,
+                vtab.table_id,
+                cursor.snapshot.as_ref(),
+                |eng| {
+                    if upcoming.len() > 1 {
+                        let _ = eng.prefetch_lazy_blobs(vtab.table_id, &upcoming);
+                    }
+                    eng.dereference_lazy_blob_into(
+                        vtab.table_id,
+                        pk_bytes,
+                        &lazy_blob,
+                        &mut cursor.slab,
+                    )
+                },
+            ) else {
                 return SQLITE_ERROR;
             };
             let span = match deref_res {
@@ -1655,7 +1685,11 @@ unsafe extern "system" fn vtab_rowid(
             if cursor.pos >= cursor.pks.len() {
                 return SQLITE_ERROR;
             }
-            *p_rowid = match extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab, cursor.snapshot.as_ref()) {
+            *p_rowid = match extract_rowid_from_pk_bytes(
+                &cursor.pks[cursor.pos],
+                vtab,
+                cursor.snapshot.as_ref(),
+            ) {
                 Ok(rid) => rid,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
@@ -1703,7 +1737,9 @@ unsafe extern "system" fn vtab_update(
             let arg0 = *argv.offset(0);
             if let Some(rid) = extract_lossless_rowid_arg(arg0) {
                 let old_pk_opt = match resolve_pk_for_rowid(
-                    vtab, rid, |t, pk| eng.row_exists(t, pk),
+                    vtab,
+                    rid,
+                    |t, pk| eng.row_exists(t, pk),
                     |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
                 ) {
                     Ok(opt) => opt,
@@ -1787,8 +1823,8 @@ unsafe extern "system" fn vtab_update(
                 //    probe up to 64 deterministic pseudo-random positive `i64` candidates (`1..=i64::MAX`),
                 //    matching SQLite's fallback rowid generator, and return `SQLITE_FULL` if exhausted.
                 if found_free.is_none() {
-                    let mut state = (eng.next_lsn() ^ 0x9E37_79B9_7F4A_7C15)
-                        .wrapping_add(vtab.table_id as u64);
+                    let mut state =
+                        (eng.next_lsn() ^ 0x9E37_79B9_7F4A_7C15).wrapping_add(vtab.table_id as u64);
                     for attempt in 0..64u64 {
                         state = state
                             .wrapping_add(0x9E37_79B9_7F4A_7C15)
@@ -1854,7 +1890,9 @@ unsafe extern "system" fn vtab_update(
         if !is_insert {
             if let Some(rid) = extract_lossless_rowid_arg(arg0) {
                 let mapped = match resolve_pk_for_rowid(
-                    vtab, rid, |t, pk| eng.row_exists(t, pk),
+                    vtab,
+                    rid,
+                    |t, pk| eng.row_exists(t, pk),
                     |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
                 ) {
                     Ok(opt) => opt,
@@ -1942,8 +1980,7 @@ unsafe extern "system" fn vtab_update(
                                 rmap.remove_by_pk(&conflict_pk);
                             }
                         }
-                        if let Err(e) =
-                            eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)
+                        if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)
                         {
                             return io_err_to_sqlite_rc(&e);
                         }
@@ -2013,7 +2050,10 @@ unsafe extern "system" fn vtab_update(
         } else {
             vtab.has_non_int_pks.store(true, Ordering::Relaxed);
             let rowid = match rowid_map::assign_synthetic_rowid(
-                &mut eng, vtab.table_id, &new_pk, vtab.durability,
+                &mut eng,
+                vtab.table_id,
+                &new_pk,
+                vtab.durability,
                 vtab.pk_affinity == ColumnAffinity::Integer,
             ) {
                 Ok(rowid) => rowid,

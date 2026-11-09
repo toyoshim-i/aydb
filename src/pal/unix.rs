@@ -300,7 +300,8 @@ impl PlatformFile for UnixPlatformFile {
             #[cfg(target_os = "linux")]
             {
                 if let Ok(len_i64) = i64::try_from(target_len) {
-                    let rc = self.with_file(|f| Ok(unsafe { posix_fallocate(f.as_raw_fd(), 0, len_i64) }))?;
+                    let rc = self
+                        .with_file(|f| Ok(unsafe { posix_fallocate(f.as_raw_fd(), 0, len_i64) }))?;
                     if rc != 0 {
                         self.with_file(|f| f.set_len(target_len))?;
                     }
@@ -415,12 +416,7 @@ impl PlatformFs for UnixPlatformFs {
             None
         };
         let file = Arc::new(UnixPlatformFile::open_internal(
-            &full_path,
-            create,
-            writable,
-            false,
-            hint,
-            pool_ref,
+            &full_path, create, writable, false, hint, pool_ref,
         )?);
         if use_pool {
             self.pool.register(&full_path, &file);
@@ -483,7 +479,10 @@ mod tests {
             .unwrap();
         f3.write_all_at(b"aydb!", 0).unwrap();
 
-        assert!(!f1.is_descriptor_open(), "f1 descriptor should have been evicted");
+        assert!(
+            !f1.is_descriptor_open(),
+            "f1 descriptor should have been evicted"
+        );
         assert!(f2.is_descriptor_open());
         assert!(f3.is_descriptor_open());
 
@@ -502,7 +501,10 @@ mod tests {
             .unwrap();
         f4.write_all_at(b"more!", 0).unwrap();
 
-        assert!(f2.is_descriptor_open(), "f2 was pinned and must not be evicted");
+        assert!(
+            f2.is_descriptor_open(),
+            "f2 was pinned and must not be evicted"
+        );
         drop(f2_pinned);
     }
 
@@ -556,7 +558,11 @@ mod tests {
         assert!(!f1.is_descriptor_open(), "f1 was evicted by the cap");
 
         fs.remove_file("idx_0001.db").unwrap();
-        assert!(!fs.list_files().unwrap().contains(&"idx_0001.db".to_string()));
+        assert!(
+            !fs.list_files()
+                .unwrap()
+                .contains(&"idx_0001.db".to_string())
+        );
         assert!(f1.is_descriptor_open());
 
         // Later opens must not close the unlinked file's descriptor.

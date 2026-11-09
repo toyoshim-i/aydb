@@ -117,7 +117,9 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         let total_len = BLOB_RECORD_HEADER_LEN
             .checked_add(key.len())
             .and_then(|n| n.checked_add(value.len()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "blob record size overflow"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "blob record size overflow")
+            })?;
 
         let total_len_u32 = u32::try_from(total_len).map_err(|_| {
             io::Error::new(
@@ -153,8 +155,7 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         self.write_buf.extend_from_slice(value);
 
         let payload_crc = crc32c(&self.write_buf[rec_start + 8..rec_start + total_len]);
-        self.write_buf[rec_start + 4..rec_start + 8]
-            .copy_from_slice(&payload_crc.to_le_bytes());
+        self.write_buf[rec_start + 4..rec_start + 8].copy_from_slice(&payload_crc.to_le_bytes());
 
         self.write_offset += total_len as u64;
         if self.write_buf.len() >= BLOB_WRITE_BUFFER_CAPACITY {
@@ -470,17 +471,33 @@ mod tests {
 
         let reader = BlobSegmentReader::new(writer.file().clone(), 1);
         let mut slab = Vec::new();
-        assert!(reader.append_blob_into(&ptr1, Some(b"k1"), &mut slab).unwrap());
+        assert!(
+            reader
+                .append_blob_into(&ptr1, Some(b"k1"), &mut slab)
+                .unwrap()
+        );
         assert_eq!(slab, val_small);
-        assert!(reader.append_blob_into(&ptr2, Some(b"k2"), &mut slab).unwrap());
+        assert!(
+            reader
+                .append_blob_into(&ptr2, Some(b"k2"), &mut slab)
+                .unwrap()
+        );
         assert_eq!(&slab[..2048], val_small.as_slice());
         assert_eq!(&slab[2048..], val_large.as_slice());
 
         // Key mismatch must leave `slab` untouched and return `Ok(false)`
         let prev_len = slab.len();
-        assert!(!reader.append_blob_into(&ptr1, Some(b"wrong"), &mut slab).unwrap());
+        assert!(
+            !reader
+                .append_blob_into(&ptr1, Some(b"wrong"), &mut slab)
+                .unwrap()
+        );
         assert_eq!(slab.len(), prev_len);
-        assert!(!reader.append_blob_into(&ptr2, Some(b"wrong"), &mut slab).unwrap());
+        assert!(
+            !reader
+                .append_blob_into(&ptr2, Some(b"wrong"), &mut slab)
+                .unwrap()
+        );
         assert_eq!(slab.len(), prev_len);
     }
 }

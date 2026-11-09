@@ -266,7 +266,13 @@ fn blob_segments_and_coalesced_wal_survive_reopen_before_flush_memtable() {
     {
         let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
         engine
-            .put_row(1, b"blob_k1", &large_blob, &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                b"blob_k1",
+                &large_blob,
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
         engine
             .put_row(
@@ -413,7 +419,13 @@ fn flush_memtable_metadata_fault_preserves_entries_until_reopen() {
     assert_eq!(engine.maintenance_failures(), 0);
     fail_flag.store(true, Ordering::SeqCst);
     engine
-        .put_row(1, b"post", &[0x11u8; 512], &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"post",
+            &[0x11u8; 512],
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .expect("a committed write must not report a post-commit flush failure");
     assert_eq!(engine.maintenance_failures(), 1);
     assert!(
@@ -429,7 +441,10 @@ fn flush_memtable_metadata_fault_preserves_entries_until_reopen() {
     let fs = Arc::clone(&engine.fs);
     drop(engine);
     let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
-    assert_eq!(reopened.get_row(1, b"post").unwrap(), Some(vec![0x11u8; 512]));
+    assert_eq!(
+        reopened.get_row(1, b"post").unwrap(),
+        Some(vec![0x11u8; 512])
+    );
 }
 
 #[test]
@@ -439,7 +454,13 @@ fn large_transaction_over_4mb_rollback_leaves_zero_leaked_rows() {
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
 
     engine
-        .put_row(1, b"pre_tx", b"baseline", &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"pre_tx",
+            b"baseline",
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
 
     engine.begin_transaction();
@@ -842,9 +863,7 @@ fn crash_consistency_and_failed_write_rollback() {
         }
         fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
             if self.is_wal && self.fail_wal_writes.load(Ordering::SeqCst) {
-                return Err(io::Error::other(
-                    "simulated WAL write I/O failure",
-                ));
+                return Err(io::Error::other("simulated WAL write I/O failure"));
             }
             let mut c = self.cache.lock().unwrap();
             let end = offset as usize + buf.len();
@@ -965,10 +984,22 @@ fn crash_consistency_and_failed_write_rollback() {
     // Write blob_1 and blob_2 to Table 1 so blob_std_1 is sealed and checkpointed
     let orig_blob = vec![0x33u8; 2000];
     engine
-        .put_row(1, b"r1", &orig_blob, &[], WriteDurability::SyncTransactional)
+        .put_row(
+            1,
+            b"r1",
+            &orig_blob,
+            &[],
+            WriteDurability::SyncTransactional,
+        )
         .unwrap();
     engine
-        .put_row(1, b"r2", &orig_blob, &[], WriteDurability::SyncTransactional)
+        .put_row(
+            1,
+            b"r2",
+            &orig_blob,
+            &[],
+            WriteDurability::SyncTransactional,
+        )
         .unwrap();
     engine.flush_memtable().unwrap();
 
@@ -997,7 +1028,13 @@ fn crash_consistency_and_failed_write_rollback() {
     // Failing commit_transaction must roll back MemTable!
     engine.begin_transaction();
     engine
-        .put_row(1, b"tx_fail_k", b"tx_val", &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"tx_fail_k",
+            b"tx_val",
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
     fs.fail_wal_writes.store(true, Ordering::SeqCst);
     assert!(engine.commit_transaction().is_err());
@@ -1312,8 +1349,16 @@ fn fast_undo_rollback_savepoints_and_zero_copy_blob_into() {
 
     let mut slab = Vec::with_capacity(4096);
     let mut spans = Vec::new();
-    assert!(engine.get_row_into(2, b"bk1", &mut slab, &mut spans).unwrap());
-    assert!(engine.get_row_into(2, b"bk2", &mut slab, &mut spans).unwrap());
+    assert!(
+        engine
+            .get_row_into(2, b"bk1", &mut slab, &mut spans)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .get_row_into(2, b"bk2", &mut slab, &mut spans)
+            .unwrap()
+    );
     assert_eq!(spans.len(), 2);
     assert_eq!(&slab[spans[0].0..spans[0].1], blob_a.as_slice());
     assert_eq!(&slab[spans[1].0..spans[1].1], blob_b.as_slice());
@@ -1706,9 +1751,9 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
         engine
             .put_row(1, &pk_r03, &val_3971, &[], WriteDurability::BufferedFast)
             .unwrap();
-        engine
-            .flush_memtable()
-            .expect("3971B value (4087B inline footprint) must spill to blob and not wedge flush_memtable");
+        engine.flush_memtable().expect(
+            "3971B value (4087B inline footprint) must spill to blob and not wedge flush_memtable",
+        );
         assert_eq!(engine.get_row(1, &pk_r03).unwrap(), Some(val_3971));
         engine.config.inline_threshold_bytes = DEFAULT_INLINE_THRESHOLD;
 
@@ -2355,7 +2400,10 @@ fn wal_write_failure_poisons_engine_until_reopen() {
         }
     }
 
-    for durability in [WriteDurability::SyncTransactional, WriteDurability::BufferedFast] {
+    for durability in [
+        WriteDurability::SyncTransactional,
+        WriteDurability::BufferedFast,
+    ] {
         let tmp = TempTestDir::new("wal_poison");
         let flag = Arc::new(AtomicBool::new(false));
         let fs = Arc::new(WalFaultFs {
@@ -2364,7 +2412,9 @@ fn wal_write_failure_poisons_engine_until_reopen() {
         });
 
         let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
-        engine.put_row(1, b"before", b"v0", &[], durability).unwrap();
+        engine
+            .put_row(1, b"before", b"v0", &[], durability)
+            .unwrap();
         assert!(!engine.is_poisoned());
 
         flag.store(true, Ordering::SeqCst);
@@ -2391,7 +2441,10 @@ fn wal_write_failure_poisons_engine_until_reopen() {
 
         let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
         assert!(!reopened.is_poisoned());
-        assert_eq!(reopened.get_row(1, b"before").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(
+            reopened.get_row(1, b"before").unwrap(),
+            Some(b"v0".to_vec())
+        );
         reopened
             .put_row(1, b"after", b"v2", &[], durability)
             .unwrap();
@@ -2517,7 +2570,13 @@ fn stale_same_epoch_wal_sectors_are_not_replayed_after_halt_at_sector_zero() {
                 .put_row(1, &[b'b', i], &val, &[], WriteDurability::BufferedFast)
                 .unwrap();
             engine
-                .put_row(1, &[b'y', i], b"sync", &[], WriteDurability::SyncTransactional)
+                .put_row(
+                    1,
+                    &[b'y', i],
+                    b"sync",
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
                 .unwrap();
         }
         // Dropped without flush_memtable(): simulates a crash with several wal_buf sectors.
@@ -2536,7 +2595,13 @@ fn stale_same_epoch_wal_sectors_are_not_replayed_after_halt_at_sector_zero() {
     {
         let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
         engine
-            .put_row(1, b"new_key", b"new_val", &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                b"new_key",
+                b"new_val",
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
     }
 
@@ -2680,7 +2745,13 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
         ctl.mode.store(1, Ordering::SeqCst);
         for i in 0..3u32 {
             engine
-                .put_row(1, &key(i), &blob(i + 10), &[], WriteDurability::BufferedFast)
+                .put_row(
+                    1,
+                    &key(i),
+                    &blob(i + 10),
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
                 .unwrap();
         }
     }
@@ -2705,7 +2776,10 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
             .cloned()
             .expect("segment A with a live blob must not be reclaimed");
         // Exactly 3 of 4 equal blobs are dead; a double count would be ~6/4 of the file.
-        assert!(a.dead_bytes > 0 && a.dead_bytes * 4 <= a.file_len * 3, "{a:?}");
+        assert!(
+            a.dead_bytes > 0 && a.dead_bytes * 4 <= a.file_len * 3,
+            "{a:?}"
+        );
         assert!(
             fs.list_files()
                 .unwrap()
@@ -2769,9 +2843,19 @@ fn corrupt_blob_uncapped_table_errors_on_read_and_delete_cleans_up() {
     {
         let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
         let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
-        for (pk, tag) in [(&b"k1"[..], &b"tag_a"[..]), (b"k2", b"tag_b"), (b"k3", b"tag_c")] {
+        for (pk, tag) in [
+            (&b"k1"[..], &b"tag_a"[..]),
+            (b"k2", b"tag_b"),
+            (b"k3", b"tag_c"),
+        ] {
             engine
-                .put_row(1, pk, &payload, &[(10, tag.to_vec())], WriteDurability::BufferedFast)
+                .put_row(
+                    1,
+                    pk,
+                    &payload,
+                    &[(10, tag.to_vec())],
+                    WriteDurability::BufferedFast,
+                )
                 .unwrap();
         }
         engine.flush_memtable().unwrap();
@@ -2838,7 +2922,13 @@ fn corrupt_blob_capped_table_evicts_row_at_next_write() {
         engine.register_capped_table(1, 10_000).unwrap();
         for (pk, tag) in [(&b"k1"[..], &b"a"[..]), (b"k2", b"b"), (b"k3", b"c")] {
             engine
-                .put_row(1, pk, &payload, &[(10, tag.to_vec())], WriteDurability::BufferedFast)
+                .put_row(
+                    1,
+                    pk,
+                    &payload,
+                    &[(10, tag.to_vec())],
+                    WriteDurability::BufferedFast,
+                )
                 .unwrap();
         }
         engine.flush_memtable().unwrap();
@@ -2869,7 +2959,13 @@ fn corrupt_blob_capped_table_evicts_row_at_next_write() {
     // Overwrite k3 inside a transaction (the queue is not drained while a tx is active).
     engine.begin_transaction();
     engine
-        .put_row(1, b"k3", b"fresh", &[(10, b"c".to_vec())], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"k3",
+            b"fresh",
+            &[(10, b"c".to_vec())],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
     assert!(engine.row_exists(1, b"k2").unwrap());
     // Committing the outermost tx drains the queue: k2 is physically removed, the overwritten
@@ -2922,11 +3018,18 @@ fn corrupt_spilled_row_meta_delete_still_cleans_secondary_and_lru() {
                 .put_row(table_id, b"pk", b"val", &sec, WriteDurability::BufferedFast)
                 .unwrap();
             engine
-                .put_row(table_id, b"other", b"val", &sec[..1], WriteDurability::BufferedFast)
+                .put_row(
+                    table_id,
+                    b"other",
+                    b"val",
+                    &sec[..1],
+                    WriteDurability::BufferedFast,
+                )
                 .unwrap();
         }
         engine.flush_memtable().unwrap();
-        targets = [1u16, 2].map(|t| blob_corruption_target(&engine, &encode_row_meta_key(t, b"pk")));
+        targets =
+            [1u16, 2].map(|t| blob_corruption_target(&engine, &encode_row_meta_key(t, b"pk")));
     }
     for t in &targets {
         apply_blob_corruption(&tmp.path, t);
@@ -2995,7 +3098,13 @@ fn bg_put_round(engine: &mut StorageEngine<OsFs>, round: usize, rows: usize, len
     for i in 0..rows {
         let key = format!("r{round:03}_{i:03}");
         engine
-            .put_row(1, key.as_bytes(), &vec![round as u8; len], &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                key.as_bytes(),
+                &vec![round as u8; len],
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
     }
     engine.flush_memtable().unwrap();
@@ -3021,7 +3130,11 @@ fn background_mode_flush_only_marks_pending_and_install_after_new_flushes() {
     for r in 0..4 {
         bg_put_round(&mut engine, r, 5, 64);
     }
-    assert_eq!(engine.active_idx_segment_count(), 4, "no inline compaction in background mode");
+    assert_eq!(
+        engine.active_idx_segment_count(),
+        4,
+        "no inline compaction in background mode"
+    );
     assert!(engine.compaction_pending());
 
     let job = engine.prepare_compaction().unwrap().expect("job");
@@ -3030,9 +3143,17 @@ fn background_mode_flush_only_marks_pending_and_install_after_new_flushes() {
 
     // Newer segments + overwrites + a delete land while the job is "running".
     bg_put_round(&mut engine, 4, 5, 64);
-    engine.delete_row(1, b"r000_000", WriteDurability::BufferedFast).unwrap();
     engine
-        .put_row(1, b"r001_000", b"overwritten", &[], WriteDurability::BufferedFast)
+        .delete_row(1, b"r000_000", WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .put_row(
+            1,
+            b"r001_000",
+            b"overwritten",
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
     engine.flush_memtable().unwrap();
     let before = engine.active_idx_segment_count();
@@ -3051,7 +3172,10 @@ fn background_mode_flush_only_marks_pending_and_install_after_new_flushes() {
                     continue;
                 }
                 let key = format!("r{r:03}_{i:03}");
-                assert_eq!(e.get_row(1, key.as_bytes()).unwrap().unwrap(), vec![r as u8; 64]);
+                assert_eq!(
+                    e.get_row(1, key.as_bytes()).unwrap().unwrap(),
+                    vec![r as u8; 64]
+                );
             }
         }
     };
@@ -3078,8 +3202,14 @@ fn overlapping_jobs_second_install_aborts_and_removes_output() {
     assert!(idx_file_names(&fs).contains(&id2_name));
 
     assert!(engine.install_compaction(out1).unwrap());
-    assert!(!engine.install_compaction(out2).unwrap(), "inputs already replaced");
-    assert!(!idx_file_names(&fs).contains(&id2_name), "aborted output must be deleted");
+    assert!(
+        !engine.install_compaction(out2).unwrap(),
+        "inputs already replaced"
+    );
+    assert!(
+        !idx_file_names(&fs).contains(&id2_name),
+        "aborted output must be deleted"
+    );
 
     // The aborted job's handles pinned the superseded inputs (undeletable on Windows) when
     // `install(out1)` queued them; the retry on the next meta commit unlinks them.
@@ -3092,7 +3222,10 @@ fn overlapping_jobs_second_install_aborts_and_removes_output() {
     for r in 0..5usize {
         for i in 0..4usize {
             let key = format!("r{r:03}_{i:03}");
-            assert_eq!(reopened.get_row(1, key.as_bytes()).unwrap().unwrap(), vec![r as u8; 64]);
+            assert_eq!(
+                reopened.get_row(1, key.as_bytes()).unwrap().unwrap(),
+                vec![r as u8; 64]
+            );
         }
     }
 }
@@ -3104,19 +3237,27 @@ fn suffix_job_keeps_tombstones_shadowing_older_segments() {
     let mut engine = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
     // Large base segment, then tiny ones, the first of which deletes a base key.
     bg_put_round(&mut engine, 0, 600, 100);
-    engine.delete_row(1, b"r000_007", WriteDurability::BufferedFast).unwrap();
+    engine
+        .delete_row(1, b"r000_007", WriteDurability::BufferedFast)
+        .unwrap();
     engine.flush_memtable().unwrap();
     bg_put_round(&mut engine, 1, 1, 8);
     bg_put_round(&mut engine, 2, 1, 8);
     assert!(engine.compaction_pending());
 
     let job = engine.prepare_compaction().unwrap().unwrap();
-    assert!(job.input_count() < engine.active_idx_segment_count(), "suffix only");
+    assert!(
+        job.input_count() < engine.active_idx_segment_count(),
+        "suffix only"
+    );
     assert!(!job.drops_tombstones(), "suffix job must keep tombstones");
     let out = job.run().unwrap();
     assert!(engine.install_compaction(out).unwrap());
 
-    assert!(engine.get_row(1, b"r000_007").unwrap().is_none(), "tombstone must still shadow base");
+    assert!(
+        engine.get_row(1, b"r000_007").unwrap().is_none(),
+        "tombstone must still shadow base"
+    );
     assert!(engine.get_row(1, b"r000_008").unwrap().is_some());
     drop(engine);
     let mut reopened = StorageEngine::open(fs, bg_cfg()).unwrap();
@@ -3143,7 +3284,11 @@ fn uninstalled_compaction_output_is_swept_on_reopen() {
     assert!(idx_file_names(&fs).contains(&orphan));
 
     let mut reopened = StorageEngine::open(fs.clone(), bg_cfg()).unwrap();
-    assert_eq!(idx_file_names(&fs), live, "orphan swept, live segments untouched");
+    assert_eq!(
+        idx_file_names(&fs),
+        live,
+        "orphan swept, live segments untouched"
+    );
     // A fresh allocation never reuses the orphan's id.
     bg_put_round(&mut reopened, 9, 2, 64);
     assert!(!idx_file_names(&fs).iter().any(|n| n == &orphan));
@@ -3180,7 +3325,13 @@ fn sync_compact_still_works_with_shared_segments() {
 
 fn put_t(engine: &mut StorageEngine<OsFs>, k: &str, v: &str) {
     engine
-        .put_row(1, k.as_bytes(), v.as_bytes(), &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            k.as_bytes(),
+            v.as_bytes(),
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
 }
 
@@ -3189,7 +3340,16 @@ fn keys_of_r(r: &crate::engine::EngineReader<'_, OsFs>, reverse: bool) -> Vec<St
     let mut slab = Vec::new();
     let mut spans = Vec::new();
     r.scan_range_into_slab(
-        1, None, None, reverse, usize::MAX, true, &mut pks, &mut slab, &mut spans, None,
+        1,
+        None,
+        None,
+        reverse,
+        usize::MAX,
+        true,
+        &mut pks,
+        &mut slab,
+        &mut spans,
+        None,
     )
     .unwrap();
     pks.into_iter()
@@ -3203,7 +3363,16 @@ fn keys_of(engine: &mut StorageEngine<OsFs>, reverse: bool) -> Vec<String> {
     let mut spans = Vec::new();
     engine
         .scan_range_into_slab(
-            1, None, None, reverse, usize::MAX, true, &mut pks, &mut slab, &mut spans, None,
+            1,
+            None,
+            None,
+            reverse,
+            usize::MAX,
+            true,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+            None,
         )
         .unwrap();
     pks.into_iter()
@@ -3226,7 +3395,11 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
     for i in 0..10_000u32 {
         put_t(&mut engine, &format!("u{i:06}"), "x");
     }
-    assert_eq!(engine.memtable.len(), mem_len, "tx writes must stay in the overlay");
+    assert_eq!(
+        engine.memtable.len(),
+        mem_len,
+        "tx writes must stay in the overlay"
+    );
     assert_eq!(engine.memtable.approximate_bytes(), mem_bytes);
     assert_eq!(engine.memtable.highest_lsn(), mem_hi);
 
@@ -3279,11 +3452,15 @@ fn owner_scan_merges_overlay_with_tombstones_and_overwrites_forward_and_reverse(
         }
 
         engine.begin_transaction_for_conn(1).unwrap();
-        engine.delete_row(1, b"b", WriteDurability::BufferedFast).unwrap();
+        engine
+            .delete_row(1, b"b", WriteDurability::BufferedFast)
+            .unwrap();
         put_t(&mut engine, "c", "tx_c");
         put_t(&mut engine, "bb", "tx_bb");
         put_t(&mut engine, "0", "tx_0");
-        engine.delete_row(1, b"e", WriteDurability::BufferedFast).unwrap();
+        engine
+            .delete_row(1, b"e", WriteDurability::BufferedFast)
+            .unwrap();
 
         let mut expect: Vec<&str> = vec!["0", "a", "bb", "c", "d"];
         if flush_first {
@@ -3312,7 +3489,11 @@ fn owner_scan_merges_overlay_with_tombstones_and_overwrites_forward_and_reverse(
         let non_owner_c = engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"c").unwrap());
         assert_eq!(
             non_owner_c,
-            Some(if flush_first { b"mem_c".to_vec() } else { b"old".to_vec() })
+            Some(if flush_first {
+                b"mem_c".to_vec()
+            } else {
+                b"old".to_vec()
+            })
         );
 
         engine.commit_transaction_for_conn(1).unwrap();
@@ -3334,14 +3515,19 @@ fn savepoint_rollback_restores_overlay_precisely() {
     put_t(&mut engine, "pre", "p2"); // overwrite of an overlay key
     put_t(&mut engine, "base", "b1"); // overwrite of a committed key
     put_t(&mut engine, "new_after_sp", "n"); // key first written after the savepoint
-    engine.delete_row(1, b"gone", WriteDurability::BufferedFast).unwrap();
+    engine
+        .delete_row(1, b"gone", WriteDurability::BufferedFast)
+        .unwrap();
     engine.savepoint_for_conn(1, 2).unwrap();
     put_t(&mut engine, "deeper", "d");
     put_t(&mut engine, "new_after_sp", "n2");
 
     engine.rollback_to_savepoint_for_conn(1, 2).unwrap();
     assert_eq!(engine.get_row(1, b"deeper").unwrap(), None);
-    assert_eq!(engine.get_row(1, b"new_after_sp").unwrap(), Some(b"n".to_vec()));
+    assert_eq!(
+        engine.get_row(1, b"new_after_sp").unwrap(),
+        Some(b"n".to_vec())
+    );
 
     engine.rollback_to_savepoint_for_conn(1, 1).unwrap();
     assert_eq!(engine.get_row(1, b"pre").unwrap(), Some(b"p1".to_vec()));
@@ -3354,7 +3540,10 @@ fn savepoint_rollback_restores_overlay_precisely() {
     put_t(&mut engine, "after", "a");
     engine.release_savepoint_for_conn(1, 1).unwrap();
     engine.commit_transaction_for_conn(1).unwrap();
-    assert_eq!(keys_of(&mut engine, false), vec!["after", "base", "gone", "pre"]);
+    assert_eq!(
+        keys_of(&mut engine, false),
+        vec!["after", "base", "gone", "pre"]
+    );
 }
 
 #[test]
@@ -3452,11 +3641,18 @@ fn commit_wal_failure_leaves_memtable_without_tx_data_and_poisons_engine() {
     fail.store(false, Ordering::SeqCst);
 
     assert!(engine.is_poisoned());
-    assert_eq!(engine.memtable.len(), mem_len, "MemTable must hold no tx data");
+    assert_eq!(
+        engine.memtable.len(),
+        mem_len,
+        "MemTable must hold no tx data"
+    );
     assert!(engine.tx_overlay.map.is_empty());
     assert!(!engine.in_active_transaction());
     assert_eq!(engine.get_row(1, b"tx000").unwrap(), None);
-    assert_eq!(engine.get_row(1, b"committed").unwrap(), Some(b"c".to_vec()));
+    assert_eq!(
+        engine.get_row(1, b"committed").unwrap(),
+        Some(b"c".to_vec())
+    );
     assert!(
         engine
             .put_row(1, b"more", b"v", &[], WriteDurability::BufferedFast)
@@ -3504,15 +3700,22 @@ fn read_view_and_exclusive_rules() {
 
     // The owner's uncommitted blob lives in the writer buffer: a shared-access reader refuses
     // to read it (and says so), the exclusive path flushes and succeeds.
-    eng.put_row(1, b"big", &pair_value(1), &[], WriteDurability::BufferedFast)
-        .unwrap();
+    eng.put_row(
+        1,
+        b"big",
+        &pair_value(1),
+        &[],
+        WriteDurability::BufferedFast,
+    )
+    .unwrap();
     {
         let r = eng.reader_for_conn(1);
         assert!(r.get_row(1, b"big").is_err());
         assert!(r.needs_exclusive_retry());
     }
     assert_eq!(
-        eng.with_committed_read_for_conn(1, |r| r.get_row(1, b"big")).unwrap(),
+        eng.with_committed_read_for_conn(1, |r| r.get_row(1, b"big"))
+            .unwrap(),
         Some(pair_value(1))
     );
     assert_eq!(
@@ -3571,17 +3774,27 @@ fn concurrent_shared_readers_never_see_torn_or_uncommitted_pairs() {
             })
             .collect();
         for n in 1..=300u32 {
-            engine.write().unwrap().begin_transaction_for_conn(1).unwrap();
+            engine
+                .write()
+                .unwrap()
+                .begin_transaction_for_conn(1)
+                .unwrap();
             for k in [&b"a"[..], b"b"] {
                 let mut g = engine.write().unwrap();
                 g.put_row(1, k, &pair_value(n), &[], WriteDurability::BufferedFast)
                     .unwrap();
                 // Owner reads its own uncommitted (possibly buffered blob) value: exclusive path.
                 assert!(g.read_needs_exclusive(1, 1));
-                let own = g.with_committed_read_for_conn(1, |r| r.get_row(1, k)).unwrap();
+                let own = g
+                    .with_committed_read_for_conn(1, |r| r.get_row(1, k))
+                    .unwrap();
                 assert_eq!(own, Some(pair_value(n)));
             }
-            engine.write().unwrap().commit_transaction_for_conn(1).unwrap();
+            engine
+                .write()
+                .unwrap()
+                .commit_transaction_for_conn(1)
+                .unwrap();
         }
         stop.store(true, Ordering::Relaxed);
         let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
@@ -3680,7 +3893,13 @@ fn block_cache_and_blob_cache_hits_and_segment_invalidation_lifecycle() {
     // Also write a 2048 B blob
     let blob_val = vec![0xBBu8; 2048];
     engine
-        .put_row(1, b"blob_row", &blob_val, &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"blob_row",
+            &blob_val,
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
 
     // Flush to create segment 1 and sealed blob segment
@@ -3695,7 +3914,10 @@ fn block_cache_and_blob_cache_hits_and_segment_invalidation_lifecycle() {
         let k = format!("k_{i:04}").into_bytes();
         assert!(engine.get_row(1, &k).unwrap().is_some());
     }
-    assert_eq!(engine.get_row(1, b"blob_row").unwrap(), Some(blob_val.clone()));
+    assert_eq!(
+        engine.get_row(1, b"blob_row").unwrap(),
+        Some(blob_val.clone())
+    );
 
     // Pass 2: read all rows again -> must HIT verified block cache and blob cache!
     let block_hits_after_p1 = engine.block_cache().hits();
@@ -3718,7 +3940,13 @@ fn block_cache_and_blob_cache_hits_and_segment_invalidation_lifecycle() {
     // Compacting segments invalidates retired segment 1
     // Write another batch and flush so there are 2 segments for compact() to merge!
     engine
-        .put_row(1, b"another_row", b"val", &[], WriteDurability::BufferedFast)
+        .put_row(
+            1,
+            b"another_row",
+            b"val",
+            &[],
+            WriteDurability::BufferedFast,
+        )
         .unwrap();
     engine.flush_memtable().unwrap();
     assert_eq!(engine.idx_segments.len(), 2);
@@ -3841,7 +4069,8 @@ fn background_install_with_dirty_memtable_does_not_persist_blob_accounting() {
     let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
     let v = vec![0xABu8; 16 * 1024];
     let put = |e: &mut StorageEngine<OsFs>, k: &[u8], v: &[u8]| {
-        e.put_row(1, k, v, &[], WriteDurability::BufferedFast).unwrap();
+        e.put_row(1, k, v, &[], WriteDurability::BufferedFast)
+            .unwrap();
     };
     put(&mut engine, b"k1", &v);
     put(&mut engine, b"k2", &v);
@@ -4000,15 +4229,28 @@ fn drop_table_with_tombstones_larger_than_wal_is_atomic_and_durable() {
     let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
     for i in 0..20000u32 {
         engine
-            .put_row(1, &i.to_be_bytes(), b"v", &[], WriteDurability::BufferedFast)
+            .put_row(
+                1,
+                &i.to_be_bytes(),
+                b"v",
+                &[],
+                WriteDurability::BufferedFast,
+            )
             .unwrap();
     }
-    engine.put_row(2, b"keep", b"v", &[], WriteDurability::BufferedFast).unwrap();
+    engine
+        .put_row(2, b"keep", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
     engine.flush_memtable().unwrap();
 
     engine.drop_table(1, None).unwrap();
     assert!(engine.get_row(1, &0u32.to_be_bytes()).unwrap().is_none());
-    assert!(engine.get_row(1, &19999u32.to_be_bytes()).unwrap().is_none());
+    assert!(
+        engine
+            .get_row(1, &19999u32.to_be_bytes())
+            .unwrap()
+            .is_none()
+    );
     drop(engine);
 
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
@@ -4030,14 +4272,21 @@ fn explicit_table_id_cannot_alias_or_remap_a_persisted_table() {
     engine.unregister_vtab(id, "alpha");
 
     // Another name must not take over the persisted id.
-    let err = engine.register_or_resolve_vtab("beta", Some(5)).unwrap_err();
+    let err = engine
+        .register_or_resolve_vtab("beta", Some(5))
+        .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     // The persisted name must not be re-bound to a different id.
-    let err = engine.register_or_resolve_vtab("alpha", Some(6)).unwrap_err();
+    let err = engine
+        .register_or_resolve_vtab("alpha", Some(6))
+        .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
     // The original binding still resolves.
-    assert_eq!(engine.register_or_resolve_vtab("alpha", Some(5)).unwrap(), 5);
+    assert_eq!(
+        engine.register_or_resolve_vtab("alpha", Some(5)).unwrap(),
+        5
+    );
     assert_eq!(engine.register_or_resolve_vtab("alpha", None).unwrap(), 5);
 }
 
@@ -4072,7 +4321,10 @@ fn buffered_recovery_stops_at_first_lost_blob() {
         .collect();
     segs.sort();
     assert!(segs.len() >= 3, "expected one blob segment per row");
-    let f = std::fs::OpenOptions::new().write(true).open(&segs[1]).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segs[1])
+        .unwrap();
     f.set_len(0).unwrap();
     drop(f);
 
@@ -4123,10 +4375,19 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
         // Reconciliation appended its records after the epoch rotation, so they are still
         // pending in the MemTable and backed only by the fresh WAL epoch.
         assert!(!engine.memtable.is_empty());
-        assert_eq!(engine.sync_wal.active_epoch(), engine.meta_mgr.state().sync_wal_epoch);
-        assert_eq!(engine.buf_wal.active_epoch(), engine.meta_mgr.state().buf_wal_epoch);
+        assert_eq!(
+            engine.sync_wal.active_epoch(),
+            engine.meta_mgr.state().sync_wal_epoch
+        );
+        assert_eq!(
+            engine.buf_wal.active_epoch(),
+            engine.meta_mgr.state().buf_wal_epoch
+        );
         assert!(engine.capped_table_state(1).unwrap().current_logical_bytes > 0);
-        (engine.sync_wal.active_epoch(), engine.buf_wal.active_epoch())
+        (
+            engine.sync_wal.active_epoch(),
+            engine.buf_wal.active_epoch(),
+        )
         // Dropped without flushing: simulates a crash.
     };
 
@@ -4248,15 +4509,22 @@ fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
 
     // A blob commit must sync the blob segment before its WAL record is made durable.
     engine.begin_transaction();
-    engine.put_row(1, b"blob", &vec![1u8; 8192], &[], sync).unwrap();
+    engine
+        .put_row(1, b"blob", &vec![1u8; 8192], &[], sync)
+        .unwrap();
     engine.commit_transaction().unwrap();
     let after_blob = ctl.blob_syncs.load(Ordering::SeqCst);
     assert!(after_blob >= 1);
-    assert_eq!(ctl.blob_syncs_at_wal_sync.load(Ordering::SeqCst), after_blob);
+    assert_eq!(
+        ctl.blob_syncs_at_wal_sync.load(Ordering::SeqCst),
+        after_blob
+    );
 
     for i in 0..100u32 {
         engine.begin_transaction();
-        engine.put_row(1, &i.to_be_bytes(), b"inline", &[], sync).unwrap();
+        engine
+            .put_row(1, &i.to_be_bytes(), b"inline", &[], sync)
+            .unwrap();
         engine.prepare_commit_transaction(sync).unwrap();
         engine.commit_transaction().unwrap();
     }
@@ -4264,7 +4532,9 @@ fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
 
     // A later blob write is synced again.
     engine.begin_transaction();
-    engine.put_row(1, b"blob2", &vec![2u8; 8192], &[], sync).unwrap();
+    engine
+        .put_row(1, b"blob2", &vec![2u8; 8192], &[], sync)
+        .unwrap();
     engine.commit_transaction().unwrap();
     assert!(ctl.blob_syncs.load(Ordering::SeqCst) > after_blob);
 }
@@ -4282,7 +4552,9 @@ fn failed_blob_sync_is_retried_by_the_next_commit() {
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     let sync = WriteDurability::SyncTransactional;
     engine.begin_transaction();
-    engine.put_row(1, b"blob", &vec![3u8; 8192], &[], sync).unwrap();
+    engine
+        .put_row(1, b"blob", &vec![3u8; 8192], &[], sync)
+        .unwrap();
 
     ctl.fail_blob_sync.store(true, Ordering::SeqCst);
     assert!(engine.prepare_commit_transaction(sync).is_err());
@@ -4381,12 +4653,19 @@ fn clean_reopen_skips_capped_reconcile_and_keeps_tick_order() {
     // Reopen after the checkpoint: byte totals are taken from boot_meta and the new row gets a
     // tick above every existing one, so the oldest row is the one evicted.
     let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
-    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, bytes);
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        bytes
+    );
     assert!(engine.access_tracker.next_tick() > 3);
     engine.put_row(1, b"k4", &payload, &[], wal).unwrap();
     assert_eq!(engine.get_row(1, b"k1").unwrap(), None);
     for k in [b"k2", b"k3", b"k4"] {
-        assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()), "{k:?}");
+        assert_eq!(
+            engine.get_row(1, k).unwrap(),
+            Some(payload.clone()),
+            "{k:?}"
+        );
     }
     engine.checkpoint().unwrap();
     drop(engine);
@@ -4401,7 +4680,10 @@ fn clean_reopen_skips_capped_reconcile_and_keeps_tick_order() {
             .unwrap();
     }
     let engine = StorageEngine::open(fs, cfg).unwrap();
-    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, 12_345);
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        12_345
+    );
 }
 
 #[test]
@@ -4425,9 +4707,16 @@ fn crash_with_wal_contents_runs_full_capped_reconcile() {
     drop(engine); // crash: k2 and k3 exist only in the WAL
 
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
-    assert_eq!(engine.capped_table_state(1).unwrap().current_logical_bytes, expected);
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        expected
+    );
     for k in [b"k1", b"k2", b"k3"] {
-        assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()), "{k:?}");
+        assert_eq!(
+            engine.get_row(1, k).unwrap(),
+            Some(payload.clone()),
+            "{k:?}"
+        );
     }
 }
 
@@ -4532,7 +4821,9 @@ fn flush_group(engine: &mut StorageEngine<OsFs>, ticket: &GroupTicket) -> u64 {
     let GroupRole::Lead(target) = ticket.2.join_group(ticket.0).unwrap() else {
         panic!("no flush has run, so this commit must lead");
     };
-    engine.finish_group_flush(target, ticket.1.sync_barrier()).unwrap();
+    engine
+        .finish_group_flush(target, ticket.1.sync_barrier())
+        .unwrap();
     target
 }
 
@@ -4542,16 +4833,26 @@ fn group_commit_is_visible_to_the_next_writer_but_not_to_readers_until_durable()
     let mut engine = open_group_engine(&tmp);
     let first = commit_into_group(&mut engine, 1, b"a", b"1");
 
-    assert!(!engine.in_active_transaction(), "the writer slot must be free");
+    assert!(
+        !engine.in_active_transaction(),
+        "the writer slot must be free"
+    );
     assert_eq!(row_visible_to(&engine, 2, b"a"), None);
 
     engine.begin_transaction_for_conn(2).unwrap();
     assert_eq!(engine.get_row(1, b"a").unwrap(), Some(b"1".to_vec()));
-    assert_eq!(row_visible_to(&engine, 3, b"a"), None, "readers must wait for durability");
+    assert_eq!(
+        row_visible_to(&engine, 3, b"a"),
+        None,
+        "readers must wait for durability"
+    );
     engine.rollback_transaction().unwrap();
 
     flush_group(&mut engine, &first);
-    assert!(matches!(first.2.join_group(first.0).unwrap(), GroupRole::Durable));
+    assert!(matches!(
+        first.2.join_group(first.0).unwrap(),
+        GroupRole::Durable
+    ));
     assert_eq!(row_visible_to(&engine, 3, b"a"), Some(b"1".to_vec()));
 }
 
@@ -4561,10 +4862,17 @@ fn one_flush_makes_every_appended_commit_durable_in_order() {
     let mut engine = open_group_engine(&tmp);
     let first = commit_into_group(&mut engine, 1, b"k", b"old");
     let second = commit_into_group(&mut engine, 2, b"k", b"new");
-    assert_eq!(engine.pending_group[1].1.len(), 1, "a batch must hold only its own writes");
+    assert_eq!(
+        engine.pending_group[1].1.len(),
+        1,
+        "a batch must hold only its own writes"
+    );
 
     assert_eq!(flush_group(&mut engine, &first), second.0);
-    assert!(matches!(second.2.join_group(second.0).unwrap(), GroupRole::Durable));
+    assert!(matches!(
+        second.2.join_group(second.0).unwrap(),
+        GroupRole::Durable
+    ));
     assert!(engine.pending_group.is_empty());
     assert_eq!(row_visible_to(&engine, 9, b"k"), Some(b"new".to_vec()));
 }
@@ -4608,7 +4916,10 @@ fn memtable_flush_includes_commits_still_waiting_for_their_group_flush() {
 
     engine.flush_memtable().unwrap();
     assert!(engine.pending_group.is_empty());
-    assert!(matches!(ticket.2.join_group(ticket.0).unwrap(), GroupRole::Durable));
+    assert!(matches!(
+        ticket.2.join_group(ticket.0).unwrap(),
+        GroupRole::Durable
+    ));
 
     drop(ticket);
     drop(engine);
@@ -4628,9 +4939,15 @@ fn buffered_commit_first_makes_earlier_group_commits_durable() {
     engine
         .prepare_commit_transaction(WriteDurability::BufferedFast)
         .unwrap();
-    assert!(matches!(engine.begin_commit_for_conn(2).unwrap(), CommitStep::Done));
+    assert!(matches!(
+        engine.begin_commit_for_conn(2).unwrap(),
+        CommitStep::Done
+    ));
 
-    assert!(matches!(ticket.2.join_group(ticket.0).unwrap(), GroupRole::Durable));
+    assert!(matches!(
+        ticket.2.join_group(ticket.0).unwrap(),
+        GroupRole::Durable
+    ));
     assert_eq!(row_visible_to(&engine, 9, b"a"), Some(b"1".to_vec()));
     assert_eq!(row_visible_to(&engine, 9, b"b"), Some(b"2".to_vec()));
 }
