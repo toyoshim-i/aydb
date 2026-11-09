@@ -40,6 +40,9 @@ pub struct MemTable {
     approximate_bytes: usize,
     max_capacity_bytes: usize,
     highest_lsn: u64,
+    /// Bumped on every insertion of committed data; deliberately not by `clear`, which only
+    /// moves the same logical content into a segment. Clones keep the value they were taken at.
+    generation: u64,
 }
 
 impl MemTable {
@@ -49,6 +52,7 @@ impl MemTable {
             approximate_bytes: 0,
             max_capacity_bytes,
             highest_lsn: 0,
+            generation: 0,
         }
     }
 
@@ -72,6 +76,12 @@ impl MemTable {
         self.highest_lsn
     }
 
+    /// Monotonic counter of committed-data publications into this table (every insert,
+    /// delete, WAL apply and overlay absorb). Unlike LSNs it cannot be hidden by a flush.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Moves every entry of a committed transaction overlay into this `MemTable` without
     /// cloning keys or values. Each entry keeps the LSN it was assigned at mutation time and
     /// replaces whatever the `MemTable` held for that key.
@@ -79,6 +89,7 @@ impl MemTable {
         if entries.is_empty() {
             return;
         }
+        self.generation += 1;
         // Bulk path: when the overlay is not tiny relative to the table, rebuild with
         // `BTreeMap::append` (O(n + m), overlay wins on equal keys) instead of n separate
         // O(log m) inserts.
@@ -288,6 +299,7 @@ impl MemTable {
     }
 
     fn upsert(&mut self, key: Vec<u8>, value: IndexValue, lsn: u64) -> Option<MemEntry> {
+        self.generation += 1;
         if lsn > self.highest_lsn {
             self.highest_lsn = lsn;
         }

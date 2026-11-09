@@ -105,3 +105,102 @@ fn ending_a_transaction_releases_its_session_without_invalidating_open_cursors()
     drop(statement);
     reader.execute_batch("ROLLBACK").unwrap();
 }
+
+fn open_counter_connection(engine: &Arc<RwLock<StorageEngine<OsFs>>>) -> SqliteConnection {
+    const DDL: &str = "CREATE VIRTUAL TABLE c USING aydb(table_id=1, durability='sync', columns='k INT PRIMARY KEY, n INT')";
+    loop {
+        let connection = SqliteConnection::open_in_memory().unwrap();
+        connection
+            .register_aydb_module_with_options(Arc::clone(engine), false)
+            .unwrap();
+        if connection.execute_batch(DDL).is_ok() {
+            return connection;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn concurrent_read_then_increment_never_loses_a_committed_update() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let directory = TempTestDir::new("snapshot_no_lost_update");
+    let mut config = EngineConfig::default();
+    // A tiny WAL forces rotation (and memtable flush) inside commits.
+    config.sync_wal_size_bytes = 32 * 1024;
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(Arc::new(OsFs::open(&directory.path, true).unwrap()), config).unwrap(),
+    ));
+    let setup = open_counter_connection(&engine);
+    setup.execute_batch("INSERT INTO c VALUES (1, 0)").unwrap();
+    let committed = Arc::new(AtomicU64::new(0));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let (engine, committed) = (Arc::clone(&engine), Arc::clone(&committed));
+            std::thread::spawn(move || {
+                let connection = open_counter_connection(&engine);
+                while std::time::Instant::now() < deadline {
+                    connection.execute_batch("BEGIN").unwrap();
+                    let n = match connection
+                        .query_all("SELECT n FROM c WHERE k=1", &[])
+                        .unwrap()[0][0]
+                    {
+                        SqlValue::Integer(value) => value,
+                        ref other => panic!("unexpected counter value {other:?}"),
+                    };
+                    let outcome = connection
+                        .execute_batch(&format!("UPDATE c SET n={} WHERE k=1", n + 1))
+                        .and_then(|()| connection.execute_batch("COMMIT"));
+                    match outcome {
+                        Ok(()) => {
+                            committed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            let _ = connection.execute_batch("ROLLBACK");
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let committed = committed.load(Ordering::Relaxed);
+    assert!(committed > 0);
+    assert_eq!(
+        setup.query_all("SELECT n FROM c WHERE k=1", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(committed as i64)]],
+        "a committed increment was overwritten by a stale writer"
+    );
+}
+
+#[test]
+fn flush_between_read_and_write_does_not_conflict_the_upgrade() {
+    let directory = TempTestDir::new("snapshot_flush_no_conflict");
+    let filesystem = Arc::new(OsFs::open(&directory.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(filesystem, EngineConfig::default()).unwrap(),
+    ));
+    let connection = SqliteConnection::open_in_memory().unwrap();
+    connection
+        .register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k INT PRIMARY KEY, value TEXT')",
+        )
+        .unwrap();
+    connection
+        .execute_batch("INSERT INTO t VALUES (1,'a')")
+        .unwrap();
+    connection.execute_batch("BEGIN").unwrap();
+    connection
+        .query_all("SELECT value FROM t WHERE k=1", &[])
+        .unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
+    connection
+        .execute_batch("UPDATE t SET value='b' WHERE k=1")
+        .unwrap();
+    connection.execute_batch("COMMIT").unwrap();
+}

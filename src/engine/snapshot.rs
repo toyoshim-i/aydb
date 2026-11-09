@@ -21,7 +21,6 @@ pub(crate) struct ReadSnapshotToken {
 
 pub(super) struct ReadSnapshot<F: PlatformFile> {
     token: Weak<()>,
-    committed_lsn: u64,
     memtable: MemTable,
     idx_segments: Vec<Arc<IdxSegmentReader<F>>>,
     std_blobs: BTreeMap<u64, BlobSegmentReader<F>>,
@@ -41,7 +40,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .expect("read snapshot identifier overflow");
         let snapshot = ReadSnapshot {
             token: Arc::downgrade(&token.keep_alive),
-            committed_lsn: self.committed_read_lsn(),
             memtable: self.memtable.clone(),
             idx_segments: self.idx_segments.clone(),
             std_blobs: self
@@ -76,12 +74,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    /// A snapshot is current while no committed data was published since capture. This compares
+    /// the memtable publication generation, not LSNs: a flush inside a commit can make the
+    /// checkpoint LSN equal an in-flight transaction's LSN and hide its later publication.
     pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken) -> bool {
         self.pending_group.is_empty()
-            && self
-                .read_snapshots
-                .get(&token.id)
-                .is_some_and(|snapshot| snapshot.committed_lsn == self.committed_read_lsn())
+            && self.read_snapshots.get(&token.id).is_some_and(|snapshot| {
+                snapshot.memtable.generation() == self.memtable.generation()
+            })
     }
 
     pub(crate) fn check_snapshot_write_upgrade(
@@ -97,12 +97,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
         Ok(())
-    }
-
-    fn committed_read_lsn(&self) -> u64 {
-        self.memtable
-            .highest_lsn()
-            .max(self.meta_mgr.state().checkpoint_lsn)
     }
 
     fn snapshot_for_view(&self, view: ReadView) -> Option<&ReadSnapshot<FS::File>> {
@@ -328,6 +322,60 @@ mod tests {
             engine.get_row(1, b"key").unwrap(),
             Some(b"pending".to_vec())
         );
+        engine.release_read_snapshot(token);
+    }
+
+    #[test]
+    fn snapshot_taken_during_wal_rotation_inside_commit_is_stale_after_publish() {
+        let tmp = TempTestDir::new("read_snapshot_rotation_in_commit");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut config = EngineConfig::default();
+        config.sync_wal_size_bytes = 8 * 4096;
+        let mut engine = StorageEngine::open(fs, config).unwrap();
+        let sync = WriteDurability::SyncTransactional;
+        let mut violations = Vec::new();
+        for i in 0..200u32 {
+            let value = i.to_le_bytes().to_vec();
+            engine.begin_transaction_for_conn(1).unwrap();
+            engine.put_row(1, b"key", &value, &[], sync).unwrap();
+            engine.prepare_commit_transaction(sync).unwrap();
+            let CommitStep::AwaitingGroup { lsn, file, .. } =
+                engine.begin_commit_for_conn(1).unwrap()
+            else {
+                panic!("expected group commit");
+            };
+            // A reader starts while the commit is still waiting for its flush.
+            let token = engine.capture_read_snapshot();
+            engine.finish_group_flush(lsn, file.sync_barrier()).unwrap();
+            let seen = engine
+                .reader_for_snapshot(&token)
+                .get_row(1, b"key")
+                .unwrap();
+            if engine.snapshot_is_current(&token) {
+                assert_ne!(seen.as_deref(), Some(value.as_slice()));
+                violations.push(i);
+            }
+            engine.release_read_snapshot(token);
+        }
+        assert!(
+            violations.is_empty(),
+            "stale snapshots reported current at commits: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_stays_current_across_flush_without_data_change() {
+        let tmp = TempTestDir::new("read_snapshot_flush_no_change");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        let sync = WriteDurability::SyncTransactional;
+        engine.put_row(1, b"key", b"a", &[], sync).unwrap();
+        let token = engine.capture_read_snapshot();
+        engine.flush_memtable().unwrap();
+        assert!(engine.snapshot_is_current(&token));
+        engine.check_snapshot_write_upgrade(1, &token).unwrap();
+        engine.put_row(1, b"key", b"b", &[], sync).unwrap();
+        assert!(!engine.snapshot_is_current(&token));
         engine.release_read_snapshot(token);
     }
 
