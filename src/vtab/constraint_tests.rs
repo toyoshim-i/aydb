@@ -170,3 +170,127 @@ fn default_declarations_are_rejected() {
         assert!(conn.execute_batch(ddl).is_err(), "{ddl}");
     }
 }
+
+/// Result rows of a query plus the result of `SELECT changes()`.
+type RowsAndChanges = (Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>);
+
+/// Runs `setup` and then `stmt` on an aydb virtual table and on a native SQLite table with the
+/// same columns, and returns `(rows, changes)` for each so the expected result comes from SQLite.
+fn run_on_vtab_and_native(
+    columns: &str,
+    setup: &str,
+    stmt: &str,
+    select: &str,
+) -> (RowsAndChanges, RowsAndChanges) {
+    let tmp = TempTestDir::new("update_vanished_row");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let vtab = SqliteConnection::open_in_memory().unwrap();
+    vtab.register_aydb_module(engine).unwrap();
+    vtab.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE t USING aydb(columns='{columns}')"
+    ))
+    .unwrap();
+    let native = SqliteConnection::open_in_memory().unwrap();
+    native
+        .execute_batch(&format!("CREATE TABLE t({columns})"))
+        .unwrap();
+    let mut out = Vec::new();
+    for db in [&vtab, &native] {
+        db.execute_batch(setup).unwrap();
+        db.execute_batch(stmt).unwrap();
+        out.push((
+            db.query_all(select, &[]).unwrap(),
+            db.query_all("SELECT changes()", &[]).unwrap(),
+        ));
+    }
+    let native_out = out.pop().unwrap();
+    let vtab_out = out.pop().unwrap();
+    (vtab_out, native_out)
+}
+
+fn assert_update_matches_native(columns: &str, setup: &str, stmt: &str, select: &str) {
+    let (vtab, native) = run_on_vtab_and_native(columns, setup, stmt, select);
+    assert_eq!(vtab.0, native.0, "rows differ for: {stmt}");
+    // SQLite skips a row that an earlier row of the same statement already replaced, so a native
+    // table counts one fewer change. A virtual table is driven through `xUpdate` calls and
+    // SQLite counts every call that returns OK, including the no-op for the vanished row, so
+    // `changes()` cannot be required to match. It may only exceed the native count.
+    let (SqlValue::Integer(vtab_changes), SqlValue::Integer(native_changes)) =
+        (&vtab.1[0][0], &native.1[0][0])
+    else {
+        panic!("changes() must be an integer");
+    };
+    assert!(vtab_changes >= native_changes, "{stmt}");
+}
+
+#[test]
+fn update_or_replace_does_not_resurrect_a_replaced_row() {
+    let text = "k TEXT PRIMARY KEY, u INT UNIQUE";
+    let sel = "SELECT k, u FROM t ORDER BY k";
+    // The first row replaces the second one, whose update must then be a no-op.
+    assert_update_matches_native(
+        text,
+        "INSERT INTO t VALUES('a',1),('b',2)",
+        "UPDATE OR REPLACE t SET u=CASE k WHEN 'a' THEN 2 ELSE 3 END",
+        sel,
+    );
+    // The second row replaces the first one: nothing vanishes before it is processed.
+    assert_update_matches_native(
+        text,
+        "INSERT INTO t VALUES('a',1),('b',2)",
+        "UPDATE OR REPLACE t SET u=5",
+        sel,
+    );
+    // A three-row chain where the middle row vanishes.
+    assert_update_matches_native(
+        text,
+        "INSERT INTO t VALUES('a',1),('b',2),('c',3)",
+        "UPDATE OR REPLACE t SET u=CASE k WHEN 'a' THEN 2 WHEN 'b' THEN 9 ELSE 4 END",
+        sel,
+    );
+}
+
+#[test]
+fn update_or_replace_does_not_resurrect_a_replaced_integer_pk_row() {
+    let int = "k INTEGER PRIMARY KEY, u INT UNIQUE";
+    let sel = "SELECT k, u FROM t ORDER BY k";
+    assert_update_matches_native(
+        int,
+        "INSERT INTO t VALUES(1,10),(2,20)",
+        "UPDATE OR REPLACE t SET u=CASE k WHEN 1 THEN 20 ELSE 30 END",
+        sel,
+    );
+}
+
+/// A PK-changing `UPDATE OR REPLACE` cannot match a native table row for row. The rowid of an
+/// aydb row is its primary-key identity, so when row 1 is moved onto the key of row 2, the
+/// rowid that SQLite still has queued for the replaced row 2 addresses the moved row, and
+/// SQLite hands `xUpdate` values it computed before the statement began. A native table keeps
+/// each row's rowid across the key change and so differs. The invariants asserted here hold on
+/// both: the statement succeeds, keys stay unique, and no row is created out of nothing, so
+/// the row count equals the native count.
+#[test]
+fn update_or_replace_pk_change_keeps_row_count_and_keys_unique() {
+    for (columns, setup, stmt) in [
+        (
+            "k TEXT PRIMARY KEY, u INT UNIQUE",
+            "INSERT INTO t VALUES('a',1),('b',2)",
+            "UPDATE OR REPLACE t SET k=CASE k WHEN 'a' THEN 'b' ELSE 'c' END",
+        ),
+        (
+            "k INTEGER PRIMARY KEY, u INT UNIQUE",
+            "INSERT INTO t VALUES(1,10),(2,20)",
+            "UPDATE OR REPLACE t SET k=CASE k WHEN 1 THEN 2 ELSE 3 END",
+        ),
+    ] {
+        let (vtab, native) = run_on_vtab_and_native(columns, setup, stmt, "SELECT k, u FROM t");
+        assert_eq!(vtab.0.len(), native.0.len(), "{stmt}");
+        let mut keys: Vec<_> = vtab.0.iter().map(|row| format!("{:?}", row[0])).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), vtab.0.len(), "{stmt}");
+    }
+}

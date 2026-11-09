@@ -1980,9 +1980,15 @@ unsafe extern "system" fn vtab_update(
                     Ok(opt) => opt,
                     Err(e) => return io_err_to_sqlite_rc(&e),
                 };
-                if let Some(old_pk) = mapped {
-                    old_pk_opt = Some((old_pk, Some(rid)));
-                }
+                // SQLite collects the rows of a multi-row UPDATE before it applies them, so
+                // an earlier row's REPLACE resolution can delete a row that is still queued.
+                // A native table skips such a row, and so does this one. The rowid has no
+                // row and no identity mapping left, so there is nothing to update; inserting
+                // here would resurrect the replaced row.
+                let Some(old_pk) = mapped else {
+                    return SQLITE_OK;
+                };
+                old_pk_opt = Some((old_pk, Some(rid)));
             } else {
                 old_pk_opt = Some((
                     sqlite_value_to_key_bytes_with_schema(
