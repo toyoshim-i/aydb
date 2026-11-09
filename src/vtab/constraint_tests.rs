@@ -294,3 +294,189 @@ fn update_or_replace_pk_change_keeps_row_count_and_keys_unique() {
         assert_eq!(keys.len(), vtab.0.len(), "{stmt}");
     }
 }
+
+/// Opens an engine with `cfg` in a fresh directory.
+fn open_engine_with(
+    name: &str,
+    cfg: EngineConfig,
+) -> (TempTestDir, Arc<RwLock<StorageEngine<OsFs>>>) {
+    let tmp = TempTestDir::new(name);
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    (tmp, engine)
+}
+
+const REPLACE_SELECT: &str = "SELECT k, u, w FROM t ORDER BY k";
+const REPLACE_SETUP: &str = "INSERT INTO t VALUES ('p','a','x'),('q','b','y'),('r','c','z')";
+/// Every probe must still hit a unique conflict, which proves the secondary index entries of
+/// the three setup rows survived.
+const REPLACE_PROBES: [&str; 6] = [
+    "INSERT INTO t VALUES ('n1','a','n1')",
+    "INSERT INTO t VALUES ('n2','n2','x')",
+    "INSERT INTO t VALUES ('n3','b','n3')",
+    "INSERT INTO t VALUES ('n4','n4','y')",
+    "INSERT INTO t VALUES ('n5','c','n5')",
+    "INSERT INTO t VALUES ('n6','n6','z')",
+];
+
+/// Runs `stmt`, which must fail, against a table holding the three setup rows, in autocommit and
+/// inside `BEGIN`. Every row and every unique index entry must survive the failed statement.
+fn assert_failed_replace_keeps_rows(options: &str, cfg: EngineConfig, stmt: &str) {
+    for in_tx in [false, true] {
+        let (_tmp, engine) = open_engine_with("failed_replace", cfg.clone());
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE t USING aydb({options}columns='k TEXT PRIMARY KEY, u TEXT UNIQUE, w TEXT UNIQUE')"
+        ))
+        .unwrap();
+        conn.execute_batch(REPLACE_SETUP).unwrap();
+        let before = conn.query_all(REPLACE_SELECT, &[]).unwrap();
+        assert_eq!(before.len(), 3);
+        if in_tx {
+            conn.execute_batch("BEGIN").unwrap();
+        }
+        assert!(
+            conn.execute_batch(stmt).is_err(),
+            "statement must fail (in_tx={in_tx})"
+        );
+        let during = conn.query_all(REPLACE_SELECT, &[]).unwrap();
+        assert_eq!(
+            during, before,
+            "rows changed by failed stmt (in_tx={in_tx})"
+        );
+        if in_tx {
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let after = conn.query_all(REPLACE_SELECT, &[]).unwrap();
+        assert_eq!(after, before, "rows after commit (in_tx={in_tx})");
+        for probe in REPLACE_PROBES {
+            assert!(
+                conn.execute_batch(probe).is_err(),
+                "index entry lost: {probe} (in_tx={in_tx})"
+            );
+        }
+        assert_eq!(conn.query_all(REPLACE_SELECT, &[]).unwrap(), before);
+    }
+}
+
+#[test]
+fn failed_insert_or_replace_with_oversized_pk_keeps_conflicting_rows() {
+    let long = "x".repeat(3000);
+    // The new row conflicts with two rows through two different UNIQUE columns.
+    assert_failed_replace_keeps_rows(
+        "",
+        EngineConfig::default(),
+        &format!("INSERT OR REPLACE INTO t VALUES ('{long}','a','y')"),
+    );
+}
+
+#[test]
+fn failed_update_or_replace_with_oversized_pk_keeps_all_rows() {
+    let long = "x".repeat(3000);
+    // The PK changes (old row removed) and a UNIQUE conflict on another row is replaced.
+    assert_failed_replace_keeps_rows(
+        "",
+        EngineConfig::default(),
+        &format!("UPDATE OR REPLACE t SET k='{long}', u='b' WHERE k='p'"),
+    );
+}
+
+#[test]
+fn failed_pk_changing_update_keeps_the_old_row() {
+    let long = "x".repeat(3000);
+    assert_failed_replace_keeps_rows(
+        "",
+        EngineConfig::default(),
+        &format!("UPDATE t SET k='{long}' WHERE k='p'"),
+    );
+}
+
+#[test]
+fn failed_replace_over_transaction_byte_budget_keeps_conflicting_rows() {
+    let mut cfg = EngineConfig::default();
+    cfg.max_transaction_bytes = 2048;
+    let big = "v".repeat(3000);
+    assert_failed_replace_keeps_rows(
+        "",
+        cfg.clone(),
+        &format!("INSERT OR REPLACE INTO t VALUES ('p','{big}','y')"),
+    );
+    assert_failed_replace_keeps_rows(
+        "",
+        cfg,
+        &format!("UPDATE OR REPLACE t SET u='{big}', w='y' WHERE k='p'"),
+    );
+}
+
+#[test]
+fn failed_replace_over_capped_quota_keeps_conflicting_rows() {
+    let big = "v".repeat(400);
+    assert_failed_replace_keeps_rows(
+        "max_bytes=300, ",
+        EngineConfig::default(),
+        &format!("INSERT OR REPLACE INTO t VALUES ('p','{big}','y')"),
+    );
+}
+
+#[test]
+fn successful_replace_matches_native_table() {
+    let cols = "k TEXT PRIMARY KEY, u TEXT UNIQUE, w TEXT UNIQUE";
+    for stmt in [
+        "INSERT OR REPLACE INTO t VALUES ('n','a','y')",
+        "INSERT OR REPLACE INTO t VALUES ('p','b','z')",
+        "UPDATE OR REPLACE t SET k='r', u='b' WHERE k='p'",
+        "UPDATE OR REPLACE t SET k='n' WHERE k='p'",
+    ] {
+        let (vtab, native) = run_on_vtab_and_native(cols, REPLACE_SETUP, stmt, REPLACE_SELECT);
+        assert_eq!(vtab.0, native.0, "rows differ for: {stmt}");
+        assert_eq!(vtab.1, native.1, "changes() differ for: {stmt}");
+    }
+}
+
+#[test]
+fn statement_savepoint_nests_inside_user_savepoints_and_rollbacks() {
+    let (_tmp, engine) = open_engine_with("replace_nested", EngineConfig::default());
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(columns='k TEXT PRIMARY KEY, u TEXT UNIQUE, w TEXT UNIQUE')",
+    )
+    .unwrap();
+    conn.execute_batch(REPLACE_SETUP).unwrap();
+    let original = conn.query_all(REPLACE_SELECT, &[]).unwrap();
+    let long = "x".repeat(3000);
+
+    // A successful REPLACE followed by a failed one inside a user savepoint.
+    conn.execute_batch("BEGIN; SAVEPOINT s; INSERT OR REPLACE INTO t VALUES ('n','a','y');")
+        .unwrap();
+    assert_eq!(conn.query_all(REPLACE_SELECT, &[]).unwrap().len(), 2);
+    assert!(
+        conn.execute_batch(&format!(
+            "INSERT OR REPLACE INTO t VALUES ('{long}','c','z')"
+        ))
+        .is_err()
+    );
+    // The failed statement left the successful one's result untouched.
+    assert_eq!(
+        conn.query_all(REPLACE_SELECT, &[]).unwrap(),
+        vec![
+            vec![
+                SqlValue::Text("n".into()),
+                SqlValue::Text("a".into()),
+                SqlValue::Text("y".into())
+            ],
+            vec![
+                SqlValue::Text("r".into()),
+                SqlValue::Text("c".into()),
+                SqlValue::Text("z".into())
+            ],
+        ]
+    );
+    conn.execute_batch("ROLLBACK TO s; RELEASE s; ROLLBACK;")
+        .unwrap();
+    assert_eq!(conn.query_all(REPLACE_SELECT, &[]).unwrap(), original);
+    for probe in REPLACE_PROBES {
+        assert!(conn.execute_batch(probe).is_err(), "{probe}");
+    }
+}

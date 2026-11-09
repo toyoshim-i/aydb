@@ -1795,6 +1795,10 @@ unsafe extern "system" fn vtab_rowid(
     .unwrap_or(SQLITE_ERROR)
 }
 
+/// Savepoint id of the engine savepoint that makes one `xUpdate` call atomic. SQLite numbers its
+/// own savepoints from zero, so a negative id never collides with one of them.
+const STATEMENT_SAVEPOINT: c_int = -1;
+
 unsafe extern "system" fn vtab_update(
     p_vtab: *mut sqlite3_vtab,
     argc: c_int,
@@ -2031,6 +2035,7 @@ unsafe extern "system" fn vtab_update(
             None => false,
         };
         let mut known_absent = pk_override.is_some();
+        let mut pk_conflict_to_delete: Option<Vec<u8>> = None;
         let unique_conflicts = match constraints::find_unique_conflicts(
             &mut eng,
             vtab,
@@ -2063,15 +2068,7 @@ unsafe extern "system" fn vtab_update(
                     return SQLITE_OK;
                 } else if conflict_mode == SQLITE_REPLACE {
                     if conflict_pk.as_slice() != new_pk.as_slice() {
-                        if vtab.has_non_int_pks.load(Ordering::Relaxed) {
-                            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                                rmap.remove_by_pk(&conflict_pk);
-                            }
-                        }
-                        if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)
-                        {
-                            return io_err_to_sqlite_rc(&e);
-                        }
+                        pk_conflict_to_delete = Some(conflict_pk);
                         known_absent = true;
                     }
                 } else {
@@ -2082,78 +2079,106 @@ unsafe extern "system" fn vtab_update(
             }
         }
 
-        for conflict_pk in unique_conflicts {
-            if vtab.has_non_int_pks.load(Ordering::Relaxed) {
-                if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                    rmap.remove_by_pk(&conflict_pk);
-                }
-            }
-            if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability) {
+        // Everything below mutates the engine. A statement that removes rows (REPLACE conflict
+        // resolution, or a PK-changing UPDATE) and then fails to store the new row must leave
+        // every row intact. SQLite cannot be relied on for that: it opens a statement journal
+        // only for statements that may write several rows, so a single-row statement that
+        // fails inside `BEGIN` keeps whatever `xUpdate` already did. The removals and the put
+        // are therefore bracketed by an engine savepoint that is rolled back on any failure.
+        let removes_rows = pk_conflict_to_delete.is_some()
+            || !unique_conflicts.is_empty()
+            || rowid_conflict_pk.is_some()
+            || old_pk_opt
+                .as_ref()
+                .is_some_and(|(old_pk, _)| old_pk.as_slice() != new_pk.as_slice());
+        if removes_rows {
+            if let Err(e) = eng.savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT) {
                 return io_err_to_sqlite_rc(&e);
             }
-        }
-
-        if let Some(conflict_pk) = rowid_conflict_pk {
-            if let Err(e) = eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability) {
-                return io_err_to_sqlite_rc(&e);
+            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                rmap.savepoint(STATEMENT_SAVEPOINT);
             }
         }
-
-        // If UPDATE changed the physical PK bytes, delete the old PK row and clean up `RowidMap`
-        if let Some((old_pk, mapped_rid)) = old_pk_opt {
-            if old_pk.as_slice() != new_pk.as_slice() {
+        let applied = (|| -> io::Result<i64> {
+            for conflict_pk in pk_conflict_to_delete.into_iter().chain(unique_conflicts) {
                 if vtab.has_non_int_pks.load(Ordering::Relaxed) {
                     if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                        if let Some(rid) = mapped_rid {
-                            rmap.remove_by_rowid(rid);
-                        } else {
-                            rmap.remove_by_pk(&old_pk);
-                        }
+                        rmap.remove_by_pk(&conflict_pk);
                     }
                 }
-                if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
-                    return io_err_to_sqlite_rc(&e);
-                }
-                if same_pk {
-                    known_absent = true;
+                eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)?;
+            }
+
+            if let Some(conflict_pk) = rowid_conflict_pk {
+                eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)?;
+            }
+
+            // If UPDATE changed the physical PK bytes, delete the old PK row and clean up `RowidMap`
+            if let Some((old_pk, mapped_rid)) = old_pk_opt {
+                if old_pk.as_slice() != new_pk.as_slice() {
+                    if vtab.has_non_int_pks.load(Ordering::Relaxed) {
+                        if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                            if let Some(rid) = mapped_rid {
+                                rmap.remove_by_rowid(rid);
+                            } else {
+                                rmap.remove_by_pk(&old_pk);
+                            }
+                        }
+                    }
+                    eng.delete_row(vtab.table_id, &old_pk, vtab.durability)?;
+                    if same_pk {
+                        known_absent = true;
+                    }
                 }
             }
-        }
 
-        if let Err(e) = eng.put_row_owned_with_hint(
-            vtab.table_id,
-            &new_pk,
-            row_bytes,
-            &sec_keys,
-            vtab.durability,
-            known_absent,
-        ) {
-            return io_err_to_sqlite_rc(&e);
-        }
-
-        let rid = if let Some(auto_id) = pk_override {
-            auto_id
-        } else if let Some(int_id) = coerced_int_pk {
-            int_id
-        } else {
-            vtab.has_non_int_pks.store(true, Ordering::Relaxed);
-            let rowid = match rowid_map::assign_synthetic_rowid(
-                &mut eng,
+            eng.put_row_owned_with_hint(
                 vtab.table_id,
                 &new_pk,
+                row_bytes,
+                &sec_keys,
                 vtab.durability,
-                vtab.pk_affinity == ColumnAffinity::Integer,
-            ) {
-                Ok(rowid) => rowid,
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            };
-            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-                if vtab.open_cursors.load(Ordering::Relaxed) == 0 {
-                    rmap.evict_oldest_half_if_needed();
+                known_absent,
+            )?;
+
+            if let Some(auto_id) = pk_override {
+                Ok(auto_id)
+            } else if let Some(int_id) = coerced_int_pk {
+                Ok(int_id)
+            } else {
+                vtab.has_non_int_pks.store(true, Ordering::Relaxed);
+                let rowid = rowid_map::assign_synthetic_rowid(
+                    &mut eng,
+                    vtab.table_id,
+                    &new_pk,
+                    vtab.durability,
+                    vtab.pk_affinity == ColumnAffinity::Integer,
+                )?;
+                if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                    if vtab.open_cursors.load(Ordering::Relaxed) == 0 {
+                        rmap.evict_oldest_half_if_needed();
+                    }
+                    rmap.remember_rowid(&new_pk, rowid);
                 }
-                rmap.remember_rowid(&new_pk, rowid);
+                Ok(rowid)
             }
-            rowid
+        })();
+        if removes_rows {
+            if applied.is_err() {
+                // Both rollbacks only undo state recorded after the savepoint was taken.
+                let _ = eng.rollback_to_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);
+                if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                    rmap.rollback_to_savepoint(STATEMENT_SAVEPOINT);
+                }
+            }
+            let _ = eng.release_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);
+            if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
+                rmap.release_savepoint(STATEMENT_SAVEPOINT, false);
+            }
+        }
+        let rid = match applied {
+            Ok(rid) => rid,
+            Err(e) => return io_err_to_sqlite_rc(&e),
         };
         if !p_rowid.is_null() {
             *p_rowid = rid;
