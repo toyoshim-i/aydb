@@ -26,19 +26,16 @@ pub(super) fn find_unique_conflicts(
     }
 
     let mut conflicts = Vec::new();
-    let mut last_pk: Option<Vec<u8>> = None;
+    let mut cursor: Option<Vec<u8>> = None;
     loop {
-        let rows = engine.scan_table_range(
+        // Continue after the last key the engine examined; a batch with fewer rows than
+        // `BATCH_SIZE` (corrupt rows skipped under the evict policy) does not end the scan.
+        let (rows, next) = engine.scan_table_batch(
             vtab.table_id,
-            last_pk.as_deref().map(|pk| (pk, false)),
+            cursor.as_deref().map(|pk| (pk, false)),
             None,
             BATCH_SIZE,
         )?;
-        if rows.is_empty() {
-            break;
-        }
-        last_pk = rows.last().map(|(pk, _)| pk.clone());
-        let last_batch = rows.len() < BATCH_SIZE;
         for (pk, existing_row) in rows {
             if old_pk == Some(pk.as_slice()) {
                 continue;
@@ -58,8 +55,9 @@ pub(super) fn find_unique_conflicts(
                 }
             }
         }
-        if last_batch {
-            break;
+        match next {
+            Some(pk) => cursor = Some(pk),
+            None => break,
         }
     }
     Ok(conflicts)

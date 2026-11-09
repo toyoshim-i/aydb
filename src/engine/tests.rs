@@ -6113,3 +6113,113 @@ fn blob_write_failure_before_sync_is_retryable_and_does_not_poison() {
 
     assert_acked_rows_survive(fs, e, &config, &acked);
 }
+
+#[test]
+fn memtable_table_scan_batch_copies_only_the_batch() {
+    let tmp = TempTestDir::new("scan_batch_copies");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    for i in 0..5000u32 {
+        engine
+            .put_row(
+                1,
+                &i.to_be_bytes(),
+                b"v",
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    assert!(engine.idx_segments.is_empty());
+
+    super::scan::TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    let rows = engine.scan_table_range(1, None, None, 128).unwrap();
+    assert_eq!(rows.len(), 128);
+    let copied = super::scan::TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get());
+    assert!(
+        copied <= 128,
+        "a 128-row batch copied {copied} of 5000 MemTable entries"
+    );
+}
+
+/// Walks the table with `scan_table_batch` the way the UNIQUE check does.
+fn walk_table_in_batches(engine: &mut StorageEngine<OsFs>, limit: usize) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let (rows, next) = engine
+            .scan_table_batch(1, cursor.as_deref().map(|pk| (pk, false)), None, limit)
+            .unwrap();
+        seen.extend(rows.into_iter().map(|(pk, _)| pk));
+        match next {
+            Some(pk) => cursor = Some(pk),
+            None => break,
+        }
+    }
+    seen
+}
+
+#[test]
+fn table_scan_batches_cover_the_table_despite_corrupt_rows_and_tombstones() {
+    for flush in [false, true] {
+        let tmp = TempTestDir::new("scan_batch_corrupt");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+        let big = vec![7u8; 4096];
+        for i in 0..300u32 {
+            engine
+                .put_row(
+                    1,
+                    &i.to_be_bytes(),
+                    &big,
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+        }
+        for i in (0..300u32).step_by(7) {
+            engine
+                .delete_row(1, &i.to_be_bytes(), WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        if flush {
+            engine.flush_memtable().unwrap();
+        }
+        // Rows 10..40 (not deleted ones) point to a blob segment that does not exist.
+        let dangling = crate::wal::BlobPtr {
+            kind: crate::wal::BlobKind::Standard,
+            table_id: 0,
+            seg_id: u64::MAX,
+            offset: 0,
+            len: 4096,
+            crc32c: 0,
+        };
+        let mut expected = Vec::new();
+        for i in 0..300u32 {
+            if i % 7 == 0 {
+                continue;
+            }
+            if (10..40).contains(&i) {
+                let key = encode_primary_row_key(1, &i.to_be_bytes());
+                engine
+                    .memtable
+                    .put_blob_ptr(key, dangling, 1_000_000 + i as u64);
+            } else {
+                expected.push(i.to_be_bytes().to_vec());
+            }
+        }
+        for limit in [1, 7, 31, 32, 128, 1000] {
+            assert_eq!(
+                walk_table_in_batches(&mut engine, limit),
+                expected,
+                "flush={flush} limit={limit}"
+            );
+        }
+        assert_eq!(
+            engine.scan_table_range(1, None, None, 100).unwrap().len(),
+            100,
+            "limit counts readable rows"
+        );
+    }
+}

@@ -14,6 +14,16 @@ use crate::wal::BlobPtr;
 
 use super::{CorruptPolicy, LazyBlob, ReadCtx, ReadView, StorageEngine};
 
+/// Result of [`StorageEngine::scan_table_batch`]: the readable rows and the resume cursor.
+pub type TableBatch = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
+
+#[cfg(test)]
+thread_local! {
+    /// Number of MemTable entries `scan_table_range` copied out of the table, for tests.
+    pub(super) static TABLE_SCAN_ENTRIES_COPIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MergedValueRef<'a> {
     Inline(&'a [u8]),
@@ -463,6 +473,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Scans up to `limit` live rows `(pk, value)` in `table_id` within `lower_bound` and `upper_bound`
     /// (`(bound_pk_bytes, inclusive)`), seeking directly via Sparse Fence Pointers!
+    ///
+    /// Rows whose blob is corrupt under the `Evict` policy are skipped and do not count toward
+    /// `limit`, so the result holds `limit` rows whenever that many readable rows exist.
     pub fn scan_table_range(
         &mut self,
         table_id: u16,
@@ -470,8 +483,43 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        let mut lower = lower_bound.map(|(pk, inc)| (pk.to_vec(), inc));
+        while rows.len() < limit {
+            let want = limit - rows.len();
+            let (batch, next) = self.scan_table_batch(
+                table_id,
+                lower.as_ref().map(|(pk, inc)| (pk.as_slice(), *inc)),
+                upper_bound,
+                want,
+            )?;
+            rows.extend(batch);
+            match next {
+                Some(pk) => lower = Some((pk, false)),
+                None => break,
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Examines up to `limit` live entries of `table_id` within the bounds (tombstones are not
+    /// entries) and returns the readable rows among them plus a resume cursor.
+    ///
+    /// A row whose blob is corrupt under the `Evict` policy is examined but not returned, so the
+    /// row count says nothing about whether more rows follow. The cursor does: it is
+    /// `Some(pk of the last examined entry)` exactly when `limit` entries were examined, and
+    /// the next batch starts after it (`(cursor, false)` as lower bound). `None` means the range
+    /// is exhausted. The work and the memory copied are `O(limit)`, independent of the table size.
+    /// Under the `Error` policy a corrupt blob fails the call.
+    pub fn scan_table_batch(
+        &mut self,
+        table_id: u16,
+        lower_bound: Option<(&[u8], bool)>,
+        upper_bound: Option<(&[u8], bool)>,
+        limit: usize,
+    ) -> io::Result<TableBatch> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
         let seek_key = match lower_bound {
@@ -486,7 +534,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if seek_key.as_slice() > ub.as_slice()
                 || (seek_key.as_slice() == ub.as_slice() && (!lo_inc || !ub_inc))
             {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
             }
         }
 
@@ -504,9 +552,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .mem_view(lo, hi)
                 .take_while(|(k, _, _)| k.starts_with(&prefix))
                 .filter(|(_, e, _)| !matches!(e.value, IndexValue::Tombstone))
-                .map(|(k, e, _)| (k.clone(), e.value.clone()))
+                .take(limit)
+                .map(|(k, e, _)| {
+                    #[cfg(test)]
+                    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(c.get() + 1));
+                    (k.clone(), e.value.clone())
+                })
                 .collect();
-            let mut rows = Vec::new();
+            let next = (entries.len() == limit)
+                .then(|| entries.last().map(|(k, _)| k[3..].to_vec()))
+                .flatten();
+            let mut rows = Vec::with_capacity(entries.len());
             for (k, value) in entries {
                 let val_opt = match value {
                     IndexValue::Inline(v) => Some(v),
@@ -515,12 +571,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 };
                 if let Some(val) = val_opt {
                     rows.push((k[3..].to_vec(), val));
-                    if rows.len() >= limit {
-                        break;
-                    }
                 }
             }
-            return Ok(rows);
+            return Ok((rows, next));
         }
 
         let merged = self.scan_merged_prefix_range(
@@ -530,12 +583,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
             limit,
         )?;
-        let mut rows = Vec::with_capacity(merged.len().min(limit));
-
-        for entry in merged {
+        let mut rows = Vec::with_capacity(merged.len());
+        let mut next = None;
+        let examined = merged.len();
+        for (i, entry) in merged.into_iter().enumerate() {
             let Some(pk) = decode_primary_row_key(table_id, &entry.key) else {
                 continue;
             };
+            if i + 1 == examined && examined == limit {
+                next = Some(pk.to_vec());
+            }
             let val_opt = match entry.value {
                 IndexValue::Inline(v) => Some(v),
                 IndexValue::Blob(ptr) => self.dereference_blob(&ptr, &entry.key)?,
@@ -543,12 +600,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             };
             if let Some(val) = val_opt {
                 rows.push((pk.to_vec(), val));
-                if rows.len() >= limit {
-                    break;
-                }
             }
         }
-        Ok(rows)
+        Ok((rows, next))
     }
 
     /// Scans primary keys matching an exact secondary index value `(table_id, index_id, col_val)`.

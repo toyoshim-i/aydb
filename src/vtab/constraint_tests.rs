@@ -480,3 +480,138 @@ fn statement_savepoint_nests_inside_user_savepoints_and_rollbacks() {
         assert!(conn.execute_batch(probe).is_err(), "{probe}");
     }
 }
+
+/// Inserts rows `(k, u = k)` into a UNIQUE table, tombstones every 5th row and optionally keeps
+/// the second half of the rows in an open transaction. Then every live `u` must conflict and
+/// every deleted `u` must be free, including the last row of the table.
+fn check_unique_scan_covers_every_row(n: i64, in_transaction: bool, flush: bool) {
+    let tmp = TempTestDir::new("unique_batch_boundaries");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, u INTEGER UNIQUE')",
+    )
+    .unwrap();
+    let committed = if in_transaction { n / 2 } else { n };
+    let mut live: Vec<i64> = Vec::new();
+    let mut deleted: Vec<i64> = Vec::new();
+    for k in 1..=committed {
+        conn.execute_batch(&format!("INSERT INTO t VALUES ({k}, {k})"))
+            .unwrap();
+        live.push(k);
+    }
+    if flush {
+        engine.write().unwrap().flush_memtable().unwrap();
+    }
+    if in_transaction {
+        conn.execute_batch("BEGIN").unwrap();
+        for k in committed + 1..=n {
+            conn.execute_batch(&format!("INSERT INTO t VALUES ({k}, {k})"))
+                .unwrap();
+            live.push(k);
+        }
+    }
+    for k in (5..=n).step_by(5) {
+        conn.execute_batch(&format!("DELETE FROM t WHERE k = {k}"))
+            .unwrap();
+        live.retain(|&x| x != k);
+        deleted.push(k);
+    }
+    let fresh = n + 1000;
+    for &u in &live {
+        assert!(
+            conn.execute_batch(&format!("INSERT INTO t VALUES ({fresh}, {u})"))
+                .is_err(),
+            "n={n} tx={in_transaction} flush={flush}: conflict on u={u} was missed"
+        );
+    }
+    for &u in &deleted {
+        conn.execute_batch(&format!("INSERT INTO t VALUES ({fresh}, {u})"))
+            .unwrap_or_else(|e| panic!("n={n}: deleted u={u} reported as conflict: {e}"));
+        conn.execute_batch(&format!("DELETE FROM t WHERE k = {fresh}"))
+            .unwrap();
+    }
+    if in_transaction {
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    assert_eq!(
+        conn.query_all("SELECT COUNT(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(live.len() as i64)]]
+    );
+}
+
+#[test]
+fn unique_scan_covers_every_row_at_batch_boundaries() {
+    for n in [127, 128, 129, 256, 257] {
+        for in_transaction in [false, true] {
+            for flush in [false, true] {
+                check_unique_scan_covers_every_row(n, in_transaction, flush);
+            }
+        }
+    }
+}
+
+/// 300 rows with 4 KB blobs; the blob of `k = 10` is corrupted on disk, so under the evict
+/// policy the first scan batch holds fewer rows than it asked for. The conflict at `k = 250`
+/// lies beyond that batch.
+#[test]
+fn unique_conflict_after_corrupt_row_is_found_in_idx_segments() {
+    let tmp = TempTestDir::new("unique_after_corrupt");
+    let opts = "on_corrupt = 'EVICT', table_id = 7, columns = 'k INTEGER PRIMARY KEY, u INTEGER UNIQUE, body BLOB'";
+    let open = |create: bool| {
+        let fs = Arc::new(OsFs::open(&tmp.path, create).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(engine.clone()).unwrap();
+        conn.execute_batch(&format!("CREATE VIRTUAL TABLE t USING aydb({opts})"))
+            .unwrap();
+        (conn, engine)
+    };
+    {
+        let (conn, engine) = open(true);
+        for k in 1..=300i64 {
+            conn.query_all(
+                "INSERT INTO t VALUES (?1, ?1, ?2)",
+                &[SqlValue::Integer(k), SqlValue::Blob(vec![k as u8; 4096])],
+            )
+            .unwrap();
+        }
+        engine.write().unwrap().flush_memtable().unwrap();
+    }
+    let blob_files: Vec<_> = std::fs::read_dir(&tmp.path)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("blob_") && n.ends_with(".db")
+        })
+        .collect();
+    assert_eq!(blob_files.len(), 1);
+    let path = blob_files[0].path();
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes.len() % 300,
+        0,
+        "300 equally sized blob records expected"
+    );
+    let rec = bytes.len() / 300;
+    bytes[10 * rec - 1] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let (conn, engine) = open(false);
+    assert!(engine.read().unwrap().active_idx_segment_count() > 0);
+    assert!(
+        conn.execute_batch("INSERT INTO t VALUES (1000, 250, x'00')")
+            .is_err(),
+        "a conflict after a corrupt row was missed"
+    );
+    assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
+    conn.execute_batch("INSERT INTO t VALUES (1000, 1000, x'00')")
+        .unwrap();
+}
