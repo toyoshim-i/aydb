@@ -1,7 +1,6 @@
 use super::*;
 use crate::engine::EngineConfig;
 use crate::util::test_util::TempTestDir;
-use crate::vtab::rowid_map::MAX_ROWID_MAP_ENTRIES;
 use std::collections::HashMap;
 
 #[test]
@@ -728,8 +727,8 @@ fn io_and_corrupt_errors_propagate_from_filter_and_update() {
 }
 
 #[test]
-fn full_scan_limit_pushdown_and_rowid_map_compaction() {
-    let tmp = TempTestDir::new("vtab_limit_and_rowid_map");
+fn full_scan_limit_pushdown_and_update_delete_after_rowid_scan() {
+    let tmp = TempTestDir::new("vtab_limit_and_rowid_scan");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
@@ -768,8 +767,8 @@ fn full_scan_limit_pushdown_and_rowid_map_compaction() {
         vec![SqlValue::Text("key_000004".into()), SqlValue::Integer(4)]
     );
 
-    // Scanning all 17,000 non-integer PK rows with rowid projection and closing cursor
-    // compacts `RowidMap` when cursor closes, and subsequent UPDATE/DELETE still works!
+    // Scanning all 17,000 non-integer PK rows with rowid projection and closing the cursor
+    // must not disturb subsequent UPDATE/DELETE by primary key.
     let all_rowids = conn.query_all("SELECT rowid FROM kv_text", &[]).unwrap();
     assert_eq!(all_rowids.len(), 17_000);
     conn.execute_batch(
@@ -1730,7 +1729,7 @@ fn rowid_map_rollback_and_sync_catalog_durability() {
     };
 
     // 2a. Explicit transaction that deletes `alpha` and updates `beta` -> `'beta_renamed'`, then rolls back:
-    //     `rid_alpha` and `rid_beta` must still resolve in `RowidMap` after `ROLLBACK`!
+    //     `rid_alpha` and `rid_beta` must still resolve after `ROLLBACK`!
     conn.execute_batch(
         "BEGIN;
          DELETE FROM n01_text WHERE k = 'alpha';
@@ -1956,28 +1955,6 @@ fn secondary_index_streaming_range_scan_and_rowid_compaction() {
         conn.query_all("SELECT v FROM p4_blob_pk WHERE k = 10", &[])
             .unwrap(),
         vec![vec![SqlValue::Text("float_ten".into())]]
-    );
-
-    // 4. Verify `RowidMap::evict_oldest_half_if_needed` compacts `fifo_order`
-    //    when `fifo_order.len() >= MAX_ROWID_MAP_ENTRIES` while `by_rowid.len() <= MAX_ROWID_MAP_ENTRIES`.
-    let mut rmap = RowidMap::default();
-    let rid_live = rmap.get_or_assign_rowid(b"\x20live_key");
-    for i in 0..MAX_ROWID_MAP_ENTRIES {
-        let key = format!("\x20temp_{i}").into_bytes();
-        let rid = rmap.get_or_assign_rowid(&key);
-        rmap.remove_by_rowid(rid);
-    }
-    assert_eq!(rmap.by_rowid.len(), 1);
-    assert!(rmap.fifo_order.len() >= MAX_ROWID_MAP_ENTRIES);
-    rmap.evict_oldest_half_if_needed();
-    assert_eq!(
-        rmap.fifo_order.len(),
-        1,
-        "stale deleted rowids in fifo_order must be compacted even when by_rowid.len() <= MAX_ROWID_MAP_ENTRIES"
-    );
-    assert_eq!(
-        rmap.get_pk(rid_live).map(|v| v.as_slice()),
-        Some(&b"\x20live_key"[..])
     );
 }
 

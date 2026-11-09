@@ -928,7 +928,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
         "INSERT INTO users_t VALUES ('{k1}', 'Alice'), ('{k2}', 'Bob');"
     ))
     .unwrap();
-    // Query Alice's rowid, then delete by that rowid; Bob happens to overwrite `rowid_to_pk[rid]` on INSERT!
+    // Query Alice's rowid, then delete by that rowid; Bob's INSERT must not take over Alice's identity!
     let r1 = conn
         .query_all(&format!("SELECT rowid FROM users_t WHERE id = '{k1}'"), &[])
         .unwrap();
@@ -936,7 +936,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
         SqlValue::Integer(v) => v,
         _ => unreachable!(),
     };
-    // Re-insert or touch k2 so `rowid_to_pk[rid]` holds k2, then delete rowid = rid1
+    // Re-insert or touch k2, then delete rowid = rid1
     conn.execute_batch(&format!(
         "UPDATE users_t SET name = 'Bob' WHERE id = '{k2}';
          DELETE FROM users_t WHERE rowid = {rid1};"
@@ -2273,7 +2273,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
     }
 
     // ------------------------------------------------------------------------
-    // 9E: RowidMap transactional undo across ROLLBACK & SAVEPOINT,
+    // 9E: Rowid identity transactional undo across ROLLBACK & SAVEPOINT,
     //     capped table quota persistence to boot_meta.db, and sync catalog durability
     // ------------------------------------------------------------------------
     {
@@ -2329,7 +2329,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
             )
             .unwrap();
 
-            // Verify both original rowids still resolve in `RowidMap` for UPDATE by rowid
+            // Verify both original rowids still resolve in the persistent rowid index for UPDATE by rowid
             conn.query_all(
                 "UPDATE n01_n04_tbl SET v = 'updated_a' WHERE rowid = ?1",
                 &[SqlValue::Integer(ra)],
@@ -2389,7 +2389,7 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         );
         println!(
             "{:<54} | {:>14} | {:>20}",
-            "9E. RowidMap Undo, Tx Quota & Sync Catalog", "PASS", "Restored & Durable"
+            "9E. Rowid Undo, Tx Quota & Sync Catalog", "PASS", "Restored & Durable"
         );
     }
 }
