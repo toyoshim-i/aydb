@@ -78,7 +78,9 @@ pub struct SimFile {
 
 struct SimFsControl {
     files: Mutex<HashMap<String, Arc<Mutex<FileState>>>>,
-    /// Snapshot of the directory file list at the last directory/metadata sync.
+    /// Files whose creation is durable, with their content at the last sync. A file enters the
+    /// map with its first `sync_durable`; `remove_file` leaves it at once (as `sync_dir` does on
+    /// Unix). `simulate_power_loss` drops every file that is not in the map.
     durable_dir_entries: Mutex<HashMap<String, Vec<u8>>>,
     /// If `Some(n)`, the `n`-th write or sync call (1-indexed) returns `io::ErrorKind::Other`.
     fail_on_io_step: AtomicUsize,
@@ -92,8 +94,8 @@ impl SimFsControl {
         if target == 0 {
             return Ok(());
         }
-        // Only count writes/syncs on metadata or index files when targeting flush faults
-        if op_file.starts_with("boot_meta") || op_file.starts_with("idx_") {
+        // Count writes and syncs of every file kind (logs, metadata, manifests, indexes, blobs).
+        {
             let step = self.io_step_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if step == target {
                 return Err(io::Error::new(
@@ -165,10 +167,10 @@ impl PlatformFile for SimFile {
     }
 
     fn sync_barrier(&self) -> io::Result<()> {
-        // On Windows, `MutableSyncLog` (`wal_sync.db`) opens with `FILE_FLAG_WRITE_THROUGH` so
-        // each write bypasses the OS cache; on Linux/macOS (`UnixPlatformFile`), `sync_barrier()`
-        // issues `fdatasync` / `fcntl(F_FULLFSYNC)` to flush written sectors to stable
-        // media. Thus `sync_barrier()` transitions buffered pages into `durable_bytes`.
+        // Every platform makes `sync_barrier()` a device flush: `FlushFileBuffers` on Windows
+        // (no file is opened write-through any more), `fdatasync` on Linux and
+        // `fcntl(F_FULLFSYNC)` on macOS for `MutableSyncLog` files. Thus `sync_barrier()`
+        // transitions buffered pages into `durable_bytes`.
         self.sync_durable()
     }
 
@@ -215,7 +217,7 @@ impl FaultInjectingFs {
         }
     }
 
-    /// Configures the simulator to fail on the `step`-th write/sync to `boot_meta` or `idx_*`.
+    /// Configures the simulator to fail on the `step`-th write/sync of any file.
     pub fn set_io_fault_step(&self, step: usize) {
         self.ctrl.io_step_counter.store(0, Ordering::SeqCst);
         self.ctrl.fail_on_io_step.store(step, Ordering::SeqCst);
@@ -228,7 +230,12 @@ impl FaultInjectingFs {
     ///   `MutableSyncLog` writes survive, optionally injecting a 512-byte sub-sector torn write
     ///   on the very last write if `inject_torn_tail` is true.
     pub fn simulate_power_loss(&self, honor_write_through_hint: bool, inject_torn_tail: bool) {
-        let files = self.ctrl.files.lock().unwrap();
+        let mut files = self.ctrl.files.lock().unwrap();
+        {
+            // A file whose creation was never made durable by a sync does not survive.
+            let durable = self.ctrl.durable_dir_entries.lock().unwrap();
+            files.retain(|name, _| durable.contains_key(name));
+        }
         for (name, file_arc) in files.iter() {
             let mut st = file_arc.lock().unwrap();
             if honor_write_through_hint && st.hint == OpenHint::MutableSyncLog {

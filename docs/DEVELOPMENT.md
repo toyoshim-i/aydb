@@ -35,3 +35,39 @@ A core goal of the `aydb` project is to produce a **living, textbook-grade recor
   * **RFC-Style ASCII Box Diagrams:** Use for exact byte/bit offsets, sector headers, and fixed-size binary slot layouts.
   * **SVG Figures (`docs/assets/*.svg`):** Use when illustrating complex multi-layer memory/disk cross-sections or pointer topologies that require pixel-precise spatial alignment.
 
+
+## 5. Crash-Consistency Tests
+
+`src/engine/crash_tests.rs` drives the engine with a seeded random workload on a simulated filesystem (`CrashFs`), crashes it at a seed-chosen point, reopens it and compares the result with an oracle. Every run is determined by its seed.
+
+**What `CrashFs` models**
+
+* Each file has a page-cache image (what reads see) and a durable image (as of the last successful sync). A power loss lets each unsynced write persist completely, be lost, or persist only in the 512-byte sectors the seed picks. Later writes may persist while earlier ones are lost (reordering). A write that extends a file may extend its length without its data, which then reads as zeros.
+* A process crash (`kill -9`) keeps the whole page cache and directory.
+* `preallocate` with `PhysicalZeroFill` ends with a sync, as the real implementations do. `LogicalExtendOnly` is not durable until a sync.
+* Directory entries follow the platform. Unix: `open_file` (create) and `remove_file` flush the directory, so entries are durable on return. Windows (assumption): the directory log is flushed by any successful `FlushFileBuffers`, and operations after the last flush survive as a random prefix, so an unflushed creation may be missing and an unflushed removal may be undone. Under both modes a data write never reaches the device before the directory operations issued before it. The mode is chosen per seed.
+* Fault injection: a power cut at a global operation index (that operation and all later ones fail), or a one-shot failure of the n-th write, sync, pre-allocation, creation or removal on a chosen file kind (`boot_meta`, `wal_sync`, `wal_buf`, `idx`, blob, manifest). A failed sync may leave the writes pending, may have flushed them, or may drop them while later syncs succeed ("fsyncgate").
+
+Not modelled: torn writes below 512 bytes, reordering within one write other than by sector, corruption of synced data, rename, multi-process access, and the real timing of group commit (the engine API is driven single-threaded).
+
+**What the oracle checks** (ARCHITECTURE.md section 4)
+
+The workload issues puts, overwrites, deletes, explicit transactions with savepoints, release and rollback, mixed durabilities, inline and out-of-line values, two capped tables, flushes, checkpoints, compaction, catalogs large enough to need a manifest (with table drops that shrink them), and small logs so that rotation collides with commits. The model keeps the state after every commit that was issued. After a crash the recovered state must equal the model state after `k` commits for some `k` between the last guaranteed commit and the newest issued one. This is the prefix property and atomicity at once. The guaranteed commit is:
+
+* after a power loss: the last acknowledged `SyncTransactional` commit (it makes every earlier buffered commit durable) or successful `checkpoint`;
+* after a process crash: the last acknowledged commit of either kind, and the state returned by an earlier recovery.
+
+Interpretations: an operation that logged nothing (a delete of a missing row, a transaction without records) is not a commit and acknowledges nothing; a commit that returned an error while the engine is poisoned, or was interrupted by the power cut, may or may not be present; a failed operation on an engine that is not poisoned must have no effect and the workload continues; the capped tables evict on their own, so a row may be absent, but a present row must carry the value the model has for `k`. Reads must never fail. Reopen must succeed after any crash, including a second crash during or right after recovery, and must leave an engine whose `checkpoint` and `compact` work. After a checkpoint the state must survive another crash unchanged.
+
+**Running**
+
+The regular test runs 1,000 seeds (about 10 seconds in a debug build, on four threads). Environment variables:
+
+* `AYDB_CRASH_SEEDS=<n>`: number of seeds (for example 2000 or more for a long run).
+* `AYDB_CRASH_SEED_START=<n>`: first seed.
+* `AYDB_CRASH_SEED=<n>`: replay one seed with the complete operation and filesystem trace in the failure report.
+* `AYDB_CRASH_KNOWN_BUGS=1`: stop working around the open engine bugs listed below.
+
+Each seed runs twice: once clean, which also measures the operation counts, and once with crash points and failures drawn from those counts.
+
+**Open engine bugs found by the harness.** The workload avoids them by default, and each has an ignored reproduction (`cargo test --lib known_bug -- --ignored`): (A) a recovery can catalog a blob segment that is queued in `pending_delete_files` and then delete it, so the next open fails with `NotFound` (cases that reach it end early); (B) reclaiming an LRU blob segment makes recovery drop whole log batches that reference it, and in the buffered stream every later batch; (C) reclaiming an LRU blob segment syncs `wal_buf.db` without syncing the standard blob writer, so a later synchronous commit skips that sync. B and C are why capped tables hold inline values only in the default workload.

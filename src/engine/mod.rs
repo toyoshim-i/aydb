@@ -18,6 +18,8 @@ pub(crate) use snapshot::ReadSnapshotToken;
 pub(crate) use tx::{CommitStep, GroupRole};
 
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod metadata_failure_tests;
 #[cfg(test)]
 mod tests;
