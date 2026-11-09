@@ -23,6 +23,7 @@ mod snapshot;
 mod snapshot_tests;
 #[cfg(test)]
 mod tests;
+mod unique_key;
 
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;

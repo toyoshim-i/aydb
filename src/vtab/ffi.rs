@@ -305,6 +305,7 @@ unsafe extern "system" {
     pub fn sqlite3_column_text(pStmt: *mut sqlite3_stmt, iCol: c_int) -> *const c_uchar;
     pub fn sqlite3_column_blob(pStmt: *mut sqlite3_stmt, iCol: c_int) -> *const c_void;
     pub fn sqlite3_column_bytes(pStmt: *mut sqlite3_stmt, iCol: c_int) -> c_int;
+    pub fn sqlite3_column_value(pStmt: *mut sqlite3_stmt, iCol: c_int) -> *mut sqlite3_value;
 
     pub fn sqlite3_create_module_v2(
         db: *mut sqlite3,
