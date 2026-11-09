@@ -98,8 +98,8 @@ fn probe_raw_into_slab(raw: RawIdxEntry<'_>, slab: &mut Vec<u8>) -> io::Result<S
 
 /// Durability guarantee requested for a write or delete operation.
 ///
-/// If a WAL append or sync fails, the call returns an error and the engine becomes *poisoned*
-/// (see [`StorageEngine::is_poisoned`]): the on-disk outcome of the failed write is unknown, so
+/// If a WAL append or sync, or a blob segment sync, fails, the call returns an error and the
+/// engine becomes *poisoned* (see [`StorageEngine::is_poisoned`]): the on-disk outcome of the failed write is unknown, so
 /// after reopening the failed write may or may not be present (but never partially applied).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteDurability {
@@ -1121,6 +1121,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let was_capped = self.capped_tables.remove(&table_id).is_some();
         self.table_has_row_meta.insert(table_id, false);
         if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
+            // Left unpoisoned on purpose: every byte of this segment is dead from here on, so
+            // no committed state ever depends on it being durable.
             let _ = old_w.sync_durable();
             if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
                 b.file_len = old_w.current_len();
@@ -1294,22 +1296,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, &value)?;
             if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
                 match blob_kind {
-                    BlobKind::Standard => {
-                        if let Some(w) = &mut self.active_std_writer {
-                            w.sync_durable()?;
-                            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                                b.file_len = w.current_len();
-                            }
-                        }
-                    }
-                    BlobKind::Lru => {
-                        if let Some(w) = self.active_lru_writers.get_mut(&table_id) {
-                            w.sync_durable()?;
-                            if let Some(b) = self.lru_blobs.get_mut(&(table_id, w.seq_id())) {
-                                b.file_len = w.current_len();
-                            }
-                        }
-                    }
+                    BlobKind::Standard => self.sync_active_std_writer()?,
+                    BlobKind::Lru => self.sync_active_lru_writer(table_id)?,
                 }
             }
             records.push(WalRecord::PutBlobPtr {
@@ -1353,12 +1341,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let ptr =
                     self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
                 if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                    if let Some(w) = &mut self.active_std_writer {
-                        w.sync_durable()?;
-                        if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                            b.file_len = w.current_len();
-                        }
-                    }
+                    self.sync_active_std_writer()?;
                 }
                 records.push(WalRecord::PutBlobPtr {
                     key: meta_key,
@@ -2219,18 +2202,52 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Syncs every active blob writer. A failure poisons the engine, see
+    /// [`Self::sync_active_std_writer`].
     pub(super) fn sync_active_blob_writers(&mut self) -> io::Result<()> {
-        if let Some(w) = &mut self.active_std_writer {
-            w.sync_durable()?;
-            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                b.file_len = w.current_len();
-            }
+        self.sync_active_std_writer()?;
+        let table_ids: Vec<u16> = self.active_lru_writers.keys().copied().collect();
+        for table_id in table_ids {
+            self.sync_active_lru_writer(table_id)?;
         }
-        for w in self.active_lru_writers.values_mut() {
-            w.sync_durable()?;
-            if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
-                b.file_len = w.current_len();
-            }
+        Ok(())
+    }
+
+    /// Syncs the active standard blob writer (if any) and records its length.
+    ///
+    /// A failed sync poisons the engine: the kernel may have dropped the dirty pages and marked
+    /// them clean, so a retried sync can report success for bytes that never reached the disk.
+    /// Continuing would let a later checkpoint or WAL record cover a lost blob. Once poisoned,
+    /// no further blob sync is attempted.
+    pub(super) fn sync_active_std_writer(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        let Some(w) = &mut self.active_std_writer else {
+            return Ok(());
+        };
+        // A failed write never reached the page cache and its buffer is kept, so it is retryable.
+        w.flush_buffer()?;
+        let synced = w.sync_durable();
+        let (seq_id, len) = (w.seq_id(), w.current_len());
+        synced.map_err(|e| self.poison(e))?;
+        if let Some(b) = self.std_blobs.get_mut(&seq_id) {
+            b.file_len = len;
+        }
+        Ok(())
+    }
+
+    /// Per-table LRU counterpart of [`Self::sync_active_std_writer`].
+    pub(super) fn sync_active_lru_writer(&mut self, table_id: u16) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        let Some(w) = self.active_lru_writers.get_mut(&table_id) else {
+            return Ok(());
+        };
+        // A failed write never reached the page cache and its buffer is kept, so it is retryable.
+        w.flush_buffer()?;
+        let synced = w.sync_durable();
+        let (seq_id, len) = (w.seq_id(), w.current_len());
+        synced.map_err(|e| self.poison(e))?;
+        if let Some(b) = self.lru_blobs.get_mut(&(table_id, seq_id)) {
+            b.file_len = len;
         }
         Ok(())
     }
@@ -2255,7 +2272,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .unwrap_or(true);
                 if roll {
                     if let Some(mut old_w) = self.active_std_writer.take() {
-                        old_w.sync_durable()?;
+                        // Poisons on any error: the writer is already out of the engine, so its
+                        // buffer cannot be retried.
+                        old_w.sync_durable().map_err(|e| self.poison(e))?;
                         if let Some(b) = self.std_blobs.get_mut(&old_w.seq_id()) {
                             b.file_len = old_w.current_len();
                         }
@@ -2296,7 +2315,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .unwrap_or(true);
                 if roll {
                     if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
-                        old_w.sync_durable()?;
+                        old_w.sync_durable().map_err(|e| self.poison(e))?;
                         if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
                             b.file_len = old_w.current_len();
                         }

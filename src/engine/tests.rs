@@ -4540,10 +4540,10 @@ fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
 }
 
 #[test]
-fn failed_blob_sync_is_retried_by_the_next_commit() {
+fn failed_blob_sync_poisons_instead_of_being_retried() {
     use blob_sync_counting::{CountFs, Ctl};
 
-    let tmp = TempTestDir::new("blob_sync_retry");
+    let tmp = TempTestDir::new("blob_sync_poison");
     let ctl = Arc::new(Ctl::default());
     let fs = Arc::new(CountFs {
         inner: OsFs::open(&tmp.path, true).unwrap(),
@@ -4559,9 +4559,13 @@ fn failed_blob_sync_is_retried_by_the_next_commit() {
     ctl.fail_blob_sync.store(true, Ordering::SeqCst);
     assert!(engine.prepare_commit_transaction(sync).is_err());
     ctl.fail_blob_sync.store(false, Ordering::SeqCst);
+    // A retried sync could report success for data the kernel already dropped, so the failure
+    // poisons the engine and the commit cannot be retried.
+    assert!(engine.is_poisoned());
     let before = ctl.blob_syncs.load(Ordering::SeqCst);
-    engine.prepare_commit_transaction(sync).unwrap();
-    assert!(ctl.blob_syncs.load(Ordering::SeqCst) > before);
+    assert!(engine.prepare_commit_transaction(sync).is_err());
+    assert!(engine.commit_transaction().is_err());
+    assert_eq!(ctl.blob_syncs.load(Ordering::SeqCst), before);
 }
 
 #[test]
@@ -5029,12 +5033,25 @@ fn buffered_commit_is_not_deferred() {
 struct PowerLossFs {
     files: std::sync::Mutex<HashMap<String, Arc<PowerLossFile>>>,
     root: PathBuf,
+    /// Fault mode shared with every `blob_*` file, see `BLOB_SYNC_FAIL_ONCE`.
+    blob_sync_fault: Arc<std::sync::atomic::AtomicU8>,
 }
+
+/// Blob sync fault modes of [`PowerLossFs`]. `BLOB_SYNC_FAIL_ONCE` models Linux "fsyncgate":
+/// the next `sync_durable` on a blob file fails, the dirty pages are dropped and marked clean,
+/// so every later sync reports success without persisting anything (`BLOB_SYNC_LIE`).
+const BLOB_SYNC_OK: u8 = 0;
+const BLOB_SYNC_FAIL_ONCE: u8 = 1;
+const BLOB_SYNC_LIE: u8 = 2;
+/// Every `write_all_at` on a blob file fails with `StorageFull`; syncs are unaffected.
+const BLOB_WRITE_FAIL: u8 = 3;
 
 struct PowerLossFile {
     durable: std::sync::Mutex<Vec<u8>>,
     cache: std::sync::Mutex<Vec<u8>>,
     write_through: bool,
+    /// Set for `blob_*` files: the shared fault mode of the filesystem.
+    blob_sync_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl PowerLossFs {
@@ -5042,7 +5059,18 @@ impl PowerLossFs {
         Self {
             files: std::sync::Mutex::new(HashMap::new()),
             root: PathBuf::from("/sim/power_loss"),
+            blob_sync_fault: Arc::new(std::sync::atomic::AtomicU8::new(BLOB_SYNC_OK)),
         }
+    }
+
+    fn set_blob_write_failure(&self, on: bool) {
+        let mode = if on { BLOB_WRITE_FAIL } else { BLOB_SYNC_OK };
+        self.blob_sync_fault.store(mode, Ordering::SeqCst);
+    }
+
+    fn arm_blob_sync_failure(&self) {
+        self.blob_sync_fault
+            .store(BLOB_SYNC_FAIL_ONCE, Ordering::SeqCst);
     }
 
     fn power_loss(&self) {
@@ -5071,6 +5099,11 @@ impl PlatformFile for PowerLossFile {
         Ok(())
     }
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        if let Some(fault) = &self.blob_sync_fault {
+            if fault.load(Ordering::SeqCst) == BLOB_WRITE_FAIL {
+                return Err(io::Error::from(io::ErrorKind::StorageFull));
+            }
+        }
         let end = offset as usize + buf.len();
         let mut images = vec![self.cache.lock().unwrap()];
         if self.write_through {
@@ -5105,6 +5138,16 @@ impl PlatformFile for PowerLossFile {
         self.sync_durable()
     }
     fn sync_durable(&self) -> io::Result<()> {
+        if let Some(fault) = &self.blob_sync_fault {
+            match fault.load(Ordering::SeqCst) {
+                BLOB_SYNC_FAIL_ONCE => {
+                    fault.store(BLOB_SYNC_LIE, Ordering::SeqCst);
+                    return Err(io::Error::other("injected blob sync failure"));
+                }
+                BLOB_SYNC_LIE => return Ok(()),
+                _ => {}
+            }
+        }
         let c = self.cache.lock().unwrap().clone();
         *self.durable.lock().unwrap() = c;
         Ok(())
@@ -5134,6 +5177,9 @@ impl PlatformFs for PowerLossFs {
             durable: std::sync::Mutex::new(Vec::new()),
             cache: std::sync::Mutex::new(Vec::new()),
             write_through: hint == OpenHint::MutableSyncLog,
+            blob_sync_fault: rel_name
+                .starts_with("blob_")
+                .then(|| Arc::clone(&self.blob_sync_fault)),
         });
         files.insert(rel_name.to_string(), Arc::clone(&f));
         Ok(f)
@@ -5745,4 +5791,328 @@ fn compaction_install_ignores_dead_bytes_of_commits_waiting_for_their_group_flus
         "the segment is reclaimed once the commit is durable"
     );
     assert_eq!(e.get_row(1, b"r1").unwrap(), Some(b"new-inline".to_vec()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Blob segment sync failures (Linux "fsyncgate"): a failed blob sync leaves the durability of
+// the blob bytes unknown, and a retried sync may report success without persisting them. The
+// engine must therefore be poisoned, so that no checkpoint, flush or WAL record can ever cover
+// a blob that is not durable.
+// ---------------------------------------------------------------------------------------------
+
+const FAULT_BLOB_LEN: usize = 1500;
+
+type AckedRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn blob_fault_config() -> EngineConfig {
+    let mut c = EngineConfig::default();
+    c.blob_cache_bytes = 0;
+    c.block_cache_bytes = 0;
+    c
+}
+
+fn blob_fault_value(tag: u8) -> Vec<u8> {
+    vec![tag; FAULT_BLOB_LEN]
+}
+
+fn blob_fault_setup(
+    config: &EngineConfig,
+) -> (Arc<PowerLossFs>, StorageEngine<PowerLossFs>, AckedRows) {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut e = StorageEngine::open(Arc::clone(&fs), config.clone()).unwrap();
+    e.register_capped_table(2, 1_000_000).unwrap();
+    e.put_row(
+        1,
+        b"before",
+        &blob_fault_value(1),
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    let acked = vec![(b"before".to_vec(), blob_fault_value(1))];
+    (fs, e, acked)
+}
+
+/// Every mutation and every checkpoint-like operation must fail after the poisoning failure.
+fn assert_blob_sync_fail_stop(e: &mut StorageEngine<PowerLossFs>) {
+    assert!(
+        e.is_poisoned(),
+        "a blob sync failure must poison the engine"
+    );
+    assert!(e.checkpoint().is_err(), "checkpoint must not succeed");
+    assert!(e.flush_memtable().is_err(), "flush must not succeed");
+    assert!(e.compact().is_err());
+    for durability in [
+        WriteDurability::SyncTransactional,
+        WriteDurability::BufferedFast,
+    ] {
+        assert!(
+            e.put_row(1, b"later", &blob_fault_value(9), &[], durability)
+                .is_err()
+        );
+        assert!(e.put_row(1, b"inline", b"v", &[], durability).is_err());
+    }
+    // Reads keep working, as in the other poison cases.
+    assert_eq!(
+        e.get_row(1, b"before").unwrap(),
+        Some(blob_fault_value(1)),
+        "reads of durable rows keep working"
+    );
+}
+
+/// Simulates a power loss, reopens, and checks that every acknowledged row is readable.
+fn assert_acked_rows_survive(
+    fs: Arc<PowerLossFs>,
+    e: StorageEngine<PowerLossFs>,
+    config: &EngineConfig,
+    acked: &AckedRows,
+) {
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, config.clone()).unwrap();
+    assert!(!e.is_poisoned());
+    for (key, value) in acked {
+        let table = if key.starts_with(b"lru") { 2 } else { 1 };
+        assert_eq!(
+            e.get_row(table, key).unwrap().as_deref(),
+            Some(value.as_slice()),
+            "acknowledged row {:?} is lost or unreadable after reopen",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+#[test]
+fn blob_sync_failure_on_sync_commit_poisons_and_never_acknowledges_lost_blob() {
+    let config = blob_fault_config();
+    let (fs, mut e, mut acked) = blob_fault_setup(&config);
+    fs.arm_blob_sync_failure();
+    let r = e.put_row(
+        1,
+        b"failed",
+        &blob_fault_value(2),
+        &[],
+        WriteDurability::SyncTransactional,
+    );
+    assert!(r.is_err(), "the failed operation must return an error");
+    // Retrying is what turns the lost sync into an acknowledged-but-lost row: the second sync of
+    // the same file reports success without persisting the bytes.
+    let retry = e.put_row(
+        1,
+        b"failed",
+        &blob_fault_value(2),
+        &[],
+        WriteDurability::SyncTransactional,
+    );
+    if retry.is_ok() {
+        acked.push((b"failed".to_vec(), blob_fault_value(2)));
+    }
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_failure_on_lru_sync_commit_poisons() {
+    let config = blob_fault_config();
+    let (fs, mut e, mut acked) = blob_fault_setup(&config);
+    e.put_row(
+        2,
+        b"lru-before",
+        &blob_fault_value(3),
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    acked.push((b"lru-before".to_vec(), blob_fault_value(3)));
+    fs.arm_blob_sync_failure();
+    let first = e.put_row(
+        2,
+        b"lru-failed",
+        &blob_fault_value(4),
+        &[],
+        WriteDurability::SyncTransactional,
+    );
+    assert!(first.is_err());
+    let retry = e.put_row(
+        2,
+        b"lru-failed",
+        &blob_fault_value(4),
+        &[],
+        WriteDurability::SyncTransactional,
+    );
+    if retry.is_ok() {
+        acked.push((b"lru-failed".to_vec(), blob_fault_value(4)));
+    }
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_failure_in_flush_memtable_poisons_and_checkpoint_stays_failed() {
+    let config = blob_fault_config();
+    let (fs, mut e, acked) = blob_fault_setup(&config);
+    e.put_row(
+        1,
+        b"buffered",
+        &blob_fault_value(5),
+        &[],
+        WriteDurability::BufferedFast,
+    )
+    .unwrap();
+    fs.arm_blob_sync_failure();
+    assert!(e.flush_memtable().is_err());
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_failure_in_checkpoint_with_empty_memtable_poisons() {
+    let config = blob_fault_config();
+    let (fs, mut e, acked) = blob_fault_setup(&config);
+    e.flush_memtable().unwrap();
+    // A rolled back transaction leaves unsynced blob bytes behind an empty MemTable.
+    e.begin_transaction();
+    e.put_row(
+        1,
+        b"rolled-back",
+        &blob_fault_value(6),
+        &[],
+        WriteDurability::BufferedFast,
+    )
+    .unwrap();
+    e.rollback_transaction().unwrap();
+    assert!(e.memtable.is_empty());
+    fs.arm_blob_sync_failure();
+    assert!(e.checkpoint().is_err());
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_failure_when_sealing_rolled_segment_poisons() {
+    let mut config = blob_fault_config();
+    config.max_blob_segment_bytes = 2048;
+    let (fs, mut e, acked) = blob_fault_setup(&config);
+    // The buffered blob rolls into a fresh segment and stays unsynced there.
+    e.put_row(
+        1,
+        b"unsynced",
+        &blob_fault_value(5),
+        &[],
+        WriteDurability::BufferedFast,
+    )
+    .unwrap();
+    fs.arm_blob_sync_failure();
+    // This append rolls the segment again and must seal the unsynced one first.
+    let r = e.put_row(
+        1,
+        b"rolls",
+        &blob_fault_value(7),
+        &[],
+        WriteDurability::BufferedFast,
+    );
+    assert!(r.is_err());
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_failure_in_transaction_commit_poisons() {
+    let config = blob_fault_config();
+    let (fs, mut e, acked) = blob_fault_setup(&config);
+    e.begin_transaction();
+    e.put_row(
+        1,
+        b"in-tx",
+        &blob_fault_value(8),
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    fs.arm_blob_sync_failure();
+    assert!(
+        e.prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .is_err()
+    );
+    assert!(e.commit_transaction().is_err());
+    let _ = e.rollback_transaction();
+    assert_blob_sync_fail_stop(&mut e);
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_sync_control_without_fault_keeps_every_row() {
+    let config = blob_fault_config();
+    let (fs, mut e, mut acked) = blob_fault_setup(&config);
+    for (i, durability) in [
+        WriteDurability::SyncTransactional,
+        WriteDurability::BufferedFast,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("ok{i}").into_bytes();
+        e.put_row(1, &key, &blob_fault_value(10 + i as u8), &[], durability)
+            .unwrap();
+        e.flush_memtable().unwrap();
+        e.checkpoint().unwrap();
+        acked.push((key, blob_fault_value(10 + i as u8)));
+    }
+    assert!(!e.is_poisoned());
+    assert_acked_rows_survive(fs, e, &config, &acked);
+}
+
+#[test]
+fn blob_write_failure_before_sync_is_retryable_and_does_not_poison() {
+    let config = blob_fault_config();
+
+    // Through a synchronous commit.
+    let (fs, mut e, mut acked) = blob_fault_setup(&config);
+    fs.set_blob_write_failure(true);
+    let r = e.put_row(
+        1,
+        b"full",
+        &blob_fault_value(2),
+        &[],
+        WriteDurability::SyncTransactional,
+    );
+    assert!(r.is_err(), "the failed write must be reported");
+    assert!(!e.is_poisoned(), "a write that never landed is retryable");
+    fs.set_blob_write_failure(false);
+    e.put_row(
+        1,
+        b"full",
+        &blob_fault_value(2),
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    acked.push((b"full".to_vec(), blob_fault_value(2)));
+
+    // Through `sync_active_blob_writers`: inside a transaction the blob stays staged in the
+    // writer buffer until it is flushed.
+    e.begin_transaction();
+    e.put_row(
+        1,
+        b"staged",
+        &blob_fault_value(3),
+        &[],
+        WriteDurability::SyncTransactional,
+    )
+    .unwrap();
+    fs.set_blob_write_failure(true);
+    assert!(e.sync_active_blob_writers().is_err());
+    assert!(
+        e.prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .is_err()
+    );
+    assert!(!e.is_poisoned());
+    fs.set_blob_write_failure(false);
+    e.prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+    e.commit_transaction().unwrap();
+    acked.push((b"staged".to_vec(), blob_fault_value(3)));
+    e.checkpoint().unwrap();
+
+    assert_acked_rows_survive(fs, e, &config, &acked);
 }
