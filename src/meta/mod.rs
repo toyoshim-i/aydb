@@ -655,6 +655,15 @@ impl<F: PlatformFs> BootMetaManager<F> {
         &self.state
     }
 
+    /// Takes the next `SeqID` in memory, before the file that will carry it is created. The id
+    /// stays consumed whatever happens to that file, so a failed creation (which can leave the
+    /// file behind with a directory entry that is not durable) is never retried under the same
+    /// name. The next commit persists the advanced counter; a crash before that is covered by
+    /// `reserve_seq_ids_above_existing_files` at the next open.
+    pub fn reserve_seq_id(&mut self) -> u64 {
+        self.state.allocate_seq_id()
+    }
+
     /// Returns which ping-pong slot currently holds the latest committed state.
     pub fn active_slot(&self) -> SlotIndex {
         self.active_slot

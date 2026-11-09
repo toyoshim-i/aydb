@@ -18,6 +18,8 @@ pub(crate) use snapshot::ReadSnapshotToken;
 pub(crate) use tx::{CommitStep, GroupRole};
 
 #[cfg(test)]
+mod blob_recovery_tests;
+#[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
 mod metadata_failure_tests;
@@ -2363,7 +2365,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             b.file_len = old_w.current_len();
                         }
                     }
-                    let seq_id = self.meta_mgr.state().next_seq_id;
+                    let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
                     self.std_blobs.insert(
                         seq_id,
@@ -2375,8 +2377,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     );
                     let std_metas = self.build_checkpointed_std_blob_metas();
                     self.meta_mgr.commit_update(|st| {
-                        let allocated = st.allocate_seq_id();
-                        debug_assert_eq!(allocated, seq_id);
                         st.std_blob_segments = std_metas;
                     })?;
                     self.active_std_writer = Some(writer);
@@ -2404,7 +2404,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             b.file_len = old_w.current_len();
                         }
                     }
-                    let seq_id = self.meta_mgr.state().next_seq_id;
+                    let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
                     self.lru_blobs.insert(
@@ -2418,8 +2418,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     );
                     let lru_metas = self.build_checkpointed_lru_blob_metas();
                     self.meta_mgr.commit_update(|st| {
-                        let allocated = st.allocate_seq_id();
-                        debug_assert_eq!(allocated, seq_id);
                         st.lru_blob_segments = lru_metas;
                     })?;
                     self.active_lru_writers.insert(table_id, writer);
