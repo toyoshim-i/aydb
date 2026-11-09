@@ -262,17 +262,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .map(|(&seq_id, b)| StdBlobSegmentMeta {
                 seq_id,
                 file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
+                dead_bytes: self.settled_std_dead_bytes(seq_id, b.dead_bytes),
             })
             .collect();
         let lru_metas: Vec<LruBlobSegmentMeta> = self
             .lru_blobs
             .iter()
             .filter(|(k, _)| !dead_lru_keys.contains(k))
-            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
+            .map(|(&(tid, seq_id), b)| LruBlobSegmentMeta {
                 seq_id,
                 file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
+                dead_bytes: self.settled_lru_dead_bytes((tid, seq_id), b.dead_bytes),
                 table_id: b.table_id,
             })
             .collect();
@@ -635,7 +635,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // checkpointed state: WAL replay re-applies the increments of any record newer than the
         // checkpoint, so persisting them here would count them twice after a crash. The memtable
         // holds exactly the post-checkpoint mutations.
-        let persist_blob_state = self.tx_depth == 0 && self.memtable.is_empty();
+        // Commits still waiting in `pending_group` are logged but maybe not durable, and their
+        // overlay is not in the memtable, so they count as well.
+        let persist_blob_state =
+            self.tx_depth == 0 && self.memtable.is_empty() && self.pending_group.is_empty();
         let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if persist_blob_state {
             self.collect_fully_dead_blob_segments()
         } else {
@@ -728,6 +731,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let _ = self.fs.remove_file(&name);
     }
 
+    /// Dead bytes of a `blob_std` segment that may be persisted or acted on (reclaim).
+    ///
+    /// While a transaction is being built or appended (its start snapshot is live) its overlay is
+    /// not published and its WAL batch may not be durable, yet its overwrites and deletes are
+    /// already counted in the in-memory `dead_bytes`. Persisting or reclaiming on those would
+    /// lose a row that is still durable if the transaction is lost, so only the bytes counted at
+    /// the start of the transaction are reported. They are counted again in memory and become
+    /// effective at the first flush after the transaction has been published.
+    pub(super) fn settled_std_dead_bytes(&self, seq: u64, dead_bytes: u64) -> u64 {
+        if self.tx_start_meta.active {
+            let at_start = self.tx_start_meta.std_blobs.get(&seq).map_or(0, |s| s.1);
+            at_start.min(dead_bytes)
+        } else {
+            dead_bytes
+        }
+    }
+
+    /// `blob_lru` counterpart of [`Self::settled_std_dead_bytes`].
+    pub(super) fn settled_lru_dead_bytes(&self, key: (u16, u64), dead_bytes: u64) -> u64 {
+        if self.tx_start_meta.active {
+            let at_start = self.tx_start_meta.lru_blobs.get(&key).map_or(0, |s| s.1);
+            at_start.min(dead_bytes)
+        } else {
+            dead_bytes
+        }
+    }
+
     pub(super) fn collect_fully_dead_blob_segments(
         &self,
     ) -> (Vec<u64>, Vec<(u16, u64)>, Vec<String>) {
@@ -736,7 +766,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .std_blobs
             .iter()
             .filter(|&(&seq, b)| {
-                Some(seq) != active_std_seq && b.file_len > 0 && b.dead_bytes >= b.file_len
+                Some(seq) != active_std_seq
+                    && b.file_len > 0
+                    && self.settled_std_dead_bytes(seq, b.dead_bytes) >= b.file_len
             })
             .map(|(&seq, _)| seq)
             .collect();
@@ -751,7 +783,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .iter()
             .filter(|&(&(tid, seq), b)| {
                 let active_seq = self.active_lru_writers.get(&tid).map(|w| w.seq_id());
-                Some(seq) != active_seq && b.file_len > 0 && b.dead_bytes >= b.file_len
+                Some(seq) != active_seq
+                    && b.file_len > 0
+                    && self.settled_lru_dead_bytes((tid, seq), b.dead_bytes) >= b.file_len
             })
             .map(|(&k, _)| k)
             .collect();
@@ -774,7 +808,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 tid == table_id
                     && Some(seq) != active_seq
                     && b.file_len > 0
-                    && b.dead_bytes >= b.file_len
+                    && self.settled_lru_dead_bytes((tid, seq), b.dead_bytes) >= b.file_len
             })
             .map(|(&k, _)| k)
             .collect();

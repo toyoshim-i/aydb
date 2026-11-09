@@ -147,6 +147,8 @@ pub(crate) enum CommitStep<F: PlatformFile> {
 
 #[derive(Clone, Default)]
 pub(crate) struct TxMetaSnapshot {
+    /// `true` for a captured snapshot, `false` for the default (no transaction in flight).
+    pub(super) active: bool,
     pub(super) next_lsn: u64,
     pub(super) std_blobs: BTreeMap<u64, (u64, u64)>,
     pub(super) lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
@@ -903,6 +905,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn capture_tx_meta_snapshot(&self) -> TxMetaSnapshot {
         TxMetaSnapshot {
+            active: true,
             next_lsn: self.next_lsn,
             std_blobs: self
                 .std_blobs

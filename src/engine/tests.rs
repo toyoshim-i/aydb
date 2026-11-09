@@ -5196,7 +5196,12 @@ fn ring_full_setup(
         f.write_all_at(&[0xEE; 32], 64).unwrap();
         f.sync_durable().unwrap();
     }
-    // Fill the chosen WAL until only its last sector is left.
+    fill_wal_to_last_sector(&mut e, durability);
+    (fs, e)
+}
+
+/// Fills the WAL of the given durability until only its last sector is left.
+fn fill_wal_to_last_sector(e: &mut StorageEngine<PowerLossFs>, durability: WriteDurability) {
     let mut i = 0;
     loop {
         let (idx, total) = match durability {
@@ -5215,7 +5220,6 @@ fn ring_full_setup(
             .unwrap();
         i += 1;
     }
-    (fs, e)
 }
 
 fn wal_epoch(e: &StorageEngine<PowerLossFs>, durability: WriteDurability) -> u64 {
@@ -5430,4 +5434,315 @@ fn ring_full_rotation_does_not_relocate_blobs_under_the_held_lsn() {
         assert_eq!(e.get_row(3, k.as_bytes()).unwrap(), Some(b"v".to_vec()));
     }
     assert_eq!(e.get_row(1, b"b").unwrap(), Some(vec![2u8; 1500]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Blob reclaim and persisted dead bytes must ignore transactions that are not yet published.
+// ---------------------------------------------------------------------------------------------
+
+const OLD_BLOB: [u8; 1500] = [0x33; 1500];
+
+fn blob_file_count(fs: &PowerLossFs) -> usize {
+    fs.list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_"))
+        .count()
+}
+
+/// Opens an engine whose table 1 holds `r1` and `r2` as 1500-byte blobs in two different, durable
+/// blob segments (so the first, sealed segment holds only `r1`). With `fill` the WAL of the given
+/// durability is then filled up to its last sector, so the next sizeable batch rotates it. With
+/// `capped` table 1 is a capped table, which puts its blobs into `blob_lru` segments.
+fn dead_blob_setup(
+    durability: WriteDurability,
+    capped: bool,
+    fill: bool,
+) -> (Arc<PowerLossFs>, StorageEngine<PowerLossFs>) {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut e = StorageEngine::open(Arc::clone(&fs), ring_full_config()).unwrap();
+    if capped {
+        e.register_capped_table(1, 1_000_000).unwrap();
+    }
+    let sync = WriteDurability::SyncTransactional;
+    e.put_row(1, b"r1", &OLD_BLOB, &[], sync).unwrap();
+    e.put_row(1, b"r2", &OLD_BLOB, &[], sync).unwrap();
+    e.flush_memtable().unwrap();
+    assert_eq!(blob_file_count(&fs), 2);
+    if fill {
+        fill_wal_to_last_sector(&mut e, durability);
+    }
+    (fs, e)
+}
+
+/// Overwrites `r1` inside a transaction that also writes 12 sizeable rows. Returns whether the
+/// commit rotated the WAL.
+fn commit_overwrite_of_r1(e: &mut StorageEngine<PowerLossFs>, durability: WriteDurability) -> bool {
+    let epoch = wal_epoch(e, durability);
+    e.begin_transaction();
+    e.put_row(1, b"r1", b"new-inline", &[], durability).unwrap();
+    for i in 0..12 {
+        let k = format!("tx{i:04}");
+        e.put_row(3, k.as_bytes(), &[9u8; 900], &[], durability)
+            .unwrap();
+    }
+    e.commit_transaction().unwrap();
+    wal_epoch(e, durability) > epoch
+}
+
+fn persisted_dead_bytes(e: &StorageEngine<PowerLossFs>) -> u64 {
+    let st = e.meta_mgr.state();
+    st.std_blob_segments
+        .iter()
+        .map(|s| s.dead_bytes)
+        .chain(st.lru_blob_segments.iter().map(|s| s.dead_bytes))
+        .sum()
+}
+
+#[test]
+fn ring_full_commit_keeps_blob_segment_of_a_transaction_lost_by_power_loss() {
+    let durability = WriteDurability::BufferedFast;
+    let (fs, mut e) = dead_blob_setup(durability, false, true);
+    assert!(commit_overwrite_of_r1(&mut e, durability));
+    assert_eq!(blob_file_count(&fs), 2);
+    // The rotation checkpointed the log without the transaction's dead bytes.
+    assert_eq!(persisted_dead_bytes(&e), 0);
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+    assert_eq!(e.get_row(1, b"r2").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+/// A capped table reclaims its `blob_lru` segments right after the commit, which first makes the
+/// buffered log durable. So the commit survives and the old segment may be gone, but the rotation
+/// inside the commit must not have emptied the segment of a row that is not yet replaced.
+#[test]
+fn ring_full_commit_on_capped_table_never_loses_the_row_it_overwrote() {
+    let durability = WriteDurability::BufferedFast;
+    let (fs, mut e) = dead_blob_setup(durability, true, true);
+    assert!(commit_overwrite_of_r1(&mut e, durability));
+    assert_eq!(blob_file_count(&fs), 1);
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(b"new-inline".to_vec()));
+    assert_eq!(e.get_row(1, b"r2").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+#[test]
+fn commit_without_full_wal_keeps_blob_segment_of_a_transaction_lost_by_power_loss() {
+    // Control: the same workload with room left in the WAL never rotates.
+    let durability = WriteDurability::BufferedFast;
+    let (fs, mut e) = dead_blob_setup(durability, false, false);
+    assert!(!commit_overwrite_of_r1(&mut e, durability));
+    assert_eq!(blob_file_count(&fs), 2);
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+#[test]
+fn dead_bytes_of_a_lost_ring_full_transaction_never_reclaim_live_blobs_after_reopen() {
+    let durability = WriteDurability::BufferedFast;
+    let (fs, mut e) = dead_blob_setup(durability, false, true);
+    assert!(commit_overwrite_of_r1(&mut e, durability));
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(Arc::clone(&fs), ring_full_config()).unwrap();
+    // Later activity: flushes, a checkpoint and compaction would all reclaim a segment whose
+    // persisted dead bytes covered the lost transaction.
+    for round in 0..3 {
+        for i in 0..4 {
+            let k = format!("more{round}{i}");
+            e.put_row(
+                2,
+                k.as_bytes(),
+                &[5u8; 200],
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        }
+        e.flush_memtable().unwrap();
+    }
+    e.checkpoint().unwrap();
+    e.compact().unwrap();
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+    assert_eq!(blob_file_count(&fs), 2);
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+#[test]
+fn ring_full_commit_still_reclaims_the_overwritten_blob_segment_at_a_later_checkpoint() {
+    for capped in [false, true] {
+        for durability in [
+            WriteDurability::SyncTransactional,
+            WriteDurability::BufferedFast,
+        ] {
+            let (fs, mut e) = dead_blob_setup(durability, capped, true);
+            assert!(commit_overwrite_of_r1(&mut e, durability));
+            // Not reclaimed by the rotation inside the commit (a capped table reclaims right
+            // after the commit, which is safe because it first makes the log durable) ...
+            let after_commit = if capped { 1 } else { 2 };
+            assert_eq!(
+                blob_file_count(&fs),
+                after_commit,
+                "{durability:?} capped={capped}"
+            );
+            // ... but by the next flush, which persists the dead bytes and unlinks the segment.
+            e.flush_memtable().unwrap();
+            assert_eq!(blob_file_count(&fs), 1, "{durability:?} capped={capped}");
+            assert_eq!(
+                e.get_row(1, b"r1").unwrap(),
+                Some(b"new-inline".to_vec()),
+                "{durability:?} capped={capped}"
+            );
+            e.put_row(2, b"marker", b"v", &[], WriteDurability::SyncTransactional)
+                .unwrap();
+            fs.power_loss();
+            std::mem::forget(e);
+            let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+            assert_eq!(e.get_row(1, b"r1").unwrap(), Some(b"new-inline".to_vec()));
+            assert_eq!(e.get_row(1, b"r2").unwrap(), Some(OLD_BLOB.to_vec()));
+        }
+    }
+}
+
+#[test]
+fn rolled_back_transaction_leaves_dead_bytes_and_snapshot_consistent() {
+    let (fs, mut e) = dead_blob_setup(WriteDurability::BufferedFast, false, false);
+    let dead_before: Vec<u64> = e.std_blobs.values().map(|b| b.dead_bytes).collect();
+    e.begin_transaction();
+    e.put_row(1, b"r1", b"new-inline", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(e.tx_start_meta.active);
+    e.rollback_transaction().unwrap();
+    assert!(!e.tx_start_meta.active);
+    let dead_after: Vec<u64> = e.std_blobs.values().map(|b| b.dead_bytes).collect();
+    assert_eq!(dead_before, dead_after);
+    e.put_row(2, b"k", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    e.flush_memtable().unwrap();
+    assert_eq!(blob_file_count(&fs), 2);
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+/// Non-transaction writes count the dead bytes of the row they replace only after their batch is
+/// in the log, so a full WAL rotating for that very write cannot reclaim the old blob.
+#[test]
+fn ring_full_non_transaction_overwrite_and_delete_keep_the_old_blob_until_logged() {
+    const VICTIMS: usize = 400;
+    for delete in [false, true] {
+        for durability in [
+            WriteDurability::SyncTransactional,
+            WriteDurability::BufferedFast,
+        ] {
+            let fs = Arc::new(PowerLossFs::new());
+            let mut e = StorageEngine::open(Arc::clone(&fs), ring_full_config()).unwrap();
+            for j in 0..VICTIMS {
+                let k = format!("v{j:04}");
+                e.put_row(
+                    1,
+                    k.as_bytes(),
+                    &OLD_BLOB,
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+            }
+            e.flush_memtable().unwrap();
+            fill_wal_to_last_sector(&mut e, durability);
+            let epoch = wal_epoch(&e, durability);
+            let mut hit = None;
+            for j in 0..VICTIMS {
+                let k = format!("v{j:04}");
+                if delete {
+                    assert!(e.delete_row(1, k.as_bytes(), durability).unwrap());
+                } else {
+                    e.put_row(1, k.as_bytes(), &[4u8; 300], &[], durability)
+                        .unwrap();
+                }
+                if wal_epoch(&e, durability) > epoch {
+                    hit = Some(j);
+                    break;
+                }
+            }
+            let hit = hit.unwrap_or_else(|| {
+                panic!("no write hit a full WAL: delete={delete} {durability:?}")
+            });
+            fs.power_loss();
+            std::mem::forget(e);
+            let mut e = StorageEngine::open(fs, ring_full_config()).unwrap();
+            for j in 0..VICTIMS {
+                let k = format!("v{j:04}");
+                let got = e.get_row(1, k.as_bytes()).unwrap();
+                // Writes before the rotation were flushed durably; the one that rotated is only
+                // durable when it was synchronous; later ones were never made.
+                let changed =
+                    j < hit || (j == hit && durability == WriteDurability::SyncTransactional);
+                let expected = match (changed, delete) {
+                    (false, _) => Some(OLD_BLOB.to_vec()),
+                    (true, true) => None,
+                    (true, false) => Some(vec![4u8; 300]),
+                };
+                assert_eq!(got, expected, "delete={delete} {durability:?} row {j}");
+            }
+        }
+    }
+}
+
+/// A commit parked in the group commit is logged but not yet durable: a compaction install must
+/// neither persist its dead bytes nor reclaim the blob segment they would empty.
+#[test]
+fn compaction_install_ignores_dead_bytes_of_commits_waiting_for_their_group_flush() {
+    let tmp = TempTestDir::new("group_pending_blob_reclaim");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.max_blob_segment_bytes = 2048;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    e.put_row(1, b"r1", &OLD_BLOB, &[], GROUP_SYNC).unwrap();
+    e.put_row(1, b"r2", &OLD_BLOB, &[], GROUP_SYNC).unwrap();
+    e.flush_memtable().unwrap();
+    e.put_row(2, b"filler", b"v", &[], GROUP_SYNC).unwrap();
+    e.flush_memtable().unwrap();
+    let blobs = |fs: &OsFs| {
+        fs.list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.starts_with("blob_"))
+            .count()
+    };
+    assert_eq!(blobs(&fs), 2);
+
+    e.begin_transaction_for_conn(1).unwrap();
+    e.put_row(1, b"r1", b"new-inline", &[], GROUP_SYNC).unwrap();
+    e.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    let CommitStep::AwaitingGroup { lsn, file, gate } = e.begin_commit_for_conn(1).unwrap() else {
+        panic!("a plain synchronous transaction must join the group commit");
+    };
+    let ticket: GroupTicket = (lsn, file, gate);
+    assert!(!e.pending_group.is_empty());
+
+    let job = e.prepare_compaction().unwrap().expect("two idx segments");
+    let out = job.run().unwrap();
+    assert!(e.install_compaction(out).unwrap());
+    assert_eq!(
+        blobs(&fs),
+        2,
+        "the unflushed commit must not reclaim a blob"
+    );
+
+    flush_group(&mut e, &ticket);
+    e.flush_memtable().unwrap();
+    assert_eq!(
+        blobs(&fs),
+        1,
+        "the segment is reclaimed once the commit is durable"
+    );
+    assert_eq!(e.get_row(1, b"r1").unwrap(), Some(b"new-inline".to_vec()));
 }
