@@ -673,6 +673,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // overlay is not in the memtable, so they count as well.
         let persist_blob_state =
             self.tx_depth == 0 && self.memtable.is_empty() && self.pending_group.is_empty();
+        if persist_blob_state {
+            // The catalog records each segment's length. Bytes beyond the durable length (for
+            // example from a rolled-back transaction) would otherwise be cataloged as present and
+            // counted dead, and a power cut would shorten the file below its cataloged length.
+            // Recovery then counts the missing tail as garbage a second time, and a segment with
+            // live data can look fully dead.
+            self.sync_active_blob_writers()?;
+        }
         let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if persist_blob_state {
             self.collect_fully_dead_blob_segments()
         } else {
@@ -885,6 +893,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if deleted_files.is_empty() {
             return Ok(());
         }
+        // The catalog records segment lengths: make them durable first (see `install_compaction`).
+        self.sync_active_blob_writers()?;
 
         for seq in dead_std {
             self.blob_cache
