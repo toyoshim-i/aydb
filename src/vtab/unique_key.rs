@@ -13,21 +13,23 @@ use super::row_codec::{ColCollation, KEY_TAG_INTEGER, KEY_TAG_NULL};
 use crate::index::BloomFilter;
 
 /// Longest canonical key stored verbatim in the index. Longer keys use the digest form.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const UNIQUE_KEY_INLINE_MAX: usize = 256;
 
 /// First byte of the digest form. Every canonical key starts with a key tag (`0x05..=0x30`), so
 /// the two forms can never be confused.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const UNIQUE_KEY_DIGEST_TAG: u8 = 0xFE;
 
 /// Number of leading key bytes kept in the digest form.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const UNIQUE_KEY_DIGEST_PREFIX: usize = 64;
 
 /// Size of the digest form: tag, length (`u32` BE), key prefix, 64-bit hash.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const UNIQUE_KEY_DIGEST_LEN: usize = 1 + 4 + UNIQUE_KEY_DIGEST_PREFIX + 8;
+
+/// Index id of the UNIQUE index of column `col_idx`: the high bit keeps it apart from the
+/// positional ids of declared `indexes=`, which count up from 1.
+pub(super) fn unique_index_id(col_idx: usize) -> u16 {
+    0x8000 | col_idx as u16
+}
 
 /// Maps a column key to the byte string whose equality is SQLite's equality for that column.
 ///
@@ -35,7 +37,6 @@ pub(super) const UNIQUE_KEY_DIGEST_LEN: usize = 1 + 4 + UNIQUE_KEY_DIGEST_PREFIX
 /// is 9 bytes (`[0x10, i64]`) while an exact-integer `REAL` is 17 bytes with an all-zero
 /// remainder (`[0x10, i64, 0 * 8]`), yet SQLite treats `1` and `1.0` as equal. The canonical form
 /// maps the 17-byte shape to the 9-byte one; every other key is returned unchanged.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn canon_unique_key(key: &[u8]) -> Vec<u8> {
     if key.len() == 17 && key[0] == KEY_TAG_INTEGER && key[9..17] == [0u8; 8] {
         key[0..9].to_vec()
@@ -47,7 +48,6 @@ pub(super) fn canon_unique_key(key: &[u8]) -> Vec<u8> {
 /// Returns the component stored in the index for a canonical key: the key itself when it is at
 /// most `UNIQUE_KEY_INLINE_MAX` bytes, otherwise
 /// `[0xFE][len u32 BE][first 64 bytes][64-bit hash of the whole key]`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn unique_index_component(canon_key: &[u8]) -> Vec<u8> {
     if canon_key.len() <= UNIQUE_KEY_INLINE_MAX {
         return canon_key.to_vec();
@@ -69,7 +69,6 @@ pub(super) fn is_digest_component(component: &[u8]) -> bool {
 /// Computes the canonical key of column `col_idx` in the finished row bytes, or `None` for NULL
 /// (a NULL never conflicts and has no index entry). INSERT, UPDATE and backfill all derive their
 /// entries from the row bytes through this function.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn unique_key_of_row(
     row: &[u8],
     col_idx: usize,

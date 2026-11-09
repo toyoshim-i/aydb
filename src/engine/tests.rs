@@ -6603,3 +6603,27 @@ fn backfill_survives_flush_and_reopen_with_a_spilled_meta() {
         .unwrap();
     assert_eq!(live_keys(&reopened, 1, NS_SECONDARY_INDEX).len(), 1);
 }
+
+// Test-only readers used by the virtual table tests, which cannot reach the engine's private scans.
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Live keys of namespace `ns` of `table_id`, in key order, as the owner sees them.
+    pub(crate) fn test_live_keys(&self, table_id: u16, ns: u8) -> io::Result<Vec<Vec<u8>>> {
+        Ok(self
+            .scan_merged_prefix(&encode_namespace_prefix(table_id, ns))?
+            .into_iter()
+            .filter(|e| !matches!(e.value, IndexValue::Tombstone))
+            .map(|e| e.key)
+            .collect())
+    }
+
+    /// The `'t'` record of a row, if it has a readable one.
+    pub(crate) fn test_row_meta(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+    ) -> io::Result<Option<RowMetaRecord>> {
+        Ok(self
+            .get_row_meta_with_ptr(&encode_row_meta_key(table_id, pk))?
+            .map(|(m, _)| m))
+    }
+}

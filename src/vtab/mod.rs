@@ -23,6 +23,8 @@ mod snapshot;
 mod snapshot_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unique_index_tests;
 mod unique_key;
 
 use core::ffi::{c_char, c_int, c_void};
@@ -1981,7 +1983,7 @@ unsafe extern "system" fn vtab_update(
             None
         };
 
-        let (new_pk, row_bytes, sec_keys) = encode_sqlite_values_direct(
+        let (new_pk, row_bytes, mut sec_keys) = encode_sqlite_values_direct(
             argv.offset(2),
             num_cols,
             vtab.pk_col_idx,
@@ -1990,6 +1992,9 @@ unsafe extern "system" fn vtab_update(
             &vtab.col_collations,
             &vtab.secondary_indexes,
         );
+        if let Err(e) = constraints::push_unique_entries(vtab, &row_bytes, &mut sec_keys) {
+            return io_err_to_sqlite_rc(&e);
+        }
 
         let coerced_int_pk = if vtab.pk_affinity == ColumnAffinity::Integer {
             decode_i64_tagged_key(&new_pk)
