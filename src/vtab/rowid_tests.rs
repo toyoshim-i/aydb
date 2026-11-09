@@ -547,3 +547,127 @@ fn marker_visible_only_in_the_open_tx_does_not_latch_a_vtab_that_scanned_it() {
     assert_two_distinct_rowids(&conn);
     assert!(fixture.migrated());
 }
+
+/// Counts every device sync (`sync_barrier` and `sync_durable`) issued through the filesystem.
+mod sync_counting {
+    use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct CountFile<F> {
+        inner: Arc<F>,
+        syncs: Arc<AtomicU64>,
+    }
+    impl<F: PlatformFile> PlatformFile for CountFile<F> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+    pub struct CountFs<S: PlatformFs> {
+        pub inner: S,
+        pub syncs: Arc<AtomicU64>,
+    }
+    impl<S: PlatformFs> PlatformFs for CountFs<S> {
+        type File = CountFile<S::File>;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(CountFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                syncs: Arc::clone(&self.syncs),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+}
+
+fn put_legacy_text_rows<FS: crate::pal::PlatformFs>(
+    engine: &mut StorageEngine<FS>,
+    count: usize,
+    durability: WriteDurability,
+) {
+    for i in 0..count {
+        let key = SqlValue::Text(format!("key{i:05}"));
+        let pk = key.to_key_bytes();
+        let row = encode_row(&[key, SqlValue::Text("v".into())]);
+        engine.put_row(1, &pk, &row, &[], durability).unwrap();
+    }
+}
+
+/// Number of device syncs one `ensure_persistent_rowids` run issues on a legacy table of `rows`
+/// rows.
+fn migration_syncs(name: &str, rows: usize, durability: WriteDurability) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = TempTestDir::new(name);
+    let syncs = Arc::new(AtomicU64::new(0));
+    let fs = Arc::new(sync_counting::CountFs {
+        inner: OsFs::open(&dir.path, true).unwrap(),
+        syncs: Arc::clone(&syncs),
+    });
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    put_legacy_text_rows(&mut engine, rows, WriteDurability::BufferedFast);
+    engine.checkpoint().unwrap();
+    let before = syncs.load(Ordering::SeqCst);
+    rowid_map::ensure_persistent_rowids(&mut engine, 1, durability, false).unwrap();
+    let used = syncs.load(Ordering::SeqCst) - before;
+    assert!(engine.rowids_initialized(1).unwrap());
+    used
+}
+
+#[test]
+fn synchronous_migration_syncs_once_regardless_of_row_count() {
+    let sync = WriteDurability::SyncTransactional;
+    let one = migration_syncs("migration_syncs_one", 1, sync);
+    let many = migration_syncs("migration_syncs_many", 300, sync);
+    assert!(one > 0, "a synchronous migration must reach the device");
+    assert_eq!(
+        many, one,
+        "device syncs must not grow with the number of migrated rows"
+    );
+    // Buffered tables never wait for the device.
+    assert_eq!(
+        migration_syncs(
+            "migration_syncs_buffered",
+            300,
+            WriteDurability::BufferedFast
+        ),
+        0
+    );
+}

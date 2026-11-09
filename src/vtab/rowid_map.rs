@@ -4,7 +4,7 @@
 use std::io;
 
 use crate::engine::{StorageEngine, WriteDurability};
-use crate::pal::OsFs;
+use crate::pal::PlatformFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::AydbVTab;
 use crate::vtab::row_codec::{
@@ -13,8 +13,16 @@ use crate::vtab::row_codec::{
 
 /// Migrates older rows in bounded batches. Each mapping pair is one atomic WAL batch, and the
 /// completion marker is written last so a failed connection can resume without changing IDs.
-pub(super) fn ensure_persistent_rowids(
-    engine: &mut StorageEngine<OsFs>,
+///
+/// The mapping pairs are written with buffered durability whatever the table requests: a power
+/// cut that loses some of them only leaves the marker absent, and the next run assigns the rest
+/// without changing the identities already kept (`assign_rowid` is idempotent). Only the marker
+/// uses the table's `durability`. A synchronous marker commit first makes every earlier buffered
+/// batch durable (the prefix rule of `append_raw_wal_batch_with_rotation`), so a durable marker
+/// never outlives its mappings, and the migration costs one sync instead of one per row. Inside
+/// a user transaction the writes join it and `durability` only marks it for a sync at commit.
+pub(crate) fn ensure_persistent_rowids<FS: PlatformFs>(
+    engine: &mut StorageEngine<FS>,
     table_id: u16,
     durability: WriteDurability,
     integer_primary_keys: bool,
@@ -37,7 +45,13 @@ pub(super) fn ensure_persistent_rowids(
                 continue;
             }
             if !integer_primary_keys || decode_i64_tagged_key(&pk).is_none() {
-                assign_synthetic_rowid(engine, table_id, &pk, durability, integer_primary_keys)?;
+                assign_synthetic_rowid(
+                    engine,
+                    table_id,
+                    &pk,
+                    WriteDurability::BufferedFast,
+                    integer_primary_keys,
+                )?;
             }
             lower = Some(pk);
             progress = true;
@@ -48,8 +62,8 @@ pub(super) fn ensure_persistent_rowids(
     }
 }
 
-pub(super) fn assign_synthetic_rowid(
-    engine: &mut StorageEngine<OsFs>,
+pub(super) fn assign_synthetic_rowid<FS: PlatformFs>(
+    engine: &mut StorageEngine<FS>,
     table_id: u16,
     pk: &[u8],
     durability: WriteDurability,

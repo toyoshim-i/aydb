@@ -2327,3 +2327,78 @@ fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
     assert!(e.unlink_after_wal_rotation.is_empty());
     assert_eq!(lru_files(&fs), e.lru_blobs.len());
 }
+
+/// The rowid migration of a legacy table writes its mappings buffered and only the completion
+/// marker with the table's durability. A power cut at every operation of a synchronous migration
+/// must leave either a marker with all of its mappings or an unfinished migration that resumes;
+/// mappings that survived keep their rowids, and an acknowledged migration is never lost.
+#[test]
+fn power_cut_during_rowid_migration_resumes_with_stable_rowids() {
+    use crate::vtab::rowid_map::ensure_persistent_rowids;
+    use crate::vtab::{SqlValue, encode_row};
+
+    const ROWS: usize = 12;
+    let sync = WriteDurability::SyncTransactional;
+    let pks: Vec<Vec<u8>> = (0..ROWS)
+        .map(|i| SqlValue::Text(format!("key{i:03}")).to_key_bytes())
+        .collect();
+    let cfg = repro_config();
+
+    // Returns the number of operations the migration issued when it ran to completion.
+    let scenario = |seed: u64, cut: Option<u64>, keep: u64, lose: u64| -> u64 {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, seed));
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for (i, pk) in pks.iter().enumerate() {
+            let row = encode_row(&[SqlValue::Text(format!("key{i:03}")), SqlValue::Integer(0)]);
+            e.put_row(1, pk, &row, &[], sync).unwrap();
+        }
+        let start = fs.op_stats().0;
+        fs.arm(cut.map(|c| start + c), None);
+        let acknowledged = ensure_persistent_rowids(&mut e, 1, sync, false).is_ok();
+        let span = fs.op_stats().0 - start;
+        fs.cut_now();
+        drop(e);
+        fs.crash(Crash::Power { keep, lose });
+
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let initialized = e.rowids_initialized(1).unwrap();
+        assert!(
+            initialized || !acknowledged,
+            "acknowledged migration lost (seed {seed}, cut {cut:?})"
+        );
+        let mut kept = Vec::new();
+        for pk in &pks {
+            let rowid = e.rowid_for_pk_view(ReadView::Owner, 1, pk).unwrap();
+            assert!(
+                rowid.is_some() || !initialized,
+                "marker without a mapping (seed {seed}, cut {cut:?})"
+            );
+            kept.push(rowid);
+        }
+        // The migration resumes; surviving identities do not change.
+        ensure_persistent_rowids(&mut e, 1, sync, false).unwrap();
+        assert!(e.rowids_initialized(1).unwrap());
+        let mut seen = std::collections::BTreeSet::new();
+        for (pk, before) in pks.iter().zip(&kept) {
+            let rowid = e
+                .rowid_for_pk_view(ReadView::Owner, 1, pk)
+                .unwrap()
+                .expect("every row has a rowid after the resumed migration");
+            assert!(before.is_none_or(|b| b == rowid), "rowid changed");
+            assert_eq!(
+                e.pk_for_rowid_view(ReadView::Owner, 1, rowid).unwrap(),
+                Some(pk.clone())
+            );
+            assert!(seen.insert(rowid), "duplicate rowid");
+        }
+        span
+    };
+
+    for (seed, keep, lose) in [(1, 0, 100), (2, 50, 50), (4, 20, 40)] {
+        let span = scenario(seed, None, keep, lose);
+        assert!(span > 0);
+        for cut in 0..=span {
+            scenario(seed, Some(cut), keep, lose);
+        }
+    }
+}
