@@ -6,7 +6,9 @@
 //! only 23 bytes inside the `MemTable`.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map;
 use std::io;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::index::{IdxSegmentBuilder, IdxSegmentReader, IndexEntry, IndexValue};
@@ -18,11 +20,82 @@ pub const DEFAULT_MEMTABLE_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
 
 const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
 
+/// A chunk that grows past this many entries is split in two. Chunks only grow (deletes are
+/// tombstones), so every chunk holds between `MAX_CHUNK_ENTRIES / 2` and `MAX_CHUNK_ENTRIES`
+/// entries, except possibly the first one.
+const MAX_CHUNK_ENTRIES: usize = 512;
+
+type EntryMap = BTreeMap<Vec<u8>, MemEntry>;
+
+/// One copy-on-write piece of the key space: all keys `k` with `min <= k < next.min`.
+#[derive(Debug, Clone)]
+struct Chunk {
+    /// Routing lower bound. Fixed at creation; the first chunk uses the empty key so that
+    /// every key has exactly one chunk.
+    min: Arc<[u8]>,
+    map: Arc<EntryMap>,
+}
+
+fn empty_chunks() -> Arc<Vec<Chunk>> {
+    Arc::new(vec![Chunk {
+        min: Arc::from(&[][..]),
+        map: Arc::new(BTreeMap::new()),
+    }])
+}
+
+/// Index of the chunk responsible for `key`.
+#[inline]
+fn chunk_index(chunks: &[Chunk], key: &[u8]) -> usize {
+    // `chunks[0].min` is empty and therefore `<= key`, so the partition point is at least 1.
+    chunks.partition_point(|c| *c.min <= *key) - 1
+}
+
+/// Splits `chunks[i]` (which the caller has just made unique) until no piece exceeds
+/// `MAX_CHUNK_ENTRIES`. Only positions after `i` change.
+fn split_if_large(chunks: &mut Vec<Chunk>, i: usize) {
+    let len = chunks[i].map.len();
+    if len <= MAX_CHUNK_ENTRIES {
+        return;
+    }
+    let Some(mid) = chunks[i].map.keys().nth(len / 2).cloned() else {
+        return;
+    };
+    let right = Arc::make_mut(&mut chunks[i].map).split_off(mid.as_slice());
+    chunks.insert(
+        i + 1,
+        Chunk {
+            min: Arc::from(mid),
+            map: Arc::new(right),
+        },
+    );
+    split_if_large(chunks, i + 1);
+    split_if_large(chunks, i);
+}
+
 /// Value and mutation sequence number stored for a key inside [`MemTable`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), derive(Clone))]
 pub struct MemEntry {
     pub lsn: u64,
     pub value: IndexValue,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of `MemEntry` deep copies made on this thread; lets tests prove that a write
+    /// after a snapshot does not copy the whole table.
+    static MEM_ENTRY_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Clone for MemEntry {
+    fn clone(&self) -> Self {
+        MEM_ENTRY_CLONES.with(|c| c.set(c.get() + 1));
+        Self {
+            lsn: self.lsn,
+            value: self.value.clone(),
+        }
+    }
 }
 
 impl MemEntry {
@@ -33,10 +106,18 @@ impl MemEntry {
 }
 
 /// Ordered in-memory mutation table with strict byte-size tracking.
-/// Clones share immutable entries until the next mutation, allowing bounded read snapshots.
+///
+/// Entries live in a sorted directory of chunks of at most [`MAX_CHUNK_ENTRIES`] entries. A
+/// clone (read snapshot) shares the directory and, through it, every chunk. The first write
+/// after a clone copies the directory (one pair of reference-count increments per chunk) and
+/// then only the single chunk it touches, so a write never copies more than
+/// `O(table / MAX_CHUNK_ENTRIES + MAX_CHUNK_ENTRIES)` and a snapshot retains at most one stale
+/// chunk per chunk written since it was taken.
 #[derive(Debug, Clone)]
 pub struct MemTable {
-    map: Arc<BTreeMap<Vec<u8>, MemEntry>>,
+    chunks: Arc<Vec<Chunk>>,
+    /// Number of distinct keys. Entries are never removed (deletes are tombstones).
+    len: usize,
     approximate_bytes: usize,
     max_capacity_bytes: usize,
     highest_lsn: u64,
@@ -48,7 +129,8 @@ pub struct MemTable {
 impl MemTable {
     pub fn new(max_capacity_bytes: usize) -> Self {
         Self {
-            map: Arc::new(BTreeMap::new()),
+            chunks: empty_chunks(),
+            len: 0,
             approximate_bytes: 0,
             max_capacity_bytes,
             highest_lsn: 0,
@@ -57,11 +139,11 @@ impl MemTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len == 0
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.len
     }
 
     pub fn approximate_bytes(&self) -> usize {
@@ -90,27 +172,42 @@ impl MemTable {
             return;
         }
         self.generation += 1;
-        // Bulk path: when the overlay is not tiny relative to the table, rebuild with
-        // `BTreeMap::append` (O(n + m), overlay wins on equal keys) instead of n separate
-        // O(log m) inserts.
-        if entries.len().saturating_mul(8) >= self.map.len() {
-            for (k, e) in &entries {
-                if let Some(old) = self.map.get(k) {
+        // Bulk path: when the overlay is not tiny relative to the table, hand each chunk its
+        // slice of the overlay and merge with `BTreeMap::append` (overlay wins on equal keys)
+        // instead of m separate O(log n) inserts. Only the touched chunks are made unique.
+        if entries.len().saturating_mul(8) >= self.len {
+            let chunks = Arc::make_mut(&mut self.chunks);
+            // Walk the chunks from the back so that splits never shift a pending index.
+            for i in (0..chunks.len()).rev() {
+                if entries.is_empty() {
+                    break;
+                }
+                let mut part = if i == 0 {
+                    std::mem::take(&mut entries)
+                } else {
+                    entries.split_off(&*chunks[i].min)
+                };
+                if part.is_empty() {
+                    continue;
+                }
+                let mut replaced = 0usize;
+                for (k, e) in &part {
+                    if let Some(old) = chunks[i].map.get(k) {
+                        replaced += 1;
+                        self.approximate_bytes = self
+                            .approximate_bytes
+                            .saturating_sub(old.approx_heap_bytes(k.len()));
+                    }
                     self.approximate_bytes = self
                         .approximate_bytes
-                        .saturating_sub(old.approx_heap_bytes(k.len()));
+                        .saturating_add(e.approx_heap_bytes(k.len()));
+                    if e.lsn > self.highest_lsn {
+                        self.highest_lsn = e.lsn;
+                    }
                 }
-                self.approximate_bytes = self
-                    .approximate_bytes
-                    .saturating_add(e.approx_heap_bytes(k.len()));
-                if e.lsn > self.highest_lsn {
-                    self.highest_lsn = e.lsn;
-                }
-            }
-            if self.map.is_empty() {
-                self.map = Arc::new(entries);
-            } else {
-                Arc::make_mut(&mut self.map).append(&mut entries);
+                self.len += part.len() - replaced;
+                Arc::make_mut(&mut chunks[i].map).append(&mut part);
+                split_if_large(chunks, i);
             }
             return;
         }
@@ -175,7 +272,7 @@ impl MemTable {
 
     /// Point lookup in the `MemTable`.
     pub fn get(&self, key: &[u8]) -> Option<&MemEntry> {
-        self.map.get(key)
+        self.chunks[chunk_index(&self.chunks, key)].map.get(key)
     }
 
     /// Scans all entries in the `MemTable` whose key starts with `prefix`.
@@ -201,7 +298,6 @@ impl MemTable {
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
     ) -> Vec<IndexEntry> {
-        use std::ops::Bound;
         let mut out = Vec::new();
         if limit == 0 {
             return out;
@@ -217,7 +313,7 @@ impl MemTable {
             Some((ub, false)) => Bound::Excluded(ub),
             None => Bound::Unbounded,
         };
-        for (k, entry) in self.map.range::<[u8], _>((Bound::Included(start), upper)) {
+        for (k, entry) in self.iter_range(Bound::Included(start), upper) {
             if !k.starts_with(prefix) {
                 break;
             }
@@ -237,10 +333,31 @@ impl MemTable {
     #[inline]
     pub fn iter_range<'a>(
         &'a self,
-        lower: std::ops::Bound<&'a [u8]>,
-        upper: std::ops::Bound<&'a [u8]>,
-    ) -> std::collections::btree_map::Range<'a, Vec<u8>, MemEntry> {
-        self.map.range::<[u8], _>((lower, upper))
+        lower: Bound<&'a [u8]>,
+        upper: Bound<&'a [u8]>,
+    ) -> MemTableRange<'a> {
+        let first = match lower {
+            Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
+            Bound::Unbounded => 0,
+        };
+        let last = match upper {
+            Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
+            Bound::Unbounded => self.chunks.len() - 1,
+        };
+        let chunks = if first <= last {
+            &self.chunks[first..=last]
+        } else {
+            &[]
+        };
+        MemTableRange {
+            chunks,
+            lower,
+            upper,
+            front: None,
+            back: None,
+            next_front: 0,
+            next_back: chunks.len(),
+        }
     }
 
     /// Writes the sorted contents of this `MemTable` to a new immutable `idx_<seq_id>.db`
@@ -252,7 +369,7 @@ impl MemTable {
         bloom_bits_per_key: usize,
     ) -> io::Result<IdxSegmentReader<F>> {
         let mut builder = IdxSegmentBuilder::create(fs, seq_id, 0, bloom_bits_per_key)?;
-        for (k, entry) in self.map.iter() {
+        for (k, entry) in self.chunks.iter().flat_map(|c| c.map.iter()) {
             match &entry.value {
                 IndexValue::Inline(val) => {
                     builder.add_raw_entry(k, entry.lsn, 1, val)?;
@@ -277,11 +394,8 @@ impl MemTable {
 
     /// Clears all entries from the `MemTable` after its segment has been durably committed to `boot_meta.db`.
     pub fn clear(&mut self) {
-        if let Some(map) = Arc::get_mut(&mut self.map) {
-            map.clear();
-        } else {
-            self.map = Arc::new(BTreeMap::new());
-        }
+        self.chunks = empty_chunks();
+        self.len = 0;
         self.approximate_bytes = 0;
     }
 
@@ -307,7 +421,13 @@ impl MemTable {
         let new_entry = MemEntry { lsn, value };
         let new_cost = new_entry.approx_heap_bytes(klen);
 
-        let prev = Arc::make_mut(&mut self.map).insert(key, new_entry);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let i = chunk_index(chunks, &key);
+        let prev = Arc::make_mut(&mut chunks[i].map).insert(key, new_entry);
+        if prev.is_none() {
+            self.len += 1;
+            split_if_large(chunks, i);
+        }
         if let Some(ref old_entry) = prev {
             let old_cost = old_entry.approx_heap_bytes(klen);
             self.approximate_bytes = self
@@ -318,6 +438,70 @@ impl MemTable {
             self.approximate_bytes = self.approximate_bytes.saturating_add(new_cost);
         }
         prev
+    }
+}
+
+/// Double-ended iterator over a key range of a [`MemTable`], in key order.
+pub struct MemTableRange<'a> {
+    /// Chunks that may hold keys of the range, in key order.
+    chunks: &'a [Chunk],
+    lower: Bound<&'a [u8]>,
+    upper: Bound<&'a [u8]>,
+    front: Option<btree_map::Range<'a, Vec<u8>, MemEntry>>,
+    back: Option<btree_map::Range<'a, Vec<u8>, MemEntry>>,
+    /// Chunks `[next_front, next_back)` have not been opened yet.
+    next_front: usize,
+    next_back: usize,
+}
+
+impl<'a> MemTableRange<'a> {
+    #[inline]
+    fn open(&self, chunk: usize) -> btree_map::Range<'a, Vec<u8>, MemEntry> {
+        self.chunks[chunk]
+            .map
+            .range::<[u8], _>((self.lower, self.upper))
+    }
+}
+
+impl<'a> Iterator for MemTableRange<'a> {
+    type Item = (&'a Vec<u8>, &'a MemEntry);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(range) = self.front.as_mut() {
+                if let Some(item) = range.next() {
+                    return Some(item);
+                }
+                self.front = None;
+            }
+            if self.next_front < self.next_back {
+                self.front = Some(self.open(self.next_front));
+                self.next_front += 1;
+            } else {
+                return self.back.as_mut()?.next();
+            }
+        }
+    }
+}
+
+impl DoubleEndedIterator for MemTableRange<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(range) = self.back.as_mut() {
+                if let Some(item) = range.next_back() {
+                    return Some(item);
+                }
+                self.back = None;
+            }
+            if self.next_front < self.next_back {
+                self.next_back -= 1;
+                self.back = Some(self.open(self.next_back));
+            } else {
+                return self.front.as_mut()?.next_back();
+            }
+        }
     }
 }
 
@@ -333,7 +517,7 @@ mod tests {
         original.put_inline(b"a".to_vec(), b"original".to_vec(), 1);
         original.put_inline(b"b".to_vec(), b"retained".to_vec(), 2);
         let snapshot = original.clone();
-        assert!(Arc::ptr_eq(&original.map, &snapshot.map));
+        assert!(Arc::ptr_eq(&original.chunks, &snapshot.chunks));
         let snapshot_bytes = snapshot.approximate_bytes();
 
         original.put_inline(b"a".to_vec(), b"changed".to_vec(), 3);
@@ -383,6 +567,297 @@ mod tests {
         );
         assert_eq!(before_clear.len(), 3);
         assert_eq!(before_clear.highest_lsn(), 6);
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Plain-`BTreeMap` model of a `MemTable`.
+    #[derive(Clone, Default)]
+    struct Model {
+        map: BTreeMap<Vec<u8>, MemEntry>,
+        bytes: usize,
+        highest_lsn: u64,
+        generation: u64,
+    }
+
+    impl Model {
+        fn put(&mut self, key: Vec<u8>, entry: MemEntry) -> Option<MemEntry> {
+            self.generation += 1;
+            self.highest_lsn = self.highest_lsn.max(entry.lsn);
+            let new_cost = entry.approx_heap_bytes(key.len());
+            let prev = self.map.insert(key.clone(), entry);
+            if let Some(old) = &prev {
+                self.bytes -= old.approx_heap_bytes(key.len());
+            }
+            self.bytes += new_cost;
+            prev
+        }
+    }
+
+    fn model_key(rng: &mut TestRng) -> Vec<u8> {
+        match rng.below(40) {
+            0 => Vec::new(),
+            1 => vec![0xFF, 0xFF],
+            2..=5 => format!("k{:03}", rng.below(300)).into_bytes(),
+            _ => format!("k{:05}", rng.below(5000)).into_bytes(),
+        }
+    }
+
+    fn model_entry(rng: &mut TestRng, lsn: u64) -> MemEntry {
+        let value = match rng.below(4) {
+            0 => IndexValue::Tombstone,
+            1 => IndexValue::Blob(BlobPtr {
+                kind: crate::wal::BlobKind::Standard,
+                table_id: 0,
+                seg_id: rng.below(100),
+                offset: 0,
+                len: 5000,
+                crc32c: 0,
+            }),
+            _ => IndexValue::Inline(vec![b'v'; rng.below(40) as usize]),
+        };
+        MemEntry { lsn, value }
+    }
+
+    fn assert_matches_model(mt: &MemTable, model: &Model, rng: &mut TestRng) {
+        assert_eq!(mt.len(), model.map.len());
+        assert_eq!(mt.is_empty(), model.map.is_empty());
+        assert_eq!(mt.approximate_bytes(), model.bytes);
+        assert_eq!(mt.highest_lsn(), model.highest_lsn);
+        assert_eq!(mt.generation(), model.generation);
+
+        let all = Bound::<&[u8]>::Unbounded;
+        let forward: Vec<_> = mt.iter_range(all, all).collect();
+        assert!(forward.iter().map(|(k, e)| (*k, *e)).eq(model.map.iter()));
+        let backward: Vec<_> = mt.iter_range(all, all).rev().collect();
+        assert!(
+            backward
+                .iter()
+                .map(|(k, e)| (*k, *e))
+                .eq(model.map.iter().rev())
+        );
+
+        // Point reads, hits and misses.
+        for _ in 0..40 {
+            let key = model_key(rng);
+            assert_eq!(mt.get(&key), model.map.get(&key));
+        }
+        for (k, e) in model.map.iter().step_by(97) {
+            assert_eq!(mt.get(k), Some(e));
+        }
+
+        // Bounded ranges, consumed from both ends in a random order.
+        for _ in 0..30 {
+            let (a, b) = (model_key(rng), model_key(rng));
+            let (lo_key, hi_key) = if a <= b { (a, b) } else { (b, a) };
+            let lo = match rng.below(3) {
+                0 => Bound::Unbounded,
+                1 => Bound::Included(lo_key.as_slice()),
+                _ => Bound::Excluded(lo_key.as_slice()),
+            };
+            let hi = match rng.below(3) {
+                0 => Bound::Unbounded,
+                1 => Bound::Included(hi_key.as_slice()),
+                _ if lo_key == hi_key && matches!(lo, Bound::Excluded(_)) => Bound::Unbounded,
+                _ => Bound::Excluded(hi_key.as_slice()),
+            };
+            if lo_key == hi_key && matches!((lo, hi), (Bound::Excluded(_), Bound::Excluded(_))) {
+                continue;
+            }
+            let mut got = mt.iter_range(lo, hi);
+            let mut want = model.map.range::<[u8], _>((lo, hi));
+            loop {
+                let (g, w) = if rng.below(2) == 0 {
+                    (got.next(), want.next())
+                } else {
+                    (got.next_back(), want.next_back())
+                };
+                assert_eq!(g, w);
+                if w.is_none() {
+                    break;
+                }
+            }
+        }
+
+        // Prefix scans go through the same range machinery.
+        let prefix = b"k00";
+        let want: Vec<_> = model
+            .map
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, e)| (k.clone(), e.lsn))
+            .collect();
+        let got: Vec<_> = mt
+            .scan_prefix(prefix)
+            .into_iter()
+            .map(|e| (e.key, e.lsn))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn matches_btreemap_model_across_random_operations() {
+        for seed in 1..=4u64 {
+            let mut rng = TestRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut mt = MemTable::new(usize::MAX);
+            let mut model = Model::default();
+            let mut snapshots: Vec<(MemTable, Model)> = Vec::new();
+            let mut lsn = 0u64;
+            for step in 0..6000 {
+                match rng.below(100) {
+                    0..=59 => {
+                        lsn += 1;
+                        let key = model_key(&mut rng);
+                        let entry = model_entry(&mut rng, lsn);
+                        let prev_model = model.put(key.clone(), entry.clone());
+                        let prev = match entry.value {
+                            IndexValue::Inline(v) => mt.put_inline(key, v, lsn),
+                            IndexValue::Blob(p) => mt.put_blob_ptr(key, p, lsn),
+                            IndexValue::Tombstone => mt.delete(key, lsn),
+                        };
+                        assert_eq!(prev, prev_model);
+                    }
+                    60..=79 => {
+                        // Alternate between tiny overlays (per-key path) and large ones
+                        // (bulk path, possibly spanning and splitting many chunks).
+                        let count = if rng.below(4) == 0 {
+                            rng.below(1500)
+                        } else {
+                            rng.below(4)
+                        };
+                        let mut overlay = BTreeMap::new();
+                        for _ in 0..count {
+                            lsn += 1;
+                            overlay.insert(model_key(&mut rng), model_entry(&mut rng, lsn));
+                        }
+                        let generation_before = mt.generation();
+                        let published = !overlay.is_empty();
+                        for (k, e) in &overlay {
+                            model.put(k.clone(), e.clone());
+                        }
+                        mt.absorb(overlay);
+                        // Every non-empty publication bumps the generation (the per-key path
+                        // may bump it more than once); an empty one must not.
+                        assert_eq!(mt.generation() > generation_before, published);
+                        model.generation = mt.generation();
+                    }
+                    80..=87 => {
+                        if snapshots.len() < 8 {
+                            snapshots.push((mt.clone(), model.clone()));
+                        } else {
+                            snapshots.remove(rng.below(8) as usize);
+                        }
+                    }
+                    88..=89 => {
+                        // Clearing keeps the generation, like a flush that moved the content.
+                        mt.clear();
+                        model.map.clear();
+                        model.bytes = 0;
+                    }
+                    _ => {}
+                }
+                if step % 500 == 499 {
+                    assert_matches_model(&mt, &model, &mut rng);
+                    for (snap, snap_model) in &snapshots {
+                        assert_matches_model(snap, snap_model, &mut rng);
+                    }
+                }
+            }
+            assert_matches_model(&mt, &model, &mut rng);
+            for (snap, snap_model) in &snapshots {
+                assert_matches_model(snap, snap_model, &mut rng);
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_stay_bounded_and_ordered_for_sequential_and_bulk_loads() {
+        let key = |i: usize| format!("key{i:08}").into_bytes();
+        let entry = |i: usize| MemEntry {
+            lsn: i as u64 + 1,
+            value: IndexValue::Inline(vec![1; 8]),
+        };
+        let mut incremental = MemTable::new(usize::MAX);
+        let mut bulk = MemTable::new(usize::MAX);
+        let total = 10_000;
+        for i in 0..total {
+            incremental.put_inline(key(i), vec![1; 8], i as u64 + 1);
+        }
+        bulk.absorb((0..total).map(|i| (key(i), entry(i))).collect());
+        for mt in [&incremental, &bulk] {
+            assert_eq!(mt.len(), total);
+            assert!(mt.chunks.len() >= total / MAX_CHUNK_ENTRIES);
+            assert!(mt.chunks.iter().all(|c| c.map.len() <= MAX_CHUNK_ENTRIES));
+            assert!(mt.chunks.windows(2).all(|w| w[0].min < w[1].min));
+            assert!(mt.chunks[0].min.is_empty());
+            for c in mt.chunks.iter() {
+                assert!(c.map.keys().all(|k| k.as_slice() >= &*c.min));
+            }
+            assert_eq!(mt.get(&key(4321)), Some(&entry(4321)));
+        }
+    }
+
+    fn entry_clones() -> usize {
+        MEM_ENTRY_CLONES.with(|c| c.get())
+    }
+
+    #[test]
+    fn write_after_snapshot_does_not_copy_the_whole_table() {
+        let total = 20_000usize;
+        let mut mt = MemTable::new(usize::MAX);
+        for i in 0..total {
+            mt.put_inline(
+                format!("key{i:08}").into_bytes(),
+                vec![7u8; 16],
+                i as u64 + 1,
+            );
+        }
+        let snapshot = mt.clone();
+
+        // Updates, inserts, deletes and a small absorb while the snapshot is alive.
+        let before = entry_clones();
+        mt.put_inline(b"key00010000".to_vec(), b"changed".to_vec(), 50_000);
+        let first_write = entry_clones() - before;
+        mt.put_inline(b"zzz-new".to_vec(), b"new".to_vec(), 50_001);
+        mt.delete(b"key00000007".to_vec(), 50_002);
+        mt.absorb(BTreeMap::from([(
+            b"key00015000".to_vec(),
+            MemEntry {
+                lsn: 50_003,
+                value: IndexValue::Inline(b"abs".to_vec()),
+            },
+        )]));
+        let copied = entry_clones() - before;
+
+        assert!(
+            first_write <= 1024,
+            "first write after a snapshot copied {first_write} of {total} entries"
+        );
+        assert!(
+            copied <= 4 * 1024,
+            "writes after a snapshot copied {copied} of {total} entries"
+        );
+        // The snapshot is untouched.
+        assert_eq!(
+            snapshot.get(b"key00010000").unwrap().value,
+            IndexValue::Inline(vec![7u8; 16])
+        );
+        assert!(snapshot.get(b"zzz-new").is_none());
+        assert_eq!(snapshot.len(), total);
+        assert_eq!(mt.len(), total + 1);
     }
 
     #[test]

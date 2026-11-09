@@ -1214,7 +1214,7 @@ type MemRange<'a> = std::collections::btree_map::Range<'a, Vec<u8>, MemEntry>;
 /// `MemTable` entry is skipped (source precedence, independent of LSN values). `reverse` selects
 /// descending order (both ranges are consumed from the back).
 pub(super) struct MemView<'a> {
-    mem: MemRange<'a>,
+    mem: crate::memtable::MemTableRange<'a>,
     ov: MemRange<'a>,
     mem_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
     ov_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
@@ -1222,7 +1222,11 @@ pub(super) struct MemView<'a> {
 }
 
 impl<'a> MemView<'a> {
-    fn new(mut mem: MemRange<'a>, mut ov: MemRange<'a>, reverse: bool) -> Self {
+    fn new(
+        mut mem: crate::memtable::MemTableRange<'a>,
+        mut ov: MemRange<'a>,
+        reverse: bool,
+    ) -> Self {
         let mem_head = if reverse { mem.next_back() } else { mem.next() };
         let ov_head = if reverse { ov.next_back() } else { ov.next() };
         Self {

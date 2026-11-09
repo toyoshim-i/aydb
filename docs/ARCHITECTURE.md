@@ -85,7 +85,7 @@ To support both fast random updates of small configuration records and zero writ
 ### 3.2 Index Storage: Immutable Offset-Indexed SSTables (`idx_*.db`) and Bounded Caching
 
 * **Writable MemTable (In-Memory, Fixed Size Cap: e.g., 4 MB – 8 MB):**
-  An in-memory B-Tree or SkipList absorbing the latest writes. Once it reaches its memory cap (`memtable_capacity_bytes`), it is flushed to disk as an immutable `idx_<SeqID>.db` segment.
+  An in-memory ordered map absorbing the latest writes, stored as a sorted directory of copy-on-write chunks of at most 512 entries each. A read snapshot shares the directory, so the first write after a snapshot copies only the directory and the one chunk it touches. Once it reaches its memory cap (`memtable_capacity_bytes`), it is flushed to disk as an immutable `idx_<SeqID>.db` segment.
 * **Immutable Index Segments (Sparse Fence Pointers & In-Heap Bloom Filters):**
   On-disk `idx_<SeqID>.db` files are organized into 4 KB blocks. The database process keeps **only the first key of each 4 KB block (Sparse Fence Pointers) and a Bloom Filter in heap memory**. Both are proportional to the indexed data (a few hundred KB to a few MB for typical databases, more for larger ones) and are not covered by the fixed cache budgets below. During lookups, the engine locates the target block offset via binary search over the fence pointers and reads the 4 KB block.
 * **Complementary Caching Architecture: OS Page Cache + Optional Bounded Verified Cache:**
