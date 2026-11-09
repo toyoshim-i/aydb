@@ -11,7 +11,9 @@ mod eviction;
 mod reader;
 mod rowid;
 mod scan;
+mod snapshot;
 mod tx;
+pub(crate) use snapshot::ReadSnapshotToken;
 
 pub(crate) use tx::{CommitStep, GroupRole};
 
@@ -253,6 +255,8 @@ pub(super) struct TrackedLruBlob<F: PlatformFile> {
 
 /// Unified Phase 1 Storage Engine.
 pub struct StorageEngine<FS: PlatformFs> {
+    read_snapshots: BTreeMap<u64, snapshot::ReadSnapshot<FS::File>>,
+    next_read_snapshot_id: u64,
     pub(super) fs: Arc<FS>,
     pub(super) config: EngineConfig,
     pub(super) meta_mgr: BootMetaManager<FS>,
@@ -712,6 +716,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let mut engine = Self {
+            read_snapshots: BTreeMap::new(),
+            next_read_snapshot_id: 1,
             fs,
             config,
             meta_mgr,
@@ -1410,7 +1416,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             IndexValue::Inline(bytes) => Some(bytes),
             IndexValue::Blob(ptr) => {
                 self.ensure_flushed_cx(cx, &ptr)?;
-                match self.read_blob_ref(&ptr, &row_key)? {
+                match self.read_blob_ref_view(cx.view, &ptr, &row_key)? {
                     Some(v) => Some(v),
                     None => {
                         self.note_corrupt_blob(&row_key, &ptr)?;
@@ -1734,7 +1740,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         } else {
             let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments.iter().rev() {
+            for seg in self.idx_segments_for_view(cx.view).iter().rev() {
                 let start = slab.len();
                 let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
                 if let Some(probe) = probe {
@@ -1820,11 +1826,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Blob(ptr) => {
                     if lazy_ok {
                         spans.push((0, 0));
-                        lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
+                        lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, ptr)));
                         hit = true;
                     } else {
                         let start = slab.len();
-                        if self.read_flushed_blob_append_into(ptr, row_key, slab)? {
+                        if self.read_flushed_blob_append_into_view(cx.view, ptr, row_key, slab)? {
                             spans.push((start, slab.len()));
                             lazy_blobs.push(None);
                             hit = true;
@@ -1835,7 +1841,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         } else {
             let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments.iter().rev() {
+            for seg in self.idx_segments_for_view(cx.view).iter().rev() {
                 let start = slab.len();
                 let probe = seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
                 if let Some(probe) = probe {
@@ -1848,9 +1854,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         SegProbe::Blob(ptr) => {
                             if lazy_ok {
                                 spans.push((0, 0));
-                                lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
+                                lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
                                 hit = true;
-                            } else if self.read_flushed_blob_append_into(&ptr, row_key, slab)? {
+                            } else if self.read_flushed_blob_append_into_view(cx.view, &ptr, row_key, slab)? {
                                 spans.push((start, slab.len()));
                                 lazy_blobs.push(None);
                                 hit = true;
@@ -2002,14 +2008,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Captures `ptr` together with a pinned handle to its segment file (see [`LazyBlob`]).
-    pub(super) fn pin_lazy_blob(&self, ptr: &BlobPtr) -> LazyBlob<FS::File> {
-        let reader = match ptr.kind {
-            BlobKind::Standard => self.std_blobs.get(&ptr.seg_id).map(|b| b.reader.clone()),
-            BlobKind::Lru => self
-                .lru_blobs
-                .get(&(ptr.table_id, ptr.seg_id))
-                .map(|b| b.reader.clone()),
-        };
+    pub(super) fn pin_lazy_blob_view(&self, view: ReadView, ptr: &BlobPtr) -> LazyBlob<FS::File> {
+        let reader = self.blob_reader_for_view(view, ptr).cloned();
         LazyBlob { ptr: *ptr, reader }
     }
 
@@ -2438,6 +2438,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         ptr: &BlobPtr,
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
+        self.read_blob_ref_view(ReadView::Owner, ptr, expected_key)
+    }
+
+    fn read_blob_ref_view(
+        &self,
+        view: ReadView,
+        ptr: &BlobPtr,
+        expected_key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
         let cache_key = BlobCacheKey {
             kind: ptr.kind as u8,
@@ -2449,19 +2458,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(Some(out));
         }
 
-        let res = match ptr.kind {
-            BlobKind::Standard => {
-                let Some(b) = self.std_blobs.get(&ptr.seg_id) else {
-                    return Ok(None);
-                };
-                b.reader.read_blob(ptr, Some(expected_key))?
-            }
-            BlobKind::Lru => {
-                let Some(b) = self.lru_blobs.get(&(ptr.table_id, ptr.seg_id)) else {
-                    return Ok(None);
-                };
-                b.reader.read_blob(ptr, Some(expected_key))?
-            }
+        let res = match self.blob_reader_for_view(view, ptr) {
+            Some(reader) => reader.read_blob(ptr, Some(expected_key))?,
+            None => return Ok(None),
         };
 
         if let Some(payload) = &res {
@@ -2480,11 +2479,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
         self.ensure_flushed_cx(cx, ptr)?;
-        self.read_flushed_blob_append_into(ptr, expected_key, out)
+        self.read_flushed_blob_append_into_view(cx.view, ptr, expected_key, out)
     }
 
-    pub(super) fn read_flushed_blob_append_into(
+    pub(super) fn read_flushed_blob_append_into_view(
         &self,
+        view: ReadView,
         ptr: &BlobPtr,
         expected_key: &[u8],
         out: &mut Vec<u8>,
@@ -2501,13 +2501,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(true);
         }
 
-        let reader = match ptr.kind {
-            BlobKind::Standard => self.std_blobs.get(&ptr.seg_id).map(|b| &b.reader),
-            BlobKind::Lru => self
-                .lru_blobs
-                .get(&(ptr.table_id, ptr.seg_id))
-                .map(|b| &b.reader),
-        };
+        let reader = self.blob_reader_for_view(view, ptr);
         let ok = match reader {
             Some(reader) if out.is_empty() => reader.read_blob_into(ptr, Some(expected_key), out)?,
             Some(reader) => reader.append_blob_into(ptr, Some(expected_key), out)?,
@@ -2527,6 +2521,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         records: Vec<WalRecord>,
         durability: WriteDurability,
     ) -> io::Result<u64> {
+        self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;
 
@@ -2674,7 +2669,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             });
         }
         let hash = BloomFilter::hash_pair(key);
-        for seg in self.idx_segments.iter().rev() {
+        for seg in self.idx_segments_for_view(view).iter().rev() {
             let status = seg.visit_hashed(key, hash, |raw| match raw.val_type {
                 1 => Ok(ExistingRowStatus::Inline),
                 2 => Ok(ExistingRowStatus::Blob(RawIdxEntry::decode_blob_ptr(
@@ -2803,7 +2798,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Some(e);
             }
         }
-        self.memtable.get(key)
+        self.memtable_for_view(view).get(key)
     }
 
     /// Overlay map visible to `view` (empty for the committed view or empty overlay).
@@ -2813,7 +2808,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         view: ReadView,
     ) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
         static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
-        if view == ReadView::Committed || self.tx_overlay.is_empty() {
+        if view != ReadView::Owner || self.tx_overlay.is_empty() {
             &EMPTY
         } else {
             &self.tx_overlay.map
@@ -2833,7 +2828,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(Some((mem_entry.lsn, mem_entry.value.clone())));
         }
         let hash = BloomFilter::hash_pair(key);
-        for seg in self.idx_segments.iter().rev() {
+        for seg in self.idx_segments_for_view(view).iter().rev() {
             if let Some((lsn, val)) = seg.get_hashed(key, hash)? {
                 return Ok(Some((lsn, val)));
             }

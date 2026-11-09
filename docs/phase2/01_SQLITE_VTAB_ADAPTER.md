@@ -126,10 +126,20 @@ To eliminate per-row 4 KB WAL sector padding on multi-row `BEGIN ... COMMIT` tra
 
 ---
 
+### 4.4 Read Transaction Snapshots
+
+The first read captures the committed MemTable and the current immutable index and blob readers. Every virtual table registered on the connection shares this view, including secondary lookups and persistent rowid lookups. Later commits, flushes and compactions can proceed while that connection continues reading its original data. Writes in a transaction use the owner's overlay so subsequent statements see their own changes.
+
+The MemTable shares its ordered map through `Arc` and copies it on the first overlapping mutation. Capturing a read does not copy its keys or values. Each distinct retained version can keep one MemTable budget in memory, in addition to segment reader metadata. Old segment files remain readable until the last snapshot or cursor releases them. Long read transactions therefore delay disk reclamation and can retain file descriptors beyond the Unix pool's idle-handle cap.
+
+`SqliteConnection` tracks SQLite statement completion and autocommit transitions through `sqlite3_trace_v2`. An explicit read view ends at COMMIT, ROLLBACK or the release of an outer SAVEPOINT. In autocommit mode the view lasts until all active statements finish. Each cursor retains its own token so a streaming query can finish across chunk refills even after its surrounding transaction ends. Cleanup that encounters a held engine lock is retried by the next read capture or mutation.
+
+A connection can upgrade its read transaction to a writer only while its captured committed version is current and no group commit is pending. A stale upgrade returns `SQLITE_BUSY` and requires restarting the transaction, preventing writes based on outdated reads. SQL snapshot reads coalesce LRU hits in memory. The native owner-read API retains the optional `EagerWriteOnRead` benchmark mode.
+
 ## 5. Concurrency Model
 
 * **Shared engine, per-connection state:** All connections to a database share one `Arc<RwLock<StorageEngine<OsFs>>>`. Cursors and statements belong to a connection.
-* **Reads:** Most reads run under the shared lock through `reader_for_conn`. A read takes the exclusive lock only when it may touch the owner's unflushed blobs or when `EagerWriteOnRead` tracking applies.
+* **Reads:** Capturing a new snapshot briefly takes the exclusive lock. Subsequent reads use `reader_for_snapshot` under the shared lock. Owner reads within a write transaction use `reader_for_conn` and take the exclusive lock when they need to flush the owner's blob buffers.
 * **Writes:** One transaction owns the writer slot at a time. The slot is released as soon as a group-committed batch is written, so transactions overlap only while earlier commits wait for their flush.
 * **Compaction:** The first registration of the module starts one background worker per engine (`src/vtab/compaction_worker.rs`), which merges segments without holding the engine lock. Registrations are reference-counted, and the last one stops the worker.
 * **Lock scope:** Virtual table callbacks take the engine lock for the duration of the callback only, never across a SQLite callback boundary.

@@ -267,6 +267,13 @@ unsafe extern "system" {
         pzTail: *mut *const c_char,
     ) -> c_int;
     pub fn sqlite3_step(pStmt: *mut sqlite3_stmt) -> c_int;
+    pub fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int;
+    pub fn sqlite3_trace_v2(
+        db: *mut sqlite3,
+        mask: core::ffi::c_uint,
+        callback: Option<unsafe extern "system" fn(core::ffi::c_uint, *mut c_void, *mut c_void, *mut c_void) -> c_int>,
+        context: *mut c_void,
+    ) -> c_int;
     pub fn sqlite3_reset(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_clear_bindings(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_finalize(pStmt: *mut sqlite3_stmt) -> c_int;

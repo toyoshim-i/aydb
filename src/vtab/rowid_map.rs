@@ -301,7 +301,11 @@ pub fn hash_pk_to_rowid(encoded_pk: &[u8]) -> i64 {
 /// For non-integer PKs (`TEXT`/`BLOB`/`REAL`/etc.), computes the collision-free synthetic `rowid`
 /// and registers `(rid, pk)` in `rowid_to_pk`.
 #[inline]
-pub(super) fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> io::Result<i64> {
+pub(super) fn extract_rowid_from_row(
+    row_bytes: &[u8],
+    vtab: &AydbVTab,
+    snapshot: Option<&crate::engine::ReadSnapshotToken>,
+) -> io::Result<i64> {
     let dir_pos = 4 + vtab.pk_col_idx * 5;
     if vtab.pk_affinity == ColumnAffinity::Integer
         && dir_pos + 5 <= row_bytes.len()
@@ -317,25 +321,35 @@ pub(super) fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> io::R
     }
     let pk =
         extract_column_key_bytes_with_collation(row_bytes, vtab.pk_col_idx, vtab.pk_collation)?;
-    extract_rowid_from_pk_bytes(&pk, vtab)
+    extract_rowid_from_pk_bytes(&pk, vtab, snapshot)
 }
 
 /// Extracts the `rowid` (`i64`) directly from `pk_bytes` for keys-only cursor scans.
 #[inline]
-pub(super) fn extract_rowid_from_pk_bytes(pk_bytes: &[u8], vtab: &AydbVTab) -> io::Result<i64> {
+pub(super) fn extract_rowid_from_pk_bytes(
+    pk_bytes: &[u8],
+    vtab: &AydbVTab,
+    snapshot: Option<&crate::engine::ReadSnapshotToken>,
+) -> io::Result<i64> {
     if vtab.pk_affinity == ColumnAffinity::Integer {
         if let Some(id) = decode_i64_tagged_key(pk_bytes) {
             return Ok(id);
         }
     }
     vtab.has_non_int_pks.store(true, Ordering::Relaxed);
-    super::with_read_access(&vtab.engine, vtab.db as usize, vtab.table_id, |eng| {
-        eng.rowid_for_pk(vtab.table_id, pk_bytes)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "row has no persistent SQLite rowid",
-            )
-        })
-    })
+    super::with_snapshot_read_access(
+        &vtab.engine,
+        vtab.db as usize,
+        vtab.table_id,
+        snapshot,
+        |eng| {
+            eng.rowid_for_pk(vtab.table_id, pk_bytes)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "row has no persistent SQLite rowid",
+                )
+            })
+        },
+    )
     .unwrap_or_else(|| Err(io::Error::other("engine lock poisoned")))
 }

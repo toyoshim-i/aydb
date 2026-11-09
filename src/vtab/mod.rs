@@ -7,6 +7,9 @@
 
 pub mod connection;
 mod compaction_worker;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 mod ddl;
 mod constraints;
 pub mod ffi;
@@ -171,6 +174,22 @@ fn with_read_access<R>(
     Some(g.with_committed_read_for_conn(conn_id, f))
 }
 
+fn with_snapshot_read_access<R>(
+    engine: &RwLock<StorageEngine<OsFs>>,
+    conn_id: usize,
+    table_id: u16,
+    snapshot: Option<&crate::engine::ReadSnapshotToken>,
+    f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
+) -> Option<R> {
+    if let Some(snapshot) = snapshot {
+        let engine = engine.read().ok()?;
+        let mut f = f;
+        Some(f(&engine.reader_for_snapshot(snapshot)))
+    } else {
+        with_read_access(engine, conn_id, table_id, f)
+    }
+}
+
 /// Maps a `StorageEngine` [`io::Error`] into the most specific SQLite result code.
 #[inline]
 fn io_err_to_sqlite_rc(err: &io::Error) -> c_int {
@@ -298,6 +317,7 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
 
 pub(super) struct ModuleAuxContext {
     pub(super) engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    read_session: Arc<snapshot::ReadSession>,
     /// Background compaction worker; joined when the module (and thus this context) is dropped.
     pub(super) _compaction_worker: Option<compaction_worker::CompactionWorker>,
 }
@@ -307,6 +327,7 @@ pub(super) struct AydbVTab {
     base: sqlite3_vtab,
     db: *mut sqlite3,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    read_session: Arc<snapshot::ReadSession>,
     table_id: u16,
     table_name: String,
     durability: WriteDurability,
@@ -335,6 +356,7 @@ pub(super) struct AydbVTab {
 #[repr(C)]
 struct AydbCursor {
     base: sqlite3_vtab_cursor,
+    snapshot: Option<crate::engine::ReadSnapshotToken>,
     /// Contiguous reusable byte slab holding scanned `row_bytes` for the current cursor batch.
     slab: Vec<u8>,
     /// `(start_offset, end_offset)` into `slab` for each row.
@@ -606,6 +628,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             },
             db,
             engine: aux.engine.clone(),
+            read_session: Arc::clone(&aux.read_session),
             table_id,
             table_name: ddl.table_name,
             durability: ddl.durability,
@@ -915,6 +938,7 @@ unsafe extern "system" fn vtab_open(
         }
         let cursor = Box::new(AydbCursor {
             base: sqlite3_vtab_cursor { pVtab: p_vtab },
+            snapshot: None,
             slab: Vec::with_capacity(512),
             spans: Vec::with_capacity(16),
             pks: Vec::new(),
@@ -945,6 +969,9 @@ unsafe extern "system" fn vtab_close(p_cursor: *mut sqlite3_vtab_cursor) -> c_in
                 drop(cursor);
                 if !p_vtab.is_null() {
                     let vtab = &*(p_vtab as *const AydbVTab);
+                    if let Ok(mut engine) = vtab.engine.try_write() {
+                        engine.cleanup_read_snapshots();
+                    }
                     let prev = vtab.open_cursors.fetch_sub(1, Ordering::Relaxed);
                     if prev == 1 && vtab.has_non_int_pks.load(Ordering::Relaxed) {
                         if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
@@ -985,8 +1012,12 @@ unsafe extern "system" fn vtab_filter(
         cursor.stream_sec_prefix.clear();
 
         let conn_id = vtab.db as usize;
+        cursor.snapshot = match vtab.read_session.for_cursor(conn_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return io_err_to_sqlite_rc(&error),
+        };
 
-        with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
+        with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
             let base_plan = idx_num & 0xFF;
             match base_plan {
                 PLAN_PK_POINT => {
@@ -1387,7 +1418,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .as_ref()
                     .map(|(b, inc)| (b.as_slice(), *inc));
                 let mut next_last_sec: Option<Vec<u8>> = None;
-                let rc = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
+                let rc = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
                     match eng.scan_secondary_index_into_slab(
                         vtab.table_id,
                         sec_index_id,
@@ -1439,7 +1470,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .map(|(b, inc)| (b.as_slice(), *inc))
             };
 
-            let rc = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
+            let rc = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
                 if let Err(e) = eng.scan_range_into_slab(
                     vtab.table_id,
                     lower_ref,
@@ -1512,7 +1543,7 @@ unsafe extern "system" fn vtab_column(
             }
             let pk_bytes = &cursor.pks[cursor.pos];
             if i_col < 0 {
-                let rid = match extract_rowid_from_pk_bytes(pk_bytes, vtab) {
+                let rid = match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
                     Ok(rid) => rid,
                     Err(e) => return io_err_to_sqlite_rc(&e),
                 };
@@ -1534,10 +1565,10 @@ unsafe extern "system" fn vtab_column(
         // Fast path 1: Rowid lookup via xColumn(p_cursor, p_ctx, -1)
         if i_col < 0 {
             let rid = if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-                extract_rowid_from_pk_bytes(pk_bytes, vtab)
+                extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref())
             } else {
                 let (start, end) = cursor.spans[cursor.pos];
-                extract_rowid_from_row(&cursor.slab[start..end], vtab)
+                extract_rowid_from_row(&cursor.slab[start..end], vtab, cursor.snapshot.as_ref())
             };
             let rid = match rid {
                 Ok(rid) => rid,
@@ -1579,7 +1610,7 @@ unsafe extern "system" fn vtab_column(
                 cursor.prefetch_end = end;
             }
 
-            let Some(deref_res) = with_read_access(&vtab.engine, conn_id, vtab.table_id, |eng| {
+            let Some(deref_res) = with_snapshot_read_access(&vtab.engine, conn_id, vtab.table_id, cursor.snapshot.as_ref(), |eng| {
                 if upcoming.len() > 1 {
                     let _ = eng.prefetch_lazy_blobs(vtab.table_id, &upcoming);
                 }
@@ -1624,7 +1655,7 @@ unsafe extern "system" fn vtab_rowid(
             if cursor.pos >= cursor.pks.len() {
                 return SQLITE_ERROR;
             }
-            *p_rowid = match extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab) {
+            *p_rowid = match extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab, cursor.snapshot.as_ref()) {
                 Ok(rid) => rid,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
@@ -1634,7 +1665,7 @@ unsafe extern "system" fn vtab_rowid(
             return SQLITE_ERROR;
         }
         if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-            *p_rowid = match extract_rowid_from_pk_bytes(pk_bytes, vtab) {
+            *p_rowid = match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
                 Ok(rid) => rid,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
@@ -1642,7 +1673,7 @@ unsafe extern "system" fn vtab_rowid(
         }
         let (start, end) = cursor.spans[cursor.pos];
         let row_bytes = &cursor.slab[start..end];
-        *p_rowid = match extract_rowid_from_row(row_bytes, vtab) {
+        *p_rowid = match extract_rowid_from_row(row_bytes, vtab, cursor.snapshot.as_ref()) {
             Ok(rid) => rid,
             Err(e) => return io_err_to_sqlite_rc(&e),
         };
@@ -2015,6 +2046,11 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
+            if let Some(snapshot) = vtab.read_session.current() {
+                if let Err(error) = eng.check_snapshot_write_upgrade(vtab.db as usize, &snapshot) {
+                    return io_err_to_sqlite_rc(&error);
+                }
+            }
             match eng.begin_transaction_for_conn(vtab.db as usize) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

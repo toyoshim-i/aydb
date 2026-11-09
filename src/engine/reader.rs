@@ -22,6 +22,8 @@ pub enum ReadView {
     Owner,
     /// Committed data only: another connection's uncommitted writes are invisible.
     Committed,
+    /// Committed sources captured before subsequent transactions published their changes.
+    Snapshot(u64),
 }
 
 pub(super) const NEED_FLUSH_MSG: &str = "unflushed blob requires exclusive access";

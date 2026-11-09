@@ -346,6 +346,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the private transaction overlay (for read-your-own-writes visibility) while coalescing their
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
+        self.cleanup_read_snapshots();
         if self.tx_depth == 0 {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
@@ -366,6 +367,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection already holds
     /// an active transaction on this `StorageEngine`.
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
             return Err(io::Error::new(

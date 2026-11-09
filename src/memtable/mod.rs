@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 use crate::index::{IdxSegmentBuilder, IdxSegmentReader, IndexEntry, IndexValue};
 use crate::pal::{PlatformFile, PlatformFs};
@@ -32,9 +33,10 @@ impl MemEntry {
 }
 
 /// Ordered in-memory mutation table with strict byte-size tracking.
+/// Clones share immutable entries until the next mutation, allowing bounded read snapshots.
 #[derive(Debug, Clone)]
 pub struct MemTable {
-    map: BTreeMap<Vec<u8>, MemEntry>,
+    map: Arc<BTreeMap<Vec<u8>, MemEntry>>,
     approximate_bytes: usize,
     max_capacity_bytes: usize,
     highest_lsn: u64,
@@ -43,7 +45,7 @@ pub struct MemTable {
 impl MemTable {
     pub fn new(max_capacity_bytes: usize) -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: Arc::new(BTreeMap::new()),
             approximate_bytes: 0,
             max_capacity_bytes,
             highest_lsn: 0,
@@ -95,9 +97,9 @@ impl MemTable {
                 }
             }
             if self.map.is_empty() {
-                self.map = entries;
+                self.map = Arc::new(entries);
             } else {
-                self.map.append(&mut entries);
+                Arc::make_mut(&mut self.map).append(&mut entries);
             }
             return;
         }
@@ -239,7 +241,7 @@ impl MemTable {
         bloom_bits_per_key: usize,
     ) -> io::Result<IdxSegmentReader<F>> {
         let mut builder = IdxSegmentBuilder::create(fs, seq_id, 0, bloom_bits_per_key)?;
-        for (k, entry) in &self.map {
+        for (k, entry) in self.map.iter() {
             match &entry.value {
                 IndexValue::Inline(val) => {
                     builder.add_raw_entry(k, entry.lsn, 1, val)?;
@@ -264,7 +266,11 @@ impl MemTable {
 
     /// Clears all entries from the `MemTable` after its segment has been durably committed to `boot_meta.db`.
     pub fn clear(&mut self) {
-        self.map.clear();
+        if let Some(map) = Arc::get_mut(&mut self.map) {
+            map.clear();
+        } else {
+            self.map = Arc::new(BTreeMap::new());
+        }
         self.approximate_bytes = 0;
     }
 
@@ -289,7 +295,7 @@ impl MemTable {
         let new_entry = MemEntry { lsn, value };
         let new_cost = new_entry.approx_heap_bytes(klen);
 
-        let prev = self.map.insert(key, new_entry);
+        let prev = Arc::make_mut(&mut self.map).insert(key, new_entry);
         if let Some(ref old_entry) = prev {
             let old_cost = old_entry.approx_heap_bytes(klen);
             self.approximate_bytes = self
@@ -308,6 +314,40 @@ mod tests {
     use super::*;
     use crate::pal::OsFs;
     use crate::util::test_util::TempTestDir;
+
+    #[test]
+    fn cloned_memtables_preserve_entries_and_accounting_after_mutations() {
+        let mut original = MemTable::new(4096);
+        original.put_inline(b"a".to_vec(), b"original".to_vec(), 1);
+        original.put_inline(b"b".to_vec(), b"retained".to_vec(), 2);
+        let snapshot = original.clone();
+        assert!(Arc::ptr_eq(&original.map, &snapshot.map));
+        let snapshot_bytes = snapshot.approximate_bytes();
+
+        original.put_inline(b"a".to_vec(), b"changed".to_vec(), 3);
+        original.delete(b"b".to_vec(), 4);
+        let after_upsert = original.clone();
+        let after_upsert_bytes = original.approximate_bytes();
+        original.absorb(BTreeMap::from([
+            (b"a".to_vec(), MemEntry { lsn: 5, value: IndexValue::Inline(b"merged".to_vec()) }),
+            (b"c".to_vec(), MemEntry { lsn: 6, value: IndexValue::Inline(b"added".to_vec()) }),
+        ]));
+        let before_clear = original.clone();
+        original.clear();
+
+        assert!(original.is_empty());
+        assert_eq!(original.approximate_bytes(), 0);
+        assert_eq!(snapshot.get(b"a").unwrap().value, IndexValue::Inline(b"original".to_vec()));
+        assert_eq!(snapshot.get(b"b").unwrap().value, IndexValue::Inline(b"retained".to_vec()));
+        assert_eq!(snapshot.approximate_bytes(), snapshot_bytes);
+        assert_eq!(snapshot.highest_lsn(), 2);
+        assert_eq!(after_upsert.get(b"a").unwrap().value, IndexValue::Inline(b"changed".to_vec()));
+        assert_eq!(after_upsert.get(b"b").unwrap().value, IndexValue::Tombstone);
+        assert_eq!(after_upsert.approximate_bytes(), after_upsert_bytes);
+        assert_eq!(before_clear.get(b"a").unwrap().value, IndexValue::Inline(b"merged".to_vec()));
+        assert_eq!(before_clear.len(), 3);
+        assert_eq!(before_clear.highest_lsn(), 6);
+    }
 
     #[test]
     fn single_pass_upsert_zero_copy_cursors_and_256kb_coalesced_segment_builder() {

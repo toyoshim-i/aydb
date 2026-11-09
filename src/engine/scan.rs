@@ -286,7 +286,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // corrupt rows must vanish (`CorruptPolicy::Evict`) verify blobs eagerly during the scan.
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
 
-        if self.idx_segments.is_empty() && !reverse {
+        if self.idx_segments_for_view(cx.view).is_empty() && !reverse {
             let lo = match lower {
                 Some((_, false)) => Bound::Excluded(seek_key),
                 _ => Bound::Included(seek_key),
@@ -329,14 +329,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     IndexValue::Blob(ptr) => {
                         if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                             spans_out.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob(ptr)));
+                            lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, ptr)));
                             pks_out.push(k[3..].to_vec());
                             if spans_out.len() >= limit {
                                 break;
                             }
                         } else {
                             let start = slab_out.len();
-                            if self.read_flushed_blob_append_into(ptr, k, slab_out)? {
+                            if self.read_flushed_blob_append_into_view(cx.view, ptr, k, slab_out)? {
                                 spans_out.push((start, slab_out.len()));
                                 if let Some(lazy_blobs) = &mut lazy_blobs_out {
                                     lazy_blobs.push(None);
@@ -387,12 +387,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     MergedValueRef::Blob(ptr) => {
                         if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                             spans_out.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob(&ptr)));
+                            lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
                             pks_out.push(key[3..].to_vec());
                             Ok(true)
                         } else {
                             let start = slab_out.len();
-                            if self.read_flushed_blob_append_into(&ptr, key, slab_out)? {
+                            if self.read_flushed_blob_append_into_view(cx.view, &ptr, key, slab_out)? {
                                 spans_out.push((start, slab_out.len()));
                                 if let Some(lazy_blobs) = &mut lazy_blobs_out {
                                     lazy_blobs.push(None);
@@ -665,7 +665,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut last_sec_key_buf: Vec<u8> = Vec::new();
 
         if keys_only {
-            if self.idx_segments.is_empty() {
+            if self.idx_segments_for_view(cx.view).is_empty() {
                 let lo = if cur_inc {
                     Bound::Included(seek_slice)
                 } else {
@@ -726,7 +726,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             batch_pks.clear();
             let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
 
-            if self.idx_segments.is_empty() {
+            if self.idx_segments_for_view(cx.view).is_empty() {
                 let lo = if cur_inc {
                     Bound::Included(active_seek)
                 } else {
@@ -904,7 +904,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable.iter_range(range.lo_bound(), range.hi_bound()),
+            self.memtable_for_view(view).iter_range(range.lo_bound(), range.hi_bound()),
             self.visible_overlay(view)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             false,
@@ -915,9 +915,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
         let populate_cache = !is_unbounded_full_scan;
 
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for_view(view).len());
         let upper_for_overlap = range.upper_for_overlap();
-        for seg in &self.idx_segments {
+        for seg in self.idx_segments_for_view(view) {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
@@ -1064,7 +1064,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable.iter_range(range.lo_bound(), range.hi_bound()),
+            self.memtable_for_view(view).iter_range(range.lo_bound(), range.hi_bound()),
             self.visible_overlay(view)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             true,
@@ -1077,8 +1077,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let seg_upper_arg = range.seg_upper_arg();
         let upper_for_overlap = range.upper_for_overlap();
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments.len());
-        for seg in &self.idx_segments {
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for_view(view).len());
+        for seg in self.idx_segments_for_view(view) {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
@@ -1289,13 +1289,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> MemView<'a> {
         static EMPTY: std::collections::BTreeMap<Vec<u8>, crate::memtable::MemEntry> =
             std::collections::BTreeMap::new();
-        let ov_range = if view == ReadView::Committed || !self.tx_overlay.overlaps_range(lo, hi) {
+        let ov_range = if view != ReadView::Owner || !self.tx_overlay.overlaps_range(lo, hi) {
             EMPTY.range::<[u8], _>((lo, hi))
         } else {
             self.tx_overlay.map.range::<[u8], _>((lo, hi))
         };
         MemView::new(
-            self.memtable.iter_range(lo, hi),
+            self.memtable_for_view(view).iter_range(lo, hi),
             ov_range,
             false,
         )

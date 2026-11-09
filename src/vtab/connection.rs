@@ -1,5 +1,9 @@
 //! Safe, ergonomic Rust wrappers for a native `sqlite3*` database connection and prepared statements.
 
+#[cfg(test)]
+#[path = "snapshot_cursor_tests.rs"]
+mod snapshot_cursor_tests;
+
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io;
@@ -19,11 +23,13 @@ use crate::vtab::ffi::{
 };
 use crate::vtab::row_codec::SqlValue;
 use crate::vtab::{AYDB_VTAB_MODULE, ModuleAuxContext, destroy_aux_context};
+use crate::vtab::snapshot::{ReadSession, ReadTrace, TRACE_PROFILE, TRACE_STATEMENT, trace_reads};
 
 /// Safe, ergonomic wrapper around a native `sqlite3*` database connection with `aydb`
 /// Virtual Table registration support.
 pub struct SqliteConnection {
     db: *mut sqlite3,
+    read_trace: Box<ReadTrace>,
 }
 
 impl SqliteConnection {
@@ -50,7 +56,20 @@ impl SqliteConnection {
             }
             return Err(io::Error::other(format!("sqlite3_open failed with rc={rc}")));
         }
-        Ok(Self { db })
+        let mut read_trace = Box::new(ReadTrace::new(db));
+        let rc = unsafe {
+            crate::vtab::ffi::sqlite3_trace_v2(
+                db,
+                TRACE_STATEMENT | TRACE_PROFILE,
+                Some(trace_reads),
+                (&mut *read_trace as *mut ReadTrace).cast(),
+            )
+        };
+        if rc != SQLITE_OK {
+            unsafe { sqlite3_close(db); }
+            return Err(io::Error::other("could not register SQLite read lifecycle trace"));
+        }
+        Ok(Self { db, read_trace })
     }
 
     /// Registers the `"aydb"` Virtual Table module (`USING aydb(...)`) backed by `engine`.
@@ -80,8 +99,11 @@ impl SqliteConnection {
         } else {
             None
         };
+        let read_session = Arc::new(ReadSession::new(Arc::clone(&engine)));
+        self.read_trace.add_session(&read_session);
         let aux = Box::new(ModuleAuxContext {
             engine,
+            read_session,
             _compaction_worker: worker,
         });
         let rc = unsafe {
@@ -164,7 +186,9 @@ impl SqliteConnection {
 impl Drop for SqliteConnection {
     fn drop(&mut self) {
         if !self.db.is_null() {
+            self.read_trace.clear();
             unsafe {
+                crate::vtab::ffi::sqlite3_trace_v2(self.db, 0, None, core::ptr::null_mut());
                 sqlite3_close(self.db);
             }
         }
