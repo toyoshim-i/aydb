@@ -112,3 +112,110 @@ fn failed_standard_blob_create_does_not_reuse_the_name() {
 fn failed_lru_blob_create_does_not_reuse_the_name() {
     failed_create_then_retry_keeps_acknowledged_row("blob_lru_", 7);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dead-byte accounting across recovery
+// ---------------------------------------------------------------------------------------------
+
+fn lru_segment_file(dir: &Path) -> Option<std::path::PathBuf> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("blob_lru_"))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+fn open_plain(dir: &Path, config: &EngineConfig) -> StorageEngine<OsFs> {
+    StorageEngine::open(Arc::new(OsFs::open(dir, true).unwrap()), config.clone()).unwrap()
+}
+
+/// A segment whose catalog entry already counts its last blob as dead, while the file lost
+/// that blob (its bytes were never synced), must not count those bytes dead a second time at
+/// each reopen: that made a segment with a live blob look fully dead and deleted it.
+#[test]
+fn reopen_does_not_count_a_cataloged_but_missing_tail_as_dead_again() {
+    let tmp = TempTestDir::new("blob_missing_tail");
+    let config = EngineConfig::default();
+    let sync = WriteDurability::SyncTransactional;
+    let mut engine = open_plain(&tmp.path, &config);
+    engine.register_capped_table(7, 1 << 20).unwrap();
+    // One segment: A (dead after the overwrite), B (live), C (dead after the delete). C is the
+    // biggest, so counting it twice would make the dead total reach the file length.
+    engine.put_row(7, b"a", &[1u8; 3000], &[], sync).unwrap();
+    engine.put_row(7, b"b", &[2u8; 3000], &[], sync).unwrap();
+    engine.put_row(7, b"c", &[3u8; 4000], &[], sync).unwrap();
+    engine.put_row(7, b"a", b"inline", &[], sync).unwrap();
+    engine.delete_row(7, b"c", sync).unwrap();
+    engine.flush_memtable().unwrap();
+    drop(engine);
+
+    // Power loss: the tail holding C never reached the device although the catalog lists it.
+    let segment = lru_segment_file(&tmp.path).unwrap();
+    let len = std::fs::metadata(&segment).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .set_len(len - 4000)
+        .unwrap();
+
+    // Several recoveries without a checkpoint in between must give the same result.
+    for _ in 0..3 {
+        drop(open_plain(&tmp.path, &config));
+    }
+    let mut engine = open_plain(&tmp.path, &config);
+    engine.put_row(7, b"d", b"inline", &[], sync).unwrap();
+    engine.flush_memtable().unwrap();
+    engine.checkpoint().unwrap();
+    assert!(segment.exists(), "a segment with a live blob was reclaimed");
+    drop(engine);
+
+    let mut engine = open_plain(&tmp.path, &config);
+    assert_eq!(engine.get_row(7, b"b").unwrap(), Some(vec![2u8; 3000]));
+}
+
+/// Bytes beyond the cataloged length that no replayed batch references are garbage and still
+/// count as dead, so a segment of dead blobs is reclaimed.
+#[test]
+fn a_fully_dead_segment_with_a_garbage_tail_is_still_reclaimed() {
+    let tmp = TempTestDir::new("blob_dead_segment");
+    let mut config = EngineConfig::default();
+    config.max_blob_segment_bytes = 4000;
+    let sync = WriteDurability::SyncTransactional;
+    let mut engine = open_plain(&tmp.path, &config);
+    engine.register_capped_table(7, 1 << 20).unwrap();
+    engine.put_row(7, b"x", &[1u8; 3000], &[], sync).unwrap();
+    // Rolls to a second segment, sealing the first.
+    engine.put_row(7, b"y", &[2u8; 3000], &[], sync).unwrap();
+    engine.flush_memtable().unwrap();
+    drop(engine);
+
+    let first = lru_segment_file(&tmp.path).unwrap();
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap();
+        f.write_all(&[0xEE; 500]).unwrap();
+    }
+
+    let mut engine = open_plain(&tmp.path, &config);
+    engine.delete_row(7, b"x", sync).unwrap();
+    for i in 0..4u8 {
+        engine.put_row(7, &[b'k', i], b"inline", &[], sync).unwrap();
+        engine.flush_memtable().unwrap();
+    }
+    engine.checkpoint().unwrap();
+    assert!(
+        !first.exists(),
+        "the fully dead segment was never reclaimed"
+    );
+    assert_eq!(engine.get_row(7, b"y").unwrap(), Some(vec![2u8; 3000]));
+}

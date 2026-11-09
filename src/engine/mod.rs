@@ -410,7 +410,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
             let file_len = physical_len.max(bmeta.file_len);
-            std_valid_end.insert(bmeta.seq_id, bmeta.file_len.min(physical_len));
+            // The catalog already accounts for every byte below its length, so only bytes beyond
+            // it can be unaccounted garbage. A file shorter than the catalog (its tail never
+            // reached the device) must not make the missing bytes count as garbage a second
+            // time: recovery has to give the same result however often it runs.
+            std_valid_end.insert(bmeta.seq_id, bmeta.file_len);
             std_blobs.insert(
                 bmeta.seq_id,
                 TrackedStdBlob {
@@ -429,10 +433,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
             let file_len = physical_len.max(lmeta.file_len);
-            lru_valid_end.insert(
-                (lmeta.table_id, lmeta.seq_id),
-                lmeta.file_len.min(physical_len),
-            );
+            // See the `blob_std` loop above.
+            lru_valid_end.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
             lru_blobs.insert(
                 (lmeta.table_id, lmeta.seq_id),
                 TrackedLruBlob {

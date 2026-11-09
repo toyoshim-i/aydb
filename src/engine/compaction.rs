@@ -677,8 +677,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // The catalog records each segment's length. Bytes beyond the durable length (for
             // example from a rolled-back transaction) would otherwise be cataloged as present and
             // counted dead, and a power cut would shorten the file below its cataloged length.
-            // Recovery then counts the missing tail as garbage a second time, and a segment with
-            // live data can look fully dead.
             self.sync_active_blob_writers()?;
         }
         let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if persist_blob_state {
