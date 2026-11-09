@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::pal::{PlatformFile, PlatformFs, PreallocStrategy};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -745,6 +745,37 @@ fn is_capped(t: u16) -> bool {
     t >= 3
 }
 
+/// Index id of the backfilled "unique" entries (the persistent UNIQUE index uses `0x8000 | col`).
+const UNIQUE_IID: u16 = 0x8001;
+
+/// Tables whose secondary entries the oracle checks. Table 1 is plain and starts every row
+/// without entries (as a legacy table does): only `backfill_secondary_keys` adds them, so a
+/// row is either complete or has no entry and no `'t'` record. Tables 2 (plain) and 3 (capped)
+/// write their entries with the row and must always be complete. Table 4 has none.
+const INDEXED_TABLES: [u16; 3] = [1, 2, 3];
+
+/// The complete, deterministic secondary keys of a row, a pure function of its value.
+fn full_keys(t: u16, v: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    match t {
+        1 => vec![(UNIQUE_IID, v[2..4].to_vec())],
+        2 => vec![(1, vec![v[2]]), (UNIQUE_IID, v[2..4].to_vec())],
+        3 => {
+            let mut keys = vec![(1, vec![v[2] % 3]), (UNIQUE_IID, v[2..4].to_vec())];
+            if v[3].is_multiple_of(4) {
+                // Long component, as a digest of an oversized unique key would be.
+                keys.push((0x8002, vec![v[3]; 77]));
+            }
+            keys
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What a plain `put_row` passes: table 1 deliberately omits its keys.
+fn put_keys(t: u16, v: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    if t == 1 { Vec::new() } else { full_keys(t, v) }
+}
+
 fn key_bytes(k: u8) -> Vec<u8> {
     format!("key{k:02}").into_bytes()
 }
@@ -937,6 +968,8 @@ struct Harness<'a> {
     wide_dropped: u16,
     quota3: u64,
     quota4: u64,
+    /// Backfill operations are frequent in this run.
+    backfill_heavy: bool,
     trace: Vec<String>,
     /// How many trace lines a failure report keeps (all of them when replaying one seed).
     trace_cap: usize,
@@ -1227,7 +1260,110 @@ impl<'a> Harness<'a> {
                 d.join("\n    ")
             )));
         }
+        self.index_check(e, &got, false)
+    }
+
+    /// Compares the secondary entries and `'t'` records with the rows that are present.
+    ///
+    /// Every present row of tables 2 and 3 must have exactly the entries and the record
+    /// `full_keys` derives from its value. A row of table 1 has either all of them or none (no
+    /// entry, no record); with `strict` it must have all of them. No other entry or record may
+    /// exist: an entry of a row that is absent (deleted, evicted, rolled back) is an orphan.
+    fn index_check(&self, e: &mut Eng, got: &Table, strict: bool) -> Result<(), String> {
+        for t in INDEXED_TABLES {
+            match self.index_problem(e, t, got, strict) {
+                Ok(None) => {}
+                Ok(Some(problem)) => {
+                    return Err(self.fail(format!("secondary index of t{t}: {problem}")));
+                }
+                Err(err) => {
+                    if self.fs.fault_happened() {
+                        return Ok(());
+                    }
+                    return Err(self.fail(format!("index check of t{t} failed to read: {err}")));
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn index_problem(
+        &self,
+        e: &mut Eng,
+        t: u16,
+        got: &Table,
+        strict: bool,
+    ) -> io::Result<Option<String>> {
+        let live = |entries: Vec<IndexEntry>| -> BTreeSet<Vec<u8>> {
+            entries
+                .into_iter()
+                .filter(|en| !matches!(en.value, IndexValue::Tombstone))
+                .map(|en| en.key)
+                .collect()
+        };
+        let actual_i = live(e.scan_merged_prefix(&encode_namespace_prefix(t, NS_SECONDARY_INDEX))?);
+        let actual_t = live(e.scan_merged_prefix(&encode_namespace_prefix(t, NS_ROW_META))?);
+        let mut want_i = BTreeSet::new();
+        let mut want_t = BTreeSet::new();
+        for ((tt, k), v) in got {
+            if *tt != t {
+                continue;
+            }
+            let pk = key_bytes(*k);
+            let full = full_keys(t, v);
+            let entries: Vec<Vec<u8>> = full
+                .iter()
+                .map(|(id, col)| encode_secondary_index_key(t, *id, col, &pk))
+                .collect();
+            let present = entries.iter().filter(|en| actual_i.contains(*en)).count();
+            let meta = match e.get_row_meta_lookup(&encode_row_meta_key(t, &pk))? {
+                MetaLookup::Found(m, _) => Some(m),
+                MetaLookup::Absent => None,
+                MetaLookup::Corrupt(_) => {
+                    return Ok(Some(format!("key{k:02}: unreadable 't' record")));
+                }
+            };
+            let complete =
+                present == entries.len() && meta.as_ref().is_some_and(|m| m.secondary_keys == full);
+            if complete {
+                if is_capped(t) && meta.as_ref().is_some_and(|m| m.recorded_tick == 0) {
+                    return Ok(Some(format!("key{k:02}: capped row has recorded_tick 0")));
+                }
+                want_i.extend(entries);
+                want_t.insert(encode_row_meta_key(t, &pk));
+            } else if t == 1 && !strict && present == 0 && meta.is_none() {
+                // Not backfilled yet.
+            } else {
+                return Ok(Some(format!(
+                    "key{k:02}: {present} of {} entries present, record {}{}",
+                    entries.len(),
+                    match &meta {
+                        None => "absent".to_string(),
+                        Some(m) if m.secondary_keys == full => "complete".to_string(),
+                        Some(m) => format!("holds {} pairs", m.secondary_keys.len()),
+                    },
+                    if strict {
+                        " (backfill had finished)"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
+        for (what, want, actual) in [
+            ("entry", &want_i, &actual_i),
+            ("'t' record", &want_t, &actual_t),
+        ] {
+            if let Some(extra) = actual.difference(want).next() {
+                return Ok(Some(format!(
+                    "orphan {what} {extra:02x?} (no present row owns it)"
+                )));
+            }
+            if let Some(missing) = want.difference(actual).next() {
+                return Ok(Some(format!("missing {what} {missing:02x?}")));
+            }
+        }
+        Ok(None)
     }
 
     /// Checks the state a reopened engine shows against the oracle and returns its commit index.
@@ -1269,6 +1405,7 @@ impl<'a> Harness<'a> {
         if k < hi {
             Coverage::bump(&self.cov.dropped_inflight);
         }
+        self.index_check(e, &got, false)?;
         self.states.truncate(k + 1);
         // Capped tables may have evicted rows the model still holds: rebase on what is there.
         let mut base = self.states[k].clone();
@@ -1331,7 +1468,9 @@ impl<'a> Harness<'a> {
         }
         for _ in 0..nops {
             let r = self.rng.below(100);
-            let go = if r < 36 {
+            let go = if self.backfill_heavy && (46..66).contains(&r) {
+                self.op_backfill(e)?
+            } else if r < 36 {
                 self.op_put(e)?
             } else if r < 46 {
                 self.op_delete(e)?
@@ -1346,7 +1485,7 @@ impl<'a> Harness<'a> {
             } else if r < 97 && self.wide_dropped < self.wide {
                 self.op_drop_wide(e)?
             } else {
-                true
+                self.op_backfill(e)?
             };
             if !go {
                 return Ok(());
@@ -1368,10 +1507,62 @@ impl<'a> Harness<'a> {
         ns.insert((t, k), v.clone());
         let what = format!("put t{t}/key{k:02} {} {}", short(&v), describe(d));
         let lsn = e.next_lsn();
-        let r = e.put_row(t, &key_bytes(k), &v, &[], d);
+        let r = e.put_row(t, &key_bytes(k), &v, &put_keys(t, &v), d);
         let logged = e.next_lsn() != lsn;
         let alive = !e.is_poisoned();
         self.record_commit(r, ns, sync, logged, alive, &what)
+    }
+
+    /// Backfills the keys of up to three consecutive present rows of table 1, one commit each
+    /// (a crash between them leaves some rows complete and the rest without entries).
+    fn op_backfill(&mut self, e: &mut Eng) -> Result<bool, String> {
+        let start = self.rng.below(KEYS as u64) as u8;
+        for i in 0..3 {
+            let k = (start + i) % KEYS;
+            let Some(v) = self.last().get(&(1, k)).cloned() else {
+                continue;
+            };
+            if !self.backfill_row(e, k, &v)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn backfill_row(&mut self, e: &mut Eng, k: u8, v: &[u8]) -> Result<bool, String> {
+        let d = pick_durability(&mut self.rng);
+        let ns = self.last().clone();
+        let what = format!("backfill t1/key{k:02} {}", describe(d));
+        let lsn = e.next_lsn();
+        let r = e
+            .backfill_secondary_keys(1, &key_bytes(k), &full_keys(1, v), d)
+            .map(|_| ());
+        let logged = e.next_lsn() != lsn;
+        let alive = !e.is_poisoned();
+        self.record_commit(
+            r,
+            ns,
+            d == WriteDurability::SyncTransactional,
+            logged,
+            alive,
+            &what,
+        )
+    }
+
+    /// Finishes the migration of table 1 after recovery: every present row must end up complete.
+    fn complete_backfill(&mut self, e: &mut Eng) -> Result<(), String> {
+        for k in 0..KEYS {
+            let Some(v) = self.last().get(&(1, k)).cloned() else {
+                continue;
+            };
+            if !self.backfill_row(e, k, &v)? {
+                return Err(self.fail("backfill stopped after recovery".into()));
+            }
+        }
+        let got = self
+            .read_all(e)?
+            .ok_or_else(|| self.fail("read failed after recovery".into()))?;
+        self.index_check(e, &got, true)
     }
 
     fn op_delete(&mut self, e: &mut Eng) -> Result<bool, String> {
@@ -1441,7 +1632,7 @@ impl<'a> Harness<'a> {
                 let k = self.rng.below(KEYS as u64) as u8;
                 let v = make_value(&mut self.rng, t, k);
                 let d = pick_durability(&mut self.rng);
-                let res = e.put_row(t, &key_bytes(k), &v, &[], d);
+                let res = e.put_row(t, &key_bytes(k), &v, &put_keys(t, &v), d);
                 self.log(format!(
                     "  tx put t{t}/key{k:02} {} {}",
                     short(&v),
@@ -1451,7 +1642,7 @@ impl<'a> Harness<'a> {
                     return self.abort_tx(e);
                 }
                 work.insert((t, k), v);
-            } else if r < 76 {
+            } else if r < 70 {
                 let t = TABLES[self.rng.below(4) as usize];
                 let k = self.rng.below(KEYS as u64) as u8;
                 let d = pick_durability(&mut self.rng);
@@ -1461,6 +1652,20 @@ impl<'a> Harness<'a> {
                     return self.abort_tx(e);
                 }
                 work.remove(&(t, k));
+            } else if r < 76 {
+                // Backfill inside the transaction: rolled back with it, otherwise committed.
+                let k = self.rng.below(KEYS as u64) as u8;
+                if let Some(v) = work.get(&(1, k)).cloned() {
+                    let d = pick_durability(&mut self.rng);
+                    let res = e.backfill_secondary_keys(1, &key_bytes(k), &full_keys(1, &v), d);
+                    self.log(format!("  tx backfill t1/key{k:02} {}", describe(d)));
+                    if self
+                        .io_ok(res, "backfill_secondary_keys in transaction")?
+                        .is_none()
+                    {
+                        return self.abort_tx(e);
+                    }
+                }
             } else if r < 84 {
                 e.savepoint(next_sp);
                 self.log(format!("  savepoint {next_sp}"));
@@ -1651,6 +1856,7 @@ fn run_case_inner(
     };
     let quota3 = 3200 + master.below(2500);
     let quota4 = 6000 + master.below(6000);
+    let backfill_heavy = master.chance(1, 3);
     let mut h = Harness {
         seed,
         fs: Arc::clone(&fs),
@@ -1664,6 +1870,7 @@ fn run_case_inner(
         wide_dropped: 0,
         quota3,
         quota4,
+        backfill_heavy,
         trace: Vec::new(),
         trace_cap: if env_u64("AYDB_CRASH_SEED").is_some() {
             usize::MAX
@@ -1818,6 +2025,7 @@ fn run_case_inner(
     h.log("post-recovery maintenance".into());
     let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         h.run_segment(&mut e, 8)?;
+        h.complete_backfill(&mut e)?;
         e.checkpoint()
             .map_err(|er| h.fail(format!("checkpoint after recovery failed: {er}")))?;
         e.compact()

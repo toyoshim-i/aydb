@@ -1471,6 +1471,134 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Adds secondary index entries to an existing row without rewriting the row.
+    ///
+    /// Each `(index_id, col_val)` pair of `extra_keys` that the row's `'t'` metadata does not
+    /// record yet is written as an `'i'` entry, and the metadata is rewritten to hold the old
+    /// and the new pairs, all in one WAL batch. The row value, blob pointer, `recorded_tick`
+    /// and logical size are kept, and nothing counts as an overwrite: no dead row bytes, no
+    /// quota or LRU change. A row without metadata (an uncapped table that never recorded any)
+    /// gets a record with tick 0.
+    ///
+    /// Returns `Ok(true)` when a batch was written, `Ok(false)` when the row is absent or
+    /// already records every pair (a repeated call is a no-op). Unreadable metadata is reported
+    /// as `InvalidData` and nothing is written. The caller owns the meaning of the pairs: a
+    /// pair with a changed `col_val` for an index the row already records is added next to the
+    /// old one, not substituted for it.
+    ///
+    /// Like [`Self::put_row`], the batch joins the enclosing transaction if one is open and
+    /// is rolled back with it.
+    pub fn backfill_secondary_keys(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        extra_keys: &[(u16, Vec<u8>)],
+        durability: WriteDurability,
+    ) -> io::Result<bool> {
+        self.check_not_poisoned()?;
+        self.drain_corrupt_evictions()?;
+        if pk.len() > 2048 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "primary key exceeds maximum length (2048 bytes)",
+            ));
+        }
+        let row_key = encode_primary_row_key(table_id, pk);
+        let existing = self.check_existing_row(&row_key)?;
+        if existing == ExistingRowStatus::NotFound {
+            return Ok(false);
+        }
+
+        let meta_key = encode_row_meta_key(table_id, pk);
+        let lookup = if self.may_have_row_meta(table_id)? {
+            self.get_row_meta_lookup(&meta_key)?
+        } else {
+            MetaLookup::Absent
+        };
+        let (old_meta, old_meta_blob_ptr) = match lookup {
+            MetaLookup::Found(meta, ptr) => (Some(meta), ptr),
+            MetaLookup::Absent => (None, None),
+            MetaLookup::Corrupt(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "row metadata is unreadable; secondary keys cannot be added",
+                ));
+            }
+        };
+        if old_meta.is_none() && self.capped_tables.contains_key(&table_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "row of a capped table has no metadata; secondary keys cannot be added",
+            ));
+        }
+
+        let (recorded_tick, logical_size, mut merged) = match old_meta {
+            Some(m) => (m.recorded_tick, m.logical_size, m.secondary_keys),
+            None => {
+                let value_len = match self.lookup_raw_entry(&row_key)? {
+                    Some((_, IndexValue::Inline(v))) => v.len(),
+                    Some((_, IndexValue::Blob(p))) => {
+                        (p.len as usize).saturating_sub(BLOB_RECORD_HEADER_LEN + row_key.len())
+                    }
+                    _ => 0,
+                };
+                (0, (pk.len() + value_len) as u32, Vec::new())
+            }
+        };
+
+        let mut records = Vec::with_capacity(2 + extra_keys.len());
+        let had_keys = merged.len();
+        for (idx_id, col_val) in extra_keys {
+            if merged.iter().any(|(i, v)| i == idx_id && v == col_val) {
+                continue;
+            }
+            if col_val.len() > u16::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secondary index value exceeds 65535 bytes",
+                ));
+            }
+            let sec_key = encode_secondary_index_key(table_id, *idx_id, col_val, pk);
+            if !IndexEntry::inline_fits_in_block(sec_key.len(), 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secondary index key exceeds 4 KB block capacity",
+                ));
+            }
+            records.push(WalRecord::PutInline {
+                key: sec_key,
+                value: Vec::new(),
+            });
+            merged.push((*idx_id, col_val.clone()));
+        }
+        if merged.len() == had_keys {
+            return Ok(false);
+        }
+
+        let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged);
+        if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
+            let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
+            if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
+                self.sync_active_std_writer()?;
+            }
+            records.push(WalRecord::PutBlobPtr {
+                key: meta_key,
+                blob_ptr: ptr,
+            });
+        } else {
+            records.push(WalRecord::PutInline {
+                key: meta_key,
+                value: meta_bytes,
+            });
+        }
+        self.table_has_row_meta.insert(table_id, true);
+        self.commit_wal_and_memtable(records, durability)?;
+        if let Some(old_m_ptr) = old_meta_blob_ptr {
+            self.record_dead_blob_bytes(&old_m_ptr);
+        }
+        Ok(true)
+    }
+
     /// Point lookup of a row (`pk`) in `table_id` (owner view: sees this engine's own
     /// transaction overlay). If `table_id` is a Capped Table, updates its `AccessTick`
     /// according to `config.lru_read_tracking`.

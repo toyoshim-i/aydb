@@ -6223,3 +6223,383 @@ fn table_scan_batches_cover_the_table_despite_corrupt_rows_and_tombstones() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// backfill_secondary_keys
+// ---------------------------------------------------------------------------------------------
+
+fn live_keys(engine: &StorageEngine<OsFs>, table_id: u16, ns: u8) -> Vec<Vec<u8>> {
+    engine
+        .scan_merged_prefix(&encode_namespace_prefix(table_id, ns))
+        .unwrap()
+        .into_iter()
+        .filter(|e| !matches!(e.value, IndexValue::Tombstone))
+        .map(|e| e.key)
+        .collect()
+}
+
+fn row_meta(engine: &mut StorageEngine<OsFs>, table_id: u16, pk: &[u8]) -> Option<RowMetaRecord> {
+    engine
+        .get_row_meta_with_ptr(&encode_row_meta_key(table_id, pk))
+        .unwrap()
+        .map(|(m, _)| m)
+}
+
+fn backfill_engine(name: &str) -> (TempTestDir, Arc<OsFs>, EngineConfig, StorageEngine<OsFs>) {
+    let tmp = TempTestDir::new(name);
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let cfg = EngineConfig::default();
+    let engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    (tmp, fs, cfg, engine)
+}
+
+const UNIQ: u16 = 0x8001;
+
+#[test]
+fn backfill_adds_entries_and_meta_to_a_row_without_either() {
+    let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_fresh");
+    engine
+        .put_row(1, b"k", b"value", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(row_meta(&mut engine, 1, b"k").is_none());
+    let wrote = engine
+        .backfill_secondary_keys(
+            1,
+            b"k",
+            &[(UNIQ, b"u1".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert!(wrote);
+    let meta = row_meta(&mut engine, 1, b"k").unwrap();
+    assert_eq!(meta.recorded_tick, 0);
+    assert_eq!(meta.logical_size, 1 + 5);
+    assert_eq!(meta.secondary_keys, vec![(UNIQ, b"u1".to_vec())]);
+    assert_eq!(
+        engine.lookup_by_secondary_index(1, UNIQ, b"u1").unwrap(),
+        vec![b"k".to_vec()]
+    );
+    assert_eq!(engine.get_row(1, b"k").unwrap().unwrap(), b"value");
+}
+
+#[test]
+fn backfill_is_idempotent_and_a_repeat_writes_nothing() {
+    let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_repeat");
+    engine
+        .put_row(1, b"k", b"value", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let keys = [(UNIQ, b"u1".to_vec()), (UNIQ, b"u1".to_vec())];
+    assert!(
+        engine
+            .backfill_secondary_keys(1, b"k", &keys, WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    let lsn = engine.next_lsn;
+    assert!(
+        !engine
+            .backfill_secondary_keys(1, b"k", &keys, WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .backfill_secondary_keys(1, b"k", &[], WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    assert_eq!(engine.next_lsn, lsn, "a repeat must not log a batch");
+    let meta = row_meta(&mut engine, 1, b"k").unwrap();
+    assert_eq!(meta.secondary_keys, vec![(UNIQ, b"u1".to_vec())]);
+    assert_eq!(live_keys(&engine, 1, NS_SECONDARY_INDEX).len(), 1);
+}
+
+#[test]
+fn backfill_keeps_declared_index_entries_and_adds_only_the_missing_ones() {
+    let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_declared");
+    engine
+        .put_row(
+            1,
+            b"k",
+            b"value",
+            &[(1, b"decl".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    let wrote = engine
+        .backfill_secondary_keys(
+            1,
+            b"k",
+            &[(1, b"decl".to_vec()), (UNIQ, b"u".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert!(wrote);
+    let meta = row_meta(&mut engine, 1, b"k").unwrap();
+    assert_eq!(
+        meta.secondary_keys,
+        vec![(1, b"decl".to_vec()), (UNIQ, b"u".to_vec())]
+    );
+    assert_eq!(live_keys(&engine, 1, NS_SECONDARY_INDEX).len(), 2);
+    // An overwrite replaces both kinds of entry through the recorded meta.
+    engine
+        .put_row(
+            1,
+            b"k",
+            b"value2",
+            &[(1, b"decl2".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert_eq!(
+        live_keys(&engine, 1, NS_SECONDARY_INDEX),
+        vec![encode_secondary_index_key(1, 1, b"decl2", b"k")]
+    );
+}
+
+#[test]
+fn backfill_on_absent_row_is_a_noop_and_corrupt_meta_is_an_error() {
+    let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_absent_corrupt");
+    assert!(
+        !engine
+            .backfill_secondary_keys(
+                1,
+                b"nope",
+                &[(UNIQ, b"u".to_vec())],
+                WriteDurability::BufferedFast
+            )
+            .unwrap()
+    );
+    assert!(live_keys(&engine, 1, NS_SECONDARY_INDEX).is_empty());
+
+    engine
+        .put_row(
+            1,
+            b"k",
+            b"v",
+            &[(1, b"a".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    engine
+        .commit_wal_and_memtable(
+            vec![WalRecord::PutInline {
+                key: encode_row_meta_key(1, b"k"),
+                value: vec![1, 2, 3],
+            }],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    let lsn = engine.next_lsn;
+    let err = engine
+        .backfill_secondary_keys(
+            1,
+            b"k",
+            &[(UNIQ, b"u".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(engine.next_lsn, lsn);
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, UNIQ, b"u")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn backfill_keeps_row_pointer_value_and_capped_tick() {
+    let tmp = TempTestDir::new("backfill_capped");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    engine.register_capped_table(1, 4_000).unwrap();
+    let big = vec![0x5Au8; 1000];
+    engine
+        .put_row(1, b"a", &big, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .put_row(1, b"b", b"small", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let row_entries = |engine: &StorageEngine<OsFs>| {
+        [b"a", b"b"]
+            .iter()
+            .map(|pk| {
+                engine
+                    .lookup_raw_entry(&encode_primary_row_key(1, *pk))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let rows_before = row_entries(&engine);
+    let meta_before = row_meta(&mut engine, 1, b"a").unwrap();
+    assert!(meta_before.recorded_tick > 0);
+    let lru_before = live_keys(&engine, 1, NS_LRU_QUEUE);
+    let state_before = engine.capped_table_state(1).unwrap();
+    let (bytes_before, evict_before) = (
+        state_before.current_logical_bytes,
+        state_before.total_evictions,
+    );
+
+    for pk in [b"a", b"b"] {
+        assert!(
+            engine
+                .backfill_secondary_keys(
+                    1,
+                    pk,
+                    &[(UNIQ, pk.to_vec())],
+                    WriteDurability::BufferedFast
+                )
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        rows_before,
+        row_entries(&engine),
+        "row records (and blob pointers) are untouched"
+    );
+    let meta_after = row_meta(&mut engine, 1, b"a").unwrap();
+    assert_eq!(meta_after.recorded_tick, meta_before.recorded_tick);
+    assert_eq!(meta_after.logical_size, meta_before.logical_size);
+    assert_eq!(live_keys(&engine, 1, NS_LRU_QUEUE), lru_before);
+    let state_after = engine.capped_table_state(1).unwrap();
+    assert_eq!(state_after.current_logical_bytes, bytes_before);
+    assert_eq!(state_after.total_evictions, evict_before);
+
+    // The tick is still what eviction orders by: "a" is the coldest and goes first, taking its
+    // backfilled entry with it.
+    for i in 0..4u8 {
+        engine
+            .put_row(1, &[b'z', i], &big, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    assert!(engine.get_row(1, b"a").unwrap().is_none());
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, UNIQ, b"a")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn backfill_entries_go_with_delete_drop_and_rollback() {
+    let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_removal");
+    for pk in [b"a", b"b"] {
+        engine
+            .put_row(
+                1,
+                pk,
+                b"v",
+                &[(1, b"d".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    let u = |pk: &[u8]| vec![(UNIQ, pk.to_vec())];
+
+    // Rollback removes entries and restores the meta.
+    engine.begin_transaction();
+    assert!(
+        engine
+            .backfill_secondary_keys(1, b"a", &u(b"a"), WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    assert_eq!(
+        engine.lookup_by_secondary_index(1, UNIQ, b"a").unwrap(),
+        vec![b"a".to_vec()]
+    );
+    engine.rollback_transaction().unwrap();
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, UNIQ, b"a")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        row_meta(&mut engine, 1, b"a").unwrap().secondary_keys,
+        vec![(1, b"d".to_vec())]
+    );
+
+    // A committed transaction keeps them.
+    engine.begin_transaction();
+    assert!(
+        engine
+            .backfill_secondary_keys(1, b"a", &u(b"a"), WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    engine.commit_transaction().unwrap();
+    assert_eq!(
+        engine.lookup_by_secondary_index(1, UNIQ, b"a").unwrap(),
+        vec![b"a".to_vec()]
+    );
+
+    // Delete removes every entry of the row.
+    assert!(
+        engine
+            .delete_row(1, b"a", WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .lookup_by_secondary_index(1, UNIQ, b"a")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        engine.lookup_by_secondary_index(1, 1, b"d").unwrap(),
+        vec![b"b".to_vec()]
+    );
+
+    // Drop removes everything that is left.
+    engine
+        .backfill_secondary_keys(1, b"b", &u(b"b"), WriteDurability::BufferedFast)
+        .unwrap();
+    engine.drop_table(1, None).unwrap();
+    for ns in [NS_PRIMARY_ROW, NS_SECONDARY_INDEX, NS_ROW_META] {
+        assert!(live_keys(&engine, 1, ns).is_empty());
+    }
+}
+
+#[test]
+fn backfill_survives_flush_and_reopen_with_a_spilled_meta() {
+    let (_tmp, fs, cfg, mut engine) = backfill_engine("backfill_reopen");
+    engine
+        .put_row(1, b"k", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .put_row(1, b"s", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .backfill_secondary_keys(
+            1,
+            b"k",
+            &[(UNIQ, b"u".to_vec())],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    // Enough pairs to push the meta record out of line.
+    let spill: Vec<(u16, Vec<u8>)> = (0..60u8).map(|i| (UNIQ + i as u16, vec![i; 90])).collect();
+    assert!(
+        engine
+            .backfill_secondary_keys(1, b"s", &spill, WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    engine.flush_memtable().unwrap();
+    drop(engine);
+
+    let mut reopened = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(
+        reopened.lookup_by_secondary_index(1, UNIQ, b"u").unwrap(),
+        vec![b"k".to_vec()]
+    );
+    assert_eq!(
+        row_meta(&mut reopened, 1, b"s").unwrap().secondary_keys,
+        spill
+    );
+    assert_eq!(live_keys(&reopened, 1, NS_SECONDARY_INDEX).len(), 61);
+    reopened
+        .delete_row(1, b"s", WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(live_keys(&reopened, 1, NS_SECONDARY_INDEX).len(), 1);
+}
