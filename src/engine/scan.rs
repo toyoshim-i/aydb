@@ -20,7 +20,7 @@ pub type TableBatch = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
 #[cfg(test)]
 thread_local! {
     /// Number of MemTable entries `scan_table_range` copied out of the table, for tests.
-    pub(super) static TABLE_SCAN_ENTRIES_COPIED: std::cell::Cell<usize> =
+    pub(crate) static TABLE_SCAN_ENTRIES_COPIED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 

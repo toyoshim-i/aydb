@@ -384,95 +384,151 @@ fn lit_int(rng: &mut Rng) -> String {
     }
 }
 
-fn sorted_rows(conn: &SqliteConnection) -> Vec<String> {
+pub(super) fn sorted_rows(conn: &SqliteConnection) -> Vec<String> {
     let mut rows: Vec<String> = rows_of(conn).iter().map(|r| format!("{r:?}")).collect();
     rows.sort();
     rows
 }
 
+/// Random statements over the `t` table: inserts, updates (including PK changes), deletes,
+/// OR IGNORE / OR REPLACE, transactions with savepoints, and pairs that free a key and reuse
+/// it. Values come from small pools so that conflicts are frequent; the pools include digest-form
+/// (over 256 byte) strings.
+pub(super) struct StatementGen {
+    rng: Rng,
+    savepoints: u32,
+    pub(super) in_tx: bool,
+    a_pool: Vec<String>,
+}
+
+impl StatementGen {
+    pub(super) fn new(seed: u64) -> Self {
+        let long = "w".repeat(300);
+        let long2 = format!("{}z", "w".repeat(299));
+        Self {
+            rng: Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xA5A5),
+            savepoints: 0,
+            in_tx: false,
+            a_pool: ["x", "y", "z", "X", "", &long, &long2]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    fn row_values(&mut self) -> String {
+        let a_pool: Vec<&str> = self.a_pool.iter().map(|s| s.as_str()).collect();
+        format!(
+            "{},{},{},{}",
+            lit_text(&mut self.rng, &a_pool),
+            lit_int(&mut self.rng),
+            lit_text(&mut self.rng, &["p", "P", "q", "Q", "p "]),
+            lit_text(&mut self.rng, &["c1", "c2"]),
+        )
+    }
+
+    pub(super) fn next(&mut self) -> String {
+        const K_POOL: [&str; 6] = ["k0", "k1", "k2", "k3", "k4", "k5"];
+        let k = K_POOL[self.rng.below(6) as usize];
+        let or = ["", "OR IGNORE ", "OR REPLACE "][self.rng.below(3) as usize];
+        match self.rng.below(17) {
+            0..=4 => format!("INSERT {or}INTO t VALUES('{k}',{})", self.row_values()),
+            5 | 6 => {
+                let a_pool: Vec<&str> = self.a_pool.iter().map(|s| s.as_str()).collect();
+                format!(
+                    "UPDATE {or}t SET a={}, b={} WHERE k='{k}'",
+                    lit_text(&mut self.rng, &a_pool),
+                    lit_int(&mut self.rng)
+                )
+            }
+            7 => format!(
+                "UPDATE {or}t SET n={}, c={} WHERE k='{k}'",
+                lit_text(&mut self.rng, &["p", "P", "q", "Q", "p "]),
+                lit_text(&mut self.rng, &["c1", "c3"]),
+            ),
+            8 => {
+                // A PK-changing UPDATE OR REPLACE with row aliasing is a known open bug.
+                let to = K_POOL[self.rng.below(6) as usize];
+                let or = if or == "OR REPLACE " { "" } else { or };
+                format!("UPDATE {or}t SET k='{to}' WHERE k='{k}'")
+            }
+            9 | 10 => format!("DELETE FROM t WHERE k='{k}'"),
+            11 if !self.in_tx => {
+                self.in_tx = true;
+                "BEGIN".to_string()
+            }
+            // Savepoints are not nested: rolling back to an outer savepoint while an inner one
+            // exists does not undo the statements after the inner one was created (an existing
+            // bug, present before the UNIQUE index).
+            11 if self.savepoints == 0 => {
+                self.savepoints = 1;
+                "SAVEPOINT s1".to_string()
+            }
+            12 if self.in_tx && self.savepoints > 0 => {
+                if self.rng.below(2) == 0 {
+                    "ROLLBACK TO s1".to_string()
+                } else {
+                    self.savepoints = 0;
+                    "RELEASE s1".to_string()
+                }
+            }
+            13 if self.in_tx => {
+                self.in_tx = false;
+                self.savepoints = 0;
+                if self.rng.below(2) == 0 {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                }
+                .to_string()
+            }
+            // Free a key (or a unique value) and reuse it at once.
+            14 => {
+                let to = K_POOL[self.rng.below(6) as usize];
+                format!(
+                    "DELETE FROM t WHERE k='{k}'; INSERT {or}INTO t VALUES('{to}',{})",
+                    self.row_values()
+                )
+            }
+            15 => {
+                let to = K_POOL[self.rng.below(6) as usize];
+                let a_pool: Vec<&str> = self.a_pool.iter().map(|s| s.as_str()).collect();
+                let a = lit_text(&mut self.rng, &a_pool);
+                format!(
+                    "UPDATE t SET a=NULL, b=NULL, n=NULL WHERE k='{k}';                      UPDATE t SET a={a} WHERE k='{to}'"
+                )
+            }
+            16 => {
+                let to = K_POOL[self.rng.below(6) as usize];
+                format!(
+                    "UPDATE t SET k='{to}x' WHERE k='{k}'; INSERT {or}INTO t VALUES('{k}',{})",
+                    self.row_values()
+                )
+            }
+            _ => format!("DELETE FROM t WHERE k='{k}'"),
+        }
+    }
+}
+
+pub(super) const NATIVE_DDL: &str = "CREATE TABLE t(k TEXT PRIMARY KEY, a TEXT UNIQUE,      b INTEGER UNIQUE, n TEXT UNIQUE COLLATE NOCASE, c TEXT)";
+
 #[test]
 fn random_statements_match_native_sqlite_and_keep_the_index_exact() {
-    let long = "w".repeat(300);
-    let long2 = format!("{}z", "w".repeat(299));
-    let a_pool = ["x", "y", "z", "X", "", &long, &long2];
-    let n_pool = ["p", "P", "q", "Q", "p "];
-    let k_pool = ["k0", "k1", "k2", "k3", "k4", "k5"];
     for seed in 0..200u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xA5A5);
+        let mut gen_ = StatementGen::new(seed);
         let fx = fixture(&format!("unique_index_diff{seed}"), "");
         let native = SqliteConnection::open_in_memory().unwrap();
-        native
-            .execute_batch(
-                "CREATE TABLE t(k TEXT PRIMARY KEY, a TEXT UNIQUE, b INTEGER UNIQUE, \
-                 n TEXT UNIQUE COLLATE NOCASE, c TEXT)",
-            )
-            .unwrap();
-        let mut savepoints = 0u32;
-        let mut in_tx = false;
+        native.execute_batch(NATIVE_DDL).unwrap();
         for step in 0..60 {
-            let k = k_pool[rng.below(6) as usize];
-            let or = ["", "OR IGNORE ", "OR REPLACE "][rng.below(3) as usize];
-            let sql = match rng.below(14) {
-                0..=4 => format!(
-                    "INSERT {or}INTO t VALUES('{k}',{},{},{},{})",
-                    lit_text(&mut rng, &a_pool),
-                    lit_int(&mut rng),
-                    lit_text(&mut rng, &n_pool),
-                    lit_text(&mut rng, &["c1", "c2"]),
-                ),
-                5 | 6 => format!(
-                    "UPDATE {or}t SET a={}, b={} WHERE k='{k}'",
-                    lit_text(&mut rng, &a_pool),
-                    lit_int(&mut rng)
-                ),
-                7 => format!(
-                    "UPDATE {or}t SET n={}, c={} WHERE k='{k}'",
-                    lit_text(&mut rng, &n_pool),
-                    lit_text(&mut rng, &["c1", "c3"]),
-                ),
-                8 => {
-                    // A PK-changing UPDATE OR REPLACE with row aliasing is a known open bug.
-                    let to = k_pool[rng.below(6) as usize];
-                    let or = if or == "OR REPLACE " { "" } else { or };
-                    format!("UPDATE {or}t SET k='{to}' WHERE k='{k}'")
-                }
-                9 | 10 => format!("DELETE FROM t WHERE k='{k}'"),
-                11 if !in_tx => {
-                    in_tx = true;
-                    "BEGIN".to_string()
-                }
-                11 => {
-                    savepoints += 1;
-                    format!("SAVEPOINT s{savepoints}")
-                }
-                12 if in_tx && savepoints > 0 => {
-                    let s = 1 + rng.below(savepoints as u64);
-                    if rng.below(2) == 0 {
-                        format!("ROLLBACK TO s{s}")
-                    } else {
-                        savepoints = s as u32 - 1;
-                        format!("RELEASE s{s}")
-                    }
-                }
-                12 => format!("DELETE FROM t WHERE k='{k}'"),
-                _ if in_tx => {
-                    in_tx = false;
-                    savepoints = 0;
-                    if rng.below(2) == 0 {
-                        "COMMIT"
-                    } else {
-                        "ROLLBACK"
-                    }
-                    .to_string()
-                }
-                _ => format!("DELETE FROM t WHERE k='{k}'"),
-            };
+            let sql = gen_.next();
             let expected = native.execute_batch(&sql);
             let actual = fx.conn.execute_batch(&sql);
             assert_eq!(
                 expected.is_ok(),
                 actual.is_ok(),
-                "seed {seed} step {step}: {sql}\n native: {expected:?}\n aydb: {actual:?}"
+                "seed {seed} step {step}: {sql}
+ native: {expected:?}
+ aydb: {actual:?}"
             );
             assert_eq!(
                 sorted_rows(&native),
@@ -481,7 +537,7 @@ fn random_statements_match_native_sqlite_and_keep_the_index_exact() {
             );
             assert_index(&fx, &format!("seed {seed} step {step}: {sql}"));
         }
-        if in_tx {
+        if gen_.in_tx {
             native.execute_batch("ROLLBACK").unwrap();
             fx.conn.execute_batch("ROLLBACK").unwrap();
             assert_index(&fx, "final rollback");

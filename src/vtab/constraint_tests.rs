@@ -560,7 +560,20 @@ fn unique_scan_covers_every_row_at_batch_boundaries() {
 /// lies beyond that batch.
 #[test]
 fn unique_conflict_after_corrupt_row_is_found_in_idx_segments() {
-    let tmp = TempTestDir::new("unique_after_corrupt");
+    // Through the UNIQUE index: the conflict is found without reading any row, so the corrupt
+    // row is not even noticed.
+    unique_conflict_after_corrupt_row(false);
+    // Through the scan (no marker is ever written): the scan reads past the corrupt row.
+    unique_conflict_after_corrupt_row(true);
+}
+
+fn unique_conflict_after_corrupt_row(scan: bool) {
+    UNIQUE_MIGRATION_DISABLED.with(|flag| flag.set(scan));
+    let tmp = TempTestDir::new(if scan {
+        "unique_after_corrupt_scan"
+    } else {
+        "unique_after_corrupt"
+    });
     let opts = "on_corrupt = 'EVICT', table_id = 7, columns = 'k INTEGER PRIMARY KEY, u INTEGER UNIQUE, body BLOB'";
     let open = |create: bool| {
         let fs = Arc::new(OsFs::open(&tmp.path, create).unwrap());
@@ -611,7 +624,9 @@ fn unique_conflict_after_corrupt_row_is_found_in_idx_segments() {
             .is_err(),
         "a conflict after a corrupt row was missed"
     );
-    assert!(engine.write().unwrap().corrupt_blob_detections() > 0);
+    let detections = engine.write().unwrap().corrupt_blob_detections();
+    assert_eq!(detections > 0, scan, "{detections} corrupt reads");
     conn.execute_batch("INSERT INTO t VALUES (1000, 1000, x'00')")
         .unwrap();
+    UNIQUE_MIGRATION_DISABLED.with(|flag| flag.set(false));
 }

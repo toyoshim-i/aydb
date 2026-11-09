@@ -14,6 +14,8 @@ mod scan;
 mod snapshot;
 mod tx;
 mod unique_index;
+#[cfg(test)]
+pub(crate) use scan::TABLE_SCAN_ENTRIES_COPIED;
 pub(crate) use snapshot::ReadSnapshotToken;
 
 pub(crate) use tx::{CommitStep, GroupRole};

@@ -89,10 +89,8 @@ impl UniqueDef {
         out
     }
 
-    /// The `(index id, component)` pairs the finished row `row` must have, by column position.
-    /// NULL has no entry. A column that cannot be given an index id is rejected (SQLite's own
-    /// column limit is far lower).
-    pub(crate) fn entries(&self, row: &[u8]) -> io::Result<Vec<(u16, Vec<u8>)>> {
+    /// The probes for the finished row `row`: one per non-NULL UNIQUE column, by column position.
+    pub(crate) fn probes(&self, row: &[u8]) -> io::Result<Vec<UniqueProbe>> {
         let mut out = Vec::with_capacity(self.cols.len());
         for &(col, collation, _) in &self.cols {
             if col >= 0x7FFF {
@@ -102,11 +100,39 @@ impl UniqueDef {
                 ));
             }
             if let Some(key) = unique_key_of_row(row, col, collation)? {
-                out.push((unique_index_id(col), unique_index_component(&key)));
+                out.push(UniqueProbe {
+                    col,
+                    collation,
+                    index_id: unique_index_id(col),
+                    component: unique_index_component(&key),
+                    key,
+                });
             }
         }
         Ok(out)
     }
+
+    /// The `(index id, component)` pairs the finished row `row` must have, by column position.
+    /// NULL has no entry. A column that cannot be given an index id is rejected (SQLite's own
+    /// column limit is far lower).
+    pub(crate) fn entries(&self, row: &[u8]) -> io::Result<Vec<(u16, Vec<u8>)>> {
+        Ok(self
+            .probes(row)?
+            .into_iter()
+            .map(|p| (p.index_id, p.component))
+            .collect())
+    }
+}
+
+/// What the conflict check needs about one UNIQUE column of a new row.
+pub(crate) struct UniqueProbe {
+    pub(crate) col: usize,
+    pub(crate) collation: ColCollation,
+    pub(crate) index_id: u16,
+    /// The canonical column key.
+    pub(crate) key: Vec<u8>,
+    /// What the index stores for `key` (the key itself, or its digest form).
+    pub(crate) component: Vec<u8>,
 }
 
 /// Maps a column key to the byte string whose equality is SQLite's equality for that column.
@@ -139,7 +165,6 @@ pub(super) fn unique_index_component(canon_key: &[u8]) -> Vec<u8> {
 }
 
 /// True when `component` is the digest form, whose equality is only a candidate match.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn is_digest_component(component: &[u8]) -> bool {
     component.first() == Some(&UNIQUE_KEY_DIGEST_TAG)
 }

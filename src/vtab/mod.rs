@@ -24,6 +24,8 @@ mod snapshot_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod unique_check_tests;
+#[cfg(test)]
 mod unique_index_tests;
 pub(crate) mod unique_key;
 pub(crate) mod unique_migration;

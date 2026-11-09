@@ -6642,3 +6642,51 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .collect())
     }
 }
+
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Writes an empty-valued key straight into the log, for tests that fabricate entries which
+    /// no row owns (as a half-finished operation of an older version could have left).
+    pub(crate) fn test_put_raw_entry(&mut self, key: Vec<u8>) -> io::Result<()> {
+        self.commit_wal_and_memtable(
+            vec![WalRecord::PutInline {
+                key,
+                value: Vec::new(),
+            }],
+            WriteDurability::BufferedFast,
+        )?;
+        Ok(())
+    }
+}
+
+#[test]
+fn secondary_lookup_sees_the_owners_uncommitted_entries_and_tombstones() {
+    for flushed in [false, true] {
+        let tmp = TempTestDir::new("lookup_owner_view");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        let sync = WriteDurability::SyncTransactional;
+        engine
+            .put_row(1, b"a", b"v", &[(0x8001, b"x".to_vec())], sync)
+            .unwrap();
+        if flushed {
+            engine.flush_memtable().unwrap();
+        }
+        let look =
+            |e: &StorageEngine<OsFs>, v: &[u8]| e.lookup_by_secondary_index(1, 0x8001, v).unwrap();
+        engine.begin_transaction();
+        // An entry deleted earlier in the same transaction is gone, a new one is visible.
+        engine.delete_row(1, b"a", sync).unwrap();
+        assert!(look(&engine, b"x").is_empty(), "flushed={flushed}");
+        engine
+            .put_row(1, b"b", b"v", &[(0x8001, b"x".to_vec())], sync)
+            .unwrap();
+        assert_eq!(look(&engine, b"x"), vec![b"b".to_vec()]);
+        engine.savepoint(7);
+        engine.delete_row(1, b"b", sync).unwrap();
+        assert!(look(&engine, b"x").is_empty());
+        engine.rollback_to_savepoint(7).unwrap();
+        assert_eq!(look(&engine, b"x"), vec![b"b".to_vec()]);
+        engine.rollback_transaction().unwrap();
+        assert_eq!(look(&engine, b"x"), vec![b"a".to_vec()]);
+    }
+}
