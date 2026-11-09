@@ -138,6 +138,16 @@ struct PendingCorruptEviction {
     ptr: BlobPtr,
 }
 
+/// The outcome of resolving a virtual table name to a `table_id` without registering it.
+pub(crate) struct VtabPlan {
+    /// The lower-cased, trimmed table name.
+    pub(crate) norm_name: String,
+    /// The `table_id` the table resolves to (an unused one for a table that is not persisted).
+    pub(crate) table_id: u16,
+    /// Whether the committed catalog already maps `norm_name` to `table_id`.
+    pub(crate) persisted: bool,
+}
+
 /// Controls how the engine tracks read-path `AccessTick` updates on Capped Tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LruReadTrackingMode {
@@ -940,6 +950,54 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         explicit_id: Option<u16>,
         durability: WriteDurability,
     ) -> io::Result<u16> {
+        let plan = self.plan_vtab_registration(table_name, explicit_id)?;
+        self.register_vtab_plan(plan, durability)
+    }
+
+    /// Registers a virtual table resolved by [`Self::plan_vtab_registration`] as live and, if the
+    /// catalog does not hold it yet, persists its catalog entry.
+    pub(crate) fn register_vtab_plan(
+        &mut self,
+        plan: VtabPlan,
+        durability: WriteDurability,
+    ) -> io::Result<u16> {
+        let VtabPlan {
+            norm_name,
+            table_id: chosen_id,
+            persisted,
+        } = plan;
+        self.active_vtab_ids
+            .insert(chosen_id, Arc::from(norm_name.as_str()));
+        if !persisted {
+            let catalog_prefix = [0u8, 0u8, b'c'];
+            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
+            cat_key.extend_from_slice(&catalog_prefix);
+            cat_key.extend_from_slice(norm_name.as_bytes());
+            if !IndexEntry::inline_fits_in_block(cat_key.len(), 2) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "virtual table name exceeds maximum catalog key length",
+                ));
+            }
+            self.commit_wal_and_memtable(
+                vec![WalRecord::PutInline {
+                    key: cat_key,
+                    value: chosen_id.to_be_bytes().to_vec(),
+                }],
+                durability,
+            )?;
+        }
+        Ok(chosen_id)
+    }
+
+    /// Decides which `table_id` a virtual table `(table_name, explicit_id)` resolves to, and
+    /// whether the committed catalog already holds it, without changing anything. Fails exactly
+    /// where [`Self::register_or_resolve_vtab_with_durability`] fails on a conflicting id.
+    pub(crate) fn plan_vtab_registration(
+        &self,
+        table_name: &str,
+        explicit_id: Option<u16>,
+    ) -> io::Result<VtabPlan> {
         self.check_not_poisoned()?;
         let norm_name = table_name.trim().to_ascii_lowercase();
         let catalog_prefix = [0u8, 0u8, b'c'];
@@ -1025,27 +1083,37 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
 
-        self.active_vtab_ids
-            .insert(chosen_id, Arc::from(norm_name.as_str()));
-        if persisted_name_to_id.get(&norm_name).copied() != Some(chosen_id) {
-            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
-            cat_key.extend_from_slice(&catalog_prefix);
-            cat_key.extend_from_slice(norm_name.as_bytes());
-            if !IndexEntry::inline_fits_in_block(cat_key.len(), 2) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "virtual table name exceeds maximum catalog key length",
-                ));
-            }
-            self.commit_wal_and_memtable(
-                vec![WalRecord::PutInline {
-                    key: cat_key,
-                    value: chosen_id.to_be_bytes().to_vec(),
-                }],
-                durability,
-            )?;
+        Ok(VtabPlan {
+            persisted: persisted_name_to_id.get(&norm_name).copied() == Some(chosen_id),
+            norm_name,
+            table_id: chosen_id,
+        })
+    }
+
+    /// Registers an already persisted virtual table as live for a connection that does not own
+    /// the active transaction. Unlike a registration made by the transaction owner, it must
+    /// survive that transaction's rollback, so it is also recorded in the snapshots a rollback
+    /// restores.
+    pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) {
+        let name: Arc<str> = Arc::from(table_name.trim().to_ascii_lowercase().as_str());
+        self.active_vtab_ids.insert(table_id, name.clone());
+        if self.tx_start_meta.active {
+            self.tx_start_meta
+                .active_vtab_ids
+                .insert(table_id, name.clone());
         }
-        Ok(chosen_id)
+        for marker in &mut self.savepoints {
+            marker
+                .meta_snapshot
+                .active_vtab_ids
+                .insert(table_id, name.clone());
+        }
+    }
+
+    /// Whether `(table_id, table_name)` is currently registered as a live virtual table.
+    pub(crate) fn is_vtab_active(&self, table_id: u16, table_name: &str) -> bool {
+        let norm_name = table_name.trim().to_ascii_lowercase();
+        self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) == Some(norm_name.as_str())
     }
 
     /// Unregisters a disconnected virtual table `(table_id, table_name)` from the live registry.

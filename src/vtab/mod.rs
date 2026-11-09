@@ -6,6 +6,8 @@
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
 mod compaction_worker;
+#[cfg(test)]
+mod connect_tests;
 pub mod connection;
 #[cfg(test)]
 mod constraint_tests;
@@ -34,7 +36,7 @@ use crate::engine::LazyBlob;
 use crate::engine::{CommitStep, EngineReader, GroupRole, StorageEngine, WriteDurability};
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
-use crate::vtab::ddl::parse_vtab_ddl;
+use crate::vtab::ddl::{ParsedVtabDdl, parse_vtab_ddl};
 use crate::vtab::ffi::{
     SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_FLOAT, SQLITE_FULL,
     SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
@@ -549,24 +551,31 @@ pub(super) unsafe extern "system" fn destroy_aux_context(ptr: *mut c_void) {
     }));
 }
 
-/// Returns the largest integer-tagged primary key of `table_id`, or `None` if it has none.
-fn max_integer_rowid(eng: &mut StorageEngine<OsFs>, table_id: u16) -> io::Result<Option<i64>> {
+/// Returns the largest integer-tagged primary key of `table_id` visible to `conn_id`, or `None`
+/// if it has none. A connection that does not own the open transaction sees committed rows only.
+fn max_integer_rowid(
+    eng: &mut StorageEngine<OsFs>,
+    conn_id: usize,
+    table_id: u16,
+) -> io::Result<Option<i64>> {
     let lower = [KEY_TAG_INTEGER];
     let upper = [KEY_TAG_INTEGER + 1];
-    let (mut pks, mut slab, mut spans) = (Vec::new(), Vec::new(), Vec::new());
-    eng.scan_range_into_slab(
-        table_id,
-        Some((&lower, true)),
-        Some((&upper, false)),
-        true,
-        1,
-        true,
-        &mut pks,
-        &mut slab,
-        &mut spans,
-        None,
-    )?;
-    Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
+    eng.with_committed_read_for_conn(conn_id, |reader| {
+        let (mut pks, mut slab, mut spans) = (Vec::new(), Vec::new(), Vec::new());
+        reader.scan_range_into_slab(
+            table_id,
+            Some((&lower, true)),
+            Some((&upper, false)),
+            true,
+            1,
+            true,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+            None,
+        )?;
+        Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
+    })
 }
 
 fn integer_rowid_occupied(
@@ -578,6 +587,116 @@ fn integer_rowid_occupied(
         || eng
             .pk_for_rowid_view(crate::engine::ReadView::Owner, table_id, rowid)?
             .is_some())
+}
+
+/// What a successful connect resolved under the engine lock.
+struct Connected {
+    table_id: u16,
+    initial_auto_rowid: i64,
+    rowids_committed: bool,
+}
+
+/// Registers the table for a connection and prepares its runtime state, all under one engine
+/// lock. Returns `None`, having changed nothing, when the table cannot be connected without
+/// writing durable state while another connection's transaction is open: it is not yet in the
+/// catalog, its capped quota is not registered as declared, or its rowid migration is pending.
+///
+/// With another transaction open, an existing migrated table is only registered as live (see
+/// [`StorageEngine::activate_persisted_vtab`]) and its runtime-only settings are applied. None of
+/// that is transactional state: the corrupt policy and inline threshold are not restored by a
+/// rollback, and the live registration is added to the snapshots a rollback restores. The rowid
+/// scan reads the committed view, so the other transaction's uncommitted rows cannot leave a gap
+/// in the automatic rowid sequence if it rolls back.
+fn connect_table(
+    eng: &mut StorageEngine<OsFs>,
+    conn_id: usize,
+    ddl: &ParsedVtabDdl,
+) -> io::Result<Option<Connected>> {
+    let plan = eng.plan_vtab_registration(&ddl.table_name, ddl.explicit_table_id)?;
+    let table_id = plan.table_id;
+    if eng.check_write_allowed_for_conn(conn_id).is_err() {
+        let quota_registered = ddl.max_bytes == 0
+            || eng
+                .capped_table_state(table_id)
+                .is_some_and(|state| state.max_bytes == ddl.max_bytes);
+        let migrated = eng
+            .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
+            .unwrap_or(false);
+        if !(plan.persisted && quota_registered && migrated) {
+            return Ok(None);
+        }
+        eng.activate_persisted_vtab(table_id, &ddl.table_name);
+    } else {
+        // Another connection may already use this registration: a failed connect must not
+        // remove it.
+        let was_active = eng.is_vtab_active(table_id, &ddl.table_name);
+        if let Err(e) = register_and_migrate(eng, ddl, plan) {
+            if !was_active {
+                eng.unregister_vtab(table_id, &ddl.table_name);
+            }
+            return Err(e);
+        }
+    }
+    // Runtime-only settings: re-derived from the DDL on every connect.
+    match ddl.on_corrupt {
+        Some(policy) => eng.set_table_corrupt_policy(table_id, policy),
+        None => eng.reset_table_corrupt_policy(table_id),
+    }
+    match ddl.inline_max {
+        Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
+        None => eng.reset_table_inline_threshold(table_id),
+    }
+    // Resume automatic rowid assignment after the largest existing integer rowid so a
+    // reconnect does not restart the sequence at 1 and fall into the random-rowid fallback.
+    // A failed scan must not prevent the table from connecting (reads report the error
+    // themselves), so it leaves the counter at its initial value.
+    let initial_auto_rowid = if ddl.pk_affinity == ColumnAffinity::Integer {
+        match max_integer_rowid(eng, conn_id, table_id) {
+            Ok(Some(m)) if m >= 0 => m.saturating_add(1),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let rowids_committed = eng
+        .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
+        .unwrap_or(false);
+    Ok(Some(Connected {
+        table_id,
+        initial_auto_rowid,
+        rowids_committed,
+    }))
+}
+
+/// The writing part of a connect: catalog entry, capped quota, and the rowid migration of an
+/// older table. It only runs when no other connection has a transaction open.
+fn register_and_migrate(
+    eng: &mut StorageEngine<OsFs>,
+    ddl: &ParsedVtabDdl,
+    plan: crate::engine::VtabPlan,
+) -> io::Result<()> {
+    let table_id = eng.register_vtab_plan(plan, ddl.durability)?;
+    if ddl.max_bytes > 0 {
+        eng.register_capped_table(table_id, ddl.max_bytes)?;
+    }
+    #[cfg(test)]
+    if FAIL_CONNECT_AFTER_REGISTRATION.with(|flag| flag.replace(false)) {
+        return Err(io::Error::other("injected connect failure"));
+    }
+    // Older databases have no rowid index. Populate missing identities in key order once;
+    // every pair is an atomic WAL batch, so a failed connection can resume safely.
+    rowid_map::ensure_persistent_rowids(
+        eng,
+        table_id,
+        ddl.durability,
+        ddl.pk_affinity == ColumnAffinity::Integer,
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes the next connect on this thread fail right after it registered the table.
+    static FAIL_CONNECT_AFTER_REGISTRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 unsafe extern "system" fn vtab_create_or_connect(
@@ -599,99 +718,48 @@ unsafe extern "system" fn vtab_create_or_connect(
             Err(rc) => return rc,
         };
 
-        // Resolve or auto-assign unique `table_id` and register Capped Table if `max_bytes > 0`
-        let table_id = {
-            let mut eng = match aux.engine.write() {
-                Ok(g) => g,
-                Err(_) => return SQLITE_ERROR,
-            };
-            if let Err(e) = eng.check_write_allowed_for_conn(db as usize) {
-                return io_err_to_sqlite_rc(&e);
-            }
-            let resolved_id = match eng.register_or_resolve_vtab_with_durability(
-                &ddl.table_name,
-                ddl.explicit_table_id,
-                ddl.durability,
-            ) {
-                Ok(id) => id,
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            };
-            if ddl.max_bytes > 0 {
-                if let Err(e) = eng.register_capped_table(resolved_id, ddl.max_bytes) {
-                    eng.unregister_vtab(resolved_id, &ddl.table_name);
-                    return io_err_to_sqlite_rc(&e);
-                }
-            }
-            // Runtime-only setting: re-derived from the DDL on every connect.
-            match ddl.on_corrupt {
-                Some(policy) => eng.set_table_corrupt_policy(resolved_id, policy),
-                None => eng.reset_table_corrupt_policy(resolved_id),
-            }
-            match ddl.inline_max {
-                Some(max_bytes) => eng.set_table_inline_threshold(resolved_id, max_bytes),
-                None => eng.reset_table_inline_threshold(resolved_id),
-            }
-            resolved_id
-        };
-
+        // Declare the columns first: it needs no engine state, so a failure leaves nothing
+        // registered.
         let declare_sql = format!("CREATE TABLE x({})", ddl.columns_spec);
         let Ok(c_sql) = CString::new(declare_sql) else {
-            if let Ok(mut eng) = aux.engine.write() {
-                eng.unregister_vtab(table_id, &ddl.table_name);
-            }
             return SQLITE_ERROR;
         };
         let rc = sqlite3_declare_vtab(db, c_sql.as_ptr());
         if rc != SQLITE_OK {
-            if let Ok(mut eng) = aux.engine.write() {
-                eng.unregister_vtab(table_id, &ddl.table_name);
-            }
             return rc;
         }
 
-        // Resume automatic rowid assignment after the largest existing integer rowid so a
-        // reconnect does not restart the sequence at 1 and fall into the random-rowid fallback.
-        // A failed scan must not prevent the table from connecting (reads report the error
-        // themselves), so it leaves the counter at its initial value.
-        let initial_auto_rowid = if ddl.pk_affinity == ColumnAffinity::Integer {
-            match aux.engine.write() {
-                Ok(mut eng) => match max_integer_rowid(&mut eng, table_id) {
-                    Ok(Some(m)) if m >= 0 => m.saturating_add(1),
-                    _ => 0,
-                },
-                Err(_) => 0,
-            }
-        } else {
-            0
-        };
-
-        let rowids_committed;
-        // Older databases have no rowid index. Populate missing identities in key order once;
-        // every pair is an atomic WAL batch, so a failed connection can resume safely.
-        {
+        // Connecting an existing, migrated table writes no durable state and never waits.
+        // Creating a table, or migrating a legacy one, does: those wait for another connection's
+        // transaction to end, bounded like `xBegin`, because the same thread may hold that
+        // connection open and could never end it.
+        let mut deadline = None;
+        let connected = loop {
             let mut eng = match aux.engine.write() {
-                Ok(eng) => eng,
+                Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
-            // The write lock was released since the check above; do not join a transaction that
-            // another connection began in the meantime.
-            if let Err(e) = eng.check_write_allowed_for_conn(db as usize) {
-                eng.unregister_vtab(table_id, &ddl.table_name);
-                return io_err_to_sqlite_rc(&e);
+            match connect_table(&mut eng, db as usize, &ddl) {
+                Ok(Some(connected)) => break connected,
+                Ok(None) => {
+                    let now = Instant::now();
+                    let end = *deadline.get_or_insert(now + eng.writer_wait_timeout());
+                    if now >= end {
+                        return SQLITE_BUSY;
+                    }
+                    let gate = eng.commit_gate();
+                    let seen = gate.tx_end_count();
+                    drop(eng);
+                    gate.wait_tx_end(seen, end - now);
+                }
+                Err(e) => return io_err_to_sqlite_rc(&e),
             }
-            if let Err(e) = rowid_map::ensure_persistent_rowids(
-                &mut eng,
-                table_id,
-                ddl.durability,
-                ddl.pk_affinity == ColumnAffinity::Integer,
-            ) {
-                eng.unregister_vtab(table_id, &ddl.table_name);
-                return io_err_to_sqlite_rc(&e);
-            }
-            rowids_committed = eng
-                .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
-                .unwrap_or(false);
-        }
+        };
+        let Connected {
+            table_id,
+            initial_auto_rowid,
+            rowids_committed,
+        } = connected;
 
         let vtab = Box::new(AydbVTab {
             base: sqlite3_vtab {

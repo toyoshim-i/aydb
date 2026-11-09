@@ -548,6 +548,59 @@ fn marker_visible_only_in_the_open_tx_does_not_latch_a_vtab_that_scanned_it() {
     assert!(fixture.migrated());
 }
 
+#[test]
+fn connecting_a_legacy_table_waits_for_the_other_transaction_and_then_migrates_it() {
+    let fixture = legacy_fixture("migration_waits_for_writer");
+    let writer = fixture.open();
+    writer
+        .execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (schema_path, engine) = (fixture.schema_path.clone(), fixture.engine.clone());
+    let reader = std::thread::spawn(move || {
+        let conn = SqliteConnection::open_file(&schema_path).unwrap();
+        conn.register_aydb_module_with_options(engine, false)
+            .unwrap();
+        let rows = conn
+            .query_all("SELECT rowid,k FROM legacy ORDER BY k", &[])
+            .map_err(|e| e.to_string());
+        done_tx.send(rows).unwrap();
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(400))
+            .is_err(),
+        "the migration writes durable state and must wait for the open transaction"
+    );
+    assert!(!fixture.migrated());
+    writer.execute_batch("COMMIT").unwrap();
+    let rows = done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    reader.join().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0][0], rows[1][0]);
+    assert!(fixture.migrated());
+}
+
+#[test]
+fn connecting_a_migrated_legacy_table_does_not_wait_for_another_transaction() {
+    let fixture = legacy_fixture("migrated_connect_during_write");
+    assert_two_distinct_rowids(&fixture.open());
+    assert!(fixture.migrated());
+    let writer = fixture.open();
+    writer
+        .execute_batch("BEGIN; INSERT INTO t1 VALUES('x','y')")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let reader = fixture.open();
+    assert_two_distinct_rowids(&reader);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+}
+
 /// Counts every device sync (`sync_barrier` and `sync_durable`) issued through the filesystem.
 mod sync_counting {
     use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
