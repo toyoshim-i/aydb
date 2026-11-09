@@ -11,6 +11,7 @@ This document defines the workflow, conventions, and engineering standards for d
 
 * **Never Push Automatically:** Do **not** execute `git push` (or any remote-mutating Git command) automatically. Pushing to a remote repository must only be performed by the user or when explicitly instructed by the user for a specific commit/branch.
 * **Clean, Atomic Commits:** Keep commits focused on a single logical change (e.g., design documentation update, a specific sub-module implementation, or a self-contained test suite).
+* **Pre-Commit Checks:** `.githooks/pre-commit` rejects a commit that fails `cargo fmt --check` or `cargo clippy --all-targets -- -D warnings`. Enable it once per clone with `git config core.hooksPath .githooks`. CI runs the same two checks.
 
 ## 3. Design-First, Phase-by-Phase Workflow
 

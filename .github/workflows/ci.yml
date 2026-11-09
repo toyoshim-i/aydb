@@ -27,7 +27,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       # The crate links the system SQLite: winsqlite3 on Windows (part of
       # the OS image), libsqlite3 on macOS (part of the OS), and the
@@ -42,6 +42,9 @@ jobs:
       # failure is not hidden by the tee that follows it.
       - name: Prepare results directory
         run: mkdir -p results
+
+      - name: Format
+        run: cargo fmt --check 2>&1 | tee results/fmt.txt
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings 2>&1 | tee results/clippy.txt

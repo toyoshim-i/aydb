@@ -1,0 +1,20 @@
+#!/bin/sh
+# Rejects a commit that fails rustfmt or clippy. Enable it once per clone with:
+#   git config core.hooksPath .githooks
+#
+# The checks run on the working tree, so unstaged Rust changes count too. A commit that touches
+# no Rust source or Cargo manifest is not checked.
+set -e
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+    echo "pre-commit: formatting differs. Run cargo fmt and stage the result." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets --quiet -- -D warnings
