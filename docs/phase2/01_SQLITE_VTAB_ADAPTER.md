@@ -107,14 +107,14 @@ SQLite routes `INSERT`, `UPDATE`, and `DELETE` statements on a virtual table to 
 
 | Operation | `argc` & `argv` Condition | `aydb` Execution Path |
 | :--- | :--- | :--- |
-| **`DELETE`** | `argc == 1` (`argv[0]` is old PK / rowid) | Extracts `old_pk` from `argv[0]` (via reversible 8-byte `i64` decoding or fallback `rowid_to_pk` map) and calls `engine.delete_row(table_id, &old_pk, durability)`. |
+| **`DELETE`** | `argc == 1` (`argv[0]` is old PK / rowid) | Extracts `old_pk` from `argv[0]` (via reversible 8-byte `i64` decoding or the persistent rowid index) and calls `engine.delete_row(table_id, &old_pk, durability)`. |
 | **`INSERT` / `REPLACE`** | `argc > 1` and `sqlite3_value_type(argv[0]) == SQLITE_NULL` | Extracts `new_pk` from `argv[2 + pk_col_idx]`, encodes all columns directly via `encode_sqlite_values_direct`, builds secondary index pairs `(index_id, col_bytes)`, and calls `engine.put_row_owned(table_id, &new_pk, row_bytes, &sec_keys, durability)`. A duplicate primary key is first resolved against `ON CONFLICT` (`sqlite3_vtab_on_conflict`), failing with `SQLITE_CONSTRAINT` by default. `put_row_owned` overwrites existing keys and cleans up old blobs and LRU entries, so `INSERT OR REPLACE` works in a single pass. |
 | **`UPDATE`** | `argc > 1` and `sqlite3_value_type(argv[0]) != SQLITE_NULL` | Resolves `old_pk` from `argv[0]`. If `old_pk != new_pk`, deletes `old_pk` first, then upserts `new_pk` via `engine.put_row_owned(...)`. |
 
 ### 4.2 Lock-Free Reversible Integer `ROWID` Mapping
 SQLite's Virtual Table bytecode sequences two-phase mutations (`DELETE` and `UPDATE`) by reading a 64-bit integer `rowid` via `xRowid` during cursor scan and passing that `rowid` back as `argv[0]` in `xUpdate`.
 * An integer primary key is stored as a 9-byte tagged key, which maps bijectively to its `i64` value (`decode_i64_tagged_key` / `encode_i64_tagged_key`). `xRowid` and `xUpdate` use this mapping on the stack without taking a mutex or touching a hash map, as long as `has_non_int_pks` is `false`.
-* For other primary keys, `aydb` sets `has_non_int_pks = true`, derives the rowid with a CRC32C + SplitMix64 hash (`hash_pk_to_rowid`), and records it in the bounded `rowid_to_pk` map.
+* For other primary keys, `aydb` uses `hash_pk_to_rowid` as the first candidate and resolves collisions against a persistent reverse index while holding the engine writer lock. The `[TableID | 'u' | PK] -> rowid` and `[TableID | 'v' | rowid] -> PK` records commit and roll back with the row. Connections read the same persisted identity, independently of cache contents or traversal order. Deletion, quota eviction and table drop remove both directions. Older databases receive the missing mappings in bounded batches on first connect, with a completion marker written last so an interrupted migration can resume.
 
 ### 4.3 Transaction Lifecycle Callbacks (`xBegin`, `xSync`, `xCommit`, `xRollback`) & Multi-Sector WAL Coalescing
 To eliminate per-row 4 KB WAL sector padding on multi-row `BEGIN ... COMMIT` transactions and multi-table OLTP workloads (such as TPC-B):

@@ -13,6 +13,8 @@ pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod rowid_tests;
 
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CString;
@@ -244,27 +246,11 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
 fn resolve_pk_for_rowid(
     vtab: &AydbVTab,
     target_rid: i64,
-    scan_all_keys: impl FnOnce(u16) -> io::Result<Vec<Vec<u8>>>,
+    lookup: impl FnOnce(u16, i64) -> io::Result<Option<Vec<u8>>>,
 ) -> io::Result<Option<Vec<u8>>> {
-    if let Ok(rmap) = vtab.rowid_to_pk.lock() {
-        if let Some(pk) = rmap.get_pk(target_rid) {
-            return Ok(Some(pk.clone()));
-        }
-    }
-    let all_keys = scan_all_keys(vtab.table_id)?;
-    let mut found = None;
-    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-        for pk in all_keys {
-            let assigned_rid = rmap.get_or_assign_rowid(&pk);
-            if assigned_rid == target_rid && found.is_none() {
-                found = Some(pk);
-                break;
-            }
-        }
-        if found.is_none() {
-            found = rmap.get_pk(target_rid).cloned();
-        }
-    }
+    // A local cache may contain a deleted or reused identity from another connection.
+    // Resolve against the same persisted read view used for the row itself.
+    let found = lookup(vtab.table_id, target_rid)?;
     if found.is_some() {
         vtab.has_non_int_pks.store(true, Ordering::Relaxed);
     }
@@ -579,6 +565,19 @@ unsafe extern "system" fn vtab_create_or_connect(
         } else {
             0
         };
+
+        // Older databases have no rowid index. Populate missing identities in key order once;
+        // every pair is an atomic WAL batch, so a failed connection can resume safely.
+        if ddl.pk_affinity != ColumnAffinity::Integer {
+            let mut eng = match aux.engine.write() {
+                Ok(eng) => eng,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if let Err(e) = rowid_map::ensure_persistent_rowids(&mut eng, table_id, ddl.durability) {
+                eng.unregister_vtab(table_id, &ddl.table_name);
+                return io_err_to_sqlite_rc(&e);
+            }
+        }
 
         let vtab = Box::new(AydbVTab {
             base: sqlite3_vtab {
@@ -1002,7 +1001,7 @@ unsafe extern "system" fn vtab_filter(
                                     Err(e) => return io_err_to_sqlite_rc(&e),
                                 }
                             } else {
-                                match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
+                                match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid(t, rid)) {
                                     Ok(Some(mapped_pk)) => {
                                         match point_fetch(
                                             eng,
@@ -1510,7 +1509,10 @@ unsafe extern "system" fn vtab_column(
             }
             let pk_bytes = &cursor.pks[cursor.pos];
             if i_col < 0 {
-                let rid = extract_rowid_from_pk_bytes(pk_bytes, vtab);
+                let rid = match extract_rowid_from_pk_bytes(pk_bytes, vtab) {
+                    Ok(rid) => rid,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
                 sqlite3_result_int64(p_ctx, rid);
                 return SQLITE_OK;
             }
@@ -1533,6 +1535,10 @@ unsafe extern "system" fn vtab_column(
             } else {
                 let (start, end) = cursor.spans[cursor.pos];
                 extract_rowid_from_row(&cursor.slab[start..end], vtab)
+            };
+            let rid = match rid {
+                Ok(rid) => rid,
+                Err(e) => return io_err_to_sqlite_rc(&e),
             };
             sqlite3_result_int64(p_ctx, rid);
             return SQLITE_OK;
@@ -1615,19 +1621,28 @@ unsafe extern "system" fn vtab_rowid(
             if cursor.pos >= cursor.pks.len() {
                 return SQLITE_ERROR;
             }
-            *p_rowid = extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab);
+            *p_rowid = match extract_rowid_from_pk_bytes(&cursor.pks[cursor.pos], vtab) {
+                Ok(rid) => rid,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            };
             return SQLITE_OK;
         }
         if cursor.pos >= cursor.spans.len() {
             return SQLITE_ERROR;
         }
         if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-            *p_rowid = extract_rowid_from_pk_bytes(pk_bytes, vtab);
+            *p_rowid = match extract_rowid_from_pk_bytes(pk_bytes, vtab) {
+                Ok(rid) => rid,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            };
             return SQLITE_OK;
         }
         let (start, end) = cursor.spans[cursor.pos];
         let row_bytes = &cursor.slab[start..end];
-        *p_rowid = extract_rowid_from_row(row_bytes, vtab);
+        *p_rowid = match extract_rowid_from_row(row_bytes, vtab) {
+            Ok(rid) => rid,
+            Err(e) => return io_err_to_sqlite_rc(&e),
+        };
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -1660,7 +1675,7 @@ unsafe extern "system" fn vtab_update(
                     }
                     return SQLITE_OK;
                 } else {
-                    let old_pk_opt = match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
+                    let old_pk_opt = match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid)) {
                         Ok(opt) => opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
                     };
@@ -1801,7 +1816,7 @@ unsafe extern "system" fn vtab_update(
                 if vtab.pk_affinity == ColumnAffinity::Integer {
                     old_pk_opt = Some((encode_i64_tagged_key(rid).to_vec(), None));
                 } else {
-                    let mapped = match resolve_pk_for_rowid(vtab, rid, |t| eng.scan_keys_range(t, None, None, usize::MAX)) {
+                    let mapped = match resolve_pk_for_rowid(vtab, rid, |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid)) {
                         Ok(opt) => opt,
                         Err(e) => return io_err_to_sqlite_rc(&e),
                     };
@@ -1906,14 +1921,19 @@ unsafe extern "system" fn vtab_update(
             int_id
         } else {
             vtab.has_non_int_pks.store(true, Ordering::Relaxed);
+            let rowid = match eng.assign_rowid(
+                vtab.table_id, &new_pk, hash_pk_to_rowid(&new_pk), vtab.durability,
+            ) {
+                Ok(rowid) => rowid,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            };
             if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
                 if vtab.open_cursors.load(Ordering::Relaxed) == 0 {
                     rmap.evict_oldest_half_if_needed();
                 }
-                rmap.get_or_assign_rowid(&new_pk)
-            } else {
-                hash_pk_to_rowid(&new_pk)
+                rmap.remember_rowid(&new_pk, rowid);
             }
+            rowid
         };
         if !p_rowid.is_null() {
             *p_rowid = rid;

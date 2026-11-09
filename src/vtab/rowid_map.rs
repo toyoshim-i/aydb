@@ -3,8 +3,11 @@
 
 use core::ffi::c_int;
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::Ordering;
 
+use crate::engine::{StorageEngine, WriteDurability};
+use crate::pal::OsFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::AydbVTab;
 use crate::vtab::row_codec::{
@@ -13,6 +16,34 @@ use crate::vtab::row_codec::{
 
 /// Maximum number of non-integer primary keys retained in `RowidMap` once all cursors close.
 pub(super) const MAX_ROWID_MAP_ENTRIES: usize = 262_144;
+
+/// Migrates older rows in bounded batches. Each mapping pair is one atomic WAL batch, and the
+/// completion marker is written last so a failed connection can resume without changing IDs.
+pub(super) fn ensure_persistent_rowids(
+    engine: &mut StorageEngine<OsFs>,
+    table_id: u16,
+    durability: WriteDurability,
+) -> io::Result<()> {
+    if engine.rowids_initialized(table_id)? {
+        return Ok(());
+    }
+    let mut lower = None;
+    loop {
+        let keys = engine.scan_keys_range(table_id, lower.as_deref(), None, 256)?;
+        let mut progress = false;
+        for pk in keys {
+            if lower.as_deref() == Some(pk.as_slice()) {
+                continue;
+            }
+            engine.assign_rowid(table_id, &pk, hash_pk_to_rowid(&pk), durability)?;
+            lower = Some(pk);
+            progress = true;
+        }
+        if !progress {
+            return engine.mark_rowids_initialized(table_id, durability);
+        }
+    }
+}
 
 /// Undo record for transactional mutations to [`RowidMap`].
 #[derive(Clone, Debug)]
@@ -62,6 +93,7 @@ impl RowidMap {
         self.fifo_order.retain(|rid| rmap_ref.contains_key(rid));
     }
 
+    #[cfg(test)]
     pub(super) fn get_or_assign_rowid(&mut self, encoded_pk: &[u8]) -> i64 {
         if let Some(&rid) = self.by_pk.get(encoded_pk) {
             return rid;
@@ -86,8 +118,25 @@ impl RowidMap {
         rid
     }
 
+    #[cfg(test)]
     pub(super) fn get_pk(&self, rid: i64) -> Option<&Vec<u8>> {
         self.by_rowid.get(&rid)
+    }
+
+    /// Caches an identity selected by the persistent reverse index.
+    pub(super) fn remember_rowid(&mut self, encoded_pk: &[u8], rowid: i64) {
+        if self.by_pk.get(encoded_pk) == Some(&rowid) {
+            return;
+        }
+        self.remove_by_pk(encoded_pk);
+        self.remove_by_rowid(rowid);
+        let pk = encoded_pk.to_vec();
+        self.by_rowid.insert(rowid, pk.clone());
+        self.by_pk.insert(pk.clone(), rowid);
+        self.fifo_order.push(rowid);
+        if self.in_tx {
+            self.tx_undo.push(RowidUndoOp::Inserted { rowid, pk });
+        }
     }
 
     pub(super) fn remove_by_rowid(&mut self, rid: i64) -> Option<Vec<u8>> {
@@ -206,8 +255,8 @@ impl RowidMap {
     }
 }
 
-/// Computes a 64-bit synthetic `rowid` from `encoded_pk` with full 64-bit entropy using two
-/// independently seeded hardware CRC32C passes followed by a SplitMix64 bijective finalizer.
+/// Computes the first rowid candidate. CRC collisions are resolved by the persistent reverse
+/// index, because changing the CRC seed does not provide independent entropy for equal lengths.
 #[inline]
 pub fn hash_pk_to_rowid(encoded_pk: &[u8]) -> i64 {
     let h1 = crc32c_append(0x0000_0000, encoded_pk) as u64;
@@ -224,7 +273,7 @@ pub fn hash_pk_to_rowid(encoded_pk: &[u8]) -> i64 {
 /// For non-integer PKs (`TEXT`/`BLOB`/`REAL`/etc.), computes the collision-free synthetic `rowid`
 /// and registers `(rid, pk)` in `rowid_to_pk`.
 #[inline]
-pub(super) fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
+pub(super) fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> io::Result<i64> {
     let dir_pos = 4 + vtab.pk_col_idx * 5;
     if vtab.pk_affinity == ColumnAffinity::Integer
         && dir_pos + 5 <= row_bytes.len()
@@ -233,31 +282,32 @@ pub(super) fn extract_rowid_from_row(row_bytes: &[u8], vtab: &AydbVTab) -> i64 {
         let offset =
             u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
         if offset + 8 <= row_bytes.len() {
-            return i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+            return Ok(i64::from_le_bytes(
+                row_bytes[offset..offset + 8].try_into().unwrap(),
+            ));
         }
     }
-    let pk = extract_column_key_bytes_with_collation(row_bytes, vtab.pk_col_idx, vtab.pk_collation)
-        .unwrap_or_default();
-    vtab.has_non_int_pks.store(true, Ordering::Relaxed);
-    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-        rmap.get_or_assign_rowid(&pk)
-    } else {
-        hash_pk_to_rowid(&pk)
-    }
+    let pk =
+        extract_column_key_bytes_with_collation(row_bytes, vtab.pk_col_idx, vtab.pk_collation)?;
+    extract_rowid_from_pk_bytes(&pk, vtab)
 }
 
 /// Extracts the `rowid` (`i64`) directly from `pk_bytes` for keys-only cursor scans.
 #[inline]
-pub(super) fn extract_rowid_from_pk_bytes(pk_bytes: &[u8], vtab: &AydbVTab) -> i64 {
+pub(super) fn extract_rowid_from_pk_bytes(pk_bytes: &[u8], vtab: &AydbVTab) -> io::Result<i64> {
     if vtab.pk_affinity == ColumnAffinity::Integer {
         if let Some(id) = decode_i64_tagged_key(pk_bytes) {
-            return id;
+            return Ok(id);
         }
     }
     vtab.has_non_int_pks.store(true, Ordering::Relaxed);
-    if let Ok(mut rmap) = vtab.rowid_to_pk.lock() {
-        rmap.get_or_assign_rowid(pk_bytes)
-    } else {
-        hash_pk_to_rowid(pk_bytes)
-    }
+    super::with_read_access(&vtab.engine, vtab.db as usize, vtab.table_id, |eng| {
+        eng.rowid_for_pk(vtab.table_id, pk_bytes)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "row has no persistent SQLite rowid",
+            )
+        })
+    })
+    .unwrap_or_else(|| Err(io::Error::other("engine lock poisoned")))
 }

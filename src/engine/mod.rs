@@ -9,6 +9,7 @@ mod compaction;
 pub use compaction::{CompactionJob, CompactionOutput};
 mod eviction;
 mod reader;
+mod rowid;
 mod scan;
 mod tx;
 
@@ -1040,7 +1041,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut records = Vec::new();
         let mut dead_ptrs = Vec::new();
 
-        for ns in [NS_PRIMARY_ROW, NS_SECONDARY_INDEX, NS_ROW_META, NS_LRU_QUEUE] {
+        for ns in [NS_PRIMARY_ROW, NS_SECONDARY_INDEX, NS_ROW_META, NS_LRU_QUEUE,
+            rowid::NS_ROWID_BY_PK, rowid::NS_PK_BY_ROWID] {
             let prefix = encode_namespace_prefix(table_id, ns);
             let entries = self.scan_merged_prefix(&prefix)?;
             for entry in entries {
@@ -1619,6 +1621,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut records = vec![WalRecord::Delete {
             key: row_key.clone(),
         }];
+        self.append_rowid_deletes(table_id, pk, &mut records)?;
         let mut old_logical_size = 0u64;
         let mut old_meta_blob_ptr = None;
 
