@@ -622,6 +622,13 @@ impl<F: PlatformFs> BootMetaManager<F> {
             }
         };
 
+        // After a process crash the winning slot may exist only in the OS cache, while the
+        // opposite slot is the only one known to be durable. The first commit overwrites that
+        // slot, so make the winner durable first; otherwise a power loss during that commit can
+        // tear both slots. One sync per open (a failure fails the open, nothing is swept or
+        // overwritten). It also covers the orphan sweep, which acts on the winner's state.
+        file.sync_durable()?;
+
         Ok(Self {
             fs,
             file,
@@ -1709,6 +1716,127 @@ mod tests {
             slot_flags(&reopened),
             (FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX)
         );
+    }
+
+    /// Event recorded by [`LoggingFs`] for `boot_meta.db`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum BootMetaEvent {
+        Write(u64),
+        Sync,
+    }
+
+    type EventLog = Arc<std::sync::Mutex<Vec<BootMetaEvent>>>;
+
+    /// Test-only `PlatformFs` that records the writes and syncs issued on `boot_meta.db`.
+    struct LoggingFs {
+        inner: OsFs,
+        log: EventLog,
+    }
+
+    struct LoggingFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        log: Option<EventLog>,
+    }
+
+    impl LoggingFile {
+        fn record(&self, event: BootMetaEvent) {
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(event);
+            }
+        }
+    }
+
+    impl PlatformFile for LoggingFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.record(BootMetaEvent::Write(offset));
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.record(BootMetaEvent::Sync);
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    impl PlatformFs for LoggingFs {
+        type File = LoggingFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(LoggingFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                log: (rel_name == BOOT_META_FILE_NAME).then(|| Arc::clone(&self.log)),
+            }))
+        }
+
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+
+        fn root_path(&self) -> &std::path::Path {
+            self.inner.root_path()
+        }
+    }
+
+    #[test]
+    fn first_slot_write_after_open_is_preceded_by_a_sync_of_boot_meta() {
+        let tmp = TempTestDir::new("sync_before_first_slot_write");
+        {
+            // Two commits make both slots valid, so the next open picks a winner.
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            let mut mgr = BootMetaManager::open_or_recover(fs).unwrap();
+            mgr.commit_update(|st| st.checkpoint_lsn = 1).unwrap();
+            mgr.commit_update(|st| st.checkpoint_lsn = 2).unwrap();
+        }
+        let log: EventLog = Arc::default();
+        let fs = Arc::new(LoggingFs {
+            inner: OsFs::open(&tmp.path, true).expect("reopen OsFs"),
+            log: Arc::clone(&log),
+        });
+        let mut mgr = BootMetaManager::open_or_recover(fs).unwrap();
+        mgr.commit_update(|st| st.checkpoint_lsn = 3).unwrap();
+        mgr.commit_update(|st| st.checkpoint_lsn = 4).unwrap();
+
+        // The winning slot may exist only in the OS cache after a process crash. It must be
+        // durable before the commit overwrites the opposite slot, the only known-durable one.
+        let events = log.lock().unwrap().clone();
+        let first_write = events
+            .iter()
+            .position(|e| matches!(e, BootMetaEvent::Write(_)))
+            .expect("a slot write");
+        assert!(
+            events[..first_write].contains(&BootMetaEvent::Sync),
+            "no boot_meta.db sync before the first slot write: {events:?}"
+        );
+        // Only the first commit pays for it: each commit adds exactly write + sync.
+        let syncs = events.iter().filter(|e| **e == BootMetaEvent::Sync).count();
+        assert_eq!(syncs, 3, "{events:?}");
     }
 
     #[test]
