@@ -229,7 +229,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Ensure all active blob segments are durably flushed before checkpointing `boot_meta.db`
         self.sync_active_blob_writers()?;
 
-        let new_seq_id = self.meta_mgr.state().next_seq_id;
+        // Consumed in memory before the file exists, so a failed write whose cleanup also fails
+        // never leaves a file that a retry would reuse (ARCHITECTURE.md section 2.3). The commit
+        // below persists the advanced counter.
+        let new_seq_id = self.meta_mgr.reserve_seq_id();
 
         let mut new_reader = match self.memtable.write_to_segment(
             &*self.fs,
@@ -282,8 +285,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lingering = self.unlink_after_wal_rotation.clone();
 
         if let Err(e) = self.meta_mgr.commit_update(|st| {
-            let allocated = st.allocate_seq_id();
-            debug_assert_eq!(allocated, new_seq_id);
             st.idx_segments.push(idx_meta);
             st.std_blob_segments = std_metas;
             st.lru_blob_segments = lru_metas;

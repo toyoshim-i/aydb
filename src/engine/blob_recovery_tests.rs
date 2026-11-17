@@ -1,4 +1,4 @@
-//! Blob segment creation that fails after it took effect.
+//! Segment file creation that fails after it took effect, and blob accounting at recovery.
 //!
 //! A creation can report an error although the file exists (the directory entry is written but
 //! not yet flushed). The retry must not reuse that name (ARCHITECTURE.md section 2.3): opening
@@ -218,4 +218,146 @@ fn a_fully_dead_segment_with_a_garbage_tail_is_still_reclaimed() {
         "the fully dead segment was never reclaimed"
     );
     assert_eq!(engine.get_row(7, b"y").unwrap(), Some(vec![2u8; 3000]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Idx segment creation that fails and cannot be cleaned up
+// ---------------------------------------------------------------------------------------------
+
+/// Shared switches of [`FlakyFs`].
+#[derive(Default)]
+struct FlakyCtl {
+    /// The next `sync_durable` of a file whose name starts with `idx_` fails.
+    fail_idx_sync_once: AtomicBool,
+    /// Every `remove_file` of a name starting with `idx_` fails (an antivirus lock).
+    fail_idx_remove: AtomicBool,
+}
+
+struct FlakyFile {
+    inner: Arc<OsFile>,
+    is_idx: bool,
+    ctl: Arc<FlakyCtl>,
+}
+
+impl PlatformFile for FlakyFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.inner.write_all_at(buf, offset)
+    }
+    fn file_len(&self) -> io::Result<u64> {
+        self.inner.file_len()
+    }
+    fn preallocate(
+        &self,
+        target_len: u64,
+        strategy: crate::pal::PreallocStrategy,
+    ) -> io::Result<()> {
+        self.inner.preallocate(target_len, strategy)
+    }
+    fn sync_barrier(&self) -> io::Result<()> {
+        self.inner.sync_barrier()
+    }
+    fn sync_durable(&self) -> io::Result<()> {
+        if self.is_idx && self.ctl.fail_idx_sync_once.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected idx sync failure"));
+        }
+        self.inner.sync_durable()
+    }
+    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.evict_os_cache(offset, len)
+    }
+}
+
+struct FlakyFs {
+    inner: OsFs,
+    ctl: Arc<FlakyCtl>,
+}
+
+impl PlatformFs for FlakyFs {
+    type File = FlakyFile;
+
+    fn open_file(
+        &self,
+        name: &str,
+        create: bool,
+        writable: bool,
+        hint: OpenHint,
+    ) -> io::Result<Arc<Self::File>> {
+        Ok(Arc::new(FlakyFile {
+            inner: self.inner.open_file(name, create, writable, hint)?,
+            is_idx: name.starts_with("idx_"),
+            ctl: Arc::clone(&self.ctl),
+        }))
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        if name.starts_with("idx_") && self.ctl.fail_idx_remove.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected idx remove failure"));
+        }
+        self.inner.remove_file(name)
+    }
+
+    fn list_files(&self) -> io::Result<Vec<String>> {
+        self.inner.list_files()
+    }
+
+    fn root_path(&self) -> &Path {
+        self.inner.root_path()
+    }
+}
+
+/// A flush whose segment sync failed and whose cleanup could not remove the file leaves a long
+/// `idx_<SeqID>.db` behind. The next flush must not write into that name: the builder does not
+/// shorten an existing file, so the old tail and footer would survive and, after a reopen, hide
+/// the acknowledged overwrite behind the old value.
+#[test]
+fn failed_idx_flush_with_failed_cleanup_does_not_reuse_the_name() {
+    let tmp = TempTestDir::new("idx_failed_flush");
+    let ctl = Arc::new(FlakyCtl::default());
+    let open = |ctl: &Arc<FlakyCtl>| {
+        Arc::new(FlakyFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            ctl: Arc::clone(ctl),
+        })
+    };
+    let mut config = EngineConfig::default();
+    config.auto_compact_segment_threshold = 0;
+    config.inline_threshold_bytes = 4000;
+    let sync = WriteDurability::SyncTransactional;
+
+    let mut engine = StorageEngine::open(open(&ctl), config.clone()).unwrap();
+    let big = vec![b'A'; 3500];
+    for i in 0..20u32 {
+        engine
+            .put_row(1, format!("k{i:03}").as_bytes(), &big, &[], sync)
+            .unwrap();
+    }
+
+    ctl.fail_idx_sync_once.store(true, Ordering::SeqCst);
+    ctl.fail_idx_remove.store(true, Ordering::SeqCst);
+    assert!(engine.flush_memtable().is_err());
+    ctl.fail_idx_remove.store(false, Ordering::SeqCst);
+
+    for i in 0..20u32 {
+        engine
+            .put_row(1, format!("k{i:03}").as_bytes(), b"x", &[], sync)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    assert_eq!(engine.get_row(1, b"k005").unwrap(), Some(b"x".to_vec()));
+    drop(engine);
+
+    let mut reopened = StorageEngine::open(open(&ctl), config).unwrap();
+    for i in 0..20u32 {
+        assert_eq!(
+            reopened.get_row(1, format!("k{i:03}").as_bytes()).unwrap(),
+            Some(b"x".to_vec()),
+            "k{i:03} lost its acknowledged overwrite after reopen"
+        );
+    }
 }
