@@ -22,11 +22,12 @@ pub(super) fn ddl(table_id: u16, extra: &str) -> String {
 }
 
 pub(super) struct Fx {
-    pub(super) dir: TempTestDir,
     pub(super) engine: Engine,
     pub(super) conn: SqliteConnection,
     pub(super) table_id: u16,
     pub(super) capped: bool,
+    // Declared last so the directory is removed after the engine has closed its files.
+    pub(super) dir: TempTestDir,
 }
 
 pub(super) fn open_engine(dir: &TempTestDir) -> Engine {

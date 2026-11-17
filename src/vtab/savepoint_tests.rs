@@ -44,11 +44,12 @@ const VARIANTS: [Variant; 3] = [
 ];
 
 struct Session {
-    _dir: TempTestDir,
     conn: SqliteConnection,
     big: String,
     label: String,
     history: Vec<String>,
+    // Declared last so the directory is removed after the connection has closed its files.
+    _dir: TempTestDir,
 }
 
 impl Session {

@@ -322,10 +322,11 @@ fn legacy_mixed_integer_table_migrates_nonintegers_without_reusing_integer_rowid
 /// schema file connect `legacy` lazily, so the connect (and its migration) can land inside a
 /// user transaction.
 struct LegacyFixture {
-    _schema_dir: TempTestDir,
-    _engine_dir: TempTestDir,
     schema_path: std::path::PathBuf,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    // Declared last so the directories are removed after the engine has closed its files.
+    _schema_dir: TempTestDir,
+    _engine_dir: TempTestDir,
 }
 
 fn legacy_fixture(name: &str) -> LegacyFixture {

@@ -28,10 +28,11 @@ const NEW_DDL: &str =
 /// (id 3), plus the engine that holds their data. Connections opened on the schema file connect
 /// both tables lazily through `xConnect`.
 struct Fixture {
-    _schema_dir: TempTestDir,
-    _engine_dir: TempTestDir,
     schema_path: PathBuf,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    // Declared last so the directories are removed after the engine has closed its files.
+    _schema_dir: TempTestDir,
+    _engine_dir: TempTestDir,
 }
 
 fn fixture(name: &str, writer_wait_timeout_ms: u32) -> Fixture {
