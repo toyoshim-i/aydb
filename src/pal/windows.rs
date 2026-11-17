@@ -47,6 +47,16 @@ const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x0800_0000;
 const FILE_FLAG_RANDOM_ACCESS: DWORD = 0x1000_0000;
 
 const ERROR_SHARING_VIOLATION: DWORD = 32;
+
+/// Number of retries after a first `ERROR_SHARING_VIOLATION` on open.
+const SHARING_VIOLATION_RETRIES: u32 = 10;
+
+/// Delay before retry number `retry` (0-based) after `ERROR_SHARING_VIOLATION`, or `None` once the
+/// budget is spent. The sequence is 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 ms: ten retries, 1023 ms
+/// in total. Scanners and backup agents commonly hold a handle for hundreds of milliseconds.
+fn sharing_violation_backoff(retry: u32) -> Option<std::time::Duration> {
+    (retry < SHARING_VIOLATION_RETRIES).then(|| std::time::Duration::from_millis(1u64 << retry))
+}
 const ERROR_HANDLE_EOF: DWORD = 38;
 const ERROR_IO_PENDING: DWORD = 997;
 
@@ -252,9 +262,9 @@ impl WinPlatformFile {
             }
         }
 
-        let mut handle = INVALID_HANDLE_VALUE;
-        for retry in 0..=4u32 {
-            handle = unsafe {
+        let mut retry = 0u32;
+        let handle = loop {
+            let handle = unsafe {
                 CreateFileW(
                     wide_path.as_ptr(),
                     access,
@@ -266,17 +276,20 @@ impl WinPlatformFile {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                break;
+                break handle;
             }
             let err = unsafe { GetLastError() };
-            // If an antivirus / EDR minifilter briefly holds a scan handle on a freshly written
-            // segment or manifest file, retry with short exponential backoff.
-            if err == ERROR_SHARING_VIOLATION && retry < 4 {
-                std::thread::sleep(std::time::Duration::from_millis(1u64 << retry));
-                continue;
+            // If an antivirus / EDR / backup scanner holds a handle on a freshly written segment
+            // or manifest file, retry with bounded exponential backoff (about 1 s in total).
+            if err == ERROR_SHARING_VIOLATION {
+                if let Some(delay) = sharing_violation_backoff(retry) {
+                    std::thread::sleep(delay);
+                    retry += 1;
+                    continue;
+                }
             }
             return Err(io::Error::from_raw_os_error(err as i32));
-        }
+        };
 
         if hint == OpenHint::BackgroundBulk {
             // Best-effort I/O priority lowering so compaction does not starve foreground reads.
@@ -561,5 +574,22 @@ impl PlatformFs for WinPlatformFs {
 
     fn root_path(&self) -> &Path {
         &self.root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sharing_violation_backoff_is_bounded_exponential_of_about_one_second() {
+        let delays: Vec<u64> = (0..)
+            .map_while(sharing_violation_backoff)
+            .map(|d| d.as_millis() as u64)
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
+        assert_eq!(delays.iter().sum::<u64>(), 1023);
+        assert_eq!(sharing_violation_backoff(10), None);
+        assert_eq!(sharing_violation_backoff(u32::MAX), None);
     }
 }
