@@ -7,6 +7,8 @@
 
 mod compaction_worker;
 #[cfg(test)]
+mod conflict_tests;
+#[cfg(test)]
 mod connect_tests;
 pub mod connection;
 #[cfg(test)]
@@ -51,14 +53,14 @@ pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::{ParsedVtabDdl, parse_vtab_ddl};
 use crate::vtab::ffi::{
     SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_FLOAT, SQLITE_FULL,
-    SQLITE_IGNORE, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
-    SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT,
-    SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
-    SQLITE_TEXT, sqlite3, sqlite3_context, sqlite3_declare_vtab, sqlite3_index_info, sqlite3_int64,
-    sqlite3_module, sqlite3_result_error_code, sqlite3_result_int64, sqlite3_value,
-    sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
-    sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_collation, sqlite3_vtab_cursor,
-    sqlite3_vtab_on_conflict,
+    SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
+    SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
+    SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_TEXT,
+    SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
+    sqlite3_index_info, sqlite3_int64, sqlite3_module, sqlite3_result_error_code,
+    sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes, sqlite3_value_double,
+    sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type, sqlite3_vtab,
+    sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
 };
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
@@ -760,6 +762,13 @@ unsafe extern "system" fn vtab_create_or_connect(
             return SQLITE_ERROR;
         };
         let rc = sqlite3_declare_vtab(db, c_sql.as_ptr());
+        if rc != SQLITE_OK {
+            return rc;
+        }
+        // Promise that `xUpdate` reports `SQLITE_CONSTRAINT` before it changes anything. SQLite
+        // then applies the statement's conflict mode (ABORT, FAIL, IGNORE, ROLLBACK) to the
+        // violation itself, row counters included, instead of treating it as a generic error.
+        let rc = sqlite3_vtab_config(db, SQLITE_VTAB_CONSTRAINT_SUPPORT, 1 as c_int);
         if rc != SQLITE_OK {
             return rc;
         }
@@ -1950,10 +1959,9 @@ unsafe extern "system" fn vtab_update(
                     && vtab.pk_affinity == ColumnAffinity::Integer)
                 && sqlite3_value_type(*argv.offset(2 + idx as isize)) == SQLITE_NULL
             {
-                match sqlite3_vtab_on_conflict(vtab.db) {
-                    SQLITE_IGNORE => return SQLITE_OK,
-                    _ => return SQLITE_CONSTRAINT,
-                }
+                // NOT NULL has no REPLACE resolution without a DEFAULT, which this adapter
+                // does not support, so SQLite handles every mode as the statement requires.
+                return SQLITE_CONSTRAINT;
             }
         }
         let pk_val_ptr = *argv.offset(2 + vtab.pk_col_idx as isize);
@@ -2093,12 +2101,8 @@ unsafe extern "system" fn vtab_update(
         } else {
             None
         };
-        if rowid_conflict_pk.is_some() {
-            match sqlite3_vtab_on_conflict(vtab.db) {
-                SQLITE_IGNORE => return SQLITE_OK,
-                SQLITE_REPLACE => {}
-                _ => return SQLITE_CONSTRAINT,
-            }
+        if rowid_conflict_pk.is_some() && sqlite3_vtab_on_conflict(vtab.db) != SQLITE_REPLACE {
+            return SQLITE_CONSTRAINT;
         }
 
         // Enforce primary key uniqueness & SQLite `ON CONFLICT` resolution
@@ -2122,10 +2126,8 @@ unsafe extern "system" fn vtab_update(
             Err(e) => return io_err_to_sqlite_rc(&e),
         };
         if !unique_conflicts.is_empty() {
-            match sqlite3_vtab_on_conflict(vtab.db) {
-                SQLITE_IGNORE => return SQLITE_OK,
-                SQLITE_REPLACE => {}
-                _ => return SQLITE_CONSTRAINT,
+            if sqlite3_vtab_on_conflict(vtab.db) != SQLITE_REPLACE {
+                return SQLITE_CONSTRAINT;
             }
         }
         if (is_insert || !same_pk) && pk_override.is_none() {
@@ -2139,16 +2141,12 @@ unsafe extern "system" fn vtab_update(
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
             if let Some(conflict_pk) = existing_conflict {
-                let conflict_mode = sqlite3_vtab_on_conflict(vtab.db);
-                if conflict_mode == SQLITE_IGNORE {
-                    return SQLITE_OK;
-                } else if conflict_mode == SQLITE_REPLACE {
-                    if conflict_pk.as_slice() != new_pk.as_slice() {
-                        pk_conflict_to_delete = Some(conflict_pk);
-                        known_absent = true;
-                    }
-                } else {
+                if sqlite3_vtab_on_conflict(vtab.db) != SQLITE_REPLACE {
                     return SQLITE_CONSTRAINT;
+                }
+                if conflict_pk.as_slice() != new_pk.as_slice() {
+                    pk_conflict_to_delete = Some(conflict_pk);
+                    known_absent = true;
                 }
             } else {
                 known_absent = true;

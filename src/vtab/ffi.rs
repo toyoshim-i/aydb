@@ -67,6 +67,9 @@ pub const SQLITE_INDEX_CONSTRAINT_LIMIT: c_uchar = 73;
 
 pub const SQLITE_INDEX_SCAN_UNIQUE: c_int = 1;
 
+/// `sqlite3_vtab_config` option: `xUpdate` returns `SQLITE_CONSTRAINT` before it changes anything.
+pub const SQLITE_VTAB_CONSTRAINT_SUPPORT: c_int = 1;
+
 /// `SQLITE_TRANSIENT` instructs SQLite to make its own private copy of a string/blob immediately.
 pub const fn sqlite_transient() -> Option<unsafe extern "system" fn(*mut c_void)> {
     unsafe { core::mem::transmute::<isize, Option<unsafe extern "system" fn(*mut c_void)>>(-1) }
@@ -230,6 +233,13 @@ pub struct sqlite3_module {
 }
 
 unsafe impl Sync for sqlite3_module {}
+
+// `sqlite3_vtab_config` is variadic, which only the C calling convention can express.
+#[cfg_attr(windows, link(name = "winsqlite3"))]
+#[cfg_attr(unix, link(name = "sqlite3"))]
+unsafe extern "C" {
+    pub fn sqlite3_vtab_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
+}
 
 #[cfg_attr(windows, link(name = "winsqlite3"))]
 #[cfg_attr(unix, link(name = "sqlite3"))]
