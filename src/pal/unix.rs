@@ -33,10 +33,30 @@ unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
     #[cfg(target_os = "macos")]
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn fsync(fd: c_int) -> c_int;
     #[cfg(target_os = "linux")]
     fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int;
     #[cfg(target_os = "linux")]
     fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+}
+
+/// macOS `ENOTTY` ("inappropriate ioctl for device").
+#[cfg(any(target_os = "macos", test))]
+const MACOS_ENOTTY: i32 = 25;
+/// macOS `ENOTSUP` (also `EOPNOTSUPP`).
+#[cfg(any(target_os = "macos", test))]
+const MACOS_ENOTSUP: i32 = 45;
+
+/// Decides whether a failed `fcntl(F_FULLFSYNC)` means "this filesystem cannot do it" (so a plain
+/// `fsync` is the best available) rather than a real flush failure. Only `ENOTSUP` (SMB and some
+/// other network or FUSE mounts; the case Go's `File.Sync` handles) and `ENOTTY` (the filesystem
+/// has no ioctl handler; seen with OpenJDK and Bitcoin Core) qualify. Any other errno, notably
+/// `EIO`, must be returned: after a failed flush the kernel may drop the dirty pages, and a later
+/// `fsync` would then report success for data that never reached the disk.
+#[cfg(any(target_os = "macos", test))]
+fn full_fsync_unsupported(errno: i32) -> bool {
+    errno == MACOS_ENOTSUP || errno == MACOS_ENOTTY
 }
 
 /// Tells the kernel how the file will be accessed. Advisory, so a failure is ignored. Blob files
@@ -332,12 +352,31 @@ impl PlatformFile for UnixPlatformFile {
 
     fn sync_durable(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
+        #[allow(clippy::needless_return)]
         {
-            let rc = self.with_file(|f| Ok(unsafe { fcntl(f.as_raw_fd(), F_FULLFSYNC) }))?;
-            if rc != -1 {
+            // errno must be read inside the closure, right after the call.
+            let res = self.with_file(|f| {
+                if unsafe { fcntl(f.as_raw_fd(), F_FULLFSYNC) } != -1 {
+                    return Ok(None);
+                }
+                Ok(Some(io::Error::last_os_error()))
+            })?;
+            let Some(err) = res else {
                 return Ok(());
+            };
+            if !full_fsync_unsupported(err.raw_os_error().unwrap_or(0)) {
+                return Err(err);
             }
+            // std's `sync_all` itself issues F_FULLFSYNC on macOS, so call `fsync` directly.
+            return self.with_file(|f| {
+                if unsafe { fsync(f.as_raw_fd()) } == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
         }
+        #[cfg(not(target_os = "macos"))]
         self.with_file(|f| f.sync_all())
     }
 
@@ -454,6 +493,15 @@ impl PlatformFs for UnixPlatformFs {
 mod tests {
     use super::*;
     use crate::util::test_util::TempTestDir;
+
+    #[test]
+    fn full_fsync_falls_back_only_for_unsupported_filesystems() {
+        assert!(full_fsync_unsupported(MACOS_ENOTSUP));
+        assert!(full_fsync_unsupported(MACOS_ENOTTY));
+        for errno in [5, 9, 22, 28, 0] {
+            assert!(!full_fsync_unsupported(errno), "errno {errno}");
+        }
+    }
 
     #[test]
     fn handle_pool_caps_descriptors_and_reopens_on_demand() {
