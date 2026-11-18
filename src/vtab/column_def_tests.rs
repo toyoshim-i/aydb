@@ -69,9 +69,6 @@ fn text_column_keeps_text_affinity_with_constraint_clauses() {
         "k TEXT PRIMARY KEY, v TEXT REFERENCES pointers(id)",
         "k TEXT PRIMARY KEY, v TEXT REFERENCES pointers (id) ON DELETE CASCADE",
         "k TEXT PRIMARY KEY, v TEXT NOT NULL REFERENCES t2(id) ON UPDATE SET NULL NOT DEFERRABLE",
-        "k TEXT PRIMARY KEY, v TEXT CHECK(v<>'zzz')",
-        "k TEXT PRIMARY KEY, v TEXT CHECK (v<>'zzz') COLLATE NOCASE",
-        "k TEXT PRIMARY KEY, v TEXT CONSTRAINT c CHECK(length(v) < 10) NOT NULL",
         "k TEXT PRIMARY KEY, v TEXT NULL",
     ] {
         check(

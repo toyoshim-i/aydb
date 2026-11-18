@@ -6,6 +6,8 @@
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
 #[cfg(test)]
+mod check_tests;
+#[cfg(test)]
 mod column_def_tests;
 mod compaction_worker;
 #[cfg(test)]
@@ -65,7 +67,7 @@ use crate::vtab::ffi::{
     SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
     SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
     SQLITE_TEXT, SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
-    sqlite3_index_info, sqlite3_int64, sqlite3_module, sqlite3_result_error_code,
+    sqlite3_index_info, sqlite3_int64, sqlite3_malloc, sqlite3_module, sqlite3_result_error_code,
     sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes, sqlite3_value_double,
     sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type, sqlite3_vtab,
     sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
@@ -374,8 +376,8 @@ fn resolve_pk_for_rowid(
 /// Static `sqlite3_module` method table registered with `sqlite3_create_module_v2`.
 pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     iVersion: 2,
-    xCreate: Some(vtab_create_or_connect),
-    xConnect: Some(vtab_create_or_connect),
+    xCreate: Some(vtab_create),
+    xConnect: Some(vtab_connect),
     xBestIndex: Some(vtab_best_index),
     xDisconnect: Some(vtab_disconnect),
     xDestroy: Some(vtab_destroy),
@@ -437,6 +439,8 @@ pub(super) struct AydbVTab {
     pub(super) pk_affinity: ColumnAffinity,
     /// The key is `INTEGER PRIMARY KEY`, a rowid alias: NULL on insert assigns the next key.
     pk_rowid_alias: bool,
+    /// The declaration has a `CHECK` that is not enforced: every write that stores a row fails.
+    has_check: bool,
     pub(super) pk_collation: ColCollation,
     /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
     secondary_indexes: Vec<(usize, u16)>,
@@ -746,13 +750,51 @@ thread_local! {
     static FAIL_CONNECT_AFTER_REGISTRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-unsafe extern "system" fn vtab_create_or_connect(
+const CHECK_UNSUPPORTED: &str = "CHECK constraints are not supported by aydb tables";
+
+/// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
+/// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
+unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
+    unsafe {
+        let buf = sqlite3_malloc((msg.len() + 1) as c_int) as *mut c_char;
+        if !buf.is_null() {
+            core::ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, buf, msg.len());
+            *buf.add(msg.len()) = 0;
+        }
+        buf
+    }
+}
+
+unsafe extern "system" fn vtab_create(
     db: *mut sqlite3,
     p_aux: *mut c_void,
     argc: c_int,
     argv: *const *const c_char,
     pp_vtab: *mut *mut sqlite3_vtab,
-    _pz_err: *mut *mut c_char,
+    pz_err: *mut *mut c_char,
+) -> c_int {
+    unsafe { vtab_create_or_connect(db, p_aux, argc, argv, pp_vtab, pz_err, true) }
+}
+
+unsafe extern "system" fn vtab_connect(
+    db: *mut sqlite3,
+    p_aux: *mut c_void,
+    argc: c_int,
+    argv: *const *const c_char,
+    pp_vtab: *mut *mut sqlite3_vtab,
+    pz_err: *mut *mut c_char,
+) -> c_int {
+    unsafe { vtab_create_or_connect(db, p_aux, argc, argv, pp_vtab, pz_err, false) }
+}
+
+unsafe fn vtab_create_or_connect(
+    db: *mut sqlite3,
+    p_aux: *mut c_void,
+    argc: c_int,
+    argv: *const *const c_char,
+    pp_vtab: *mut *mut sqlite3_vtab,
+    pz_err: *mut *mut c_char,
+    is_create: bool,
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         if p_aux.is_null() || pp_vtab.is_null() {
@@ -764,6 +806,15 @@ unsafe extern "system" fn vtab_create_or_connect(
             Ok(d) => d,
             Err(rc) => return rc,
         };
+        // A new table may not have a CHECK it cannot enforce. An existing one (written by an
+        // older build) must still connect so that it can be read and dropped; its
+        // writes are refused instead.
+        if is_create && ddl.has_check {
+            if !pz_err.is_null() {
+                *pz_err = sqlite_error_message(CHECK_UNSUPPORTED);
+            }
+            return SQLITE_ERROR;
+        }
 
         // Declare the columns first: it needs no engine state, so a failure leaves nothing
         // registered.
@@ -845,6 +896,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             pk_col_idx: ddl.pk_col_idx,
             pk_affinity: ddl.pk_affinity,
             pk_rowid_alias: ddl.pk_rowid_alias,
+            has_check: ddl.has_check,
             pk_collation: ddl.pk_collation,
             secondary_indexes: ddl.secondary_indexes,
             next_auto_rowid: AtomicI64::new(initial_auto_rowid),
@@ -1956,6 +2008,17 @@ unsafe extern "system" fn vtab_update(
         }
 
         // Case 2: INSERT or UPDATE (`argc == 2 + num_cols`)
+        if vtab.has_check {
+            // A row cannot be checked, so none may be stored. SQLITE_CONSTRAINT would be
+            // resolved by the statement's conflict mode (OR IGNORE would skip the row and report
+            // success, OR REPLACE would delete conflicting rows first), so this is a plain
+            // error that every mode reports as such.
+            if !(*p_vtab).zErrMsg.is_null() {
+                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
+            }
+            (*p_vtab).zErrMsg = sqlite_error_message(CHECK_UNSUPPORTED);
+            return SQLITE_ERROR;
+        }
         let num_cols = vtab.col_names.len();
         if (argc as usize) < 2 + num_cols {
             return SQLITE_ERROR;

@@ -28,6 +28,8 @@ pub(super) struct ParsedVtabDdl {
     /// The key column is a rowid alias: declared exactly `INTEGER PRIMARY KEY` (not `DESC`).
     /// Only then does a NULL key mean "assign the next key".
     pub(super) pk_rowid_alias: bool,
+    /// Some column has a `CHECK` constraint, which this adapter cannot enforce.
+    pub(super) has_check: bool,
     pub(super) pk_collation: ColCollation,
     pub(super) secondary_indexes: Vec<(usize, u16)>,
 }
@@ -251,6 +253,7 @@ struct ColumnDef {
     primary_key: bool,
     /// `INTEGER PRIMARY KEY` that SQLite treats as an alias of the rowid.
     rowid_alias: bool,
+    check: bool,
 }
 
 /// Consumes the parenthesised group that follows keyword token `tokens[i]`, either attached to
@@ -281,6 +284,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         unique: false,
         primary_key: false,
         rowid_alias: false,
+        check: false,
     };
     let mut i = 1usize;
     let mut type_words: Vec<String> = Vec::new();
@@ -347,8 +351,12 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                 def.unique = true;
                 i += 1;
             }
-            // Parsed as a constraint; not enforced yet.
-            "CHECK" => i = skip_paren_group(tokens, i).ok_or(SQLITE_ERROR)?,
+            // Parsed so that the rest of the definition is read correctly. The adapter cannot
+            // evaluate it, so `xCreate` rejects it and a table that has one refuses writes.
+            "CHECK" => {
+                def.check = true;
+                i = skip_paren_group(tokens, i).ok_or(SQLITE_ERROR)?;
+            }
             "COLLATE" => {
                 let Some(name) = tokens.get(i + 1) else {
                     return Err(SQLITE_ERROR);
@@ -494,6 +502,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
         let mut pk_rowid_alias = false;
+        let mut has_check = false;
         for col_def in split_top_level_commas(&columns_spec) {
             let trimmed = col_def.trim();
             // The parser does not support comments or per-constraint conflict policies.
@@ -518,6 +527,7 @@ pub(super) unsafe fn parse_vtab_ddl(
                 pk_col_idx = col_names.len();
                 pk_rowid_alias = def.rowid_alias;
             }
+            has_check |= def.check;
             col_names.push(def.name);
             col_affinities.push(def.affinity);
             col_collations.push(def.collation);
@@ -570,6 +580,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             pk_col_idx,
             pk_affinity,
             pk_rowid_alias,
+            has_check,
             pk_collation,
             secondary_indexes,
         })
