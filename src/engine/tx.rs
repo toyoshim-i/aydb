@@ -1042,7 +1042,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
             // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, record_count, &mut self.pending_tx_buf);
+            WalBatch::finalize_encoded_buf(lsn, 0, 0, record_count, &mut self.pending_tx_buf);
             let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
             let res = self.append_raw_wal_batch_with_rotation(&raw_buf, durability);
             raw_buf.clear();
@@ -1058,7 +1058,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // chunk. Ensure the target WAL file has enough capacity so all chunks of the
         // transaction remain in the same WAL epoch without flushing uncommitted `MemTable` state.
         let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
-        let mut cursor = 16usize;
+        let mut cursor = crate::wal::WAL_BATCH_HEADER_SIZE;
         let total_len = raw_buf.len();
         let mut chunks: Vec<(Vec<u8>, u32)> = Vec::new();
         let mut chunk_buf = Vec::with_capacity(MAX_WAL_CHUNK_BYTES + 4096);
@@ -1067,7 +1067,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         while cursor < total_len {
             if chunk_records == 0 {
                 chunk_buf.clear();
-                chunk_buf.extend_from_slice(&[0u8; 16]);
+                chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
                 if chunks.is_empty() {
                     // Prepend `WalRecord::TxBegin` (`4u8`) to the first chunk.
                     chunk_buf.push(4u8);
@@ -1106,7 +1106,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             {
                 chunks.push((core::mem::take(&mut chunk_buf), chunk_records));
                 chunk_buf = Vec::with_capacity(MAX_WAL_CHUNK_BYTES + 4096);
-                chunk_buf.extend_from_slice(&[0u8; 16]);
+                chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
                 chunk_records = 0;
             }
             chunk_buf.extend_from_slice(rec_slice);
@@ -1122,11 +1122,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if chunks.len() == 1 {
             let (mut single_buf, mut single_records) = chunks.pop().unwrap();
-            // Strip the leading `TxBegin` (`4u8` at index 16) since it fit in a single chunk
-            single_buf.remove(16);
+            // The transaction fit in one chunk: strip the leading `TxBegin` after the header.
+            single_buf.remove(crate::wal::WAL_BATCH_HEADER_SIZE);
             single_records -= 1;
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, single_records, &mut single_buf);
+            WalBatch::finalize_encoded_buf(lsn, 0, 0, single_records, &mut single_buf);
             self.append_raw_wal_batch_with_rotation(&single_buf, durability)?;
             self.next_lsn = lsn + 1;
             return Ok(());
@@ -1162,7 +1162,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         for (mut cbuf, crec) in chunks {
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, crec, &mut cbuf);
+            WalBatch::finalize_encoded_buf(lsn, 0, 0, crec, &mut cbuf);
             self.append_raw_wal_batch_with_rotation(&cbuf, durability)?;
             self.next_lsn = lsn + 1;
         }

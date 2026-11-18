@@ -33,6 +33,24 @@ pub const WAL_SECTOR_SIZE: usize = 4096;
 /// Size of the WAL sector header (`0..16`).
 pub const WAL_SECTOR_HEADER_SIZE: usize = 16;
 
+/// On-disk WAL format version, stored in bytes `14..16` of every sector header (u16 LE).
+///
+/// It is checked only after the sector's epoch and CRC32C match, so sectors left over from
+/// earlier epochs are still ignored silently. Version `0` is the old format (the reserved value).
+pub const WAL_FORMAT_VERSION: u16 = 1;
+
+/// Size of the batch header: `[lsn u64 | batch_crc32c u32 | record_count u32 | prev_lsn u64 |
+/// durable_lsn u64]`, followed by the records.
+pub const WAL_BATCH_HEADER_SIZE: usize = 32;
+
+/// Offset of `record_count` in the batch header; also where the `batch_crc32c` range starts.
+///
+/// `batch_crc32c` covers `buf[WAL_BATCH_CRC_START..]`: `record_count`, `prev_lsn`, `durable_lsn`
+/// and the records, as one contiguous range. (Before format version 1 it covered only the
+/// records, `buf[16..]`, so a flipped `record_count` was caught only indirectly.) The LSN and
+/// the CRC field itself lie outside the range.
+const WAL_BATCH_CRC_START: usize = 12;
+
 /// Maximum fragment payload bytes inside a single 4 KB sector (`4080` bytes).
 pub const WAL_SECTOR_PAYLOAD_CAP: usize = WAL_SECTOR_SIZE - WAL_SECTOR_HEADER_SIZE;
 
@@ -123,12 +141,21 @@ pub enum WalRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalBatch {
     pub lsn: u64,
+    /// LSN of the batch appended immediately before this one (`0` if none or not yet tracked).
+    pub prev_lsn: u64,
+    /// Highest LSN known durable when this batch was appended (`0` if none or not yet tracked).
+    pub durable_lsn: u64,
     pub records: Vec<WalRecord>,
 }
 
 impl WalBatch {
     pub fn new(lsn: u64, records: Vec<WalRecord>) -> Self {
-        Self { lsn, records }
+        Self {
+            lsn,
+            prev_lsn: 0,
+            durable_lsn: 0,
+            records,
+        }
     }
 
     /// Appends serialized record bytes for `records` into `buf`.
@@ -178,24 +205,39 @@ impl WalBatch {
         }
     }
 
-    /// Fills in the 16-byte `[lsn (8B) | batch_crc32c (4B) | record_count (4B)]` header at `buf[0..16]`.
-    pub fn finalize_encoded_buf(lsn: u64, record_count: u32, buf: &mut [u8]) {
-        let batch_crc = crc32c(&buf[16..]);
+    /// Fills in the 32-byte `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | prev_lsn (8B) |
+    /// durable_lsn (8B)]` header at `buf[0..WAL_BATCH_HEADER_SIZE]`.
+    pub fn finalize_encoded_buf(
+        lsn: u64,
+        prev_lsn: u64,
+        durable_lsn: u64,
+        record_count: u32,
+        buf: &mut [u8],
+    ) {
         buf[0..8].copy_from_slice(&lsn.to_le_bytes());
-        buf[8..12].copy_from_slice(&batch_crc.to_le_bytes());
         buf[12..16].copy_from_slice(&record_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&prev_lsn.to_le_bytes());
+        buf[24..32].copy_from_slice(&durable_lsn.to_le_bytes());
+        let batch_crc = crc32c(&buf[WAL_BATCH_CRC_START..]);
+        buf[8..12].copy_from_slice(&batch_crc.to_le_bytes());
     }
 
-    /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`
+    /// Serializes this batch into the 32-byte header followed by the records,
     /// reusing an existing buffer `out` without intermediate heap allocations.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.clear();
-        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&[0u8; WAL_BATCH_HEADER_SIZE]);
         Self::append_records_to_buf(&self.records, out);
-        Self::finalize_encoded_buf(self.lsn, self.records.len() as u32, out);
+        Self::finalize_encoded_buf(
+            self.lsn,
+            self.prev_lsn,
+            self.durable_lsn,
+            self.records.len() as u32,
+            out,
+        );
     }
 
-    /// Serializes this batch into `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | records...]`
+    /// Serializes this batch into the 32-byte header followed by the records
     /// in a single allocation without intermediate copying.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
@@ -209,14 +251,16 @@ impl WalBatch {
 
         let lsn = r.read_u64_le()?;
         let expected_crc = r.read_u32_le()?;
-        let record_count = r.read_u32_le()? as usize;
-
+        // The CRC range starts at `record_count`, so verify it before trusting any later field.
         if crc32c(r.remaining_slice()) != expected_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "WalBatch CRC32C mismatch",
             ));
         }
+        let record_count = r.read_u32_le()? as usize;
+        let prev_lsn = r.read_u64_le()?;
+        let durable_lsn = r.read_u64_le()?;
 
         // Minimum serialized WalRecord is 1 byte (1B op for TxBegin / TxCommit).
         if record_count > r.remaining() {
@@ -290,7 +334,12 @@ impl WalBatch {
             ));
         }
 
-        Ok(Self { lsn, records })
+        Ok(Self {
+            lsn,
+            prev_lsn,
+            durable_lsn,
+            records,
+        })
     }
 }
 
@@ -748,7 +797,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
         self.sector_buf[4..12].copy_from_slice(&self.active_epoch.to_le_bytes());
         self.sector_buf[12..14].copy_from_slice(&(self.current_valid_bytes as u16).to_le_bytes());
-        self.sector_buf[14..16].copy_from_slice(&0u16.to_le_bytes());
+        self.sector_buf[14..16].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
 
         let sector_crc = crc32c(&self.sector_buf[4..WAL_SECTOR_SIZE]);
         self.sector_buf[0..4].copy_from_slice(&sector_crc.to_le_bytes());
@@ -785,6 +834,17 @@ pub struct SingleStreamRecovery {
     pub batches: Vec<WalBatch>,
     /// Index of the first sector after the valid log prefix (where new writes may resume).
     pub next_sector_idx: usize,
+    /// Set when the scan stopped at a current-epoch sector with a valid CRC but a format version
+    /// other than [`WAL_FORMAT_VERSION`]. Later recovery steps turn this into `UnsupportedFormat`.
+    #[allow(dead_code)]
+    pub(crate) unsupported_format: Option<UnsupportedWalFormat>,
+}
+
+/// A sector that is intact (current epoch, valid CRC) but written in another WAL format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnsupportedWalFormat {
+    pub sector_idx: usize,
+    pub version: u16,
 }
 
 /// Scans a single WAL file from Sector 0 and extracts all complete [`WalBatch`] items matching
@@ -799,6 +859,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
     let mut batches = Vec::new();
     let mut partial_batch_buf: Option<Vec<u8>> = None;
     let mut next_sector_idx = 0usize;
+    let mut unsupported_format = None;
 
     // Read in 256 KB windows (64 sectors) to maximize sequential throughput during recovery.
     const WINDOW_SECTORS: usize = 64;
@@ -827,6 +888,17 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
             let actual_crc = crc32c(&sector[4..WAL_SECTOR_SIZE]);
             if actual_crc != expected_crc {
                 // Reached a torn write at the log tail!
+                halted = true;
+                break;
+            }
+
+            // Checked only now: a sector from an earlier epoch or a torn one never reports it.
+            let version = u16::from_le_bytes(sector[14..16].try_into().unwrap());
+            if version != WAL_FORMAT_VERSION {
+                unsupported_format = Some(UnsupportedWalFormat {
+                    sector_idx: sec_idx + i,
+                    version,
+                });
                 halted = true;
                 break;
             }
@@ -934,6 +1006,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
     Ok(SingleStreamRecovery {
         batches,
         next_sector_idx,
+        unsupported_format,
     })
 }
 
@@ -1939,5 +2012,146 @@ mod tests {
         w.append_batch(&put_batch(3, b"c", 10)).unwrap();
         drop(w);
         assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 3]);
+    }
+
+    fn linked_batch() -> WalBatch {
+        let mut b = put_batch(7, b"k", 20);
+        b.prev_lsn = 6;
+        b.durable_lsn = 4;
+        b
+    }
+
+    #[test]
+    fn batch_round_trips_prev_and_durable_lsn() {
+        let b = linked_batch();
+        let enc = b.encode();
+        assert_eq!(&enc[16..24], &6u64.to_le_bytes());
+        assert_eq!(&enc[24..32], &4u64.to_le_bytes());
+        assert_eq!(WalBatch::decode(&enc).unwrap(), b);
+        // `WalBatch::new` leaves both at 0 until the engine tracks them.
+        let plain = put_batch(1, b"k", 1);
+        assert_eq!((plain.prev_lsn, plain.durable_lsn), (0, 0));
+        assert_eq!(WalBatch::decode(&plain.encode()).unwrap(), plain);
+    }
+
+    #[test]
+    fn batch_crc_covers_record_count_prev_lsn_and_durable_lsn() {
+        let enc = linked_batch().encode();
+        assert_eq!(enc.len(), WAL_BATCH_HEADER_SIZE + 1 + 4 + 1 + 4 + 20);
+        // RecordCount (12..16), PrevLsn (16..24), DurableLsn (24..32) and the records.
+        for pos in [12, 16, 23, 24, 31, 32, enc.len() - 1] {
+            let mut bad = enc.clone();
+            bad[pos] ^= 0x01;
+            let err = WalBatch::decode(&bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "byte {pos}");
+            assert!(err.to_string().contains("CRC32C"), "byte {pos}: {err}");
+        }
+    }
+
+    /// Rewrites the format version of sector `idx` and re-seals its CRC, as an old or future
+    /// writer would have left it.
+    fn set_sector_version(fs: &FailFs, name: &str, idx: usize, version: u16) {
+        let f = fs
+            .open_file(name, false, true, OpenHint::MutableBufferedLog)
+            .unwrap();
+        let off = (idx * WAL_SECTOR_SIZE) as u64;
+        let mut sec = vec![0u8; WAL_SECTOR_SIZE];
+        f.read_exact_at(&mut sec, off).unwrap();
+        sec[14..16].copy_from_slice(&version.to_le_bytes());
+        let crc = crc32c(&sec[4..]);
+        sec[0..4].copy_from_slice(&crc.to_le_bytes());
+        f.write_all_at(&sec, off).unwrap();
+    }
+
+    fn recover_stream(fs: &FailFs, name: &str, epoch: u64) -> SingleStreamRecovery {
+        let f = fs
+            .open_file(name, false, false, OpenHint::MutableSyncLog)
+            .unwrap();
+        recover_single_wal_stream(&*f, epoch).unwrap()
+    }
+
+    #[test]
+    fn sectors_carry_the_current_format_version() {
+        let (_tmp, fs, _, _) = fail_fs("wal_version_written");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+        drop(w);
+        let f = fs
+            .open_file(WAL_SYNC_FILE_NAME, false, false, OpenHint::MutableSyncLog)
+            .unwrap();
+        let mut sec = vec![0u8; WAL_SECTOR_SIZE];
+        f.read_exact_at(&mut sec, 0).unwrap();
+        drop(f);
+        assert_eq!(&sec[14..16], &WAL_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(
+            recover_stream(&fs, WAL_SYNC_FILE_NAME, 1).unsupported_format,
+            None
+        );
+    }
+
+    #[test]
+    fn current_epoch_sector_with_other_version_is_unsupported_format() {
+        for version in [0u16, 2] {
+            let (_tmp, fs, _, _) = fail_fs("wal_version_current");
+            let mut w = WalStreamWriter::open(
+                &fs,
+                WAL_SYNC_FILE_NAME,
+                64 * 1024,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            )
+            .unwrap();
+            for lsn in 1..=3 {
+                w.append_batch(&put_batch(lsn, b"a", 10)).unwrap();
+            }
+            drop(w);
+            set_sector_version(&fs, WAL_SYNC_FILE_NAME, 1, version);
+
+            let rec = recover_stream(&fs, WAL_SYNC_FILE_NAME, 1);
+            assert_eq!(
+                rec.unsupported_format,
+                Some(UnsupportedWalFormat {
+                    sector_idx: 1,
+                    version
+                })
+            );
+            // The stream stops at the unreadable sector, as for a bad CRC.
+            assert_eq!(
+                rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(),
+                vec![1]
+            );
+            assert_eq!(rec.next_sector_idx, 1);
+        }
+    }
+
+    #[test]
+    fn stale_epoch_sector_with_any_version_is_ignored_silently() {
+        for version in [0u16, 1, 2, 0xFFFF] {
+            let (_tmp, fs, _, _) = fail_fs("wal_version_stale");
+            let mut w = WalStreamWriter::open(
+                &fs,
+                WAL_SYNC_FILE_NAME,
+                64 * 1024,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            )
+            .unwrap();
+            w.append_batch(&put_batch(1, b"a", 10)).unwrap();
+            drop(w);
+            set_sector_version(&fs, WAL_SYNC_FILE_NAME, 0, version);
+
+            // Epoch 2 is current now; the epoch-1 sector is a leftover.
+            let rec = recover_stream(&fs, WAL_SYNC_FILE_NAME, 2);
+            assert_eq!(rec.unsupported_format, None, "version {version}");
+            assert!(rec.batches.is_empty());
+            assert_eq!(rec.next_sector_idx, 0);
+        }
     }
 }

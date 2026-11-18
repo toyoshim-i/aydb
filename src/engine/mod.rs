@@ -2957,7 +2957,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             if self.pending_tx_record_count == 0 {
                 self.pending_tx_buf.clear();
-                self.pending_tx_buf.extend_from_slice(&[0u8; 16]);
+                self.pending_tx_buf
+                    .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
             }
             WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
             self.pending_tx_record_count += records.len() as u32;
