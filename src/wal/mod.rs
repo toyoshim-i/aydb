@@ -11,6 +11,12 @@ use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 use crate::util::byte_reader::ByteReader;
 use crate::util::crc32c::crc32c;
 
+mod recovery;
+pub use self::recovery::{
+    StreamCounts, TwoStreamRecoveryResult, WalDamage, WalDamageReason, WalRecoveryReport,
+    recover_two_streams,
+};
+
 /// Fixed filename for the synchronous write-through WAL stream.
 pub const WAL_SYNC_FILE_NAME: &str = "wal_sync.db";
 
@@ -833,15 +839,21 @@ impl<F: PlatformFile> Drop for WalStreamWriter<F> {
 }
 
 /// Summary returned after scanning a single WAL file during crash recovery.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SingleStreamRecovery {
-    /// Reassembled, CRC-verified batches in sequential order.
+    /// Reassembled, CRC-verified batches of the valid prefix, in sequential order.
     pub batches: Vec<WalBatch>,
     /// Index of the first sector after the valid log prefix (where new writes may resume).
     pub next_sector_idx: usize,
-    /// Set when the scan stopped at a current-epoch sector with a valid CRC but a format version
-    /// other than [`WAL_FORMAT_VERSION`]. Later recovery steps turn this into `UnsupportedFormat`.
-    #[allow(dead_code)]
+    /// Intact batches found in current-epoch sectors after the first sector the scan could not
+    /// use. They are never replayed: a batch before them may be lost. Their `prev_lsn` links and
+    /// `durable_lsn` values still bound the lost range (ARCHITECTURE.md 4.6.4).
+    pub(crate) past_stop: Vec<WalBatch>,
+    /// Current-epoch sectors that failed their CRC32C or whose contents did not parse, anywhere
+    /// in the file. After a power cut these are torn writes of the unsynced tail.
+    pub(crate) corrupt_sectors: usize,
+    /// The first current-epoch sector with a valid CRC but a format version other than
+    /// [`WAL_FORMAT_VERSION`].
     pub(crate) unsupported_format: Option<UnsupportedWalFormat>,
 }
 
@@ -852,8 +864,108 @@ pub(crate) struct UnsupportedWalFormat {
     pub version: u16,
 }
 
-/// Scans a single WAL file from Sector 0 and extracts all complete [`WalBatch`] items matching
-/// `expected_epoch`, halting cleanly at the first sector with an older epoch or a torn-write CRC.
+/// What [`scan_sector`] made of one sector.
+enum SectorScan {
+    /// The sector parsed completely.
+    Usable,
+    /// Its epoch is not the expected one: an older sector, or never written.
+    OtherEpoch,
+    /// The CRC32C failed, or the contents did not parse (batches found before the bad spot in
+    /// the same sector were still delivered).
+    Corrupt,
+    /// Current epoch and valid CRC32C, but another format version.
+    OtherVersion(u16),
+}
+
+/// Parses one sector, appending the batches that end in it to `out`.
+///
+/// `partial` carries a batch whose first fragments lie in earlier sectors. With `lenient` set
+/// (after the scan has already stopped once) a continuation fragment without its start is
+/// skipped instead of being corruption: its batch began in a sector that was lost.
+fn scan_sector(
+    sector: &[u8],
+    expected_epoch: u64,
+    lenient: bool,
+    partial: &mut Option<Vec<u8>>,
+    out: &mut Vec<WalBatch>,
+) -> SectorScan {
+    let sector_epoch = u64::from_le_bytes(sector[4..12].try_into().unwrap());
+    if sector_epoch != expected_epoch {
+        return SectorScan::OtherEpoch;
+    }
+    let expected_crc = u32::from_le_bytes(sector[0..4].try_into().unwrap());
+    if crc32c(&sector[4..WAL_SECTOR_SIZE]) != expected_crc {
+        return SectorScan::Corrupt;
+    }
+    // Checked only now: a sector from an earlier epoch or a torn one never reports it.
+    let version = u16::from_le_bytes(sector[14..16].try_into().unwrap());
+    if version != WAL_FORMAT_VERSION {
+        return SectorScan::OtherVersion(version);
+    }
+    let valid_bytes = u16::from_le_bytes(sector[12..14].try_into().unwrap()) as usize;
+    if valid_bytes == 0 || valid_bytes > WAL_SECTOR_PAYLOAD_CAP {
+        return SectorScan::Corrupt;
+    }
+
+    // Parse fragments within `sector[16 .. 16 + valid_bytes]`.
+    let mut pos = WAL_SECTOR_HEADER_SIZE;
+    let limit = WAL_SECTOR_HEADER_SIZE + valid_bytes;
+    while pos < limit {
+        if limit - pos < FRAGMENT_HEADER_SIZE {
+            return SectorScan::Corrupt;
+        }
+        let Ok(frag_type) = FragmentType::from_u8(sector[pos]) else {
+            return SectorScan::Corrupt;
+        };
+        let frag_len = u16::from_le_bytes([sector[pos + 1], sector[pos + 2]]) as usize;
+        pos += FRAGMENT_HEADER_SIZE;
+        if limit - pos < frag_len {
+            return SectorScan::Corrupt;
+        }
+        let frag_data = &sector[pos..pos + frag_len];
+        pos += frag_len;
+
+        match frag_type {
+            FragmentType::Full => {
+                // A previous `First`/`Middle` chain left dangling by a crash is discarded.
+                *partial = None;
+                match WalBatch::decode(frag_data) {
+                    Ok(batch) => out.push(batch),
+                    Err(_) => return SectorScan::Corrupt,
+                }
+            }
+            FragmentType::First => {
+                // Also discards any prior dangling `First`/`Middle` chain.
+                *partial = Some(frag_data.to_vec());
+            }
+            FragmentType::Middle => match partial {
+                Some(buf) => buf.extend_from_slice(frag_data),
+                None if lenient => {}
+                None => return SectorScan::Corrupt,
+            },
+            FragmentType::Last => match partial.take() {
+                Some(mut buf) => {
+                    buf.extend_from_slice(frag_data);
+                    match WalBatch::decode(&buf) {
+                        Ok(batch) => out.push(batch),
+                        Err(_) => return SectorScan::Corrupt,
+                    }
+                }
+                None if lenient => {}
+                None => return SectorScan::Corrupt,
+            },
+        }
+    }
+    SectorScan::Usable
+}
+
+/// Scans a single WAL file from Sector 0 and extracts the [`WalBatch`] items of `expected_epoch`.
+///
+/// The valid prefix ends at the first sector with an older epoch, a torn-write CRC, an unparsable
+/// body or an unsupported format version. The scan does not stop there: it reads the whole file
+/// and collects the intact batches of later current-epoch sectors in `past_stop`, because
+/// write-back reordering can persist a later sector while losing an earlier one. After a stop it
+/// also forgets any half-read batch, since the rest of it lies in the sector that was lost.
 pub fn recover_single_wal_stream<F: PlatformFile>(
     file: &F,
     expected_epoch: u64,
@@ -861,10 +973,9 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
     let file_len = file.file_len()?;
     let total_sectors = (file_len / WAL_SECTOR_SIZE as u64) as usize;
 
-    let mut batches = Vec::new();
+    let mut rec = SingleStreamRecovery::default();
     let mut partial_batch_buf: Option<Vec<u8>> = None;
-    let mut next_sector_idx = 0usize;
-    let mut unsupported_format = None;
+    let mut stopped = false;
 
     // Read in 256 KB windows (64 sectors) to maximize sequential throughput during recovery.
     const WINDOW_SECTORS: usize = 64;
@@ -879,289 +990,42 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
             (sec_idx * WAL_SECTOR_SIZE) as u64,
         )?;
 
-        let mut halted = false;
         for i in 0..count {
             let sector = &window_buf[i * WAL_SECTOR_SIZE..(i + 1) * WAL_SECTOR_SIZE];
-            let sector_epoch = u64::from_le_bytes(sector[4..12].try_into().unwrap());
-            if sector_epoch != expected_epoch {
-                // Reached a sector from a previous epoch (or uninitialized 0). Log tail found!
-                halted = true;
-                break;
-            }
-
-            let expected_crc = u32::from_le_bytes(sector[0..4].try_into().unwrap());
-            let actual_crc = crc32c(&sector[4..WAL_SECTOR_SIZE]);
-            if actual_crc != expected_crc {
-                // Reached a torn write at the log tail!
-                halted = true;
-                break;
-            }
-
-            // Checked only now: a sector from an earlier epoch or a torn one never reports it.
-            let version = u16::from_le_bytes(sector[14..16].try_into().unwrap());
-            if version != WAL_FORMAT_VERSION {
-                unsupported_format = Some(UnsupportedWalFormat {
-                    sector_idx: sec_idx + i,
-                    version,
-                });
-                halted = true;
-                break;
-            }
-
-            let valid_bytes = u16::from_le_bytes(sector[12..14].try_into().unwrap()) as usize;
-            if valid_bytes == 0 || valid_bytes > WAL_SECTOR_PAYLOAD_CAP {
-                halted = true;
-                break;
-            }
-
-            // Parse fragments within `sector[16 .. 16 + valid_bytes]`.
-            let mut pos = WAL_SECTOR_HEADER_SIZE;
-            let limit = WAL_SECTOR_HEADER_SIZE + valid_bytes;
-            let mut sector_corrupt = false;
-
-            while pos < limit {
-                if limit - pos < FRAGMENT_HEADER_SIZE {
-                    sector_corrupt = true;
-                    break;
+            let out = if stopped {
+                &mut rec.past_stop
+            } else {
+                &mut rec.batches
+            };
+            match scan_sector(sector, expected_epoch, stopped, &mut partial_batch_buf, out) {
+                SectorScan::Usable => {
+                    if !stopped {
+                        rec.next_sector_idx = sec_idx + i + 1;
+                    }
+                    continue;
                 }
-                let frag_type = match FragmentType::from_u8(sector[pos]) {
-                    Ok(ft) => ft,
-                    Err(_) => {
-                        sector_corrupt = true;
-                        break;
-                    }
-                };
-                let frag_len = u16::from_le_bytes([sector[pos + 1], sector[pos + 2]]) as usize;
-                pos += FRAGMENT_HEADER_SIZE;
-                if limit - pos < frag_len {
-                    sector_corrupt = true;
-                    break;
-                }
-                let frag_data = &sector[pos..pos + frag_len];
-                pos += frag_len;
-
-                match frag_type {
-                    FragmentType::Full => {
-                        if let Some(ref mut buf) = partial_batch_buf {
-                            // A previous `First`/`Middle` fragment chain was left dangling by a crash;
-                            // discard the incomplete partial batch and decode the new `Full` fragment.
-                            buf.clear();
-                        }
-                        partial_batch_buf = None;
-                        match WalBatch::decode(frag_data) {
-                            Ok(batch) => batches.push(batch),
-                            Err(_) => {
-                                sector_corrupt = true;
-                                break;
-                            }
-                        }
-                    }
-                    FragmentType::First => {
-                        if let Some(ref mut buf) = partial_batch_buf {
-                            // Discard any prior dangling `First`/`Middle` chain.
-                            buf.clear();
-                            buf.extend_from_slice(frag_data);
-                        } else {
-                            let mut buf = Vec::with_capacity(frag_len * 2);
-                            buf.extend_from_slice(frag_data);
-                            partial_batch_buf = Some(buf);
-                        }
-                    }
-                    FragmentType::Middle => {
-                        if let Some(ref mut buf) = partial_batch_buf {
-                            buf.extend_from_slice(frag_data);
-                        } else {
-                            sector_corrupt = true;
-                            break;
-                        }
-                    }
-                    FragmentType::Last => {
-                        if let Some(mut buf) = partial_batch_buf.take() {
-                            buf.extend_from_slice(frag_data);
-                            match WalBatch::decode(&buf) {
-                                Ok(batch) => batches.push(batch),
-                                Err(_) => {
-                                    sector_corrupt = true;
-                                    break;
-                                }
-                            }
-                        } else {
-                            sector_corrupt = true;
-                            break;
-                        }
-                    }
+                SectorScan::OtherEpoch => {}
+                SectorScan::Corrupt => rec.corrupt_sectors += 1,
+                SectorScan::OtherVersion(version) => {
+                    rec.unsupported_format.get_or_insert(UnsupportedWalFormat {
+                        sector_idx: sec_idx + i,
+                        version,
+                    });
                 }
             }
-
-            if sector_corrupt {
-                halted = true;
-                break;
-            }
-
-            next_sector_idx = sec_idx + i + 1;
-        }
-
-        if halted {
-            break;
+            // An unusable sector: the batch it would have continued is lost.
+            stopped = true;
+            partial_batch_buf = None;
         }
         sec_idx += count;
     }
 
     // Any incomplete `First`/`Middle` chain without a `Last` fragment is automatically discarded.
-    Ok(SingleStreamRecovery {
-        batches,
-        next_sector_idx,
-        unsupported_format,
-    })
+    Ok(rec)
 }
 
-/// Output of the two-stream (`wal_sync.db` + `wal_buf.db`) crash-recovery coordinator.
-#[derive(Debug, Clone)]
-pub struct TwoStreamRecoveryResult {
-    /// Merged batches ordered by ascending `lsn` (with `lsn > checkpoint_lsn` and valid blobs).
-    pub merged_batches: Vec<WalBatch>,
-    /// Highest `lsn` observed across all recovered batches (or `checkpoint_lsn` if none).
-    pub max_recovered_lsn: u64,
-    /// Next sector index for `wal_sync.db`.
-    pub next_sync_sector_idx: usize,
-    /// Next sector index for `wal_buf.db`.
-    pub next_buf_sector_idx: usize,
-}
-
-/// Returns whether every `PutBlobPtr` in `batches` passes `validate_blob`. An `Err` from the
-/// validator is a real I/O failure and is propagated instead of being read as "blob absent".
-fn batches_blobs_valid<V>(batches: &[WalBatch], validate_blob: &mut V) -> io::Result<bool>
-where
-    V: FnMut(&BlobPtr) -> io::Result<bool>,
-{
-    for b in batches {
-        for rec in &b.records {
-            if let WalRecord::PutBlobPtr { blob_ptr, .. } = rec {
-                if !validate_blob(blob_ptr)? {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// Recovers both `wal_sync.db` and `wal_buf.db`, filters out batches with `lsn <= checkpoint_lsn`,
-/// merges them in $O(N)$ by ascending `lsn`, and validates `PutBlobPtr` records via `validate_blob`
-/// (enforcing the `Write-Blob-Before-WAL` crash-consistency protocol). `validate_blob` returns
-/// `Ok(false)` for a blob that was never durably written and `Err` for a genuine I/O error, which
-/// aborts recovery so that no committed batch is dropped because of a transient failure.
-pub fn recover_two_streams<F, V>(
-    sync_file: &F,
-    sync_epoch: u64,
-    buf_file: &F,
-    buf_epoch: u64,
-    checkpoint_lsn: u64,
-    mut validate_blob: V,
-) -> io::Result<TwoStreamRecoveryResult>
-where
-    F: PlatformFile,
-    V: FnMut(&BlobPtr) -> io::Result<bool>,
-{
-    let sync_rec = recover_single_wal_stream(sync_file, sync_epoch)?;
-    let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
-
-    // Filter out uncommitted multi-chunk transactions (`TxBegin` without a matching `TxCommit`)
-    // per stream AND validate `PutBlobPtr` records across the entire transaction group
-    // before stripping transaction markers, while recording the highest LSN observed across
-    // all recovered batches.
-    let mut max_lsn = checkpoint_lsn;
-    //
-    // With `prefix_only`, the stream is a commit-ordered prefix: emission stops at the first batch
-    // or transaction group whose blob validation returned `Ok(false)`, so no later batch is
-    // replayed past a rolled-back one. Remaining batches are still scanned for the highest LSN so
-    // that `next_lsn` never reuses a logged LSN.
-    let mut filter_committed_stream = |batches: Vec<WalBatch>,
-                                       validate_blob: &mut V,
-                                       prefix_only: bool|
-     -> io::Result<Vec<WalBatch>> {
-        let mut out = Vec::with_capacity(batches.len());
-        let mut pending_tx: Option<Vec<WalBatch>> = None;
-        let mut truncated = false;
-
-        for mut b in batches {
-            if b.lsn > max_lsn {
-                max_lsn = b.lsn;
-            }
-            if b.lsn <= checkpoint_lsn || truncated {
-                continue;
-            }
-            let has_begin = b.records.iter().any(|r| matches!(r, WalRecord::TxBegin));
-            let has_commit = b.records.iter().any(|r| matches!(r, WalRecord::TxCommit));
-            b.records
-                .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
-
-            if has_begin {
-                // Start of a new multi-chunk transaction; discard any prior incomplete one.
-                let mut tx_vec = Vec::new();
-                if !b.records.is_empty() {
-                    tx_vec.push(b);
-                }
-                if has_commit {
-                    if batches_blobs_valid(&tx_vec, validate_blob)? {
-                        out.extend(tx_vec);
-                    } else if prefix_only {
-                        truncated = true;
-                    }
-                    pending_tx = None;
-                } else {
-                    pending_tx = Some(tx_vec);
-                }
-            } else if let Some(ref mut tx_vec) = pending_tx {
-                if !b.records.is_empty() {
-                    tx_vec.push(b);
-                }
-                if has_commit {
-                    let completed_tx = pending_tx.take().unwrap();
-                    if batches_blobs_valid(&completed_tx, validate_blob)? {
-                        out.extend(completed_tx);
-                    } else if prefix_only {
-                        truncated = true;
-                    }
-                }
-            } else if !b.records.is_empty() {
-                if batches_blobs_valid(core::slice::from_ref(&b), validate_blob)? {
-                    out.push(b);
-                } else if prefix_only {
-                    truncated = true;
-                }
-            }
-        }
-        Ok(out)
-    };
-
-    // Sync-stream blobs are synced before the WAL record, so an invalid blob there is isolated.
-    // Buffered-stream blobs and records are flushed independently, so power loss can drop an
-    // earlier commit while a later one survives; replay must not expose that hole.
-    let sync_batches = filter_committed_stream(sync_rec.batches, &mut validate_blob, false)?;
-    let buf_batches = filter_committed_stream(buf_rec.batches, &mut validate_blob, true)?;
-
-    // Two-way merge sort by ascending `lsn` by value (zero-clone).
-    let mut merged = Vec::with_capacity(sync_batches.len() + buf_batches.len());
-    let mut sync_iter = sync_batches.into_iter().peekable();
-    let mut buf_iter = buf_batches.into_iter().peekable();
-    while let (Some(s_peek), Some(b_peek)) = (sync_iter.peek(), buf_iter.peek()) {
-        if s_peek.lsn <= b_peek.lsn {
-            merged.push(sync_iter.next().unwrap());
-        } else {
-            merged.push(buf_iter.next().unwrap());
-        }
-    }
-    merged.extend(sync_iter);
-    merged.extend(buf_iter);
-
-    Ok(TwoStreamRecoveryResult {
-        merged_batches: merged,
-        max_recovered_lsn: max_lsn,
-        next_sync_sector_idx: sync_rec.next_sector_idx,
-        next_buf_sector_idx: buf_rec.next_sector_idx,
-    })
-}
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1333,6 +1197,13 @@ mod tests {
         assert_eq!(rec.next_sector_idx, 2);
     }
 
+    /// A batch linked to the previous LSN, as in a log without gaps from transactions.
+    fn chained(lsn: u64, records: Vec<WalRecord>) -> WalBatch {
+        let mut b = WalBatch::new(lsn, records);
+        b.prev_lsn = lsn - 1;
+        b
+    }
+
     #[test]
     fn two_stream_lsn_merge_and_write_blob_before_wal_validation() {
         let tmp = TempTestDir::new("two_stream");
@@ -1358,7 +1229,7 @@ mod tests {
 
         // LSN 10 (already checkpointed, <= checkpoint_lsn=10) in buf
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 10,
                 vec![WalRecord::PutInline {
                     key: b"old".to_vec(),
@@ -1369,7 +1240,7 @@ mod tests {
 
         // LSN 11 in buf (valid blob seg_id=1)
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 11,
                 vec![WalRecord::PutBlobPtr {
                     key: b"cache_ok".to_vec(),
@@ -1387,7 +1258,7 @@ mod tests {
 
         // LSN 12 in sync (critical setting)
         sync_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 12,
                 vec![WalRecord::PutInline {
                     key: b"theme".to_vec(),
@@ -1398,7 +1269,7 @@ mod tests {
 
         // LSN 13 in buf (dangling blob seg_id=99 that never reached disk before power loss!)
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 13,
                 vec![WalRecord::PutBlobPtr {
                     key: b"cache_unflushed".to_vec(),
@@ -1416,7 +1287,7 @@ mod tests {
 
         // LSN 14 in sync
         sync_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 14,
                 vec![WalRecord::PutInline {
                     key: b"lang".to_vec(),
@@ -1443,10 +1314,11 @@ mod tests {
         let res = recover_two_streams(&*sync_f, 5, &*buf_f, 3, 10, |ptr| Ok(ptr.seg_id == 1))
             .expect("recover two streams");
 
-        // Expected LSN order: 11 (from buf), 12 (from sync), 14 (from sync).
-        // LSN 10 was filtered by checkpoint_lsn=10, and LSN 13 was safely skipped by BlobValidator!
+        // Expected LSN order: 11 (from buf), 12 (from sync). LSN 10 was filtered by
+        // checkpoint_lsn=10. LSN 13 has a blob that never reached disk: it is the cut, so LSN 14
+        // is not replayed although its own blob is fine (it may have read from 13).
         let recovered_lsns: Vec<u64> = res.merged_batches.iter().map(|b| b.lsn).collect();
-        assert_eq!(recovered_lsns, vec![11, 12, 14]);
+        assert_eq!(recovered_lsns, vec![11, 12]);
         assert_eq!(res.max_recovered_lsn, 14);
     }
 
@@ -1514,7 +1386,7 @@ mod tests {
 
         // Batch 1 (LSN 1): valid batch
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 1,
                 vec![WalRecord::PutInline {
                     key: b"k1".to_vec(),
@@ -1525,7 +1397,7 @@ mod tests {
 
         // Batch 2 (LSN 2): multi-record batch where a Delete and PutInline accompany an unverified PutBlobPtr
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 2,
                 vec![
                     WalRecord::Delete {
@@ -1598,7 +1470,7 @@ mod tests {
 
         // Chunk 1 (LSN 1): TxBegin + valid inline write
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 1,
                 vec![
                     WalRecord::TxBegin,
@@ -1612,7 +1484,7 @@ mod tests {
 
         // Chunk 2 (LSN 2): PutBlobPtr (invalid/missing blob) + TxCommit
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 2,
                 vec![
                     WalRecord::PutBlobPtr {
@@ -1633,7 +1505,7 @@ mod tests {
 
         // Also verify a subsequent valid 2-chunk transaction (LSNs 3 and 4) IS recovered
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 3,
                 vec![
                     WalRecord::TxBegin,
@@ -1645,7 +1517,7 @@ mod tests {
             ))
             .unwrap();
         buf_w
-            .append_batch(&WalBatch::new(
+            .append_batch(&chained(
                 4,
                 vec![
                     WalRecord::PutBlobPtr {
@@ -1678,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_stream_stops_at_first_invalid_blob_but_sync_stream_continues() {
+    fn unverifiable_blob_cuts_both_streams() {
         let tmp = TempTestDir::new("buf_prefix");
         let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
         let wal_size = 64 * 1024u64;
@@ -1699,7 +1571,7 @@ mod tests {
         )
         .unwrap();
         let blob = |lsn: u64, seg_id: u64| {
-            WalBatch::new(
+            chained(
                 lsn,
                 vec![WalRecord::PutBlobPtr {
                     key: format!("k{lsn}").into_bytes(),
@@ -1726,7 +1598,8 @@ mod tests {
         })
         .unwrap();
         let lsns: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
-        assert_eq!(lsns, vec![1, 4]);
+        // Batch 2 (sync) is the cut: neither the valid sync batch 4 nor the buffered 3 and 5.
+        assert_eq!(lsns, vec![1]);
         assert_eq!(recovered.max_recovered_lsn, 5);
     }
 

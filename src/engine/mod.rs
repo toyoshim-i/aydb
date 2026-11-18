@@ -66,6 +66,7 @@ use crate::wal::{
     WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalStreamMode, WalStreamWriter,
     recover_two_streams,
 };
+pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport};
 
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx};
 pub use self::reader::{EngineReader, ReadView};
@@ -365,6 +366,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) last_buf_synced_lsn: u64,
     /// Predecessor link and durable watermark stamped into every WAL batch (section 4.6).
     pub(super) wal_links: wal_links::WalLinks,
+    /// What recovery found in the WAL during `open` (section 4.6.8).
+    last_wal_recovery: WalRecoveryReport,
     /// Set after a WAL append/sync failure (original error text). While set, every mutating
     /// operation fails and the engine must be reopened (the on-disk state is unknown).
     pub(super) poisoned: Option<String>,
@@ -601,6 +604,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             },
         )?;
 
+        let wal_report = rec.report;
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);
         buf_wal.set_cursor_after_recovery(rec.next_buf_sector_idx);
 
@@ -811,9 +815,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
-            // Replayed batches are checkpointed before the epochs rotate (see below), so the
-            // first new batch links to the highest recovered LSN, which equals the checkpoint.
+            // `max_recovered_lsn` is the highest LSN seen anywhere, discarded batches included.
+            // Everything replayed is checkpointed before the epochs rotate (see below), at
+            // `next_lsn - 1`, which equals it, so the first new batch links to a predecessor
+            // at or below the checkpoint, as recovery requires.
             wal_links: wal_links::WalLinks::new(rec.max_recovered_lsn),
+            last_wal_recovery: wal_report,
             poisoned: None,
             maintenance_failures: AtomicU64::new(0),
             last_maintenance_error: Mutex::new(None),
@@ -2308,6 +2315,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Reference to the engine's in-process small blob cache.
     pub fn blob_cache(&self) -> &Arc<VerifiedBlobCache> {
         &self.blob_cache
+    }
+
+    /// What recovery found in the WAL during the `open` that created this engine. It is defined
+    /// even when nothing happened (no damage, nothing replayed). The WAL is damaged only when
+    /// acknowledged commits were lost; the unsynced tail of a power cut is not damage.
+    pub fn last_wal_recovery(&self) -> &WalRecoveryReport {
+        &self.last_wal_recovery
     }
 
     /// Number of blob verification failures (or dangling blob pointers) detected since open.

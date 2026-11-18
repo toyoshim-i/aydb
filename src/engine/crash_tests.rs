@@ -896,6 +896,9 @@ struct Coverage {
     /// were logged (the oracle is only meaningful if it sees real cuts).
     lsn_checks: AtomicU64,
     lsn_cuts: AtomicU64,
+    /// Recoveries whose report was checked to show no damage (power cuts and `kill -9` cannot
+    /// damage synced data, whatever unsynced tail they lose).
+    no_damage_checks: AtomicU64,
     /// Recoveries checked by the durable-watermark oracle, those whose logged batches carried a
     /// watermark above the checkpoint, and the batches below it that were verified present.
     durable_checks: AtomicU64,
@@ -921,7 +924,8 @@ impl Coverage {
             "cases={} crashes={} (process={}) cut_tripped={} failure_fired={} [{}] \
              recovery_crashes={} lost_buffered_tail={} dropped_inflight={} wal_rotations={} \
              maintenance_failures={} poisoned={} unstable_recovery={} \
-             lsn_checks={} lsn_cuts={} durable_checks={} durable_marks={} durable_batches={} \
+             lsn_checks={} lsn_cuts={} no_damage_checks={} durable_checks={} durable_marks={} \
+             durable_batches={} \
              manifests_seen={} blob_segments_seen={}",
             g(&self.cases),
             g(&self.crashes),
@@ -938,6 +942,7 @@ impl Coverage {
             g(&self.unstable_recovery),
             g(&self.lsn_checks),
             g(&self.lsn_cuts),
+            g(&self.no_damage_checks),
             g(&self.durable_checks),
             g(&self.durable_marks),
             g(&self.durable_batches),
@@ -1479,8 +1484,8 @@ impl<'a> Harness<'a> {
     /// state-level oracle in [`Self::verify`] cannot see this, because a later commit may
     /// overwrite the effect of a missing one.
     ///
-    /// Valid only while the harness never damages synced data (power cuts and `kill -9` only);
-    /// damage modes must be excluded or must expect the cut instead.
+    /// It holds for any damage as well: the replay is always the batches below the cut. It also
+    /// checks that no LSN found in the crashed logs, discarded or not, would be reused.
     fn check_lsn_prefix(&self, logged: &[(String, Vec<u8>)]) -> Result<(), String> {
         let post: Vec<(String, Vec<u8>)> = {
             let st = self.fs.st();
@@ -1540,6 +1545,25 @@ impl<'a> Harness<'a> {
         let want: Vec<u64> = reference.merged_batches.iter().map(|b| b.lsn).collect();
         let got: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
         Coverage::bump(&self.cov.lsn_checks);
+        for (name, epoch) in [
+            ("wal_sync.db", m.sync_wal_epoch),
+            ("wal_buf.db", m.buf_wal_epoch),
+        ] {
+            let scan = crate::wal::recover_single_wal_stream(&*raw_file(&post_fs, name), epoch)
+                .map_err(|e| self.fail(format!("oracle: scanning {name}: {e}")))?;
+            let top = scan
+                .batches
+                .iter()
+                .chain(&scan.past_stop)
+                .map(|b| b.lsn)
+                .max();
+            if top.is_some_and(|t| t > recovered.max_recovered_lsn) {
+                return Err(self.fail(format!(
+                    "{name} holds LSN {top:?} above the highest LSN recovery saw ({})",
+                    recovered.max_recovered_lsn
+                )));
+            }
+        }
         if got.len() < want.len() {
             Coverage::bump(&self.cov.lsn_cuts);
         }
@@ -1615,6 +1639,16 @@ impl<'a> Harness<'a> {
     fn open(&mut self, what: &str) -> Result<Eng, String> {
         let e = open_engine(&self.fs, &self.cfg)
             .map_err(|e| self.fail(format!("reopen failed ({what}): {e}")))?;
+        // Power cuts and `kill -9` lose only an unsynced tail, which is not damage: the report of
+        // every recovery must be clean, however many batches it had to discard.
+        let report = e.last_wal_recovery();
+        if let Some(d) = &report.damage {
+            return Err(self.fail(format!(
+                "recovery ({what}) reports WAL damage after a crash that cannot damage synced \
+                 data: {d:?}"
+            )));
+        }
+        Coverage::bump(&self.cov.no_damage_checks);
         if self.fs.st().events.is_some() {
             let st = e.meta_mgr.state();
             self.log(format!(
@@ -2932,7 +2966,6 @@ fn assert_recovered_prefix(e: &mut Eng, keys: &[&[u8]], cut: usize) {
 /// although the synchronous commit s2 below them is gone, so a commit that read s2 could survive
 /// without it.
 #[test]
-#[ignore = "fails until ordered WAL recovery (ARCHITECTURE.md 4.6, step 4)"]
 fn damaged_sync_sector_cuts_later_buffered_batches() {
     let cfg = repro_config();
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
@@ -2971,13 +3004,64 @@ fn damaged_sync_sector_cuts_later_buffered_batches() {
     let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
     // The cut is at s2: only s1 may survive, nothing at or after it in either stream.
     assert_recovered_prefix(&mut e, &keys, 1);
+    // The loss of an acknowledged commit is reported: b3 names s2 as its missing predecessor and
+    // the sector that held it fails its CRC.
+    let damage = e.last_wal_recovery().damage.clone().expect("damage");
+    assert_eq!(damage.reason, WalDamageReason::CorruptSector);
+    assert_eq!(damage.first_lost_lsn, sync_lsns[1]);
+    assert_eq!(damage.discarded_batches.buffered, 2);
+    assert_eq!(damage.discarded_batches.sync, 1);
+    assert_eq!(damage.last_lsn_seen, sync_lsns[2]);
+    assert_eq!(e.last_wal_recovery().replayed_batches.sync, 1);
+    assert_eq!(e.last_wal_recovery().replayed_batches.buffered, 0);
+
+    // No LSN that was ever logged is reused, discarded batches included, and the first new
+    // batch links to the checkpoint, so the next recovery finds a clean chain.
+    assert!(e.next_lsn() > sync_lsns[2], "next_lsn {}", e.next_lsn());
+    e.put_row(1, b"n6", b"v", &[], sync).unwrap();
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    assert_eq!(e.last_wal_recovery().damage, None);
+    assert_eq!(e.last_wal_recovery().replayed_batches.sync, 1);
+    assert!(e.get_row(1, b"n6").unwrap().is_some());
+    assert!(e.get_row(1, b"s1").unwrap().is_some());
+    assert!(e.get_row(1, b"s2").unwrap().is_none());
+}
+
+/// A clean open reports nothing: no damage, nothing replayed, an empty torn tail.
+#[test]
+fn clean_open_reports_no_damage() {
+    let cfg = repro_config();
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    assert_eq!(e.last_wal_recovery(), &WalRecoveryReport::default());
+    drop(e);
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.put_row(1, b"a", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    e.put_row(1, b"b", b"v", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Process);
+    let e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    let r = e.last_wal_recovery();
+    assert_eq!(r.damage, None);
+    assert_eq!(
+        r.replayed_batches,
+        StreamCounts {
+            sync: 1,
+            buffered: 1
+        }
+    );
 }
 
 /// Reproduction 2 of ARCHITECTURE.md 4.6.1: a sync batch whose blob cannot be verified is dropped
 /// on its own while the batches after it, in both streams, are kept. A later commit may have read
 /// the value that the dropped commit wrote.
 #[test]
-#[ignore = "fails until ordered WAL recovery (ARCHITECTURE.md 4.6, step 4)"]
 fn unverifiable_sync_blob_cuts_later_batches_of_both_streams() {
     let cfg = repro_config();
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
@@ -2994,7 +3078,8 @@ fn unverifiable_sync_blob_cuts_later_batches_of_both_streams() {
     fs.cut_now();
     drop(e);
     fs.crash(Crash::Power { keep: 0, lose: 100 });
-    assert_eq!(wal_lsns(&fs, "wal_sync.db").len(), 3, "setup");
+    let sync_lsns = wal_lsns(&fs, "wal_sync.db");
+    assert_eq!(sync_lsns.len(), 3, "setup");
     assert_eq!(wal_lsns(&fs, "wal_buf.db").len(), 1, "setup");
 
     // Media damage: a byte inside the value of s2 rots in its synced blob segment, so the blob
@@ -3013,4 +3098,9 @@ fn unverifiable_sync_blob_cuts_later_batches_of_both_streams() {
     let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
     // The cut is at s2: only s1 may survive, neither s4 (sync) nor b3 (buffered).
     assert_recovered_prefix(&mut e, &keys, 1);
+    let damage = e.last_wal_recovery().damage.clone().expect("damage");
+    assert_eq!(damage.reason, WalDamageReason::UnverifiableBlob);
+    assert_eq!(damage.first_lost_lsn, sync_lsns[1]);
+    assert_eq!(damage.discarded_batches.sync, 2);
+    assert_eq!(damage.discarded_batches.buffered, 1);
 }
