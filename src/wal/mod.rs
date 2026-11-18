@@ -704,6 +704,11 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         self.defer_barrier = defer;
     }
 
+    /// Whether synchronous appends currently leave the device barrier to the caller.
+    pub(crate) fn barrier_deferred(&self) -> bool {
+        self.defer_barrier
+    }
+
     /// Returns a shared handle to the log file, usable without access to this writer.
     pub(crate) fn file_handle(&self) -> Arc<F> {
         Arc::clone(&self.file)

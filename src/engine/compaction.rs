@@ -322,6 +322,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.idx_segments.push(Arc::new(new_reader));
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        // `drain_pending_durable` ran first, so no group-committed batch is lost to the rotation.
+        self.wal_links.rotated();
         Ok(())
     }
 
@@ -368,6 +370,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.meta_mgr.try_process_pending_deletes();
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        // Callers drain the group commit first (or have nothing pending, as `open` does).
+        self.wal_links.rotated();
         Ok(())
     }
 

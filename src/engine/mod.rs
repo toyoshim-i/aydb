@@ -14,6 +14,7 @@ mod scan;
 mod snapshot;
 mod tx;
 mod unique_index;
+mod wal_links;
 #[cfg(test)]
 pub(crate) use scan::TABLE_SCAN_ENTRIES_COPIED;
 pub(crate) use snapshot::ReadSnapshotToken;
@@ -32,6 +33,8 @@ mod metadata_failure_tests;
 mod read_poison_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wal_link_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -67,6 +70,7 @@ use crate::wal::{
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx};
 pub use self::reader::{EngineReader, ReadView};
 use self::tx::{SavepointMarker, TxMetaSnapshot};
+use self::wal_links::LogStream;
 
 /// Result of a policy-free `'t'` row-meta lookup.
 pub(super) enum MetaLookup {
@@ -359,6 +363,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) last_buf_append_lsn: u64,
     /// Highest LSN in `buf_wal` synced to durable storage.
     pub(super) last_buf_synced_lsn: u64,
+    /// Predecessor link and durable watermark stamped into every WAL batch (section 4.6).
+    pub(super) wal_links: wal_links::WalLinks,
     /// Set after a WAL append/sync failure (original error text). While set, every mutating
     /// operation fails and the engine must be reopened (the on-disk state is unknown).
     pub(super) poisoned: Option<String>,
@@ -805,6 +811,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
+            // Replayed batches are checkpointed before the epochs rotate (see below), so the
+            // first new batch links to the highest recovered LSN, which equals the checkpoint.
+            wal_links: wal_links::WalLinks::new(rec.max_recovered_lsn),
             poisoned: None,
             maintenance_failures: AtomicU64::new(0),
             last_maintenance_error: Mutex::new(None),
@@ -2970,10 +2979,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         self.drain_pending_durable()?;
-        let batch = WalBatch::new(lsn, records);
+        let mut batch = WalBatch::new(lsn, records);
+        self.flush_active_blob_buffers()?;
+        (batch.prev_lsn, batch.durable_lsn) = self.wal_links_for_append(durability)?;
         let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
         batch.encode_into(&mut raw);
-        self.flush_active_blob_buffers()?;
         let res = self.append_raw_wal_batch_with_rotation(&raw, durability);
         raw.clear();
         self.scratch_wal_encoded = raw;
@@ -3006,7 +3016,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .make_durable_and_seal(durable)
             .map_err(|e| self.poison(e))?;
         self.last_buf_synced_lsn = self.last_buf_append_lsn;
+        self.wal_links.buf_synced();
         Ok(())
+    }
+
+    /// Returns the `(prev_lsn, durable_lsn)` header fields for the next batch of `durability`.
+    ///
+    /// Prefix durability comes first: before a `SyncTransactional` batch at LSN `L` is appended,
+    /// every earlier `BufferedFast` batch AND its out-of-line blobs are synced. That sync must
+    /// precede the stamp, so that the watermark of the synchronous batch covers them. Callers
+    /// stamp the header after this call and append the batch right away under the same lock.
+    pub(super) fn wal_links_for_append(
+        &mut self,
+        durability: WriteDurability,
+    ) -> io::Result<(u64, u64)> {
+        if durability == WriteDurability::SyncTransactional
+            && self.last_buf_append_lsn > self.last_buf_synced_lsn
+        {
+            self.make_buf_wal_durable(true)?;
+        }
+        Ok(self.wal_links.stamp())
     }
 
     pub(super) fn append_raw_wal_batch_with_rotation(
@@ -3021,15 +3050,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.next_lsn
         };
 
-        // Enforce prefix durability across `wal_buf.db`, active blob segments, and `wal_sync.db`:
-        // before appending a `SyncTransactional` batch at LSN `L`, ensure all earlier `BufferedFast`
-        // batches AND their out-of-line blobs (`last_buf_append_lsn > last_buf_synced_lsn`) are synced!
-        if durability == WriteDurability::SyncTransactional
-            && self.last_buf_append_lsn > self.last_buf_synced_lsn
-        {
-            self.make_buf_wal_durable(true)?;
-        }
-
+        // Prefix durability across `wal_buf.db`, active blob segments, and `wal_sync.db` was
+        // enforced by `wal_links_for_append`, which stamped this batch's header.
         // A failed append/sync leaves the on-disk outcome of this batch unknown (it may or may not
         // be replayed after restart), so the engine is poisoned and must be reopened.
         let r = match durability {
@@ -3071,8 +3093,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        if durability == WriteDurability::BufferedFast {
-            self.last_buf_append_lsn = self.last_buf_append_lsn.max(batch_lsn);
+        // Only now that the append succeeded does the batch become the predecessor of the next.
+        // A synchronous append that ran its own barrier also made every earlier write to
+        // `wal_sync.db` durable, including group-committed batches that await their flush.
+        let prev_lsn = match encoded.get(16..24) {
+            Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+            None => self.wal_links.stamp().0,
+        };
+        match durability {
+            WriteDurability::BufferedFast => {
+                self.last_buf_append_lsn = self.last_buf_append_lsn.max(batch_lsn);
+                self.wal_links
+                    .appended(LogStream::Buffered, batch_lsn, prev_lsn, false);
+            }
+            WriteDurability::SyncTransactional => {
+                let synced = !self.sync_wal.barrier_deferred();
+                self.wal_links
+                    .appended(LogStream::Sync, batch_lsn, prev_lsn, synced);
+            }
         }
         Ok(())
     }

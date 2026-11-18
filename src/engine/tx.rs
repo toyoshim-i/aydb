@@ -639,6 +639,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
         match flushed {
             Ok(()) => {
+                // The flush ran after the batch was written and no other append can have
+                // followed it, because the transaction held the writer slot.
+                self.wal_links.sync_flushed_all();
                 self.tx_depth = 0;
                 self.publish_committed_transaction();
                 Ok(())
@@ -661,6 +664,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         match flushed {
             Ok(()) => {
+                // Only batches up to `target` were written when the flush started.
+                self.wal_links.sync_flushed(target);
                 self.absorb_durable_through(target);
                 self.commit_gate.mark_durable(target, true);
                 // Safe point unless another transaction is active (checked by the callee).
@@ -685,6 +690,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.commit_gate.fail(&e);
             return Err(self.poison(e));
         }
+        // The barrier ran under the engine lock, after every append to the file.
+        self.wal_links.sync_flushed_all();
         self.absorb_durable_through(target);
         self.commit_gate.mark_durable(target, false);
         Ok(())
@@ -1042,7 +1049,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
             // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, 0, 0, record_count, &mut self.pending_tx_buf);
+            let (prev, durable) = self.wal_links_for_append(durability)?;
+            WalBatch::finalize_encoded_buf(
+                lsn,
+                prev,
+                durable,
+                record_count,
+                &mut self.pending_tx_buf,
+            );
             let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
             let res = self.append_raw_wal_batch_with_rotation(&raw_buf, durability);
             raw_buf.clear();
@@ -1126,7 +1140,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             single_buf.remove(crate::wal::WAL_BATCH_HEADER_SIZE);
             single_records -= 1;
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, 0, 0, single_records, &mut single_buf);
+            let (prev, durable) = self.wal_links_for_append(durability)?;
+            WalBatch::finalize_encoded_buf(lsn, prev, durable, single_records, &mut single_buf);
             self.append_raw_wal_batch_with_rotation(&single_buf, durability)?;
             self.next_lsn = lsn + 1;
             return Ok(());
@@ -1162,7 +1177,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         for (mut cbuf, crec) in chunks {
             let lsn = self.next_lsn;
-            WalBatch::finalize_encoded_buf(lsn, 0, 0, crec, &mut cbuf);
+            let (prev, durable) = self.wal_links_for_append(durability)?;
+            WalBatch::finalize_encoded_buf(lsn, prev, durable, crec, &mut cbuf);
             self.append_raw_wal_batch_with_rotation(&cbuf, durability)?;
             self.next_lsn = lsn + 1;
         }

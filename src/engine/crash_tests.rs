@@ -896,6 +896,11 @@ struct Coverage {
     /// were logged (the oracle is only meaningful if it sees real cuts).
     lsn_checks: AtomicU64,
     lsn_cuts: AtomicU64,
+    /// Recoveries checked by the durable-watermark oracle, those whose logged batches carried a
+    /// watermark above the checkpoint, and the batches below it that were verified present.
+    durable_checks: AtomicU64,
+    durable_marks: AtomicU64,
+    durable_batches: AtomicU64,
     manifests_seen: AtomicU64,
     blob_segments_seen: AtomicU64,
     fail_by_kind: [AtomicU64; KIND_COUNT],
@@ -916,7 +921,8 @@ impl Coverage {
             "cases={} crashes={} (process={}) cut_tripped={} failure_fired={} [{}] \
              recovery_crashes={} lost_buffered_tail={} dropped_inflight={} wal_rotations={} \
              maintenance_failures={} poisoned={} unstable_recovery={} \
-             lsn_checks={} lsn_cuts={} manifests_seen={} blob_segments_seen={}",
+             lsn_checks={} lsn_cuts={} durable_checks={} durable_marks={} durable_batches={} \
+             manifests_seen={} blob_segments_seen={}",
             g(&self.cases),
             g(&self.crashes),
             g(&self.process_crashes),
@@ -932,6 +938,9 @@ impl Coverage {
             g(&self.unstable_recovery),
             g(&self.lsn_checks),
             g(&self.lsn_cuts),
+            g(&self.durable_checks),
+            g(&self.durable_marks),
+            g(&self.durable_batches),
             g(&self.manifests_seen),
             g(&self.blob_segments_seen),
         )
@@ -1543,6 +1552,66 @@ impl<'a> Harness<'a> {
         Ok(())
     }
 
+    /// Durable-watermark oracle (ARCHITECTURE.md 4.6.4). Takes the largest `durable_lsn` among the
+    /// batches in the page-cache images of both logs before the crash. Every batch at or below
+    /// it, and above the checkpoint, was promised to be on the device, so the crashed files must
+    /// still hold it, for a power cut as for `kill -9`. The batches are read raw: whether their
+    /// blobs verify is a different question.
+    fn check_durable_watermark(&self, logged: &[(String, Vec<u8>)]) -> Result<(), String> {
+        let post: Vec<(String, Vec<u8>)> = {
+            let st = self.fs.st();
+            st.dir
+                .iter()
+                .map(|(n, &id)| (n.clone(), st.inodes[id].cache.clone()))
+                .collect()
+        };
+        let post_fs = scratch_fs(post);
+        let logged_fs = scratch_fs(logged.to_vec());
+        let logs = ["wal_sync.db", "wal_buf.db"];
+        let has = |fs: &CrashFs, n: &str| fs.st().dir.contains_key(n);
+        if !logs.iter().all(|n| has(&post_fs, n) && has(&logged_fs, n)) {
+            return Ok(());
+        }
+        let Ok(meta) =
+            crate::meta::BootMetaManager::open_or_recover_deferred_sweep(Arc::clone(&post_fs))
+        else {
+            return Ok(());
+        };
+        let m = meta.state().clone();
+        let batches = |fs: &CrashFs, name: &str, epoch: u64| {
+            crate::wal::recover_single_wal_stream(&*raw_file(fs, name), epoch).map(|r| r.batches)
+        };
+        let read = |fs: &CrashFs| -> io::Result<Vec<crate::wal::WalBatch>> {
+            let mut all = batches(fs, "wal_sync.db", m.sync_wal_epoch)?;
+            all.extend(batches(fs, "wal_buf.db", m.buf_wal_epoch)?);
+            all.retain(|b| b.lsn > m.checkpoint_lsn);
+            Ok(all)
+        };
+        let before = read(&logged_fs)
+            .map_err(|e| self.fail(format!("oracle: reading the logs failed: {e}")))?;
+        let after = read(&post_fs)
+            .map_err(|e| self.fail(format!("oracle: reading the crashed logs: {e}")))?;
+        let floor = before.iter().map(|b| b.durable_lsn).max().unwrap_or(0);
+        let present: BTreeSet<u64> = after.iter().map(|b| b.lsn).collect();
+        Coverage::bump(&self.cov.durable_checks);
+        if floor > m.checkpoint_lsn {
+            Coverage::bump(&self.cov.durable_marks);
+        }
+        for b in before.iter().filter(|b| b.lsn <= floor) {
+            Coverage::bump(&self.cov.durable_batches);
+            if !present.contains(&b.lsn) {
+                let have: Vec<u64> = present.iter().copied().collect();
+                let logged_lsns: Vec<u64> = before.iter().map(|b| b.lsn).collect();
+                return Err(self.fail(format!(
+                    "batch {} was promised durable (watermark {floor}) but is missing after \
+                     the crash\n  logged lsns:    {logged_lsns:?}\n  recovered lsns: {have:?}",
+                    b.lsn,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn open(&mut self, what: &str) -> Result<Eng, String> {
         let e = open_engine(&self.fs, &self.cfg)
             .map_err(|e| self.fail(format!("reopen failed ({what}): {e}")))?;
@@ -2089,6 +2158,7 @@ fn run_case_inner(
         let logged = h.snapshot_wal();
         fs.crash(crash);
         h.check_lsn_prefix(&logged)?;
+        h.check_durable_watermark(&logged)?;
         if fs.st().events.is_some() {
             h.log(format!(
                 "after the crash:
