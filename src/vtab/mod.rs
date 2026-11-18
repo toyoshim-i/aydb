@@ -29,6 +29,8 @@ mod key_null_tests;
 #[cfg(test)]
 mod pk_update_tests;
 #[cfg(test)]
+mod read_poison_tests;
+#[cfg(test)]
 mod rename_tests;
 pub mod row_codec;
 pub mod rowid_map;

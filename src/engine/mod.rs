@@ -27,6 +27,8 @@ mod crash_tests;
 #[cfg(test)]
 mod metadata_failure_tests;
 #[cfg(test)]
+mod read_poison_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, HashMap};
@@ -838,6 +840,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some() || self.meta_mgr.is_poisoned()
+    }
+
+    /// Test seam: poisons the engine as a failed WAL write would.
+    #[cfg(test)]
+    pub(crate) fn debug_poison(&mut self, reason: &str) {
+        let _ = self.poison(io::Error::other(reason.to_string()));
     }
 
     /// Returns how many post-commit maintenance steps have failed. The writes that triggered them
@@ -1892,8 +1900,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Runs `f` with exclusive access in `view`: flushes buffered blobs and retries when the
-    /// reader asks for it, then applies queued eager LRU promotions. The second tuple element
-    /// carries a flush/promotion error (the read result itself is returned untouched).
+    /// reader asks for it, then applies queued eager LRU promotions on a best-effort basis. The
+    /// second tuple element carries a flush error (the read result itself is returned untouched).
     pub(super) fn run_read<R>(
         &mut self,
         view: ReadView,
@@ -1910,15 +1918,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 continue;
             }
+            // The promotions are an optimisation of the read, never part of its result: a
+            // poisoned engine cannot write them, and a write that fails must not fail the read.
+            // A hit that is not written is still noted in RAM, so the LRU order learns it
+            // lazily as for any coalesced read; the on-disk queue and the row metadata stay as
+            // they were, consistent with each other.
             let hits = cx.eager_hits.take();
-            let mut err = None;
+            let mut write_failed = self.is_poisoned();
             for (table_id, pk) in hits {
-                if let Err(e) = self.eager_promote_lru_on_read(table_id, &pk) {
-                    err = Some(e);
-                    break;
+                if !write_failed && self.eager_promote_lru_on_read(table_id, &pk).is_err() {
+                    write_failed = true;
+                }
+                if write_failed {
+                    self.access_tracker.record_read_hit(table_id, &pk);
                 }
             }
-            return (r, err);
+            return (r, None);
         }
     }
 
