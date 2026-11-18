@@ -420,27 +420,34 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         active_epoch: u64,
         mode: WalStreamMode,
     ) -> io::Result<Self> {
+        let mut writer = Self::open_unallocated(fs, file_name, target_size, active_epoch, mode)?;
+        writer.allocate_to_target()?;
+        Ok(writer)
+    }
+
+    /// Opens the stream like [`Self::open`] but leaves a file that is shorter than `target_size`
+    /// as it is, so that recovery can read it and a refused open changes nothing. The caller must
+    /// call [`Self::allocate_to_target`] before the first append.
+    pub fn open_unallocated(
+        fs: &impl PlatformFs<File = F>,
+        file_name: &str,
+        target_size: u64,
+        active_epoch: u64,
+        mode: WalStreamMode,
+    ) -> io::Result<Self> {
         assert!(
             target_size >= WAL_SECTOR_SIZE as u64
                 && target_size.is_multiple_of(WAL_SECTOR_SIZE as u64),
             "WAL size must be a positive multiple of 4096 bytes"
         );
-        let (hint, prealloc) = match mode {
-            WalStreamMode::SyncSectorIsolated => {
-                (OpenHint::MutableSyncLog, PreallocStrategy::PhysicalZeroFill)
-            }
+        let hint = match mode {
+            WalStreamMode::SyncSectorIsolated => OpenHint::MutableSyncLog,
             WalStreamMode::BufferedImmediateOsCache | WalStreamMode::BufferedUserSpaceCoalesced => {
-                (
-                    OpenHint::MutableBufferedLog,
-                    PreallocStrategy::LogicalExtendOnly,
-                )
+                OpenHint::MutableBufferedLog
             }
         };
 
         let file = fs.open_file(file_name, true, true, hint)?;
-        if file.file_len()? < target_size {
-            file.preallocate(target_size, prealloc)?;
-        }
 
         let total_sectors = (target_size / WAL_SECTOR_SIZE as u64) as usize;
         Ok(Self {
@@ -457,6 +464,20 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             multi_sector_buf: Vec::new(),
             defer_barrier: false,
         })
+    }
+
+    /// Lengthens the file to the size the stream was opened with, if it is shorter.
+    pub fn allocate_to_target(&mut self) -> io::Result<()> {
+        let target = (self.total_sectors * WAL_SECTOR_SIZE) as u64;
+        if self.file.file_len()? < target {
+            let prealloc = match self.mode {
+                WalStreamMode::SyncSectorIsolated => PreallocStrategy::PhysicalZeroFill,
+                WalStreamMode::BufferedImmediateOsCache
+                | WalStreamMode::BufferedUserSpaceCoalesced => PreallocStrategy::LogicalExtendOnly,
+            };
+            self.file.preallocate(target, prealloc)?;
+        }
+        Ok(())
     }
 
     /// Positions the writer cursor right after the last valid sector recovered during startup.

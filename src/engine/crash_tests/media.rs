@@ -71,8 +71,6 @@ pub(super) struct MediaCov {
     pub stale: AtomicU64,
     /// Damaged directories where `Fail` refused (and left every file alone).
     pub refused: AtomicU64,
-    /// ... of which lengthened a truncated log file (known bug).
-    pub refused_extended: AtomicU64,
     /// Damaged directories that opened without a report although batches were lost.
     pub lost_unreported: AtomicU64,
     /// ... of which a batch behind a zeroed or stale sector would have proved the loss.
@@ -94,7 +92,7 @@ impl MediaCov {
     pub(super) fn report(&self) -> String {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
         format!(
-            "damaged={} (flip={} zero={} truncate={} stale={}) refused={} (extended_wal={}) \
+            "damaged={} (flip={} zero={} truncate={} stale={}) refused={} \
              lost_unreported={} (hidden={} unprovable={}) lost_acked={} \
              salvage_checks={} salvaged_txs={} salvage_visible_discarded={} group_tickets={} \
              group_leads={} group_shared={} group_sync_path={}",
@@ -104,7 +102,6 @@ impl MediaCov {
             g(&self.truncated),
             g(&self.stale),
             g(&self.refused),
-            g(&self.refused_extended),
             g(&self.lost_unreported),
             g(&self.hidden),
             g(&self.unprovable),
@@ -303,17 +300,6 @@ impl Harness<'_> {
             ) else {
                 return Ok(None);
             };
-            // The engine lengthens a log file that is shorter than configured with zeros before
-            // it scans it, which also completes a sector that was only partly persisted.
-            let size = [self.cfg.sync_wal_size_bytes, self.cfg.buf_wal_size_bytes]
-                [(name == WAL_FILES[1]) as usize] as usize;
-            let (mut lg, mut cur) = (lg.clone(), cur.clone());
-            for img in [&mut lg, &mut cur] {
-                if img.len() < size {
-                    img.resize(size, 0);
-                }
-            }
-            let (lg, cur) = (&lg, &cur);
             before.extend(found(
                 scan_img(name, lg.clone(), epoch).map_err(|e| io("scan", e))?,
             ));
@@ -561,30 +547,11 @@ impl Harness<'_> {
                     .chain(before.keys())
                     .filter(|n| after.get(*n) != before.get(*n))
                     .collect();
-                // KNOWN ENGINE BUG (`fail_policy_leaves_a_truncated_wal_file_untouched`): the open
-                // lengthens a log file that is shorter than configured before it looks at the
-                // damage. Nothing else may change, and what was there stays.
-                let only_growth = changed.iter().all(|n| {
-                    WAL_FILES.contains(&n.as_str())
-                        && match (before.get(*n), after.get(*n)) {
-                            (Some(b), Some(a)) => {
-                                a.0.len() > b.0.len()
-                                    && a.0[..b.0.len()] == b.0[..]
-                                    && a.0[b.0.len()..].iter().all(|&x| x == 0)
-                                    && a.1.len() >= b.1.len()
-                                    && a.1[..b.1.len()] == b.1[..]
-                            }
-                            _ => false,
-                        }
-                });
-                if !changed.is_empty() && !only_growth {
+                if !changed.is_empty() {
                     return Err(self.fail(format!(
                         "a failed open under Fail changed a file (boot_meta.db included): \
                          {changed:?}"
                     )));
-                }
-                if !changed.is_empty() {
-                    Coverage::bump(&cov.refused_extended);
                 }
                 Coverage::bump(&cov.refused);
             }

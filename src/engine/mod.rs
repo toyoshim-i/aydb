@@ -623,14 +623,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lru_blobs.iter().map(|(&k, b)| (k, b.dead_bytes)).collect();
 
         // 4. Open `wal_sync.db` and `wal_buf.db` and run Two-Stream Recovery
-        let mut sync_wal = WalStreamWriter::open(
+        let mut sync_wal = WalStreamWriter::open_unallocated(
             &*fs,
             WAL_SYNC_FILE_NAME,
             config.sync_wal_size_bytes,
             state_snapshot.sync_wal_epoch,
             WalStreamMode::SyncSectorIsolated,
         )?;
-        let mut buf_wal = WalStreamWriter::open(
+        let mut buf_wal = WalStreamWriter::open_unallocated(
             &*fs,
             WAL_BUF_FILE_NAME,
             config.buf_wal_size_bytes,
@@ -681,6 +681,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, damage.clone()));
         }
+        // A log file shorter than configured (a fresh one, or one cut short by a third party) is
+        // lengthened only now, so that a refused open leaves it as it was.
+        sync_wal.allocate_to_target()?;
+        buf_wal.allocate_to_target()?;
         // Recovery allocates no SeqID, so reserving here still precedes every allocation.
         meta_mgr.reserve_seq_ids_above_existing_files()?;
 

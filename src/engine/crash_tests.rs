@@ -3968,13 +3968,9 @@ fn append_group_put(e: &mut Eng, key: &[u8], value: &[u8], sec: &[(u16, Vec<u8>)
     }
 }
 
-/// KNOWN BUG, found by the media-damage mode (ARCHITECTURE.md 4.6.6 promises that a refused open
-/// leaves every file byte-identical): a log file that a third party truncated is shorter than
-/// configured, and `StorageEngine::open` lengthens it (`WalStreamWriter::open` pre-allocates)
-/// before recovery has looked at the damage. The refused open under `Fail` therefore changes
-/// the file. A fix is to decide on the damage first, or to open the writers after the decision.
+/// A log file that a third party truncated is shorter than configured. A refused open under `Fail`
+/// must leave it as it is: the file is lengthened only after the damage decision.
 #[test]
-#[ignore = "known bug: a refused open lengthens a truncated log file"]
 fn fail_policy_leaves_a_truncated_wal_file_untouched() {
     let (fs, _keys, _s2) = sync_sector_damage_fs();
     // Only the first sector of the sync log is left: s2 and s5 are gone, the buffered batches
