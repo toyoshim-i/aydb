@@ -20,6 +20,8 @@ mod ddl;
 pub mod ffi;
 #[cfg(test)]
 mod key_null_tests;
+#[cfg(test)]
+mod pk_update_tests;
 pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
@@ -2223,6 +2225,15 @@ unsafe extern "system" fn vtab_update(
             }
         }
 
+        // A row whose key changes keeps its rowid, as on a native table. SQLite addresses the
+        // rows it still has queued by their old rowids, so a rowid that moved to another row
+        // (or a new one derived from the new key) would make them hit the wrong row.
+        let kept_rowid = old_rowid_arg.filter(|_| {
+            old_pk_opt
+                .as_ref()
+                .is_some_and(|old| old.as_slice() != new_pk.as_slice())
+        });
+
         // Everything below mutates the engine. A statement that removes rows (REPLACE conflict
         // resolution, or a PK-changing UPDATE) and then fails to store the new row must leave
         // every row intact. SQLite cannot be relied on for that: it opens a statement journal
@@ -2272,7 +2283,7 @@ unsafe extern "system" fn vtab_update(
                 Ok(auto_id)
             } else if let Some(int_id) = coerced_int_pk {
                 Ok(int_id)
-            } else if let Some(rowid) = mapped_rowid {
+            } else if let Some(rowid) = mapped_rowid.or(kept_rowid) {
                 eng.set_rowid(vtab.table_id, &new_pk, rowid, vtab.durability)?;
                 Ok(rowid)
             } else {
