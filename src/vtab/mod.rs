@@ -5,6 +5,8 @@
 //! lookups (Plan 2), primary-key range scans (Plan 3), secondary index range scans (Plan 4),
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
+#[cfg(test)]
+mod column_def_tests;
 mod compaction_worker;
 #[cfg(test)]
 mod conflict_tests;
