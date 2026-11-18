@@ -98,6 +98,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         desired: &[(u16, Vec<u8>)],
         durability: WriteDurability,
     ) -> io::Result<bool> {
+        self.drain_group_for_autocommit()?;
         self.check_not_poisoned()?;
         self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {

@@ -131,8 +131,6 @@ pub(super) struct OpRec {
 /// A group commit that was appended but whose flush has not been seen to finish.
 pub(super) struct Ticket {
     pub lsn: u64,
-    /// The rows it writes.
-    pub rows: Vec<(u16, u8)>,
     /// Index into `Harness::states` of the state the commit produces.
     pub state: usize,
     pub file: Arc<CrashFile>,
@@ -853,7 +851,6 @@ impl Harness<'_> {
         let logged = e.pending_tx_record_count > 0;
         let before_commit = e.next_lsn();
         let step = e.begin_commit_for_conn(conn);
-        let touched_rows: Vec<(u16, u8)> = touched.keys().copied().collect();
         self.note_op(lsn0, e.next_lsn().max(before_commit), touched);
         let alive = !e.is_poisoned();
         match step {
@@ -864,10 +861,8 @@ impl Harness<'_> {
                     "  appended as lsn {lsn}, state {state}, flush pending"
                 ));
                 Coverage::bump(&self.cov.media.group_tickets);
-                let rows = touched_rows;
                 self.tickets.push(Ticket {
                     lsn,
-                    rows,
                     state,
                     file,
                     gate,
@@ -891,39 +886,6 @@ impl Harness<'_> {
                 self.record_commit(Err(err), work, true, logged, alive, "group tx begin_commit")
             }
         }
-    }
-
-    /// Flushes every waiting group commit, as the leader of the flush.
-    pub(super) fn drain_group(&mut self, e: &mut Eng) -> Result<bool, String> {
-        while let Some(t) = self.tickets.first() {
-            let (lsn, file, gate) = (t.lsn, Arc::clone(&t.file), Arc::clone(&t.gate));
-            let go = self.flush_ticket(e, lsn, &file, &gate)?;
-            self.settle_tickets(e);
-            if !go {
-                return Ok(false);
-            }
-            if self.tickets.first().is_some_and(|t| t.lsn == lsn) {
-                // Not published: the engine is dead (a fault), nothing more to flush.
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// KNOWN ENGINE BUG (`delete_after_a_pending_group_commit_removes_its_secondary_entries`): a
-    /// write outside a transaction reads the committed rows and misses the one that a pending
-    /// group commit wrote. Until that is fixed, an autocommit operation on a row that a group
-    /// commit still holds waits for its flush.
-    pub(super) fn avoid_pending_row(
-        &mut self,
-        e: &mut Eng,
-        table: u16,
-        key: u8,
-    ) -> Result<bool, String> {
-        if self.mode.group && self.tickets.iter().any(|t| t.rows.contains(&(table, key))) {
-            return self.drain_group(e);
-        }
-        Ok(true)
     }
 
     /// Picks a waiting group commit and finds it durable or runs the flush it leads.

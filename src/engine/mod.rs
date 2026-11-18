@@ -1389,6 +1389,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// quota registrations, and system catalog entries.
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         self.corrupt_policies.remove(&table_id);
         self.table_inline_thresholds.remove(&table_id);
         self.blob_cache.invalidate_table_blobs(table_id);
@@ -1529,6 +1530,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         known_absent: bool,
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
@@ -1752,6 +1754,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<bool> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
@@ -2075,6 +2078,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<bool> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
         if pk.len() > 2048 {
             return Err(io::Error::new(
@@ -2451,6 +2455,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Ok(())
             }
         }
+    }
+
+    /// Outside a transaction, makes the group-committed batches that await their flush durable
+    /// and publishes them to the `MemTable`, so that the caller reads the newest version of every
+    /// row it maintains secondary entries, row metadata or rowid mappings for. Writers read the
+    /// committed state, which does not hold a pending group commit yet, while a transaction
+    /// starts from the pending entries (`seed_overlay_from_pending`).
+    ///
+    /// This costs nothing when no group commit is pending. Otherwise it runs the device flush that
+    /// the write's own commit would run first anyway (`commit_wal_and_memtable` drains too), so
+    /// the write waits for the group's flush exactly as it did, only before its reads.
+    pub(super) fn drain_group_for_autocommit(&mut self) -> io::Result<()> {
+        if self.tx_depth == 0 {
+            self.drain_pending_durable()?;
+        }
+        Ok(())
     }
 
     /// Deletes rows queued by [`CorruptPolicy::Evict`] reads.

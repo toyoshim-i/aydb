@@ -103,6 +103,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
         reserved: impl Fn(&Self, i64) -> io::Result<bool>,
     ) -> io::Result<i64> {
+        self.drain_group_for_autocommit()?;
         if let Some(rowid) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             return Ok(rowid);
         }
@@ -142,6 +143,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         rowid: i64,
         durability: WriteDurability,
     ) -> io::Result<()> {
+        self.drain_group_for_autocommit()?;
         let mut records = Vec::new();
         if let Some(old) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             if old == rowid {

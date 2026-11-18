@@ -1815,9 +1815,6 @@ impl<'a> Harness<'a> {
         let d = pick_durability(&mut self.rng);
         let sync = d == WriteDurability::SyncTransactional;
         let v = make_value(&mut self.rng, t, k);
-        if !self.avoid_pending_row(e, t, k)? {
-            return Ok(false);
-        }
         let mut ns = self.last().clone();
         ns.insert((t, k), v.clone());
         let what = format!("put t{t}/key{k:02} {} {}", short(&v), describe(d));
@@ -1885,9 +1882,6 @@ impl<'a> Harness<'a> {
         let t = self.pick_table();
         let k = self.rng.below(KEYS as u64) as u8;
         let d = pick_durability(&mut self.rng);
-        if !self.avoid_pending_row(e, t, k)? {
-            return Ok(false);
-        }
         let mut ns = self.last().clone();
         ns.remove(&(t, k));
         let what = format!("delete t{t}/key{k:02} {}", describe(d));
@@ -2385,9 +2379,6 @@ fn run_case_inner(
     h.log("post-recovery maintenance".into());
     let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         h.run_segment(&mut e, 8)?;
-        // KNOWN ENGINE BUG (see `Harness::avoid_pending_row`): the backfill below misses a row
-        // that a pending group commit holds.
-        h.drain_group(&mut e)?;
         h.complete_backfill(&mut e)?;
         e.checkpoint()
             .map_err(|er| h.fail(format!("checkpoint after recovery failed: {er}")))?;
@@ -3996,15 +3987,10 @@ fn fail_policy_leaves_a_truncated_wal_file_untouched() {
     }
 }
 
-/// KNOWN BUG, found by the group-commit mode: a write outside a transaction reads the committed
-/// rows and not the one that a pending group commit wrote (the `begin_transaction*` paths seed
-/// their overlay from the pending commits, the autocommit paths do not). `delete_row` therefore
-/// takes the secondary entries of the old version from the row's `'t'` record and leaves the
-/// entries of the group-committed version behind as orphans. `backfill_secondary_keys` misses
-/// such a row altogether. A fix is to drain the pending group commits first, as the other
-/// paths that write to the MemTable directly do.
+/// A write outside a transaction must see the row that a pending group commit wrote: it reads
+/// the old row's `'t'` record to maintain the secondary entries, and a stale read leaves the
+/// entries of the group-committed version behind as orphans.
 #[test]
-#[ignore = "known bug: an autocommit write does not see a pending group commit"]
 fn delete_after_a_pending_group_commit_removes_its_secondary_entries() {
     let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
     let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
@@ -4078,4 +4064,49 @@ fn old_format_wal_is_unsupported_format_and_stale_sectors_are_ignored() {
         let e = StorageEngine::open(Arc::clone(&fs), fail_config()).unwrap();
         assert_eq!(e.last_wal_recovery().damage, None, "version {version}");
     }
+}
+
+/// A pending group commit replaced a row; an autocommit `put_row` replaces it again and must
+/// remove the secondary entries of the group-committed version.
+#[test]
+fn put_after_a_pending_group_commit_replaces_its_secondary_entries() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    let mut rng = Rng::new(7);
+    let mut value = || make_value(&mut rng, 2, 8);
+    let (old, grouped, newest) = (value(), value(), value());
+    e.put_row(2, b"k", &old, &full_keys(2, &old), SYNC).unwrap();
+    append_group_put(&mut e, b"k", &grouped, &full_keys(2, &grouped));
+    assert!(
+        !e.pending_group.is_empty(),
+        "the flush must still be pending"
+    );
+    e.put_row(2, b"k", &newest, &full_keys(2, &newest), BUF)
+        .unwrap();
+    let want: BTreeSet<Vec<u8>> = full_keys(2, &newest)
+        .iter()
+        .map(|(id, col)| encode_secondary_index_key(2, *id, col, b"k"))
+        .collect();
+    let got: BTreeSet<Vec<u8>> = live_index_entries(&mut e, 2).into_iter().collect();
+    assert_eq!(got, want, "entries of a superseded version remain");
+}
+
+/// `backfill_secondary_keys` must find a row that a pending group commit wrote.
+#[test]
+fn backfill_after_a_pending_group_commit_finds_its_row() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    let mut rng = Rng::new(7);
+    let value = make_value(&mut rng, 2, 8);
+    append_group_put(&mut e, b"k", &value, &[]);
+    assert!(
+        !e.pending_group.is_empty(),
+        "the flush must still be pending"
+    );
+    let keys = full_keys(2, &value);
+    assert!(
+        e.backfill_secondary_keys(2, b"k", &keys, BUF).unwrap(),
+        "the row exists"
+    );
+    assert_eq!(live_index_entries(&mut e, 2).len(), keys.len());
 }
