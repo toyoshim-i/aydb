@@ -162,6 +162,7 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
+    pub(super) vtabs_created_len: usize,
     pub(super) quotas_modified_in_tx: bool,
 }
 
@@ -358,6 +359,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
+            self.vtabs_created_in_tx.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = None;
@@ -386,6 +388,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
+            self.vtabs_created_in_tx.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = Some(conn_id);
@@ -729,6 +732,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
+        self.vtabs_created_in_tx.clear();
         let overlay = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
         self.memtable.absorb(overlay);
@@ -801,6 +805,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         self.tx_depth = 0;
+        self.vtabs_created_in_tx.clear();
         self.tx_owner_conn = None;
         self.deferred_flush_on_commit = false;
         self.deferred_compact_on_commit = false;
@@ -979,6 +984,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_vtab_ids: self.active_vtab_ids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
+            vtabs_created_len: self.vtabs_created_in_tx.len(),
             quotas_modified_in_tx: self.quotas_modified_in_tx,
         }
     }
@@ -1000,6 +1006,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.active_vtab_ids = snap.active_vtab_ids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
+        self.vtabs_created_in_tx.truncate(snap.vtabs_created_len);
         self.quotas_modified_in_tx = snap.quotas_modified_in_tx;
     }
 

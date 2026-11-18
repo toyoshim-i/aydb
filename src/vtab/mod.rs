@@ -18,6 +18,8 @@ pub mod connection;
 #[cfg(test)]
 mod constraint_tests;
 mod constraints;
+#[cfg(test)]
+mod create_tests;
 mod ddl;
 #[cfg(test)]
 mod drop_tests;
@@ -65,6 +67,7 @@ use crate::engine::{
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
 use crate::vtab::ddl::{ParsedVtabDdl, parse_vtab_ddl};
+use crate::vtab::ffi::sqlite3_table_column_metadata;
 use crate::vtab::ffi::{
     SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_FLOAT, SQLITE_FULL,
     SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
@@ -649,6 +652,8 @@ struct Connected {
     initial_auto_rowid: i64,
     rowids_committed: bool,
     unique_ready: bool,
+    /// The catalog had no entry for the table before this connect: it is a new table.
+    newly_created: bool,
 }
 
 /// Registers the table for a connection and prepares its runtime state, all under one engine
@@ -669,6 +674,7 @@ fn connect_table(
 ) -> io::Result<Option<Connected>> {
     let plan = eng.plan_vtab_registration(&ddl.table_name, ddl.explicit_table_id)?;
     let table_id = plan.table_id;
+    let newly_created = !plan.persisted;
     if eng.check_write_allowed_for_conn(conn_id).is_err() {
         let quota_registered = ddl.max_bytes == 0
             || eng
@@ -732,6 +738,7 @@ fn connect_table(
         initial_auto_rowid,
         rowids_committed,
         unique_ready,
+        newly_created,
     }))
 }
 
@@ -780,6 +787,24 @@ unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
         }
         buf
     }
+}
+
+/// Waits, bounded like `xBegin`, for another connection's transaction to end: the same thread
+/// may hold that connection open and could never end it. Returns false once the wait ran out.
+fn wait_for_other_transaction(
+    eng: std::sync::RwLockWriteGuard<'_, StorageEngine<OsFs>>,
+    deadline: &mut Option<Instant>,
+) -> bool {
+    let now = Instant::now();
+    let end = *deadline.get_or_insert(now + eng.writer_wait_timeout());
+    if now >= end {
+        return false;
+    }
+    let gate = eng.commit_gate();
+    let seen = gate.tx_end_count();
+    drop(eng);
+    gate.wait_tx_end(seen, end - now);
+    true
 }
 
 unsafe extern "system" fn vtab_create(
@@ -856,25 +881,64 @@ unsafe fn vtab_create_or_connect(
         // transaction to end, bounded like `xBegin`, because the same thread may hold that
         // connection open and could never end it.
         let mut deadline = None;
+        // SQLite adds a table that `xCreate` made to the transaction without calling `xBegin`
+        // for it, but still calls its `xCommit` and `xRollback`. Inside a user transaction the
+        // create therefore has to open the engine transaction itself, or the catalog entry
+        // (and, since `xBegin` never comes, every row inserted afterwards) would be committed
+        // at once and survive a ROLLBACK. If an earlier write already opened it, this joins it.
+        let join_user_tx = is_create && sqlite3_get_autocommit(db) == 0;
+        let mut began_here = false;
         let connected = loop {
             let mut eng = match aux.engine.write() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
+            if join_user_tx && !began_here && !eng.in_active_transaction() {
+                match eng.begin_transaction_for_conn(db as usize) {
+                    Ok(()) => began_here = true,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if !wait_for_other_transaction(eng, &mut deadline) {
+                            return SQLITE_BUSY;
+                        }
+                        continue;
+                    }
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                }
+            }
+            // A table that this transaction created under this name or id, and that SQLite is
+            // creating again, was undone in SQLite's schema by a `ROLLBACK TO` that the table
+            // never heard of (it was not announced the savepoint it was created in). Remove
+            // what is left of it before the new table starts.
+            if is_create && eng.in_active_transaction() {
+                for (id, name) in
+                    eng.take_vtabs_created_in_tx(ddl.explicit_table_id, &ddl.table_name)
+                {
+                    if let Err(e) = eng.drop_stale_created_vtab(id, &name) {
+                        if began_here {
+                            let _ = eng.rollback_transaction_for_conn(db as usize);
+                        }
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                }
+            }
             match connect_table(&mut eng, db as usize, &ddl) {
-                Ok(Some(connected)) => break connected,
+                Ok(Some(connected)) => {
+                    if is_create && connected.newly_created {
+                        eng.note_vtab_created_in_tx(connected.table_id, &ddl.table_name);
+                    }
+                    break connected;
+                }
                 Ok(None) => {
-                    let now = Instant::now();
-                    let end = *deadline.get_or_insert(now + eng.writer_wait_timeout());
-                    if now >= end {
+                    if !wait_for_other_transaction(eng, &mut deadline) {
                         return SQLITE_BUSY;
                     }
-                    let gate = eng.commit_gate();
-                    let seen = gate.tx_end_count();
-                    drop(eng);
-                    gate.wait_tx_end(seen, end - now);
                 }
-                Err(e) => return io_err_to_sqlite_rc(&e),
+                Err(e) => {
+                    if began_here {
+                        let _ = eng.rollback_transaction_for_conn(db as usize);
+                    }
+                    return io_err_to_sqlite_rc(&e);
+                }
             }
         };
         let Connected {
@@ -882,6 +946,7 @@ unsafe fn vtab_create_or_connect(
             initial_auto_rowid,
             rowids_committed,
             unique_ready,
+            ..
         } = connected;
 
         let vtab = Box::new(AydbVTab {
@@ -2532,6 +2597,28 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     .unwrap_or(SQLITE_ERROR)
 }
 
+/// Whether SQLite's schema still has a table of this name. Any doubt counts as "yes": a table is
+/// only removed on a definite "no such table".
+unsafe fn schema_has_table(db: *mut sqlite3, name: &str) -> bool {
+    let Ok(c_name) = CString::new(name) else {
+        return true;
+    };
+    let rc = unsafe {
+        sqlite3_table_column_metadata(
+            db,
+            core::ptr::null(),
+            c_name.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    rc != SQLITE_ERROR
+}
+
 unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
@@ -2541,6 +2628,15 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         };
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
+        }
+        // A table this transaction created whose creation a `ROLLBACK TO` has since undone in
+        // SQLite's schema (nothing tells the table) must not be committed.
+        let name = vtab.name();
+        if eng.is_created_in_tx(vtab.table_id, &name) && !schema_has_table(vtab.db, &name) {
+            let _ = eng.take_vtabs_created_in_tx(Some(vtab.table_id), &name);
+            if let Err(e) = eng.drop_stale_created_vtab(vtab.table_id, &name) {
+                return io_err_to_sqlite_rc(&e);
+            }
         }
         if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
             return io_err_to_sqlite_rc(&e);

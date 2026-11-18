@@ -336,6 +336,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) savepoints: Vec<SavepointMarker>,
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
+    /// Virtual tables created (`xCreate`) inside the currently active transaction, as
+    /// `(table_id, normalised name)`.
+    pub(super) vtabs_created_in_tx: Vec<(u16, String)>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
@@ -787,6 +790,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_start_meta: TxMetaSnapshot::default(),
             savepoints: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
+            vtabs_created_in_tx: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
             table_has_row_meta: BTreeMap::new(),
@@ -1115,6 +1119,63 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .active_vtab_ids
                 .insert(table_id, name.clone());
         }
+    }
+
+    /// Notes that the active transaction created virtual table `(table_id, table_name)`.
+    pub(crate) fn note_vtab_created_in_tx(&mut self, table_id: u16, table_name: &str) {
+        if self.tx_depth > 0 {
+            self.vtabs_created_in_tx
+                .push((table_id, table_name.trim().to_ascii_lowercase()));
+        }
+    }
+
+    /// Whether the active transaction created virtual table `(table_id, table_name)`.
+    pub(crate) fn is_created_in_tx(&self, table_id: u16, table_name: &str) -> bool {
+        let norm = table_name.trim().to_ascii_lowercase();
+        self.vtabs_created_in_tx
+            .iter()
+            .any(|(id, name)| *id == table_id && *name == norm)
+    }
+
+    /// Drops a table that the active transaction created and that SQLite no longer has, but only
+    /// if the catalog still maps `table_name` to `table_id`. A savepoint rollback the engine was
+    /// told about has already removed the table, and its id (or name) may belong to another
+    /// table by now.
+    pub(crate) fn drop_stale_created_vtab(
+        &mut self,
+        table_id: u16,
+        table_name: &str,
+    ) -> io::Result<()> {
+        let norm = table_name.trim().to_ascii_lowercase();
+        let mut key = vec![0u8, 0u8, b'c'];
+        key.extend_from_slice(norm.as_bytes());
+        let mapped = match self.lookup_raw_entry_view(ReadView::Owner, &key)? {
+            Some((_, IndexValue::Inline(val))) if val.len() == 2 => {
+                Some(u16::from_be_bytes([val[0], val[1]]))
+            }
+            _ => None,
+        };
+        if mapped == Some(table_id) {
+            self.drop_table(table_id, Some(&norm))?;
+        }
+        Ok(())
+    }
+
+    /// Removes the tables that the active transaction created under `table_name` or with
+    /// `table_id`, and returns them. SQLite only runs `xCreate` for a name its schema does not
+    /// have, so one of these is a creation that a `ROLLBACK TO` undid in the schema but, because
+    /// SQLite never announces such a savepoint to a table made inside it, not in the engine.
+    pub(crate) fn take_vtabs_created_in_tx(
+        &mut self,
+        table_id: Option<u16>,
+        table_name: &str,
+    ) -> Vec<(u16, String)> {
+        let norm = table_name.trim().to_ascii_lowercase();
+        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
+            .into_iter()
+            .partition(|(id, name)| *name == norm || Some(*id) == table_id);
+        self.vtabs_created_in_tx = kept;
+        stale
     }
 
     /// Whether `(table_id, table_name)` is currently registered as a live virtual table.
