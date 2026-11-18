@@ -892,6 +892,10 @@ struct Coverage {
     poisoned: AtomicU64,
     /// Recoveries whose result changed at the next, immediate crash.
     unstable_recovery: AtomicU64,
+    /// Recoveries checked by the LSN-order oracle, and those that replayed fewer batches than
+    /// were logged (the oracle is only meaningful if it sees real cuts).
+    lsn_checks: AtomicU64,
+    lsn_cuts: AtomicU64,
     manifests_seen: AtomicU64,
     blob_segments_seen: AtomicU64,
     fail_by_kind: [AtomicU64; KIND_COUNT],
@@ -912,7 +916,7 @@ impl Coverage {
             "cases={} crashes={} (process={}) cut_tripped={} failure_fired={} [{}] \
              recovery_crashes={} lost_buffered_tail={} dropped_inflight={} wal_rotations={} \
              maintenance_failures={} poisoned={} unstable_recovery={} \
-             manifests_seen={} blob_segments_seen={}",
+             lsn_checks={} lsn_cuts={} manifests_seen={} blob_segments_seen={}",
             g(&self.cases),
             g(&self.crashes),
             g(&self.process_crashes),
@@ -926,6 +930,8 @@ impl Coverage {
             g(&self.maintenance_failures),
             g(&self.poisoned),
             g(&self.unstable_recovery),
+            g(&self.lsn_checks),
+            g(&self.lsn_cuts),
             g(&self.manifests_seen),
             g(&self.blob_segments_seen),
         )
@@ -946,6 +952,29 @@ enum FaultChoice {
 }
 
 type Eng = StorageEngine<CrashFs>;
+
+/// A throwaway filesystem holding the given files, durable and cached alike. The oracle reads
+/// recovery inputs through it without touching the filesystem under test or its random stream.
+fn scratch_fs(files: Vec<(String, Vec<u8>)>) -> Arc<CrashFs> {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 0));
+    {
+        let mut st = fs.st();
+        for (name, img) in files {
+            let id = st.inodes.len();
+            st.inodes.push(Inode {
+                name: name.clone(),
+                cache: img.clone(),
+                durable: img,
+                pending: Vec::new(),
+                linked: true,
+                create_seq: 0,
+                unlink_seq: None,
+            });
+            st.dir.insert(name, id);
+        }
+    }
+    fs
+}
 
 struct Harness<'a> {
     seed: u64,
@@ -1419,6 +1448,99 @@ impl<'a> Harness<'a> {
         self.acked_any = k;
         self.log(format!("recovered at state {k} (range {lo}..={hi})"));
         Ok(k)
+    }
+
+    /// Copies the log files as the page cache holds them now: every batch that was logged,
+    /// including those the coming crash will lose. Call before [`CrashFs::crash`].
+    fn snapshot_wal(&self) -> Vec<(String, Vec<u8>)> {
+        let st = self.fs.st();
+        ["wal_sync.db", "wal_buf.db"]
+            .iter()
+            .filter_map(|&n| {
+                let id = *st.dir.get(n)?;
+                Some((n.to_string(), st.inodes[id].cache.clone()))
+            })
+            .collect()
+    }
+
+    /// LSN-order oracle (ARCHITECTURE.md 4.6.2, 4.6.11). Runs the recovery coordinator on a copy
+    /// of the crashed filesystem, before the engine opens it, and on the logs as they were before
+    /// the crash. The batches recovery would replay must be a prefix of the logged batches in
+    /// global LSN order: nothing may be replayed after a logged batch that is missing. The
+    /// state-level oracle in [`Self::verify`] cannot see this, because a later commit may
+    /// overwrite the effect of a missing one.
+    ///
+    /// Valid only while the harness never damages synced data (power cuts and `kill -9` only);
+    /// damage modes must be excluded or must expect the cut instead.
+    fn check_lsn_prefix(&self, logged: &[(String, Vec<u8>)]) -> Result<(), String> {
+        let post: Vec<(String, Vec<u8>)> = {
+            let st = self.fs.st();
+            st.dir
+                .iter()
+                .map(|(n, &id)| (n.clone(), st.inodes[id].cache.clone()))
+                .collect()
+        };
+        let post_fs = scratch_fs(post);
+        let has = |fs: &CrashFs, n: &str| fs.st().dir.contains_key(n);
+        // Without a log file in either copy there is nothing to compare (the engine creates it).
+        let logs = ["wal_sync.db", "wal_buf.db"];
+        let logged_fs = scratch_fs(logged.to_vec());
+        if !logs.iter().all(|n| has(&post_fs, n) && has(&logged_fs, n)) {
+            return Ok(());
+        }
+        // A meta file that cannot be loaded makes the real open fail or start empty; the
+        // state-level checks report that.
+        let Ok(meta) =
+            crate::meta::BootMetaManager::open_or_recover_deferred_sweep(Arc::clone(&post_fs))
+        else {
+            return Ok(());
+        };
+        let m = meta.state().clone();
+        let sf = raw_file(&post_fs, "wal_sync.db");
+        let bf = raw_file(&post_fs, "wal_buf.db");
+        let mut validate = |ptr: &crate::wal::BlobPtr| -> io::Result<bool> {
+            let r =
+                crate::blob::BlobSegmentReader::open(&*post_fs, ptr.kind, ptr.table_id, ptr.seg_id);
+            match r {
+                Ok(r) => r.validate_blob_ptr(ptr),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            }
+        };
+        let recovered = crate::wal::recover_two_streams(
+            &*sf,
+            m.sync_wal_epoch,
+            &*bf,
+            m.buf_wal_epoch,
+            m.checkpoint_lsn,
+            &mut validate,
+        )
+        .map_err(|e| self.fail(format!("oracle: recovery of the crashed logs failed: {e}")))?;
+        // The same logs before the crash, with every blob taken as present: the reference order.
+        let sf = raw_file(&logged_fs, "wal_sync.db");
+        let bf = raw_file(&logged_fs, "wal_buf.db");
+        let reference = crate::wal::recover_two_streams(
+            &*sf,
+            m.sync_wal_epoch,
+            &*bf,
+            m.buf_wal_epoch,
+            m.checkpoint_lsn,
+            |_| Ok(true),
+        )
+        .map_err(|e| self.fail(format!("oracle: reading the logged batches failed: {e}")))?;
+        let want: Vec<u64> = reference.merged_batches.iter().map(|b| b.lsn).collect();
+        let got: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
+        Coverage::bump(&self.cov.lsn_checks);
+        if got.len() < want.len() {
+            Coverage::bump(&self.cov.lsn_cuts);
+        }
+        if got.len() > want.len() || want[..got.len()] != got[..] {
+            return Err(self.fail(format!(
+                "recovery replays batches that are not a prefix of the logged LSN order\n  \
+                 logged:    {want:?}\n  recovered: {got:?}"
+            )));
+        }
+        Ok(())
     }
 
     fn open(&mut self, what: &str) -> Result<Eng, String> {
@@ -1964,7 +2086,9 @@ fn run_case_inner(
             Coverage::bump(&cov.process_crashes);
         }
         h.log(format!("crash: {crash:?}"));
+        let logged = h.snapshot_wal();
         fs.crash(crash);
+        h.check_lsn_prefix(&logged)?;
         if fs.st().events.is_some() {
             h.log(format!(
                 "after the crash:
@@ -2682,4 +2806,141 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
             scenario(seed, Some(cut), keep, lose);
         }
     }
+}
+
+// =============================================================================================
+// WAL damage: recovery must replay a prefix of the global LSN order (ARCHITECTURE.md 4.6)
+// =============================================================================================
+//
+// These tests damage data that was already synced (a bad sector, a rotten blob), which neither a
+// power cut nor `kill -9` can do: the engine orders its flushes so that those only ever lose an
+// unsynced tail. The recovered state must still be the batches below the first missing or
+// unverifiable one, in global LSN order across both streams.
+
+/// Applies `f` to both images of a file, so that the damage survives either kind of crash.
+fn damage_synced(fs: &CrashFs, name: &str, f: impl Fn(&mut Vec<u8>)) {
+    let mut st = fs.st();
+    let id = st.dir[name];
+    let ino = &mut st.inodes[id];
+    f(&mut ino.cache);
+    f(&mut ino.durable);
+}
+
+/// LSNs of the batches `recover_single_wal_stream` finds in a log file, in log order. The epoch
+/// is taken from sector 0, which is how the current epoch looks after a clean run.
+fn wal_lsns(fs: &CrashFs, name: &str) -> Vec<u64> {
+    let img = content(fs, name).unwrap();
+    let epoch = u64::from_le_bytes(img[4..12].try_into().unwrap());
+    let f = raw_file(fs, name);
+    crate::wal::recover_single_wal_stream(&*f, epoch)
+        .unwrap()
+        .batches
+        .iter()
+        .map(|b| b.lsn)
+        .collect()
+}
+
+/// Asserts that exactly the first `cut` of `keys` (in commit order, table 1) are present.
+fn assert_recovered_prefix(e: &mut Eng, keys: &[&[u8]], cut: usize) {
+    let present: Vec<bool> = keys
+        .iter()
+        .map(|k| e.get_row(1, k).unwrap().is_some())
+        .collect();
+    let want: Vec<bool> = (0..keys.len()).map(|i| i < cut).collect();
+    assert_eq!(
+        present,
+        want,
+        "commit order {:?}: expected exactly the first {cut} commits, present flags are {present:?}",
+        keys.iter()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Reproduction 1 of ARCHITECTURE.md 4.6.1: `wal_sync.db` stops early at a damaged sector while
+/// `wal_buf.db` holds durable batches with higher LSNs. Today the buffered batches are replayed
+/// although the synchronous commit s2 below them is gone, so a commit that read s2 could survive
+/// without it.
+#[test]
+#[ignore = "fails until ordered WAL recovery (ARCHITECTURE.md 4.6, step 4)"]
+fn damaged_sync_sector_cuts_later_buffered_batches() {
+    let cfg = repro_config();
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    let buf = WriteDurability::BufferedFast;
+    // Commit order (= LSN order): s1, s2 (sync), b3, b4 (buffered), s5 (sync). The last
+    // synchronous commit makes b3 and b4 durable first (prefix durability).
+    let keys: [&[u8]; 5] = [b"s1", b"s2", b"b3", b"b4", b"s5"];
+    e.put_row(1, keys[0], b"v", &[], sync).unwrap();
+    e.put_row(1, keys[1], b"v", &[], sync).unwrap();
+    e.put_row(1, keys[2], b"v", &[], buf).unwrap();
+    e.put_row(1, keys[3], b"v", &[], buf).unwrap();
+    e.put_row(1, keys[4], b"v", &[], sync).unwrap();
+    fs.cut_now();
+    drop(e);
+    // Everything above is durable, so a power cut that loses all unsynced data loses nothing.
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let sync_lsns = wal_lsns(&fs, "wal_sync.db");
+    let buf_lsns = wal_lsns(&fs, "wal_buf.db");
+    assert_eq!((sync_lsns.len(), buf_lsns.len()), (3, 2), "setup");
+    assert!(
+        sync_lsns[1] < buf_lsns[0] && buf_lsns[1] < sync_lsns[2],
+        "setup"
+    );
+
+    // Media damage: one bit flips in the synced sector that holds s2 (sync batches are sector
+    // isolated, so it is sector 1). The sector CRC no longer matches, so the stream stops there.
+    damage_synced(&fs, "wal_sync.db", |img| img[4096 + 100] ^= 0x01);
+    assert_eq!(
+        wal_lsns(&fs, "wal_sync.db").len(),
+        1,
+        "setup: the damage took effect"
+    );
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    // The cut is at s2: only s1 may survive, nothing at or after it in either stream.
+    assert_recovered_prefix(&mut e, &keys, 1);
+}
+
+/// Reproduction 2 of ARCHITECTURE.md 4.6.1: a sync batch whose blob cannot be verified is dropped
+/// on its own while the batches after it, in both streams, are kept. A later commit may have read
+/// the value that the dropped commit wrote.
+#[test]
+#[ignore = "fails until ordered WAL recovery (ARCHITECTURE.md 4.6, step 4)"]
+fn unverifiable_sync_blob_cuts_later_batches_of_both_streams() {
+    let cfg = repro_config();
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    let buf = WriteDurability::BufferedFast;
+    // Commit order: s1 (inline), s2 (out-of-line value), b3 (buffered), s4 (sync, which makes
+    // b3 durable). The blob of s2 was synced before its WAL record.
+    let keys: [&[u8]; 4] = [b"s1", b"s2", b"b3", b"s4"];
+    e.put_row(1, keys[0], b"v", &[], sync).unwrap();
+    e.put_row(1, keys[1], &[0x5A; 1500], &[], sync).unwrap();
+    e.put_row(1, keys[2], b"v", &[], buf).unwrap();
+    e.put_row(1, keys[3], b"v", &[], sync).unwrap();
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    assert_eq!(wal_lsns(&fs, "wal_sync.db").len(), 3, "setup");
+    assert_eq!(wal_lsns(&fs, "wal_buf.db").len(), 1, "setup");
+
+    // Media damage: a byte inside the value of s2 rots in its synced blob segment, so the blob
+    // CRC no longer matches. Both WAL streams stay intact.
+    let blob = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.starts_with("blob_std_"))
+        .expect("setup: the value is out of line");
+    damage_synced(&fs, &blob, |img| {
+        let at = img.windows(32).position(|w| w == [0x5A; 32]).unwrap();
+        img[at + 100] ^= 0x01;
+    });
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    // The cut is at s2: only s1 may survive, neither s4 (sync) nor b3 (buffered).
+    assert_recovered_prefix(&mut e, &keys, 1);
 }
