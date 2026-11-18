@@ -123,7 +123,7 @@ To support both fast random updates of small configuration records and zero writ
 * **Two-Tier Durability via Physical Stream Separation (`wal_sync.db` vs. `wal_buf.db`):**
   To preserve `dwShareMode = 0` exclusivity, avoid flushing multi-megabyte buffered cache pages during small synchronous commits, and prevent LSN sector holes on power loss, `aydb` separates the journal into two physical streams:
   1. **Sync Mode (`wal_sync.db`, Critical configuration & catalog changes):** Physically pre-zeroed so NTFS `ValidDataLength (VDL)` equals `EOF` from creation. Sectors are padded to 4 KB boundaries, written to the OS cache, and flushed to the device before the commit returns (§4.5).
-  2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, so committed batches survive application crashes or `TerminateProcess` / `kill -9`. A full OS crash or power outage may roll back the most recent unflushed buffered writes. At every buffered-WAL sync point (prefix sync before a `wal_sync.db` append, transaction prepare, LRU segment reclaim) the open sector is **sealed**, so an already-synced sector is never rewritten in place by a later append (cost: at most one partly used 4 KB sector per sync point). During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`.
+  2. **Buffered Mode (`wal_buf.db`, HTTP cache insertions & high-frequency state updates):** Opened as a standard buffered sequential file. Writes enter the OS page cache immediately and return without disk stalls, so committed batches survive application crashes or `TerminateProcess` / `kill -9`. A full OS crash or power outage may roll back the most recent unflushed buffered writes. At every buffered-WAL sync point (prefix sync before a `wal_sync.db` append, transaction prepare, LRU segment reclaim) the open sector is **sealed**, so an already-synced sector is never rewritten in place by a later append (cost: at most one partly used 4 KB sector per sync point). During recovery, valid records from both `wal_sync.db` and `wal_buf.db` are merge-sorted in ascending order of their global 64-bit `LSN`. (Today a stream that stops early is silently truncated and the other stream is still replayed in full; §4.6 describes the agreed design that detects this and makes the replay a strict prefix of the global order.)
 
 ### 4.3 Consistency Protocol for KV Separation (`Write-Blob-Before-WAL`)
 
@@ -132,7 +132,7 @@ To prevent dangling pointers (where an index entry survives recovery but its tar
 1. **Write Ordering:** Always write `[Magic | BlobCRC32C | Key | Value]` to `blob_<SeqID>.db` first, and only then append the pointer record `[Key | BlobSegID | Offset | Len | BlobCRC32C]` to the WAL (`wal_sync.db` or `wal_buf.db`).
 2. **CRC Verification on Recovery and Read:**
    For `BufferedFast` commits, expensive `FlushFileBuffers` calls on `blob` files are omitted. (`SyncTransactional` commits sync the blob writers before the WAL record.) Instead, during WAL replay after a power failure (or during normal reads), the engine verifies the `BlobCRC32C` stored in the WAL/index against the actual bytes in the `blob` file. If a power outage prevented the blob write from reaching disk (file truncated or CRC mismatch), the engine does **not** treat the database as corrupted; instead, it safely discards the uncommitted record. This validation happens only at startup (`recover_two_streams` + `validate_blob_ptr` for WAL-replayed pointers; blobs referenced from `idx` segments were synced before their checkpoint). After open, a blob that fails verification (CRC/magic/key mismatch, short read, missing segment) is genuine corruption and is **never** silently reported as absence: per-table `on_corrupt` policy either returns `InvalidData` / `SQLITE_CORRUPT` naming the table and primary key (`error`, default for uncapped tables; explicit deletes still succeed and clean up) or hides the row and queues it for automatic deletion at the next safe write (`evict`, default for capped tables). Both modes bump `StorageEngine::corrupt_blob_detections()`.
-   Recovery applies the startup validation per stream. In `wal_sync.db` a batch whose blob cannot be verified is dropped on its own, because the blob is synced before the WAL record is written. In `wal_buf.db` blobs and WAL records are flushed independently, so a power loss can persist a later commit while losing an earlier one. Recovery of the buffered stream therefore has **prefix semantics**: it stops at the first batch (or transaction group) with an unverifiable blob and discards everything after it in that stream, so that replay never exposes a hole in the commit order. Only a blob that was never durably written counts as unverifiable. A real I/O error while reading a blob during validation is not treated as absence; it aborts recovery and fails the open, so that a transient error cannot cause a committed batch to be dropped.
+   Recovery applies the startup validation per stream. In `wal_sync.db` a batch whose blob cannot be verified is dropped on its own, because the blob is synced before the WAL record is written (**current behaviour**; the agreed design in §4.6 replaces this per-batch drop with a single global cut, because dropping one batch while keeping later ones can replay a commit that read from the dropped one). In `wal_buf.db` blobs and WAL records are flushed independently, so a power loss can persist a later commit while losing an earlier one. Recovery of the buffered stream therefore has **prefix semantics**: it stops at the first batch (or transaction group) with an unverifiable blob and discards everything after it in that stream, so that replay never exposes a hole in the commit order. Only a blob that was never durably written counts as unverifiable. A real I/O error while reading a blob during validation is not treated as absence; it aborts recovery and fails the open, so that a transient error cannot cause a committed batch to be dropped.
    Because recovery verifies the blobs of every batch above `checkpoint_lsn`, a blob segment must not be unlinked while a logged batch of the current WAL epoch may point into it. A `blob_lru` segment reclaimed after an eviction therefore leaves the catalog at once but is queued for deletion only by the next commit that rotates the WAL epochs; a crash before that leaves an uncataloged file that recovery adopts if a batch references it and sweeps otherwise.
 3. **WAL Failure Poisons the Engine:**
    If a WAL write/sync, a blob segment sync, or a metadata slot write/sync fails, the engine is poisoned. Further mutations return errors until the database is reopened, while reads keep working. A failed WAL commit may or may not be present after recovery, but it is never partially applied. A failed blob sync is never retried: on Linux a failed `fsync` can drop the dirty pages and mark them clean, so a second `fsync` on the same file may report success for bytes that never reached the disk ("fsyncgate"). Retrying would let a later checkpoint commit `idx` entries that point at lost blobs and rotate away the WAL that held the only other evidence of them. Only a failure of the file sync itself (including `ENOSPC` reported at `fsync` time) poisons; a blob `write` that fails before the sync leaves its buffer intact and is simply retried, without poisoning. This covers every blob sync that feeds a commit or checkpoint: the pre-WAL sync of a `SyncTransactional` commit, the sync of the active writers before a MemTable flush or checkpoint, and the sealing of a segment when it rolls. The one sync whose failure is ignored is the one in `drop_table`, because every byte of the dropped table's segment is already dead. A failed metadata update may already have made its new slot authoritative, so index outputs and both generations' files are retained and metadata updates and garbage collection stop until recovery resolves the on-disk state.
@@ -161,6 +161,284 @@ A synchronous SQL commit (`xCommit`) has three steps, and only the first and las
 * **A failed flush fails the whole group.** The engine is poisoned and every waiting commit returns an error, as with any WAL sync failure (§4.3 item 3).
 * **Commits outside the group.** A synchronous commit with post-commit maintenance (capped tables, dropped tables, quota persistence, a due MemTable flush) keeps the writer slot during its own flush, still without the engine lock. A transaction split across several WAL batches (over 512 KB) flushes under the lock.
 * **Why `wal_sync.db` is not write-through on Windows.** NTFS holds `FILE_FLAG_WRITE_THROUGH` writes back while the same file is being flushed, so such writes could not join a group flush in progress. Write-through alone also does not guarantee durability, because it can complete in a drive's volatile cache. Each commit relies on the device flush instead.
+
+### 4.6 WAL Damage Detection and Ordered Recovery (agreed design for the next implementation, not implemented)
+
+Everything in this subsection is a design that has been agreed but **not built**. Sections 4.2 and 4.3 describe the behaviour of the current code. Where this subsection and those sections differ, the current code follows them until the steps in 4.6.12 land.
+
+#### 4.6.1 The problem
+
+Recovery today treats each WAL stream on its own. `recover_single_wal_stream` stops at the first sector whose epoch is wrong, whose CRC fails, or whose contents do not parse. `recover_two_streams` then filters each stream (the buffered stream is cut at the first unverifiable blob, the sync stream drops only the offending batch) and merges what is left by LSN. `StorageEngine::open` replays that and rotates both epochs, which overwrites the evidence. Two ordering holes follow, and both have been reproduced:
+
+1. **A stream stops early but the other stream keeps going.** If `wal_sync.db` stops at a damaged sector, batches with higher LSNs in `wal_buf.db` are still replayed.
+2. **A sync batch with an unverifiable blob is dropped while later batches are kept.** A later commit may have read the value that the dropped commit wrote.
+
+In both cases the recovered state can contain a commit that read a value from a commit that is missing. Neither hole can be reached by power loss or `kill -9` alone, because the engine orders its flushes: before a synchronous append, `make_buf_wal_durable` syncs the buffered blobs and the buffered WAL; before any later append, `drain_pending_durable` flushes group-committed sync batches; sync blobs are synced before their WAL record; a failed blob sync poisons the engine. A 10,000-seed crash run with an LSN-level oracle found no violation. Both holes need **media damage of data that was already synced** (a bad sector, a bit flip, a file truncated by a third party). The crash harness does not corrupt synced data and does not drive group commit, so it could not see them.
+
+The issue is therefore not that power loss breaks ordering. It is that when durable data has been damaged, the engine silently turns a loss of acknowledged commits into a state that is not a prefix of history.
+
+#### 4.6.2 Invariant
+
+> The recovered state is the replay of exactly the batches below a **cut point**: the first commit, in global LSN order across both streams, that is missing or unverifiable. Nothing at or after the cut is replayed, in either stream.
+
+This is prefix semantics lifted from one stream (as §4.3 item 2 already does for the buffered stream) to the merged log. Prefix semantics is the only property under which "a commit never sees a missing predecessor" holds without tracking read sets.
+
+Recovery then has two separate jobs, and the design keeps them separate:
+
+* **Where is the cut?** Decided by the predecessor link (4.6.3). Always applies.
+* **Was acknowledged data lost at the cut?** Decided by the durable watermark (4.6.4). Only this is reported and governed by a policy (4.6.6).
+
+A cut caused by the ordinary unsynced tail of a power cut is normal and silent. A cut that lies at or below something the engine had already made durable is damage.
+
+#### 4.6.3 Predecessor link
+
+LSNs are **not dense**. Inside an explicit transaction every statement advances `next_lsn`, but only one batch is logged at commit, so a transaction of k statements leaves k-1 unused LSNs before its batch; multi-chunk transactions behave likewise. A missing LSN therefore proves nothing, and "look for gaps" cannot work.
+
+Each batch instead records `prev_lsn`: the LSN of the batch appended immediately before it, **across both streams**. The engine appends under a single lock and keeps `last_appended_lsn`, updated only after an append succeeded (a failed append poisons the engine, so no later batch can name it). The chunks of a multi-chunk transaction are ordinary batches and are part of the chain. Group-committed sync batches are appended under the same lock before their flush, so they are chained in append order, which equals LSN order.
+
+Recovery merges the valid batches of both streams by LSN and walks the chain:
+
+* the first batch must have `prev_lsn <= checkpoint_lsn` (the batches before it are in an `idx` segment);
+* every later batch must have `prev_lsn` equal to the LSN of the batch before it in the merged order.
+
+A broken link means the batch named by `prev_lsn` is missing or was unverifiable, and **that named LSN is the cut**. It is an exact, real batch LSN, not a guess from a gap. A batch with an unverifiable blob is treated the same way: its LSN is the cut.
+
+```mermaid
+flowchart TD
+    A[Scan both streams: valid sectors, parse batches] --> B[Merge valid batches by LSN]
+    B --> C[Walk chain from checkpoint_lsn]
+    C --> D{Next batch links to predecessor and blobs verify?}
+    D -- yes --> C
+    D -- no --> E[Cut = missing or unverifiable predecessor LSN]
+    C -- end of batches --> F[No cut inside found batches]
+    E --> G[floor = max durable_lsn over ALL valid batches found, including past the cut]
+    F --> G
+    G --> H{Some lost LSN <= floor?}
+    H -- no --> I[Benign unsynced tail: replay prefix, no damage]
+    H -- yes --> J[WalDamage: apply WalDamagePolicy]
+```
+
+The alternative of re-allocating LSNs densely at flush time was rejected (4.6.10).
+
+#### 4.6.4 Durable watermark and the damage rule
+
+The chain locates the cut but cannot say whether the lost batches had been promised to anyone. After a power cut, the buffered stream may legitimately lose a suffix, and with out-of-order write-back it may even keep batch 12 and lose batch 11. That is not damage: nothing in 11 or 12 was ever durable.
+
+Every batch therefore records `durable_lsn`: the highest LSN **known durable** when the batch was appended. It is always the LSN of a real batch (or at most `checkpoint_lsn`), taken from an engine field that advances only after a device sync that covered the batch, in both streams, returned success. A sync batch is appended after the buffered stream has been made durable and after pending group batches were drained, so it carries a watermark that covers everything before it. A buffered batch carries the watermark of the last completed sync.
+
+Recovery computes
+
+```
+floor = max(durable_lsn)   over every valid batch it finds,
+                           including batches found by scanning past a stop point
+```
+
+and applies **one rule**:
+
+> The WAL is damaged if and only if some missing or unverifiable LSN is `<= floor`.
+
+Consequences:
+
+* A missing range entirely above `floor` is the legitimate unsynced tail of a power cut, including out-of-order persistence in the buffered stream. It is never reported as damage.
+* If the batch whose LSN equals `floor` is not itself found, an acknowledged batch is gone: the tail beyond the last chain-valid batch reaches below `floor` (reason `AcknowledgedTailLost`).
+* A valid sector after a stop is **not** damage by itself. Its only roles are to contribute its `durable_lsn` to `floor` and to bound the lost range (it is the proof that something at or after the stop existed). Treating "valid data after a hole" as damage would flag every power cut that persisted buffered pages out of order, which is the false positive the watermark exists to avoid.
+
+Example (buffered stream persisted out of order; power cut):
+
+```
+LSN        10(sync)  11(buf)   12(buf)
+persisted  yes       NO        yes        12.prev_lsn = 11 -> broken, cut = 11
+floor      = max(durable_lsn(10), durable_lsn(12)) = 10    (nothing past 10 was synced)
+11 > 10    -> not damage. Replay 10. Batch 12 is discarded (it is past the cut).
+```
+
+Example (same, but a sync batch 13 followed):
+
+```
+13 is a sync batch, appended after 11 and 12 were made durable: durable_lsn(13) = 12.
+Batch 11 is lost: floor = 12 >= 11 -> damage (MissingPredecessor, cut = 11).
+```
+
+#### 4.6.5 Format
+
+The link and the watermark are stored in a **fixed batch header extension**. A batch payload (§4.2) becomes:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------------------------------------------------------+
+|                         LSN (u64, LE)                         |
+|                                                               |
++---------------------------------------------------------------+
+|                      BatchCRC32C (u32)                        |
++---------------------------------------------------------------+
+|                      RecordCount (u32)                        |
++---------------------------------------------------------------+
+|                       PrevLsn (u64, LE)                       |   new
+|                                                               |
++---------------------------------------------------------------+
+|                      DurableLsn (u64, LE)                     |   new
+|                                                               |
++---------------------------------------------------------------+
+|                    Records ... (RecordCount)                  |
++---------------------------------------------------------------+
+```
+
+`BatchCRC32C` is extended to cover `RecordCount`, `PrevLsn`, `DurableLsn` and the records (the implementation must confirm the exact range covered today and keep it a single contiguous range). The header grows from 16 to 32 bytes: 16 bytes per batch.
+
+**Why a fixed extension and not a leading record with LEB128 deltas.** Deltas relative to the batch LSN would usually cost 2 to 4 bytes instead of 16, but they make the batch header variable-length, add a record type that every record parser and test helper must skip, and make a corrupted delta indistinguishable from a legal one unless it is separately checked. 16 bytes against a 4 KB sector is small next to the payloads this engine logs, and a fixed header keeps parsing trivial and offsets constant. If measurements later show the overhead matters for tiny buffered batches, delta encoding is a compatible refinement under a further version bump.
+
+**Format version.** The WAL has no version field today. It is stored in the **sector header's reserved two bytes at offsets 14..16**, which are written as zero now and are already covered by the sector CRC32C:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------------------------------------------------------+
+|                      SectorCRC32C (u32)                       |
++---------------------------------------------------------------+
+|                        WalEpoch (u64, LE)                     |
+|                                                               |
++-------------------------------+-------------------------------+
+|        ValidBytes (u16)       |   WalFormatVersion (u16) = 1  |   was Reserved = 0
++-------------------------------+-------------------------------+
+```
+
+Old format is `0` (the reserved value), the new one is `1`. Only the version of a sector is checked **after** its epoch and CRC match, so sectors left over from earlier epochs are still ignored silently and cost nothing. A sector with the current epoch and a valid CRC but a version other than `1` is an `UnsupportedFormat` damage at that sector.
+
+**No backward compatibility.** `aydb` is pre-release. There is no legacy reader, no "unverified" replay mode, and no `boot_meta.db` downgrade flag for this feature. A WAL in the old format is handled as damaged data like any other unreadable WAL: `Truncate` discards it and starts a new one, `Fail` rejects it. A database that was closed cleanly (checkpoint, empty WAL) has no current-epoch sectors worth reading and opens normally.
+
+#### 4.6.6 At the cut, and the policy
+
+At the cut:
+
+* Replay stops before it, in both streams. The sync stream's per-batch dropping of an unverifiable blob (§4.3 item 2) and the buffered stream's per-stream prefix cut are both replaced by this one global cut.
+* `next_lsn` becomes **the highest LSN seen anywhere plus one**, including batches past the cut that are discarded and the `durable_lsn` values read, so no LSN that was ever logged is reused. A reused LSN would let a stale batch left behind in an old sector be mistaken for a new one.
+
+Damage handling is chosen with `EngineConfig::wal_damage_policy`, in the style of `CorruptPolicy { Error, Evict }` for blobs:
+
+```rust
+pub enum WalDamagePolicy {
+    /// Default. Replay the verified prefix, discard the rest, and continue.
+    Truncate,
+    /// Refuse to open; leave every file untouched.
+    Fail,
+}
+```
+
+* **`Truncate` (default).** Replay the prefix below the cut, commit the catalog, and rotate the epochs, as an open without damage does. The batches at and after the cut are discarded. `open` succeeds, and the damage is visible only in the report (4.6.8).
+* **`Fail`.** `open` returns `io::ErrorKind::InvalidData` whose inner error is a `WalDamage` value (downcastable with `get_ref()` / `downcast_ref`). The decision is made **before** blob reconciliation, before any catalog commit, and before the epoch rotation, so `wal_sync.db`, `wal_buf.db`, `boot_meta.db` and every other file are byte-identical to what they were. The application can restore from a backup, or open with salvage (4.6.7) to keep what it can.
+
+**Why `Truncate` is the default.** How a database handles a damaged log depends on who is there when it happens. Server databases such as PostgreSQL and InnoDB stop and leave the decision to an administrator, who has backups and tools to repair or discard the log. An embedded database usually has nobody: if an application cannot open its data, the user sees an application that does not start, and uninstalls or resets it. SQLite, the closest precedent, never refuses: its WAL checksums are chained, and recovery silently keeps the frames before the first bad one. `aydb` is embedded first, and its SQLite tables are meant to behave like SQLite tables, so it does the same by default. It differs from SQLite in two ways: the replayed state is a prefix of the global order across both streams (4.6.2), and the loss is reported instead of passing unnoticed.
+
+**No evidence copy.** `Truncate` does not copy the damaged WAL files aside before it discards them. For the embedded case nobody reads such copies, and they cost disk space on a device that may be short of it. An application that wants the data uses `Fail` and salvage instead.
+
+A SQLite application opens the engine itself and passes it to the adapter (see [guides/SQLITE.md](./guides/SQLITE.md)). Both `Fail` and salvage are therefore used at the engine level, from the application's own open call, before the adapter exists. The adapter needs no new error path and offers no salvage of its own, as SQLite offers none.
+
+#### 4.6.7 Salvage
+
+Under `Truncate`, the batches after the cut are discarded although many of them are intact and were acknowledged to their writers. They are discarded because any of them may have read a value written by a lost commit, and only the application can tell whether replaying one is still correct. Salvage hands them to the application instead of deciding for it:
+
+```rust
+impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Opens as `Truncate` does and returns the transactions it discarded.
+    pub fn open_with_salvage(
+        fs: Arc<FS>,
+        config: EngineConfig,
+    ) -> io::Result<(Self, Vec<SalvagedTx>)>;
+}
+
+pub struct SalvagedTx {
+    pub lsn: u64,                // LSN of the transaction's last batch
+    pub ops: Vec<SalvagedOp>,
+}
+
+pub enum SalvagedOp {
+    Put { table: String, key: Vec<u8>, value: Vec<u8> },
+    Delete { table: String, key: Vec<u8> },
+}
+```
+
+* **Why inside `open`.** A discarded batch may point at blobs that the open itself reclaims as unreferenced. Salvage reads those values before blob reconciliation and returns them as bytes, so the application never has to order the steps. A separate read-only function run before `open` would leave that ordering to the application.
+* **Whole transactions only.** A transaction larger than one chunk spans several batches framed by `TxBegin` and `TxCommit`; it is returned only if every chunk is intact. A single-batch transaction is returned if its batch is intact.
+* **Primary rows only.** Only records in the primary-row namespace are returned, with the table named through the catalog. Secondary index entries, unique index entries, rowid mappings, row metadata and catalog records are derived data: writing the rows back through the normal API rebuilds them.
+* **Not returned, only counted** in the report: schema changes after the cut (a table created, dropped or renamed), records of tables the catalog does not know, and values whose blob fails verification.
+* **The data is engine-level.** Keys and values are in the `aydb` encoding. An application that uses the SQLite adapter must decode them itself, with the row codec.
+
+`open_with_salvage` with no damage returns an empty list and is otherwise the same as `open`. An application usually calls it after `open` under `Fail` returned `WalDamage`, but it can also call it every time.
+
+#### 4.6.8 Report
+
+`StorageEngine::last_wal_recovery()` returns the report of the most recent `open` (defined even when nothing happened):
+
+```rust
+pub struct WalRecoveryReport {
+    pub torn_tail_sectors: StreamCounts,   // informational; benign unsynced tail
+    pub replayed_batches: StreamCounts,    // per stream
+    pub last_replayed_lsn: u64,
+    pub damage: Option<WalDamage>,
+}
+
+pub struct WalDamage {
+    pub reason: WalDamageReason,
+    pub first_lost_lsn: u64,               // the cut
+    pub last_lsn_seen: u64,                // highest LSN found anywhere
+    pub discarded_batches: StreamCounts,   // valid batches at or after the cut
+    pub unsalvageable: u64,                // schema changes, unknown tables, bad blobs
+}
+
+pub enum WalDamageReason {
+    MissingPredecessor,    // chain broken: a named predecessor is not there
+    UnverifiableBlob,      // batch present, its blob failed validation
+    CorruptSector,         // CRC/parse failure with acknowledged data beyond it
+    AcknowledgedTailLost,  // the batch at `floor` is gone
+    UnsupportedFormat,     // WalFormatVersion mismatch, including the old format
+}
+```
+
+`torn_tail_sectors` counts what today is silently ignored and is **not** damage. Under the default `Truncate`, the report is the only trace of a loss. It costs little, and it lets an application put the loss in its own logs or crash reports, which is how a developer can learn that it happens in the field. The report is plain Rust data. Exposing it through SQL (a pragma or a table-valued function) is deferred.
+
+#### 4.6.9 Concurrency and cost
+
+Recovery already reads both files completely; the chain walk is a linear pass over the merged batches and keeps only the previous LSN. Normal operation adds two `u64` per batch (4.6.5) and two engine fields (`last_appended_lsn`, `durable_lsn`), both guarded by the engine lock that already serializes appends. No extra sync is introduced: the watermark records what the existing flush ordering already established.
+
+#### 4.6.10 Alternatives considered
+
+* **Dense LSN allocation at flush.** If LSNs were assigned when a batch is written, a gap would prove loss. But `MemTable` entries and `idx` entries carry the LSN from mutation time and transactions read their own writes by LSN, so the change would reach the MemTable, the transaction overlay and the `idx` format, none of which has been audited for it. The predecessor link gives the same information without moving any LSN.
+* **Watermark in the two reserved sector bytes only.** Two bytes cannot hold a 64-bit LSN. (They are used for the format version instead.)
+* **Look-ahead heuristics without the watermark** ("a valid sector after a stop means damage", or "a gap of more than n sectors"). After a power cut the buffered stream can persist later pages and lose earlier ones, so these report damage for an ordinary crash. A false positive under `Fail` would refuse to open after every power cut.
+* **Keep silent truncation.** Simplest, and what the code does. It hides the loss of acknowledged commits and can replay a state that is not a prefix of history. The default `Truncate` keeps the silence toward the user of the application but fixes both problems: the state is a prefix, and the loss is in the report.
+* **`Fail` as the default.** The right default for a server with an administrator (4.6.6), but for an embedded application it turns recoverable damage into an application that does not start.
+* **Copy the damaged WAL aside before truncating.** Rejected for the embedded case (4.6.6): nobody reads the copies, and they need retention rules, an exclusion from the orphan sweep and a failure path of their own.
+* **Salvage in the SQLite adapter**, for example as SQL statements or decoded column values. SQLite itself salvages nothing, and an application that needs salvage can use the engine-level data and the row codec.
+
+#### 4.6.11 Testing plan
+
+* **The two reproductions** as permanent regression tests, written first against the current code to fail, then passing after the change: (1) sync stream stops early, later buffered batches exist; (2) sync batch with an unverifiable blob, later batches exist.
+* **A permanent LSN-order oracle in the crash harness.** After every recovery, the recovered set of batch LSNs must be a prefix of the logged LSNs in global order. The 10,000-seed run is repeated with it.
+* **Extend the crash harness** to corrupt already-synced WAL data (bit flips, zeroed sectors, truncation in either stream) and to **drive group commit**, so the paths that the engine's ordering protects against power loss are exercised against media damage.
+* **Unit tests** of the chain walk (gaps from transactions and multi-chunk batches are not breaks; first batch links to `<= checkpoint_lsn`; a break names the right cut) and of the damage rule (power-cut tail above `floor` is silent; out-of-order buffered persistence is silent; the two examples in 4.6.4; `floor` taken from batches past a stop).
+* **`Fail` leaves the WAL byte-identical:** hash every file before and after a failed open, including `boot_meta.db`.
+* **`Truncate` is the default:** an open with damage and a default `EngineConfig` succeeds, replays exactly the prefix and reports the damage.
+* **Salvage:** `open_with_salvage` returns the intact transactions after the cut, in LSN order, with blob values read before reconciliation; a multi-chunk transaction with a missing chunk is not returned; derived records are not returned; schema changes and unknown tables are counted in `unsalvageable`; with no damage the list is empty.
+* **Crash during recovery:** a crash before the rotation reopens to the same result and the same salvage list; a crash after the rotation reopens cleanly, with nothing left to salvage.
+* **Old format:** a WAL with version 0 at the current epoch is `UnsupportedFormat`; stale sectors from earlier epochs are ignored.
+
+#### 4.6.12 Implementation steps
+
+Each step is separately committable and leaves the tree green.
+
+1. **Test first:** the two reproductions and the LSN-order oracle in the crash harness (the reproductions marked as expected failures until step 4).
+2. **Format:** `WalFormatVersion` in the sector header, `PrevLsn` and `DurableLsn` in the batch header, writer and parser, CRC range; version check producing `UnsupportedFormat` internally. No behaviour change yet beyond the format.
+3. **Engine tracking:** `last_appended_lsn` and `durable_lsn`, filled into every append, including multi-chunk transactions and group commit.
+4. **Ordered recovery:** merge, chain walk, global cut, `floor` and the damage rule, `next_lsn` from the highest LSN seen, removal of the per-batch drop and the per-stream prefix cut. Reproductions pass. Damage is only computed and reported (`last_wal_recovery`) in this step.
+5. **Policy:** `WalDamagePolicy` with `Truncate` as the default, `WalDamage` as an `InvalidData` error under `Fail` before any mutation.
+6. **Salvage:** `open_with_salvage`, `SalvagedTx`, and the `unsalvageable` count in the report.
+7. **Harness extension:** media-damage and group-commit modes in the crash harness; unit and fault-injection tests of 4.6.11.
+8. **Docs:** replace the "agreed design" banner and the "current behaviour" notes in §4.2 and §4.3 with the implemented behaviour, record the measured per-batch overhead with its commit (see the point-in-time-number convention), and document `WalDamagePolicy`, the report and salvage in the SQLite guide.
+
+#### 4.6.13 Open items
+
+* The exact byte range covered by `BatchCRC32C` today (to be confirmed in step 2).
 
 ---
 
