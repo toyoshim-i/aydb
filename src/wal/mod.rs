@@ -13,8 +13,8 @@ use crate::util::crc32c::crc32c;
 
 mod recovery;
 pub use self::recovery::{
-    StreamCounts, TwoStreamRecoveryResult, WalDamage, WalDamageReason, WalRecoveryReport,
-    recover_two_streams,
+    DiscardedTx, StreamCounts, TwoStreamRecoveryResult, WalDamage, WalDamageReason,
+    WalRecoveryReport, recover_two_streams,
 };
 
 /// Fixed filename for the synchronous write-through WAL stream.
@@ -43,7 +43,7 @@ pub const WAL_SECTOR_HEADER_SIZE: usize = 16;
 ///
 /// It is checked only after the sector's epoch and CRC32C match, so sectors left over from
 /// earlier epochs are still ignored silently. Version `0` is the old format (the reserved value).
-pub const WAL_FORMAT_VERSION: u16 = 1;
+pub const WAL_FORMAT_VERSION: u16 = 2;
 
 /// Size of the batch header: `[lsn u64 | batch_crc32c u32 | record_count u32 | prev_lsn u64 |
 /// durable_lsn u64]`, followed by the records.
@@ -141,6 +141,9 @@ pub enum WalRecord {
     TxBegin,
     /// Marks the final chunk of a multi-chunk transaction.
     TxCommit,
+    /// Marks a middle chunk of a multi-chunk transaction, so that a batch without any marker
+    /// is always a complete single-batch transaction.
+    TxContinue,
 }
 
 /// An atomic group of [`WalRecord`] mutations assigned a single monotonically increasing `lsn`.
@@ -172,7 +175,7 @@ impl WalBatch {
                 WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
                 WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),
                 WalRecord::Delete { key } => 5 + key.len(),
-                WalRecord::TxBegin | WalRecord::TxCommit => 1,
+                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
             };
         }
         buf.reserve(extra);
@@ -206,6 +209,9 @@ impl WalBatch {
                 }
                 WalRecord::TxCommit => {
                     buf.push(5u8);
+                }
+                WalRecord::TxContinue => {
+                    buf.push(6u8);
                 }
             }
         }
@@ -268,7 +274,7 @@ impl WalBatch {
         let prev_lsn = r.read_u64_le()?;
         let durable_lsn = r.read_u64_le()?;
 
-        // Minimum serialized WalRecord is 1 byte (1B op for TxBegin / TxCommit).
+        // Minimum serialized WalRecord is 1 byte (1B op for a marker).
         if record_count > r.remaining() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -323,6 +329,9 @@ impl WalBatch {
                 }
                 5 => {
                     records.push(WalRecord::TxCommit);
+                }
+                6 => {
+                    records.push(WalRecord::TxContinue);
                 }
                 other => {
                     return Err(io::Error::new(
@@ -2001,7 +2010,7 @@ mod tests {
 
     #[test]
     fn current_epoch_sector_with_other_version_is_unsupported_format() {
-        for version in [0u16, 2] {
+        for version in [0u16, 1] {
             let (_tmp, fs, _, _) = fail_fs("wal_version_current");
             let mut w = WalStreamWriter::open(
                 &fs,

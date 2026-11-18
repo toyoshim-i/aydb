@@ -244,7 +244,7 @@ impl MemTable {
                 WalRecord::Delete { key } => {
                     self.delete(key.clone(), batch.lsn);
                 }
-                WalRecord::TxBegin | WalRecord::TxCommit => {}
+                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => {}
             }
         }
     }
@@ -266,7 +266,7 @@ impl MemTable {
             WalRecord::PutInline { key, value } => self.put_inline(key, value, lsn),
             WalRecord::PutBlobPtr { key, blob_ptr } => self.put_blob_ptr(key, blob_ptr, lsn),
             WalRecord::Delete { key } => self.delete(key, lsn),
-            WalRecord::TxBegin | WalRecord::TxCommit => None,
+            WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => None,
         }
     }
 

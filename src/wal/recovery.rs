@@ -69,7 +69,13 @@ pub struct WalDamage {
     /// Intact batches found above the checkpoint that were not replayed: those at or after the
     /// cut, those past an unusable sector, and the chunks of a transaction the cut interrupted.
     pub discarded_batches: StreamCounts,
-    /// Records that cannot be salvaged. Not filled in yet.
+    /// Operations after the cut that salvage cannot return (ARCHITECTURE.md 4.6.7): a schema
+    /// change (a catalog record), a primary-row record of a table the catalog does not know, and
+    /// a value whose blob fails verification. Each such operation counts once, and its whole
+    /// transaction is dropped from the salvage list. The multi-chunk transactions that lost a
+    /// chunk are not counted; like the unsynced tail of a power cut they are simply lost. It is
+    /// the same whether the log is opened by `open` or `open_with_salvage`. Recovery itself does
+    /// not know tables or blobs, so the engine fills it in; recovery leaves it at 0.
     pub unsalvageable: u64,
 }
 
@@ -274,44 +280,130 @@ pub(crate) fn judge(
     Some((reason, lost))
 }
 
+/// How a batch frames a transaction. A batch without any marker is a complete single-batch
+/// transaction; a multi-chunk transaction is `Begin`, `Continue`.., `Commit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    None,
+    Begin,
+    Continue,
+    Commit,
+}
+
+fn framing(batch: &WalBatch) -> Framing {
+    let has = |m: &WalRecord| batch.records.contains(m);
+    if has(&WalRecord::TxBegin) {
+        Framing::Begin
+    } else if has(&WalRecord::TxContinue) {
+        Framing::Continue
+    } else if has(&WalRecord::TxCommit) {
+        Framing::Commit
+    } else {
+        Framing::None
+    }
+}
+
+fn is_marker(r: &WalRecord) -> bool {
+    matches!(
+        r,
+        WalRecord::TxBegin | WalRecord::TxContinue | WalRecord::TxCommit
+    )
+}
+
 /// Keeps the transactions that completed within `batches`, the chain-valid batches below the cut
-/// in LSN order. The `TxBegin`/`TxCommit` markers are stripped. A multi-chunk transaction whose
-/// `TxCommit` is missing, because the cut lies inside it or the log ends there, is dropped as a
-/// whole, so it is never partly applied. A new `TxBegin` also drops an earlier open transaction.
+/// in LSN order. The `TxBegin`/`TxContinue`/`TxCommit` markers are stripped. A multi-chunk
+/// transaction whose `TxCommit` is missing, because the cut lies inside it or the log ends there,
+/// is dropped as a whole, so it is never partly applied. A new `TxBegin`, or a batch without
+/// markers, also drops an earlier open transaction, and a `TxContinue` or `TxCommit` batch
+/// without an open transaction is an orphan and is dropped.
 pub(crate) fn complete_transactions(batches: Vec<Found>) -> Vec<Found> {
     let mut out = Vec::with_capacity(batches.len());
     let mut open: Vec<Found> = Vec::new();
-    let mut in_tx = false;
     for mut found in batches {
-        let has_begin = found
-            .batch
-            .records
-            .iter()
-            .any(|r| matches!(r, WalRecord::TxBegin));
-        let has_commit = found
-            .batch
-            .records
-            .iter()
-            .any(|r| matches!(r, WalRecord::TxCommit));
-        found
-            .batch
-            .records
-            .retain(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit));
-        if has_begin {
-            open.clear();
-            in_tx = true;
-        }
-        if in_tx {
-            open.push(found);
-            if has_commit {
-                out.append(&mut open);
-                in_tx = false;
+        let kind = framing(&found.batch);
+        found.batch.records.retain(|r| !is_marker(r));
+        match kind {
+            Framing::Begin => {
+                open.clear();
+                open.push(found);
             }
-        } else {
-            out.push(found);
+            Framing::Continue if !open.is_empty() => open.push(found),
+            Framing::Commit if !open.is_empty() => {
+                open.push(found);
+                out.append(&mut open);
+            }
+            Framing::None => {
+                open.clear();
+                out.push(found);
+            }
+            Framing::Continue | Framing::Commit => {}
         }
     }
     out
+}
+
+/// A transaction that lies entirely at or after the cut, every batch of it intact, and that
+/// recovery therefore discarded although it could be read (ARCHITECTURE.md 4.6.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardedTx {
+    /// LSN of the transaction's last batch.
+    pub lsn: u64,
+    /// All records of its batches in log order, without transaction markers.
+    pub records: Vec<WalRecord>,
+}
+
+/// Finds the transactions that are discarded as a whole although their batches are intact:
+/// those that lie completely at or after the cut (every index `>= valid` of the merged chain
+/// `all`). A batch without markers is a complete single-batch transaction. A multi-chunk
+/// transaction (`TxBegin`, `TxContinue`.., `TxCommit`) counts only if every chunk is present and
+/// each links to the one before it by `prev_lsn` (the engine appends the chunks of a transaction
+/// back to back). A `TxContinue` or `TxCommit` batch without its open transaction, because the
+/// begin chunk or an earlier chunk is lost, is an orphan: it is never returned and not counted.
+pub(crate) fn post_cut_transactions(all: &[Found], valid: usize) -> Vec<DiscardedTx> {
+    // Each group is a list of indices into `all`; an open group is the last one, until it ends.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut open = false;
+    for (i, found) in all.iter().enumerate() {
+        let kind = framing(&found.batch);
+        if open && kind != Framing::Begin && kind != Framing::None {
+            let group = groups.last_mut().expect("an open group exists");
+            if found.batch.prev_lsn == all[group[group.len() - 1]].batch.lsn {
+                group.push(i);
+                open = kind != Framing::Commit;
+                continue;
+            }
+        }
+        if open {
+            // The open group did not finish: a chunk is missing. It is dropped.
+            groups.pop();
+            open = false;
+        }
+        match kind {
+            Framing::Begin => {
+                groups.push(vec![i]);
+                open = true;
+            }
+            Framing::None => groups.push(vec![i]),
+            Framing::Continue | Framing::Commit => {}
+        }
+    }
+    if open {
+        groups.pop();
+    }
+    groups
+        .into_iter()
+        .filter(|g| g.iter().all(|&i| i >= valid))
+        .map(|g| {
+            let last = g.last().map_or(0, |&i| all[i].batch.lsn);
+            let records = g
+                .iter()
+                .flat_map(|&i| all[i].batch.records.iter())
+                .filter(|r| !is_marker(r))
+                .cloned()
+                .collect();
+            DiscardedTx { lsn: last, records }
+        })
+        .collect()
 }
 
 /// Output of the two-stream (`wal_sync.db` + `wal_buf.db`) crash-recovery coordinator.
@@ -328,6 +420,9 @@ pub struct TwoStreamRecoveryResult {
     /// Next sector index for `wal_buf.db`.
     pub next_buf_sector_idx: usize,
     pub report: WalRecoveryReport,
+    /// The salvageable transactions at or after the cut, in LSN order; filled in only when
+    /// `report.damage` is set.
+    pub discarded_txs: Vec<DiscardedTx>,
 }
 
 /// Recovers both `wal_sync.db` and `wal_buf.db` as one log (ARCHITECTURE.md 4.6): the batches
@@ -409,6 +504,12 @@ where
     for f in &all {
         found_per_stream.bump(f.stream);
     }
+    let verdict = judge(walk.cut, floor, last_good, flags);
+    let discarded_txs = if verdict.is_some() {
+        post_cut_transactions(&all, walk.valid)
+    } else {
+        Vec::new()
+    };
     all.truncate(walk.valid);
     let completed = complete_transactions(all);
 
@@ -427,7 +528,7 @@ where
     }
     report.replayed_batches = applied;
 
-    if let Some((reason, first_lost_lsn)) = judge(walk.cut, floor, last_good, flags) {
+    if let Some((reason, first_lost_lsn)) = verdict {
         report.damage = Some(WalDamage {
             reason,
             first_lost_lsn,
@@ -446,5 +547,6 @@ where
         next_sync_sector_idx,
         next_buf_sector_idx,
         report,
+        discarded_txs,
     })
 }

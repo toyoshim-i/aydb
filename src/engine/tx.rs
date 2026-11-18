@@ -284,7 +284,7 @@ impl TxOverlay {
             WalRecord::PutInline { key, value } => (key, IndexValue::Inline(value)),
             WalRecord::PutBlobPtr { key, blob_ptr } => (key, IndexValue::Blob(blob_ptr)),
             WalRecord::Delete { key } => (key, IndexValue::Tombstone),
-            WalRecord::TxBegin | WalRecord::TxCommit => return,
+            WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => return,
         };
         self.note_key(&key);
 
@@ -1068,7 +1068,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // Large transaction buffer (> 512 KB): chunk serialized records into <= 512 KB WalBatches
-        // framed by `WalRecord::TxBegin` in the first chunk and `WalRecord::TxCommit` in the last
+        // framed by `WalRecord::TxBegin` in the first chunk, `WalRecord::TxContinue` in each middle
+        // chunk and `WalRecord::TxCommit` in the last
         // chunk. Ensure the target WAL file has enough capacity so all chunks of the
         // transaction remain in the same WAL epoch without flushing uncommitted `MemTable` state.
         let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
@@ -1145,6 +1146,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.append_raw_wal_batch_with_rotation(&single_buf, durability)?;
             self.next_lsn = lsn + 1;
             return Ok(());
+        }
+
+        // Prepend `WalRecord::TxContinue` (`6u8`) to every middle chunk, so that a batch without
+        // a marker is always a complete single-batch transaction.
+        let last_idx = chunks.len() - 1;
+        for (cbuf, crec) in &mut chunks[1..last_idx] {
+            cbuf.insert(crate::wal::WAL_BATCH_HEADER_SIZE, 6u8);
+            *crec += 1;
         }
 
         if let Some((last_buf, last_records)) = chunks.last_mut() {

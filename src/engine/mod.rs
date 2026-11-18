@@ -10,6 +10,7 @@ pub use compaction::{CompactionJob, CompactionOutput};
 mod eviction;
 mod reader;
 mod rowid;
+mod salvage;
 mod scan;
 mod snapshot;
 mod tx;
@@ -19,6 +20,7 @@ mod wal_links;
 pub(crate) use scan::TABLE_SCAN_ENTRIES_COPIED;
 pub(crate) use snapshot::ReadSnapshotToken;
 
+pub use salvage::{SalvagedOp, SalvagedTx};
 pub(crate) use tx::{CommitStep, GroupRole, STATEMENT_SAVEPOINT};
 
 #[cfg(test)]
@@ -427,6 +429,40 @@ fn open_uncataloged_blob<FS: PlatformFs>(
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Opens or recovers a `StorageEngine` rooted at `fs`.
     pub fn open(fs: Arc<FS>, config: EngineConfig) -> io::Result<Self> {
+        Ok(Self::open_inner(fs, config, false)?.0)
+    }
+
+    /// Opens as [`WalDamagePolicy::Truncate`] does, whatever `config.wal_damage_policy` says,
+    /// and returns the transactions that recovery discarded at or after the cut
+    /// (ARCHITECTURE.md 4.6.7), in LSN order. With no damage the list is empty and this is
+    /// exactly [`Self::open`].
+    ///
+    /// Only transactions whose batches are all intact are returned, and only their primary-row
+    /// operations, in the encoding of the engine (`key` and `value` as `put_row` takes them, with
+    /// the table's catalog name; a value kept in a blob is read before the open reclaims it).
+    /// Secondary and unique index entries, rowid mappings and row metadata are derived data and
+    /// are left out. A transaction that contains a schema change, a row of a table the catalog
+    /// does not know, or a value whose blob fails verification is not returned; its operations of
+    /// that kind are counted in [`WalDamage::unsalvageable`]. A multi-chunk transaction that lost
+    /// a chunk is neither returned nor counted.
+    ///
+    /// The list lives only in memory. A crash before the open has rotated the WAL epochs
+    /// reproduces it at the next open; afterwards the discarded batches are gone.
+    pub fn open_with_salvage(
+        fs: Arc<FS>,
+        mut config: EngineConfig,
+    ) -> io::Result<(Self, Vec<SalvagedTx>)> {
+        config.wal_damage_policy = WalDamagePolicy::Truncate;
+        Self::open_inner(fs, config, true)
+    }
+
+    /// The common path of [`Self::open`] and [`Self::open_with_salvage`]. `with_salvage` asks for
+    /// the discarded transactions; the `unsalvageable` count of the report is computed either way.
+    fn open_inner(
+        fs: Arc<FS>,
+        config: EngineConfig,
+        with_salvage: bool,
+    ) -> io::Result<(Self, Vec<SalvagedTx>)> {
         let mut meta_mgr = BootMetaManager::open_or_recover_deferred_sweep(fs.clone())?;
         let state_snapshot = meta_mgr.state().clone();
 
@@ -602,7 +638,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             config.buf_wal_mode,
         )?;
 
-        let rec = recover_two_streams(
+        let mut rec = recover_two_streams(
             &**sync_wal.file(),
             state_snapshot.sync_wal_epoch,
             &**buf_wal.file(),
@@ -619,6 +655,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 },
             },
         )?;
+
+        // Salvage reads blobs that the reconciliation below may prune, so it comes first. It only
+        // reads, so under `Fail` nothing is written yet either. It runs only when damage was
+        // found, which is also the only case where a plain open pays for the blob reads.
+        let mut salvaged = Vec::new();
+        let discarded = core::mem::take(&mut rec.discarded_txs);
+        if let Some(damage) = rec.report.damage.as_mut() {
+            let found = salvage::salvage(
+                &idx_segments,
+                &rec.merged_batches,
+                discarded,
+                &std_blobs,
+                &lru_blobs,
+                with_salvage,
+            )?;
+            damage.unsalvageable = found.unsalvageable;
+            salvaged = found.txs;
+        }
 
         // Under `Fail` nothing may have been written yet: the seq-id reservation below is a
         // catalog commit (which also unlinks pending deletes), so it comes after this check.
@@ -663,7 +717,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::PutInline { key, .. }
                     | WalRecord::PutBlobPtr { key, .. }
                     | WalRecord::Delete { key } => Some(key.as_slice()),
-                    WalRecord::TxBegin | WalRecord::TxCommit => None,
+                    WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => None,
                 };
                 if let Some(key) = key_opt {
                     let old_ptr = if let Some(mem_entry) = memtable.get(key) {
@@ -881,7 +935,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // orphaned segment/manifest files and process pending deletes!
         engine.meta_mgr.sweep_orphans()?;
 
-        Ok(engine)
+        Ok((engine, salvaged))
     }
 
     /// Returns the next LSN that will be assigned to a WAL batch.
@@ -2986,7 +3040,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         28 + key.len() + (blob_ptr.len as usize)
                     }
                     WalRecord::Delete { key } => 5 + key.len(),
-                    WalRecord::TxBegin | WalRecord::TxCommit => 1,
+                    WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
                 })
                 .sum();
             let next_tx_bytes = self.pending_tx_bytes.saturating_add(batch_bytes);

@@ -3276,3 +3276,494 @@ fn fail_policy_opens_clean_and_crashed_databases() {
         assert_eq!(e.last_wal_recovery().damage, None, "{crash:?}");
     }
 }
+
+// =============================================================================================
+// Salvage (ARCHITECTURE.md 4.6.7)
+// =============================================================================================
+
+const SYNC: WriteDurability = WriteDurability::SyncTransactional;
+const BUF: WriteDurability = WriteDurability::BufferedFast;
+
+/// `repro_config` with a MemTable large enough that no commit of these tests triggers a flush,
+/// which would checkpoint the WAL the tests want to damage.
+fn salvage_config() -> EngineConfig {
+    let mut c = repro_config();
+    c.memtable_capacity_bytes = 64 << 20;
+    c
+}
+
+/// A crashed directory whose sync log has a bad sector at batch `s2`. Written in LSN order:
+/// the catalog entries of tables `orders` (1) and `indexed` (2), `s1` (`orders`/`a`, intact),
+/// `s2` (`orders`/`b`, damaged: the cut), then whatever `script` does. Everything is durable.
+fn damaged_fs(script: impl FnOnce(&mut Eng)) -> Arc<CrashFs> {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), salvage_config()).unwrap();
+    let orders = e.register_or_resolve_vtab_with_durability("orders", None, SYNC);
+    assert_eq!(orders.unwrap(), 1);
+    let indexed = e.register_or_resolve_vtab_with_durability("indexed", None, SYNC);
+    assert_eq!(indexed.unwrap(), 2);
+    e.put_row(1, b"a", b"va", &[], SYNC).unwrap();
+    let cut = e.next_lsn();
+    e.put_row(1, b"b", b"vb", &[], SYNC).unwrap();
+    script(&mut e);
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    // Sync batches of this size occupy one sector each, so the position is the sector.
+    let at = wal_lsns(&fs, "wal_sync.db")
+        .iter()
+        .position(|&l| l == cut)
+        .expect("s2 is in the sync log");
+    damage_synced(&fs, "wal_sync.db", |img| img[at * 4096 + 100] ^= 0x01);
+    fs
+}
+
+fn open_salvage(fs: &Arc<CrashFs>) -> (Eng, Vec<SalvagedTx>) {
+    StorageEngine::open_with_salvage(Arc::clone(fs), salvage_config()).unwrap()
+}
+
+fn put_op(table: &str, key: &[u8], value: &[u8]) -> SalvagedOp {
+    SalvagedOp::Put {
+        table: table.to_string(),
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+fn del_op(table: &str, key: &[u8]) -> SalvagedOp {
+    SalvagedOp::Delete {
+        table: table.to_string(),
+        key: key.to_vec(),
+    }
+}
+
+/// The script of the first salvage tests: a buffered put, a buffered delete of an intact row and
+/// a synchronous put, all after the cut. Returns their LSNs.
+fn plain_script(e: &mut Eng) -> Vec<u64> {
+    let mut lsns = vec![e.next_lsn()];
+    e.put_row(1, b"c", b"vc", &[], BUF).unwrap();
+    lsns.push(e.next_lsn());
+    assert!(e.delete_row(1, b"a", BUF).unwrap());
+    lsns.push(e.next_lsn());
+    e.put_row(1, b"d", b"vd", &[], SYNC).unwrap();
+    lsns
+}
+
+#[test]
+fn salvage_returns_intact_transactions_after_the_cut_in_lsn_order() {
+    let mut lsns = Vec::new();
+    let fs = damaged_fs(|e| lsns = plain_script(e));
+    let (mut e, salvaged) = open_salvage(&fs);
+    assert_eq!(
+        salvaged,
+        vec![
+            SalvagedTx {
+                lsn: lsns[0],
+                ops: vec![put_op("orders", b"c", b"vc")]
+            },
+            SalvagedTx {
+                lsn: lsns[1],
+                ops: vec![del_op("orders", b"a")]
+            },
+            SalvagedTx {
+                lsn: lsns[2],
+                ops: vec![put_op("orders", b"d", b"vd")]
+            },
+        ]
+    );
+    // The state is the prefix below the cut, as under `Truncate`.
+    assert!(row_is(&mut e, 1, b"a", b"va"));
+    for k in [&b"b"[..], b"c", b"d"] {
+        assert!(e.get_row(1, k).unwrap().is_none());
+    }
+    let damage = e.last_wal_recovery().damage.clone().expect("damage");
+    assert_eq!(damage.unsalvageable, 0);
+}
+
+#[test]
+fn salvage_reads_a_blob_value_that_the_open_reclaims() {
+    let big = vec![0x5Au8; 1500];
+    let fs = damaged_fs(|e| {
+        e.put_row(1, b"big", &big, &[], SYNC).unwrap();
+        e.put_row(1, b"e", b"ve", &[], SYNC).unwrap();
+    });
+    let has_blob = |fs: &Arc<CrashFs>| {
+        fs.list_files()
+            .unwrap()
+            .iter()
+            .any(|n| n.starts_with("blob_std_"))
+    };
+    assert!(has_blob(&fs), "setup");
+    let (mut e, salvaged) = open_salvage(&fs);
+    assert_eq!(salvaged.len(), 2);
+    assert_eq!(salvaged[0].ops, vec![put_op("orders", b"big", &big)]);
+    assert_eq!(salvaged[1].ops, vec![put_op("orders", b"e", b"ve")]);
+    assert!(e.get_row(1, b"big").unwrap().is_none());
+    // Only the discarded batch referenced the segment: it is reclaimed as usual.
+    assert!(!has_blob(&fs), "{:?}", fs.list_files());
+}
+
+/// Writes `n` rows `<prefix>000..` of 3000 inline bytes in one synchronous transaction.
+fn write_big_tx(e: &mut Eng, prefix: &str, n: usize) {
+    e.begin_transaction();
+    for i in 0..n {
+        let key = format!("{prefix}{i:03}");
+        e.put_row(1, key.as_bytes(), &[0x11; 3000], &[], SYNC)
+            .unwrap();
+    }
+    e.commit_transaction().unwrap();
+}
+
+/// Two multi-chunk transactions after the cut, the second with the chunk `lost` (0 = begin,
+/// 1 = a middle one, 2 = the last, which carries the commit marker) damaged. Only the first one
+/// and the single-batch commit after both may be salvaged.
+fn multi_chunk_case(lost: usize) {
+    const N: usize = 400;
+    let fs = damaged_fs(|e| {
+        e.set_table_inline_threshold(1, 4000);
+        write_big_tx(e, "k", N);
+        write_big_tx(e, "x", N);
+        e.put_row(1, b"z", b"vz", &[], SYNC).unwrap();
+    });
+    let epoch = u64::from_le_bytes(
+        content(&fs, "wal_sync.db").unwrap()[4..12]
+            .try_into()
+            .unwrap(),
+    );
+    let rec = crate::wal::recover_single_wal_stream(&*raw_file(&fs, "wal_sync.db"), epoch).unwrap();
+    // The scan stops at the damaged s2; everything after it is found past the stop.
+    let lsns: Vec<u64> = (rec.batches.iter().chain(&rec.past_stop))
+        .map(|b| b.lsn)
+        .collect();
+    // Catalog x2, s1, (s2 is lost), chunks of "k", chunks of "x", z.
+    assert!(
+        (lsns.len() - 4).is_multiple_of(2) && (lsns.len() - 4) / 2 >= 3,
+        "{lsns:?}"
+    );
+    let chunks = (lsns.len() - 4) / 2;
+    let (k_last, x_lost) = (
+        lsns[3 + chunks - 1],
+        lsns[3 + chunks + lost.min(chunks - 1)],
+    );
+    let img = content(&fs, "wal_sync.db").unwrap();
+    let used = img
+        .chunks(4096)
+        .take_while(|s| s.iter().any(|&b| b != 0))
+        .count();
+    let span = (used - 5) / 2;
+    // A sector inside the chunk: chunks hold 512 KB, about 128 sectors, the last one the rest.
+    let sector = 4 + span + [10, span / 2, span - 2][lost];
+    damage_synced(&fs, "wal_sync.db", |img| img[sector * 4096 + 100] ^= 0x01);
+    let rec = crate::wal::recover_single_wal_stream(&*raw_file(&fs, "wal_sync.db"), epoch).unwrap();
+    let found: Vec<u64> = rec.past_stop.iter().map(|b| b.lsn).collect();
+    assert!(
+        found.contains(&k_last) && !found.contains(&x_lost),
+        "setup: {found:?}"
+    );
+
+    let (mut e, salvaged) = open_salvage(&fs);
+    let want_k: Vec<SalvagedOp> = (0..N)
+        .map(|i| put_op("orders", format!("k{i:03}").as_bytes(), &[0x11; 3000]))
+        .collect();
+    let got: Vec<u64> = salvaged.iter().map(|t| t.lsn).collect();
+    assert_eq!(
+        salvaged.len(),
+        2,
+        "{got:?} lost {lost} lsns {lsns:?} found {found:?}"
+    );
+    assert_eq!(
+        salvaged[0],
+        SalvagedTx {
+            lsn: k_last,
+            ops: want_k
+        }
+    );
+    assert_eq!(salvaged[1].ops, vec![put_op("orders", b"z", b"vz")]);
+    assert!(e.get_row(1, b"k000").unwrap().is_none());
+    let damage = e.last_wal_recovery().damage.clone().unwrap();
+    assert_eq!(damage.unsalvageable, 0);
+}
+
+#[test]
+fn salvage_returns_a_multi_chunk_transaction_only_if_every_chunk_is_intact() {
+    for lost in 0..3 {
+        multi_chunk_case(lost);
+    }
+}
+
+/// A transaction of at least four chunks loses its begin and its commit chunk. Its middle chunks
+/// are intact but are not a transaction: none of them may be returned, while an unrelated
+/// single-batch transaction after it still is.
+#[test]
+fn salvage_never_returns_the_middle_chunks_of_a_transaction_that_lost_both_ends() {
+    let fs = damaged_fs(|e| {
+        e.set_table_inline_threshold(1, 4000);
+        write_big_tx(e, "m", 600);
+        e.put_row(1, b"z", b"vz", &[], SYNC).unwrap();
+    });
+    let epoch = u64::from_le_bytes(
+        content(&fs, "wal_sync.db").unwrap()[4..12]
+            .try_into()
+            .unwrap(),
+    );
+    let scan = || crate::wal::recover_single_wal_stream(&*raw_file(&fs, "wal_sync.db"), epoch);
+    let rec = scan().unwrap();
+    let lsns: Vec<u64> = (rec.batches.iter().chain(&rec.past_stop))
+        .map(|b| b.lsn)
+        .collect();
+    // Catalog x2, s1, (s2 is lost), the chunks, z.
+    let chunks = lsns.len() - 4;
+    assert!(chunks >= 4, "{lsns:?}");
+    let used = content(&fs, "wal_sync.db")
+        .unwrap()
+        .chunks(4096)
+        .take_while(|s| s.iter().any(|&b| b != 0))
+        .count();
+    let span = used - 5;
+    for sector in [4 + 10, 4 + span - 2] {
+        damage_synced(&fs, "wal_sync.db", |img| img[sector * 4096 + 100] ^= 0x01);
+    }
+    let found: Vec<u64> = scan().unwrap().past_stop.iter().map(|b| b.lsn).collect();
+    let middles = &lsns[4..3 + chunks - 1];
+    assert!(
+        !found.contains(&lsns[3]) && !found.contains(&lsns[2 + chunks]),
+        "setup: {found:?}"
+    );
+    assert!(
+        middles.iter().all(|l| found.contains(l)),
+        "setup: {found:?}"
+    );
+
+    let (_e, salvaged) = open_salvage(&fs);
+    let got: Vec<u64> = salvaged.iter().map(|t| t.lsn).collect();
+    assert_eq!(got, vec![lsns[lsns.len() - 1]], "{got:?}");
+    assert_eq!(salvaged[0].ops, vec![put_op("orders", b"z", b"vz")]);
+}
+
+#[test]
+fn salvage_skips_derived_records() {
+    let fs = damaged_fs(|e| {
+        e.put_row(2, b"p1", b"v1", &[(1, b"col1".to_vec())], SYNC)
+            .unwrap();
+        // An overwrite also deletes the old index entry and rewrites the row metadata.
+        e.put_row(2, b"p1", b"v2", &[(1, b"col2".to_vec())], SYNC)
+            .unwrap();
+    });
+    let (_e, salvaged) = open_salvage(&fs);
+    let ops: Vec<Vec<SalvagedOp>> = salvaged.into_iter().map(|t| t.ops).collect();
+    assert_eq!(
+        ops,
+        vec![
+            vec![put_op("indexed", b"p1", b"v1")],
+            vec![put_op("indexed", b"p1", b"v2")]
+        ]
+    );
+}
+
+/// After the cut: a good put, a new table (schema change), a put into it (unknown to recovery),
+/// a transaction mixing a known and an unknown table, and another good put.
+fn schema_script(e: &mut Eng) {
+    e.put_row(1, b"c", b"vc", &[], SYNC).unwrap();
+    let late = e
+        .register_or_resolve_vtab_with_durability("late", None, SYNC)
+        .unwrap();
+    e.put_row(late, b"x", b"vx", &[], SYNC).unwrap();
+    e.begin_transaction();
+    e.put_row(1, b"m", b"vm", &[], SYNC).unwrap();
+    e.put_row(late, b"y", b"vy", &[], SYNC).unwrap();
+    e.commit_transaction().unwrap();
+    e.put_row(1, b"d", b"vd", &[], SYNC).unwrap();
+}
+
+#[test]
+fn salvage_counts_schema_changes_and_unknown_tables_instead_of_returning_them() {
+    let fs = damaged_fs(schema_script);
+    let (e, salvaged) = open_salvage(&fs);
+    let ops: Vec<Vec<SalvagedOp>> = salvaged.into_iter().map(|t| t.ops).collect();
+    assert_eq!(
+        ops,
+        vec![
+            vec![put_op("orders", b"c", b"vc")],
+            vec![put_op("orders", b"d", b"vd")]
+        ]
+    );
+    // The catalog entry, the row of the unknown table, and the transaction's unknown-table row;
+    // the transaction's known row is lost with it (whole transactions only).
+    let damage = e.last_wal_recovery().damage.clone().unwrap();
+    assert_eq!(damage.unsalvageable, 3);
+    // A plain open reports the same count.
+    let fs = damaged_fs(schema_script);
+    let e = StorageEngine::open(Arc::clone(&fs), salvage_config()).unwrap();
+    let damage = e.last_wal_recovery().damage.clone().unwrap();
+    assert_eq!(damage.unsalvageable, 3);
+}
+
+#[test]
+fn salvage_counts_a_value_whose_blob_fails_verification() {
+    let fs = damaged_fs(|e| {
+        e.put_row(1, b"big", &[0x5A; 1500], &[], SYNC).unwrap();
+        e.put_row(1, b"e", b"ve", &[], SYNC).unwrap();
+    });
+    let blob = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.starts_with("blob_std_"))
+        .expect("setup");
+    damage_synced(&fs, &blob, |img| {
+        let at = img.windows(32).position(|w| w == [0x5A; 32]).unwrap();
+        img[at + 100] ^= 0x01;
+    });
+    let (e, salvaged) = open_salvage(&fs);
+    assert_eq!(salvaged.len(), 1);
+    assert_eq!(salvaged[0].ops, vec![put_op("orders", b"e", b"ve")]);
+    let damage = e.last_wal_recovery().damage.clone().unwrap();
+    assert_eq!(damage.unsalvageable, 1);
+}
+
+#[test]
+fn salvage_without_damage_is_an_empty_list_and_a_plain_open() {
+    let build = || {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+        let mut e = StorageEngine::open(Arc::clone(&fs), salvage_config()).unwrap();
+        e.register_or_resolve_vtab_with_durability("orders", None, SYNC)
+            .unwrap();
+        e.put_row(1, b"a", b"va", &[], BUF).unwrap();
+        e.put_row(1, b"b", &[0x77; 2000], &[], SYNC).unwrap();
+        e.put_row(1, b"c", b"vc", &[], BUF).unwrap();
+        fs.cut_now();
+        drop(e);
+        fs.crash(Crash::Power { keep: 0, lose: 100 });
+        fs
+    };
+    let (fs_a, fs_b) = (build(), build());
+    let (mut a, salvaged) = open_salvage(&fs_a);
+    let mut b = StorageEngine::open(Arc::clone(&fs_b), salvage_config()).unwrap();
+    assert!(salvaged.is_empty());
+    assert_eq!(a.last_wal_recovery().damage, None);
+    assert_eq!(a.last_wal_recovery(), b.last_wal_recovery());
+    for k in [&b"a"[..], b"b", b"c"] {
+        assert_eq!(a.get_row(1, k).unwrap(), b.get_row(1, k).unwrap());
+    }
+    // `c` was buffered after the last synchronous commit: lost like any unsynced tail.
+    assert!(a.get_row(1, b"a").unwrap().is_some() && a.get_row(1, b"b").unwrap().is_some());
+    assert!(dir_state(&fs_a) == dir_state(&fs_b));
+}
+
+#[test]
+fn salvaged_operations_written_back_restore_the_rows() {
+    let big = vec![0x5Au8; 1500];
+    let fs = damaged_fs(|e| {
+        plain_script(e);
+        e.put_row(1, b"big", &big, &[], SYNC).unwrap();
+    });
+    let (mut e, salvaged) = open_salvage(&fs);
+    for tx in &salvaged {
+        for op in &tx.ops {
+            match op {
+                SalvagedOp::Put { table, key, value } => {
+                    let id = e
+                        .register_or_resolve_vtab_with_durability(table, None, SYNC)
+                        .unwrap();
+                    e.put_row(id, key, value, &[], SYNC).unwrap();
+                }
+                SalvagedOp::Delete { table, key } => {
+                    let id = e
+                        .register_or_resolve_vtab_with_durability(table, None, SYNC)
+                        .unwrap();
+                    e.delete_row(id, key, SYNC).unwrap();
+                }
+            }
+        }
+    }
+    // `a` was deleted by a salvaged transaction; `b` was lost with the cut itself.
+    assert!(e.get_row(1, b"a").unwrap().is_none());
+    assert!(e.get_row(1, b"b").unwrap().is_none());
+    assert!(row_is(&mut e, 1, b"c", b"vc"));
+    assert!(row_is(&mut e, 1, b"d", b"vd"));
+    assert!(row_is(&mut e, 1, b"big", &big));
+}
+
+#[test]
+fn salvage_open_after_fail_open_returns_the_list() {
+    let fs = damaged_fs(|e| {
+        plain_script(e);
+    });
+    let mut cfg = salvage_config();
+    cfg.wal_damage_policy = WalDamagePolicy::Fail;
+    let before = dir_state(&fs);
+    let err = match StorageEngine::open(Arc::clone(&fs), cfg.clone()) {
+        Ok(_) => panic!("open under Fail must refuse a damaged WAL"),
+        Err(e) => e,
+    };
+    let damage = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<WalDamage>())
+        .expect("the inner error is the WalDamage")
+        .clone();
+    assert!(dir_state(&fs) == before, "a failed open changed a file");
+    // Salvage opens as `Truncate` whatever the configured policy is.
+    let (e, salvaged) = StorageEngine::open_with_salvage(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(salvaged.len(), 3);
+    assert_eq!(e.last_wal_recovery().damage.as_ref(), Some(&damage));
+}
+
+#[test]
+fn crash_during_a_salvage_open_reopens_to_the_same_list_or_cleanly() {
+    let build = || {
+        damaged_fs(|e| {
+            plain_script(e);
+            e.put_row(1, b"big", &[0x5A; 1500], &[], SYNC).unwrap();
+        })
+    };
+    let rows = |e: &mut Eng| -> Vec<Option<Vec<u8>>> {
+        [&b"a"[..], b"b", b"c", b"d", b"big"]
+            .iter()
+            .map(|k| e.get_row(1, k).unwrap())
+            .collect()
+    };
+    let fs = build();
+    let start = fs.op_stats().0;
+    let (mut e, want) = open_salvage(&fs);
+    let total = fs.op_stats().0 - start;
+    let (want_damage, want_rows) = (e.last_wal_recovery().damage.clone(), rows(&mut e));
+    assert!(
+        want.len() == 4 && want_damage.is_some() && total > 4,
+        "setup"
+    );
+    drop(e);
+
+    let crashes = [
+        Crash::Process,
+        Crash::Power { keep: 0, lose: 100 },
+        Crash::Power { keep: 50, lose: 50 },
+    ];
+    let (mut same, mut clean) = (0, 0);
+    for crash in crashes {
+        for k in 0..=total {
+            let fs = build();
+            let base = fs.op_stats().0;
+            fs.arm(Some(base + k), None);
+            let opened = StorageEngine::open_with_salvage(Arc::clone(&fs), salvage_config());
+            fs.cut_now();
+            drop(opened);
+            fs.crash(crash);
+            let (mut e, got) = open_salvage(&fs);
+            if got.is_empty() {
+                // The epochs had rotated: nothing is left to salvage, the prefix state remains.
+                assert_eq!(e.last_wal_recovery().damage, None, "{crash:?} cut {k}");
+                clean += 1;
+            } else {
+                assert_eq!(got, want, "{crash:?} cut {k}");
+                assert_eq!(
+                    e.last_wal_recovery().damage,
+                    want_damage,
+                    "{crash:?} cut {k}"
+                );
+                same += 1;
+            }
+            assert_eq!(rows(&mut e), want_rows, "{crash:?} cut {k}");
+        }
+    }
+    assert!(same > 0 && clean > 0, "same {same}, clean {clean}");
+}

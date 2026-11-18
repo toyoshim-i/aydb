@@ -2,7 +2,8 @@
 //! what the scans find past an unusable sector.
 
 use super::recovery::{
-    CutKind, Found, StopFlags, Stream, complete_transactions, judge, walk_chain,
+    CutKind, Found, StopFlags, Stream, complete_transactions, judge, post_cut_transactions,
+    walk_chain,
 };
 use super::*;
 use crate::pal::OsFs;
@@ -165,6 +166,9 @@ fn an_interrupted_transaction_is_dropped_as_a_whole() {
         if commit {
             f.batch.records.push(WalRecord::TxCommit);
         }
+        if !begin && !commit {
+            f.batch.records.insert(0, WalRecord::TxContinue);
+        }
         f
     };
     let lsns = |v: Vec<Found>| v.iter().map(|f| f.batch.lsn).collect::<Vec<_>>();
@@ -189,11 +193,14 @@ fn transaction_markers_are_stripped_and_a_new_begin_drops_an_open_transaction() 
     a.batch.records.insert(0, WalRecord::TxBegin);
     let mut b = found(2, 1, 0);
     b.batch.records.insert(0, WalRecord::TxBegin);
-    b.batch.records.push(WalRecord::TxCommit);
-    let out = complete_transactions(vec![a, b]);
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].batch.lsn, 2);
-    assert_eq!(out[0].batch.records.len(), 1, "markers are stripped");
+    let mut c = found(3, 2, 0);
+    c.batch.records.push(WalRecord::TxCommit);
+    let out = complete_transactions(vec![a, b, c]);
+    assert_eq!(out.iter().map(|f| f.batch.lsn).collect::<Vec<_>>(), [2, 3]);
+    assert!(
+        out.iter().all(|f| f.batch.records.len() == 1),
+        "markers are stripped"
+    );
 }
 
 // ---- Recovery of real log files ----
@@ -478,6 +485,9 @@ fn tx_chunk(lsn: u64, prev: u64, begin: bool, commit: bool) -> WalBatch {
     if commit {
         b.records.push(WalRecord::TxCommit);
     }
+    if !begin && !commit {
+        b.records.insert(0, WalRecord::TxContinue);
+    }
     b
 }
 
@@ -513,7 +523,10 @@ fn a_multi_chunk_transaction_cut_in_the_middle_is_not_applied() {
         r.merged_batches
             .iter()
             .flat_map(|b| &b.records)
-            .all(|r| !matches!(r, WalRecord::TxBegin | WalRecord::TxCommit))
+            .all(|r| !matches!(
+                r,
+                WalRecord::TxBegin | WalRecord::TxContinue | WalRecord::TxCommit
+            ))
     );
     assert_eq!(r.max_recovered_lsn, 6);
     assert_eq!(r.report.damage, None, "nothing was acknowledged");
@@ -785,4 +798,83 @@ fn a_file_left_over_from_an_older_epoch_is_read_one_window_at_most() {
     let bytes = counting.bytes.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reads, 1);
     assert!(bytes <= 64 * WAL_SECTOR_SIZE, "read {bytes} bytes");
+}
+
+/// A four-chunk transaction (begin, two middles, commit) plus plain batches around it.
+fn four_chunk_chain() -> Vec<Found> {
+    let chunk = |lsn, prev, begin, commit| {
+        let b = tx_chunk(lsn, prev, begin, commit);
+        Found {
+            batch: b,
+            stream: Stream::Sync,
+            in_prefix: true,
+        }
+    };
+    vec![
+        found(1, 0, 0),
+        chunk(2, 1, true, false),
+        chunk(3, 2, false, false),
+        chunk(4, 3, false, false),
+        chunk(5, 4, false, true),
+        found(6, 5, 0),
+    ]
+}
+
+fn salvage_lsns(all: &[Found], valid: usize) -> Vec<u64> {
+    post_cut_transactions(all, valid)
+        .iter()
+        .map(|t| t.lsn)
+        .collect()
+}
+
+#[test]
+fn grouping_returns_complete_transactions_and_stops_at_a_missing_chunk() {
+    let all = four_chunk_chain();
+    assert_eq!(salvage_lsns(&all, 0), vec![1, 5, 6]);
+    // The cut lies inside the transaction: the chunks before it are not salvaged either.
+    assert_eq!(salvage_lsns(&all, 3), vec![6]);
+    // A missing middle chunk breaks the link: the transaction is not returned.
+    let mut gap = four_chunk_chain();
+    gap.remove(3);
+    assert_eq!(salvage_lsns(&gap, 0), vec![1, 6]);
+    // The transaction's records are returned in order without markers.
+    let tx = &post_cut_transactions(&all, 0)[1];
+    assert_eq!(tx.records.len(), 4);
+    assert!(
+        tx.records
+            .iter()
+            .all(|r| !matches!(r, WalRecord::TxContinue))
+    );
+}
+
+#[test]
+fn grouping_never_returns_orphan_continuations() {
+    // Begin lost: the middles and the commit are orphans, whatever links they have.
+    let mut no_begin = four_chunk_chain();
+    no_begin.remove(1);
+    assert_eq!(salvage_lsns(&no_begin, 0), vec![1, 6]);
+    // Begin and commit lost: only the middles remain.
+    let mut no_ends = four_chunk_chain();
+    no_ends.remove(4);
+    no_ends.remove(1);
+    assert_eq!(salvage_lsns(&no_ends, 0), vec![1, 6]);
+    // Commit lost: the open transaction is dropped, and the batch after it is still returned.
+    let mut no_commit = four_chunk_chain();
+    no_commit.remove(4);
+    assert_eq!(salvage_lsns(&no_commit, 0), vec![1, 6]);
+    // The same rule applies to replay.
+    let kept: Vec<u64> = complete_transactions(no_ends)
+        .iter()
+        .map(|f| f.batch.lsn)
+        .collect();
+    assert_eq!(kept, vec![1, 6]);
+}
+
+#[test]
+fn tx_continue_survives_an_encode_decode_round_trip() {
+    let mut b = put(7, 6, 0);
+    b.records.insert(0, WalRecord::TxContinue);
+    let bytes = b.encode();
+    assert_eq!(WalBatch::decode(&bytes).unwrap(), b);
+    assert_eq!(bytes.len(), put(7, 6, 0).encode().len() + 1);
 }

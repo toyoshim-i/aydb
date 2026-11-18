@@ -303,11 +303,13 @@ The link and the watermark are stored in a **fixed batch header extension**. A b
 |                        WalEpoch (u64, LE)                     |
 |                                                               |
 +-------------------------------+-------------------------------+
-|        ValidBytes (u16)       |   WalFormatVersion (u16) = 1  |   was Reserved = 0
+|        ValidBytes (u16)       |   WalFormatVersion (u16) = 2  |   was Reserved = 0
 +-------------------------------+-------------------------------+
 ```
 
-Old format is `0` (the reserved value), the new one is `1`. Only the version of a sector is checked **after** its epoch and CRC match, so sectors left over from earlier epochs are still ignored silently and cost nothing. A sector with the current epoch and a valid CRC but a version other than `1` is an `UnsupportedFormat` damage at that sector.
+Old format is `0` (the reserved value), the new one is `2`. Version `1` was the first revision of this format (the link and the watermark without the continuation marker below); it never shipped and is rejected like `0`. Only the version of a sector is checked **after** its epoch and CRC match, so sectors left over from earlier epochs are still ignored silently and cost nothing. A sector with the current epoch and a valid CRC but a version other than `2` is an `UnsupportedFormat` damage at that sector.
+
+**Transaction framing.** A transaction larger than one chunk (512 KB) is logged as several batches: the first holds a `TxBegin` record, every middle one a `TxContinue` record (op byte `6`), the last a `TxCommit` record. A batch without any of the three is always a complete single-batch transaction. Without `TxContinue` a middle chunk whose begin and commit chunks are lost could not be told from a single-batch transaction. The cost is one byte per middle chunk of a transaction above 512 KB, and nothing for any other batch.
 
 **No backward compatibility.** `aydb` is pre-release. There is no legacy reader, no "unverified" replay mode, and no `boot_meta.db` downgrade flag for this feature. A WAL in the old format is handled as damaged data like any other unreadable WAL: `Truncate` discards it and starts a new one, `Fail` rejects it. A database that was closed cleanly (checkpoint, empty WAL) has no current-epoch sectors worth reading and opens normally.
 
@@ -363,12 +365,12 @@ pub enum SalvagedOp {
 ```
 
 * **Why inside `open`.** A discarded batch may point at blobs that the open itself reclaims as unreferenced. Salvage reads those values before blob reconciliation and returns them as bytes, so the application never has to order the steps. A separate read-only function run before `open` would leave that ordering to the application.
-* **Whole transactions only.** A transaction larger than one chunk spans several batches framed by `TxBegin` and `TxCommit`; it is returned only if every chunk is intact. A single-batch transaction is returned if its batch is intact.
+* **Whole transactions only.** A transaction larger than one chunk spans several batches framed by `TxBegin` and `TxCommit`; it is returned only if every chunk is intact, present and linked to the one before it by `prev_lsn` (the engine appends the chunks of a transaction back to back), and the whole transaction lies at or after the cut. A single-batch transaction is returned if its batch is intact. A multi-chunk transaction that lost a chunk is not returned and not counted in `unsalvageable`: like the unsynced tail of a power cut it is simply lost. The rule is exact because of the framing markers (4.6.5): a batch without a marker is a complete single-batch transaction, and a `TxContinue` or `TxCommit` batch whose open transaction is missing (its begin or an earlier chunk is lost) is an orphan continuation, never returned and not counted.
 * **Primary rows only.** Only records in the primary-row namespace are returned, with the table named through the catalog. Secondary index entries, unique index entries, rowid mappings, row metadata and catalog records are derived data: writing the rows back through the normal API rebuilds them.
-* **Not returned, only counted** in the report: schema changes after the cut (a table created, dropped or renamed), records of tables the catalog does not know, and values whose blob fails verification.
+* **Not returned, only counted** in the report: schema changes after the cut (a table created, dropped or renamed: any catalog record), records of tables the catalog does not know, and values whose blob fails verification. Each such operation counts once, and its **whole transaction is dropped** from the list, so the other operations of that transaction are lost silently. The catalog is the one that stands after the replay of the prefix below the cut. The count is the same for `open` and `open_with_salvage`, under `Truncate` and under `Fail`. It needs the blobs of the discarded batches to be read and verified, so it is computed only when damage was found; an undamaged open pays nothing.
 * **The data is engine-level.** Keys and values are in the `aydb` encoding. An application that uses the SQLite adapter must decode them itself, with the row codec.
 
-`open_with_salvage` with no damage returns an empty list and is otherwise the same as `open`. An application usually calls it after `open` under `Fail` returned `WalDamage`, but it can also call it every time.
+`open_with_salvage` opens as `Truncate` whatever `EngineConfig::wal_damage_policy` says, so it can follow an `open` that failed under `Fail`. With no damage it returns an empty list and is otherwise the same as `open`; both share one code path. The list exists only in memory: a crash before the epoch rotation of the open reproduces it at the next open, a crash after it leaves nothing to salvage. An application usually calls it after `open` under `Fail` returned `WalDamage`, but it can also call it every time.
 
 #### 4.6.8 Report
 
@@ -387,7 +389,7 @@ pub struct WalDamage {
     pub first_lost_lsn: u64,               // the cut
     pub last_lsn_seen: u64,                // highest LSN found anywhere
     pub discarded_batches: StreamCounts,   // valid batches at or after the cut
-    pub unsalvageable: u64,                // schema changes, unknown tables, bad blobs
+    pub unsalvageable: u64,                // operations: schema changes, unknown tables, bad blobs
 }
 
 pub enum WalDamageReason {
