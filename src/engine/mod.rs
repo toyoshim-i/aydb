@@ -144,6 +144,20 @@ pub enum CorruptPolicy {
     Evict,
 }
 
+/// What `StorageEngine::open` does when recovery finds that acknowledged commits were lost from
+/// the WAL (media damage, never the unsynced tail of a power cut; see ARCHITECTURE.md 4.6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalDamagePolicy {
+    /// Replays the verified prefix of the log, discards the rest and opens. The loss is visible
+    /// only in [`StorageEngine::last_wal_recovery`].
+    #[default]
+    Truncate,
+    /// `open` fails with `io::ErrorKind::InvalidData` whose inner error is the [`WalDamage`]
+    /// (reach it with `get_ref()` and `downcast_ref`). The decision comes before anything is
+    /// written or deleted, so every file is left as it was.
+    Fail,
+}
+
 /// A queued automatic deletion of a row whose blob failed verification (`Evict` policy).
 struct PendingCorruptEviction {
     /// Key of the record (`'r'` row or `'t'` row-meta) whose blob was corrupt.
@@ -217,6 +231,8 @@ pub struct EngineConfig {
     pub block_cache_bytes: usize,
     /// Total capacity for in-process verified small blob payload cache (`0` disables blob cache).
     pub blob_cache_bytes: usize,
+    /// What `open` does when the WAL lost acknowledged commits (default: truncate and continue).
+    pub wal_damage_policy: WalDamagePolicy,
 }
 
 impl Default for EngineConfig {
@@ -238,6 +254,7 @@ impl Default for EngineConfig {
             max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
             block_cache_bytes: DEFAULT_BLOCK_CACHE_BYTES,
             blob_cache_bytes: DEFAULT_BLOB_CACHE_BYTES,
+            wal_damage_policy: WalDamagePolicy::default(),
         }
     }
 }
@@ -411,7 +428,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Opens or recovers a `StorageEngine` rooted at `fs`.
     pub fn open(fs: Arc<FS>, config: EngineConfig) -> io::Result<Self> {
         let mut meta_mgr = BootMetaManager::open_or_recover_deferred_sweep(fs.clone())?;
-        meta_mgr.reserve_seq_ids_above_existing_files()?;
         let state_snapshot = meta_mgr.state().clone();
 
         let block_cache = Arc::new(VerifiedBlockCache::new(config.block_cache_bytes));
@@ -603,6 +619,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 },
             },
         )?;
+
+        // Under `Fail` nothing may have been written yet: the seq-id reservation below is a
+        // catalog commit (which also unlinks pending deletes), so it comes after this check.
+        if let (WalDamagePolicy::Fail, Some(damage)) =
+            (config.wal_damage_policy, &rec.report.damage)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, damage.clone()));
+        }
+        // Recovery allocates no SeqID, so reserving here still precedes every allocation.
+        meta_mgr.reserve_seq_ids_above_existing_files()?;
 
         let wal_report = rec.report;
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);

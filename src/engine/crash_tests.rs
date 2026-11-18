@@ -2001,6 +2001,8 @@ fn engine_config(rng: &mut Rng) -> EngineConfig {
     c.auto_compact_segment_threshold = 3 + rng.below(3) as usize;
     c.block_cache_bytes = 0;
     c.blob_cache_bytes = 0;
+    // Power cuts and `kill -9` must never look like damage, so every recovery opens under `Fail`.
+    c.wal_damage_policy = WalDamagePolicy::Fail;
     c
 }
 
@@ -3103,4 +3105,174 @@ fn unverifiable_sync_blob_cuts_later_batches_of_both_streams() {
     assert_eq!(damage.first_lost_lsn, sync_lsns[1]);
     assert_eq!(damage.discarded_batches.sync, 2);
     assert_eq!(damage.discarded_batches.buffered, 1);
+}
+
+// =============================================================================================
+// WalDamagePolicy (ARCHITECTURE.md 4.6.6)
+// =============================================================================================
+
+/// Every file of the directory with both of its images, so that a failed open is shown to have
+/// written, created, synced and removed nothing.
+fn dir_state(fs: &CrashFs) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+    let st = fs.st();
+    st.dir
+        .iter()
+        .map(|(name, &id)| {
+            let ino = &st.inodes[id];
+            (name.clone(), (ino.cache.clone(), ino.durable.clone()))
+        })
+        .collect()
+}
+
+/// Reproduction 1 (see `damaged_sync_sector_cuts_later_buffered_batches`), crashed and damaged
+/// but not yet reopened. Returns the keys in commit order.
+fn sync_sector_damage_fs() -> (Arc<CrashFs>, [&'static [u8]; 5], u64) {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    let buf = WriteDurability::BufferedFast;
+    let keys: [&[u8]; 5] = [b"s1", b"s2", b"b3", b"b4", b"s5"];
+    for (i, k) in keys.iter().enumerate() {
+        let d = if i == 2 || i == 3 { buf } else { sync };
+        e.put_row(1, k, b"v", &[], d).unwrap();
+    }
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let s2 = wal_lsns(&fs, "wal_sync.db")[1];
+    damage_synced(&fs, "wal_sync.db", |img| img[4096 + 100] ^= 0x01);
+    (fs, keys, s2)
+}
+
+/// Reproduction 2 (see `unverifiable_sync_blob_cuts_later_batches_of_both_streams`).
+fn rotten_blob_fs() -> (Arc<CrashFs>, [&'static [u8]; 4], u64) {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    let keys: [&[u8]; 4] = [b"s1", b"s2", b"b3", b"s4"];
+    e.put_row(1, keys[0], b"v", &[], sync).unwrap();
+    e.put_row(1, keys[1], &[0x5A; 1500], &[], sync).unwrap();
+    e.put_row(1, keys[2], b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    e.put_row(1, keys[3], b"v", &[], sync).unwrap();
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let s2 = wal_lsns(&fs, "wal_sync.db")[1];
+    let blob = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.starts_with("blob_std_"))
+        .expect("setup: the value is out of line");
+    damage_synced(&fs, &blob, |img| {
+        let at = img.windows(32).position(|w| w == [0x5A; 32]).unwrap();
+        img[at + 100] ^= 0x01;
+    });
+    (fs, keys, s2)
+}
+
+fn fail_config() -> EngineConfig {
+    let mut c = repro_config();
+    c.wal_damage_policy = WalDamagePolicy::Fail;
+    c
+}
+
+/// Opens under `Fail`, expects the damage error and checks that no file changed in any way.
+fn assert_fail_open_is_untouched(fs: &Arc<CrashFs>, reason: WalDamageReason, first_lost: u64) {
+    let before = dir_state(fs);
+    let err = match StorageEngine::open(Arc::clone(fs), fail_config()) {
+        Ok(_) => panic!("open under Fail must refuse a damaged WAL"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let damage = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<WalDamage>())
+        .expect("the inner error is the WalDamage");
+    assert_eq!(damage.reason, reason);
+    assert_eq!(damage.first_lost_lsn, first_lost);
+    assert!(err.to_string().contains(&first_lost.to_string()), "{err}");
+    assert!(dir_state(fs) == before, "a failed open changed a file");
+}
+
+#[test]
+fn fail_policy_refuses_damaged_sync_sector_and_leaves_files_untouched() {
+    let (fs, keys, s2) = sync_sector_damage_fs();
+    // An orphan above `next_seq_id` makes a normal open commit the catalog to reserve its SeqID;
+    // a refused open must not.
+    let orphan = crate::meta::format_idx_file_name(9_999);
+    fs.open_file(&orphan, true, true, OpenHint::ImmutableSequential)
+        .unwrap()
+        .write_all_at(b"orphan", 0)
+        .unwrap();
+    assert_fail_open_is_untouched(&fs, WalDamageReason::CorruptSector, s2);
+    // The same directory still opens under `Truncate` and gives the prefix.
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    assert_recovered_prefix(&mut e, &keys, 1);
+    assert!(e.last_wal_recovery().damage.is_some());
+}
+
+#[test]
+fn fail_policy_refuses_unverifiable_blob_and_leaves_files_untouched() {
+    let (fs, keys, s2) = rotten_blob_fs();
+    assert_fail_open_is_untouched(&fs, WalDamageReason::UnverifiableBlob, s2);
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    assert_recovered_prefix(&mut e, &keys, 1);
+    assert!(e.last_wal_recovery().damage.is_some());
+}
+
+/// `Truncate` is the default: a default configuration opens a damaged WAL, replays exactly the
+/// prefix and reports the damage.
+#[test]
+fn default_policy_truncates_and_reports_damage() {
+    assert_eq!(
+        EngineConfig::default().wal_damage_policy,
+        WalDamagePolicy::Truncate
+    );
+    for (fs, keys, s2) in [
+        {
+            let (fs, k, s2) = sync_sector_damage_fs();
+            (fs, k.to_vec(), s2)
+        },
+        {
+            let (fs, k, s2) = rotten_blob_fs();
+            (fs, k.to_vec(), s2)
+        },
+    ] {
+        let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+        assert_recovered_prefix(&mut e, &keys, 1);
+        let damage = e.last_wal_recovery().damage.clone().expect("damage");
+        assert_eq!(damage.first_lost_lsn, s2);
+    }
+}
+
+/// `Fail` has no false positives: a new database, a clean reopen and every kind of ordinary
+/// crash (an unsynced tail is not damage) open normally.
+#[test]
+fn fail_policy_opens_clean_and_crashed_databases() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let e = StorageEngine::open(Arc::clone(&fs), fail_config()).unwrap();
+    assert_eq!(e.last_wal_recovery(), &WalRecoveryReport::default());
+    drop(e);
+    for crash in [
+        Crash::Process,
+        Crash::Power { keep: 0, lose: 100 },
+        Crash::Power { keep: 50, lose: 50 },
+        Crash::Power { keep: 100, lose: 0 },
+    ] {
+        let mut e = StorageEngine::open(Arc::clone(&fs), fail_config()).unwrap();
+        assert_eq!(e.last_wal_recovery().damage, None);
+        e.put_row(1, b"a", b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        e.put_row(1, b"b", b"v", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        e.put_row(1, b"c", b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        fs.cut_now();
+        drop(e);
+        fs.crash(crash);
+        let e = StorageEngine::open(Arc::clone(&fs), fail_config()).unwrap();
+        assert_eq!(e.last_wal_recovery().damage, None, "{crash:?}");
+    }
 }

@@ -73,6 +73,31 @@ pub struct WalDamage {
     pub unsalvageable: u64,
 }
 
+impl std::fmt::Display for WalDamageReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingPredecessor => "a batch is missing from the log",
+            Self::UnverifiableBlob => "a blob of a logged batch failed verification",
+            Self::CorruptSector => "a log sector is corrupt",
+            Self::AcknowledgedTailLost => "the log ends below an acknowledged commit",
+            Self::UnsupportedFormat => "a log sector has an unsupported format version",
+        })
+    }
+}
+
+impl std::fmt::Display for WalDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WAL damaged: {} (first lost LSN {}, highest LSN seen {})",
+            self.reason, self.first_lost_lsn, self.last_lsn_seen
+        )
+    }
+}
+
+/// Lets `WalDamagePolicy::Fail` hand the damage to the caller inside an `io::Error`.
+impl std::error::Error for WalDamage {}
+
 /// What the most recent `open` found in the WAL.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalRecoveryReport {
