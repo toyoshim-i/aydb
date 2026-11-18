@@ -597,7 +597,7 @@ fn storage_class_key_tags_auto_rowid_and_mixed_range() {
     conn.execute_batch(
         "CREATE VIRTUAL TABLE auto_pk_t USING aydb(
             table_id = 31,
-            columns = 'id INT PRIMARY KEY, label TEXT'
+            columns = 'id INTEGER PRIMARY KEY, label TEXT'
         );
         INSERT INTO auto_pk_t VALUES (NULL, 'first');
         INSERT INTO auto_pk_t VALUES (NULL, 'second');

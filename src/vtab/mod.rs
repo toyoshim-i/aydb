@@ -18,6 +18,8 @@ mod constraint_tests;
 mod constraints;
 mod ddl;
 pub mod ffi;
+#[cfg(test)]
+mod key_null_tests;
 pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
@@ -57,8 +59,8 @@ use crate::vtab::ffi::{
     SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_FLOAT, SQLITE_FULL,
     SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
     SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
-    SQLITE_INTEGER, SQLITE_IOERR, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_TEXT,
-    SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
+    SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
+    SQLITE_TEXT, SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
     sqlite3_index_info, sqlite3_int64, sqlite3_module, sqlite3_result_error_code,
     sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes, sqlite3_value_double,
     sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type, sqlite3_vtab,
@@ -429,6 +431,8 @@ pub(super) struct AydbVTab {
     col_collations: Vec<ColCollation>,
     pub(super) pk_col_idx: usize,
     pub(super) pk_affinity: ColumnAffinity,
+    /// The key is `INTEGER PRIMARY KEY`, a rowid alias: NULL on insert assigns the next key.
+    pk_rowid_alias: bool,
     pub(super) pk_collation: ColCollation,
     /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
     secondary_indexes: Vec<(usize, u16)>,
@@ -836,6 +840,7 @@ unsafe extern "system" fn vtab_create_or_connect(
             col_collations: ddl.col_collations,
             pk_col_idx: ddl.pk_col_idx,
             pk_affinity: ddl.pk_affinity,
+            pk_rowid_alias: ddl.pk_rowid_alias,
             pk_collation: ddl.pk_collation,
             secondary_indexes: ddl.secondary_indexes,
             next_auto_rowid: AtomicI64::new(initial_auto_rowid),
@@ -1954,11 +1959,17 @@ unsafe extern "system" fn vtab_update(
 
         let arg0 = *argv.offset(0);
         let is_insert = sqlite3_value_type(arg0) == SQLITE_NULL;
+        // A native rowid alias refuses to become NULL in an UPDATE ("datatype mismatch"), a hard
+        // error that no conflict clause turns into a skipped row.
+        if !is_insert
+            && vtab.pk_rowid_alias
+            && sqlite3_value_type(*argv.offset(2 + vtab.pk_col_idx as isize)) == SQLITE_NULL
+        {
+            return SQLITE_MISMATCH;
+        }
         for (idx, &not_null) in vtab.col_not_null.iter().enumerate() {
             if not_null
-                && !(idx == vtab.pk_col_idx
-                    && is_insert
-                    && vtab.pk_affinity == ColumnAffinity::Integer)
+                && !(idx == vtab.pk_col_idx && is_insert && vtab.pk_rowid_alias)
                 && sqlite3_value_type(*argv.offset(2 + idx as isize)) == SQLITE_NULL
             {
                 // NOT NULL has no REPLACE resolution without a DEFAULT, which this adapter
@@ -1971,7 +1982,7 @@ unsafe extern "system" fn vtab_update(
 
         // Handle `SQLITE_NULL` primary key
         let pk_override = if pk_val_type == SQLITE_NULL {
-            if is_insert && vtab.pk_affinity == ColumnAffinity::Integer {
+            if is_insert && vtab.pk_rowid_alias {
                 let mut candidate = vtab.next_auto_rowid.load(Ordering::Relaxed);
                 if candidate <= 0 {
                     candidate = 1;

@@ -25,6 +25,9 @@ pub(super) struct ParsedVtabDdl {
     pub(super) col_unique: Vec<bool>,
     pub(super) pk_col_idx: usize,
     pub(super) pk_affinity: ColumnAffinity,
+    /// The key column is a rowid alias: declared exactly `INTEGER PRIMARY KEY` (not `DESC`).
+    /// Only then does a NULL key mean "assign the next key".
+    pub(super) pk_rowid_alias: bool,
     pub(super) pk_collation: ColCollation,
     pub(super) secondary_indexes: Vec<(usize, u16)>,
 }
@@ -246,6 +249,8 @@ struct ColumnDef {
     not_null: bool,
     unique: bool,
     primary_key: bool,
+    /// `INTEGER PRIMARY KEY` that SQLite treats as an alias of the rowid.
+    rowid_alias: bool,
 }
 
 /// Consumes the parenthesised group that follows keyword token `tokens[i]`, either attached to
@@ -275,15 +280,20 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         not_null: false,
         unique: false,
         primary_key: false,
+        rowid_alias: false,
     };
     let mut i = 1usize;
     let mut type_words: Vec<String> = Vec::new();
+    let mut has_size = false;
     while i < tokens.len() {
         let tok = tokens[i];
         let quoted = matches!(tok.as_bytes()[0], b'"' | b'\'' | b'`' | b'[');
         if !quoted && token_keyword(tok).is_some_and(|k| CONSTRAINT_KEYWORDS.contains(&k.as_str()))
         {
             break;
+        }
+        if tok.contains('(') {
+            has_size = true;
         }
         if quoted {
             type_words.push(unquote_identifier(tok).to_ascii_uppercase());
@@ -295,6 +305,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         i += 1;
     }
     def.affinity = ColumnAffinity::from_type_str(&type_words.join(" "));
+    let integer_typed = type_words.len() == 1 && type_words[0] == "INTEGER" && !has_size;
 
     while i < tokens.len() {
         let Some(keyword) = token_keyword(tokens[i]) else {
@@ -312,8 +323,12 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                     return Err(SQLITE_ERROR);
                 }
                 def.primary_key = true;
+                def.rowid_alias = integer_typed;
                 i += 2;
-                if is_word(tokens.get(i), "ASC") || is_word(tokens.get(i), "DESC") {
+                if is_word(tokens.get(i), "DESC") {
+                    def.rowid_alias = false;
+                    i += 1;
+                } else if is_word(tokens.get(i), "ASC") {
                     i += 1;
                 }
                 if is_word(tokens.get(i), "AUTOINCREMENT") {
@@ -478,6 +493,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_not_null = Vec::new();
         let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
+        let mut pk_rowid_alias = false;
         for col_def in split_top_level_commas(&columns_spec) {
             let trimmed = col_def.trim();
             // The parser does not support comments or per-constraint conflict policies.
@@ -500,6 +516,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             let def = parse_column_def(&raw_tokens)?;
             if def.primary_key {
                 pk_col_idx = col_names.len();
+                pk_rowid_alias = def.rowid_alias;
             }
             col_names.push(def.name);
             col_affinities.push(def.affinity);
@@ -552,6 +569,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             col_unique,
             pk_col_idx,
             pk_affinity,
+            pk_rowid_alias,
             pk_collation,
             secondary_indexes,
         })
@@ -790,5 +808,24 @@ mod tests {
         let ok = parse(&[cols, "indexes='\"x,y\", [Z]'"]).unwrap();
         assert_eq!(ok.secondary_indexes, vec![(1, 1), (2, 2)]);
         assert_eq!(parse(&[cols, "indexes='\"x\"'"]).err(), Some(SQLITE_ERROR));
+    }
+
+    #[test]
+    fn only_integer_primary_key_is_a_rowid_alias() {
+        for (spec, alias) in [
+            ("k INTEGER PRIMARY KEY, v TEXT", true),
+            ("k integer primary key not null, v TEXT", true),
+            ("k INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, v TEXT", true),
+            ("k INTEGER CONSTRAINT p PRIMARY KEY ASC, v TEXT", true),
+            ("k INT PRIMARY KEY, v TEXT", false),
+            ("k BIGINT PRIMARY KEY, v TEXT", false),
+            ("k TEXT PRIMARY KEY, v TEXT", false),
+            ("k INTEGER(4) PRIMARY KEY, v TEXT", false),
+            ("k UNSIGNED INTEGER PRIMARY KEY, v TEXT", false),
+            ("k INTEGER PRIMARY KEY DESC, v TEXT", false),
+            ("k INTEGER, v TEXT", false),
+        ] {
+            assert_eq!(cols(spec).pk_rowid_alias, alias, "{spec}");
+        }
     }
 }

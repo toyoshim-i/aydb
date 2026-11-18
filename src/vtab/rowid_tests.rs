@@ -140,7 +140,7 @@ fn connect_integer_table(engine: Arc<RwLock<StorageEngine<OsFs>>>) -> SqliteConn
     conn.register_aydb_module_with_options(engine, false)
         .unwrap();
     conn.execute_batch(
-        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k INT PRIMARY KEY, v TEXT')",
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, v TEXT')",
     )
     .unwrap();
     conn
