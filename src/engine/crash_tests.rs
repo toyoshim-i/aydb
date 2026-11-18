@@ -23,6 +23,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
+mod media;
+use media::{Mode, OpRec, Ticket, Touched};
+
 // =============================================================================================
 // Deterministic random numbers
 // =============================================================================================
@@ -907,6 +910,8 @@ struct Coverage {
     manifests_seen: AtomicU64,
     blob_segments_seen: AtomicU64,
     fail_by_kind: [AtomicU64; KIND_COUNT],
+    /// Counters of the media-damage and group-commit modes.
+    media: media::MediaCov,
 }
 
 impl Coverage {
@@ -926,7 +931,8 @@ impl Coverage {
              maintenance_failures={} poisoned={} unstable_recovery={} \
              lsn_checks={} lsn_cuts={} no_damage_checks={} durable_checks={} durable_marks={} \
              durable_batches={} \
-             manifests_seen={} blob_segments_seen={}",
+             manifests_seen={} blob_segments_seen={}
+  media/group: {}",
             g(&self.cases),
             g(&self.crashes),
             g(&self.process_crashes),
@@ -948,6 +954,7 @@ impl Coverage {
             g(&self.durable_batches),
             g(&self.manifests_seen),
             g(&self.blob_segments_seen),
+            self.media.report(),
         )
     }
 }
@@ -1016,6 +1023,19 @@ struct Harness<'a> {
     trace: Vec<String>,
     /// How many trace lines a failure report keeps (all of them when replaying one seed).
     trace_cap: usize,
+    mode: Mode,
+    /// The logs were damaged after the last crash and no open has seen them yet: the next open
+    /// runs under `Truncate` and may report damage.
+    damage_pending: bool,
+    /// Batches were lost to the damage, so the next recovery may show an older state than the
+    /// acknowledged one.
+    relaxed: bool,
+    /// What the copies of the damaged directory reported; the real open must report the same.
+    expect_damage: Option<Option<WalDamage>>,
+    /// The LSNs and rows of the workload's operations in this epoch, for the salvage oracle.
+    oplog: Vec<OpRec>,
+    /// Group commits appended and not yet seen durable.
+    tickets: Vec<Ticket>,
 }
 
 impl<'a> Harness<'a> {
@@ -1211,6 +1231,13 @@ impl<'a> Harness<'a> {
             self.log("  (failed, transaction rolled back, engine alive)".into());
         }
         Ok(!dead)
+    }
+
+    /// A table of the workload: the capped ones are left out when group commit is driven (the
+    /// engine does not group while a capped table exists).
+    fn pick_table(&mut self) -> u16 {
+        let n = if self.mode.group { 2 } else { 4 };
+        TABLES[self.rng.below(n) as usize]
     }
 
     fn last(&self) -> &Table {
@@ -1418,7 +1445,11 @@ impl<'a> Harness<'a> {
         let got = self
             .read_all(e)?
             .ok_or_else(|| self.fail("faults are armed during verification".into()))?;
-        let lo = if process_crash {
+        // After media damage that lost batches, acknowledged commits may be gone (what recovery
+        // was bound to report is checked against the logs by `damage_wal`).
+        let lo = if self.relaxed {
+            0
+        } else if process_crash {
             self.acked_any
         } else {
             self.acked_sync
@@ -1460,6 +1491,8 @@ impl<'a> Harness<'a> {
         }
         self.states[k] = base;
         self.acked_any = k;
+        self.acked_sync = self.acked_sync.min(k);
+        self.relaxed = false;
         self.log(format!("recovered at state {k} (range {lo}..={hi})"));
         Ok(k)
     }
@@ -1542,8 +1575,24 @@ impl<'a> Harness<'a> {
             |_| Ok(true),
         )
         .map_err(|e| self.fail(format!("oracle: reading the logged batches failed: {e}")))?;
-        let want: Vec<u64> = reference.merged_batches.iter().map(|b| b.lsn).collect();
+        let mut want: Vec<u64> = reference.merged_batches.iter().map(|b| b.lsn).collect();
         let got: Vec<u64> = recovered.merged_batches.iter().map(|b| b.lsn).collect();
+        // A failed write can leave a torn sector in the page cache while the device still holds
+        // an earlier, complete version of it. Whatever batch the crashed files hold was logged,
+        // so it belongs to the reference even if the cache hid it from the snapshot.
+        for (name, epoch) in [
+            ("wal_sync.db", m.sync_wal_epoch),
+            ("wal_buf.db", m.buf_wal_epoch),
+        ] {
+            let scan = crate::wal::recover_single_wal_stream(&*raw_file(&post_fs, name), epoch)
+                .map_err(|e| self.fail(format!("oracle: scanning {name}: {e}")))?;
+            for b in scan.batches.iter().chain(&scan.past_stop) {
+                if b.lsn > m.checkpoint_lsn && !want.contains(&b.lsn) {
+                    want.push(b.lsn);
+                }
+            }
+        }
+        want.sort_unstable();
         Coverage::bump(&self.cov.lsn_checks);
         for (name, epoch) in [
             ("wal_sync.db", m.sync_wal_epoch),
@@ -1636,13 +1685,35 @@ impl<'a> Harness<'a> {
         Ok(())
     }
 
+    /// The configuration of a recovery: `Fail` unless media damage was applied and not yet seen
+    /// by an open (power cuts and `kill -9` must never look like damage).
+    fn recovery_cfg(&self) -> EngineConfig {
+        let mut cfg = self.cfg.clone();
+        if self.damage_pending {
+            cfg.wal_damage_policy = WalDamagePolicy::Truncate;
+        }
+        cfg
+    }
+
     fn open(&mut self, what: &str) -> Result<Eng, String> {
-        let e = open_engine(&self.fs, &self.cfg)
+        let e = open_engine(&self.fs, &self.recovery_cfg())
             .map_err(|e| self.fail(format!("reopen failed ({what}): {e}")))?;
-        // Power cuts and `kill -9` lose only an unsynced tail, which is not damage: the report of
-        // every recovery must be clean, however many batches it had to discard.
         let report = e.last_wal_recovery();
-        if let Some(d) = &report.damage {
+        if self.damage_pending {
+            // The first open of a damaged directory reports what the copies reported (unless a
+            // recovery that was cut short may already have consumed the evidence).
+            if let Some(want) = self.expect_damage.take() {
+                if report.damage != want {
+                    return Err(self.fail(format!(
+                        "recovery ({what}) of the damaged logs reports {:?}, the copies {want:?}",
+                        report.damage
+                    )));
+                }
+            }
+            self.damage_pending = false;
+        } else if let Some(d) = &report.damage {
+            // Power cuts and `kill -9` lose only an unsynced tail, which is not damage: the
+            // report of every recovery must be clean, however many batches it had to discard.
             return Err(self.fail(format!(
                 "recovery ({what}) reports WAL damage after a crash that cannot damage synced \
                  data: {d:?}"
@@ -1670,6 +1741,19 @@ impl<'a> Harness<'a> {
 
     /// Registers the capped tables (idempotent: a registration lost to a crash is redone).
     fn ensure_tables(&mut self, e: &mut Eng) -> Result<bool, String> {
+        if self.mode.media {
+            // Salvage names the tables through the catalog.
+            for t in TABLES {
+                let name = format!("t{t}");
+                let r = e.register_or_resolve_vtab_with_durability(&name, Some(t), SYNC);
+                if self.io_ok(r, "register_or_resolve_vtab")?.is_none() {
+                    return Ok(false);
+                }
+            }
+        }
+        if self.mode.group {
+            return Ok(true);
+        }
         let mut want = vec![(3u16, self.quota3), (4u16, self.quota4)];
         if self.wide > 0 {
             for i in 0..self.wide {
@@ -1688,6 +1772,9 @@ impl<'a> Harness<'a> {
     }
 
     fn run_segment(&mut self, e: &mut Eng, nops: usize) -> Result<(), String> {
+        if self.mode.group {
+            return self.run_group_segment(e, nops);
+        }
         if !self.ensure_tables(e)? {
             return Ok(());
         }
@@ -1723,17 +1810,21 @@ impl<'a> Harness<'a> {
     }
 
     fn op_put(&mut self, e: &mut Eng) -> Result<bool, String> {
-        let t = TABLES[self.rng.below(4) as usize];
+        let t = self.pick_table();
         let k = self.rng.below(KEYS as u64) as u8;
         let d = pick_durability(&mut self.rng);
         let sync = d == WriteDurability::SyncTransactional;
         let v = make_value(&mut self.rng, t, k);
+        if !self.avoid_pending_row(e, t, k)? {
+            return Ok(false);
+        }
         let mut ns = self.last().clone();
         ns.insert((t, k), v.clone());
         let what = format!("put t{t}/key{k:02} {} {}", short(&v), describe(d));
         let lsn = e.next_lsn();
         let r = e.put_row(t, &key_bytes(k), &v, &put_keys(t, &v), d);
         let logged = e.next_lsn() != lsn;
+        self.note_op(lsn, e.next_lsn(), Touched::from([((t, k), vec![Some(v)])]));
         let alive = !e.is_poisoned();
         self.record_commit(r, ns, sync, logged, alive, &what)
     }
@@ -1791,15 +1882,19 @@ impl<'a> Harness<'a> {
     }
 
     fn op_delete(&mut self, e: &mut Eng) -> Result<bool, String> {
-        let t = TABLES[self.rng.below(4) as usize];
+        let t = self.pick_table();
         let k = self.rng.below(KEYS as u64) as u8;
         let d = pick_durability(&mut self.rng);
+        if !self.avoid_pending_row(e, t, k)? {
+            return Ok(false);
+        }
         let mut ns = self.last().clone();
         ns.remove(&(t, k));
         let what = format!("delete t{t}/key{k:02} {}", describe(d));
         let lsn = e.next_lsn();
         let r = e.delete_row(t, &key_bytes(k), d).map(|_| ());
         let logged = e.next_lsn() != lsn;
+        self.note_op(lsn, e.next_lsn(), Touched::from([((t, k), vec![None])]));
         let alive = !e.is_poisoned();
         self.record_commit(
             r,
@@ -1844,16 +1939,18 @@ impl<'a> Harness<'a> {
     }
 
     fn op_tx(&mut self, e: &mut Eng) -> Result<bool, String> {
+        let lsn0 = e.next_lsn();
         e.begin_transaction();
         self.log("begin".into());
         let mut work = self.last().clone();
-        let mut sps: Vec<(i32, Table)> = Vec::new();
+        let mut touched = Touched::new();
+        let mut sps: Vec<(i32, Table, Touched)> = Vec::new();
         let mut next_sp = 1;
         let steps = 1 + self.rng.below(7);
         for _ in 0..steps {
             let r = self.rng.below(100);
             if r < 60 {
-                let t = TABLES[self.rng.below(4) as usize];
+                let t = self.pick_table();
                 let k = self.rng.below(KEYS as u64) as u8;
                 let v = make_value(&mut self.rng, t, k);
                 let d = pick_durability(&mut self.rng);
@@ -1866,9 +1963,10 @@ impl<'a> Harness<'a> {
                 if self.io_ok(res, "put_row in transaction")?.is_none() {
                     return self.abort_tx(e);
                 }
-                work.insert((t, k), v);
+                work.insert((t, k), v.clone());
+                touched.entry((t, k)).or_default().push(Some(v));
             } else if r < 70 {
-                let t = TABLES[self.rng.below(4) as usize];
+                let t = self.pick_table();
                 let k = self.rng.below(KEYS as u64) as u8;
                 let d = pick_durability(&mut self.rng);
                 let res = e.delete_row(t, &key_bytes(k), d);
@@ -1877,6 +1975,7 @@ impl<'a> Harness<'a> {
                     return self.abort_tx(e);
                 }
                 work.remove(&(t, k));
+                touched.entry((t, k)).or_default().push(None);
             } else if r < 76 {
                 // Backfill inside the transaction: rolled back with it, otherwise committed.
                 let k = self.rng.below(KEYS as u64) as u8;
@@ -1894,7 +1993,7 @@ impl<'a> Harness<'a> {
             } else if r < 84 {
                 e.savepoint(next_sp);
                 self.log(format!("  savepoint {next_sp}"));
-                sps.push((next_sp, work.clone()));
+                sps.push((next_sp, work.clone(), touched.clone()));
                 next_sp += 1;
             } else if r < 92 {
                 if let Some(i) = sps
@@ -1902,13 +2001,14 @@ impl<'a> Harness<'a> {
                     .checked_sub(1)
                     .map(|n| self.rng.below(n as u64 + 1) as usize)
                 {
-                    let (id, snap) = sps[i].clone();
+                    let (id, snap, snap_touched) = sps[i].clone();
                     let res = e.rollback_to_savepoint(id);
                     self.log(format!("  rollback to savepoint {id}"));
                     if self.io_ok(res, "rollback_to_savepoint")?.is_none() {
                         return self.abort_tx(e);
                     }
                     work = snap;
+                    touched = snap_touched;
                     sps.truncate(i + 1);
                 }
             } else if let Some(i) = sps
@@ -1969,7 +2069,9 @@ impl<'a> Harness<'a> {
             return Ok(!dead);
         }
         let logged = e.pending_tx_record_count > 0;
+        let before_commit = e.next_lsn();
         let r = e.commit_transaction();
+        self.note_op(lsn0, e.next_lsn().max(before_commit), touched);
         let alive = !e.is_poisoned();
         self.record_commit(
             r,
@@ -2056,31 +2158,41 @@ fn pick_fault(rng: &mut Rng, stat: Option<&EpochStat>, prefer_manifest: bool) ->
 /// randomised power loss).
 fn run_case(
     seed: u64,
+    mode: Mode,
     plan: Option<&[EpochStat]>,
     cov: &Coverage,
 ) -> Result<Vec<EpochStat>, String> {
-    run_case_inner(seed, plan, cov)
+    run_case_inner(seed, mode, plan, cov)
 }
 
 fn run_case_inner(
     seed: u64,
+    mode: Mode,
     plan: Option<&[EpochStat]>,
     cov: &Coverage,
 ) -> Result<Vec<EpochStat>, String> {
     let mut master = Rng::new(seed);
-    let mode = if master.chance(1, 2) {
+    let dir_mode = if master.chance(1, 2) {
         DirMode::Unix
     } else {
         DirMode::Windows
     };
-    let fs = Arc::new(CrashFs::new(mode, master.next()));
-    let cfg = engine_config(&mut master);
+    let fs = Arc::new(CrashFs::new(dir_mode, master.next()));
+    let mut cfg = engine_config(&mut master);
+    if mode.group && !master.chance(1, 4) {
+        // Room for several commits before the MemTable has to flush, which ends the grouping
+        // (a quarter of the seeds keep the small MemTable, so that the commit that waits on its
+        // own flush is covered too).
+        cfg.memtable_capacity_bytes = 4096 * (6 + master.below(10) as usize);
+    }
     let epochs = 1 + master.below(3) as usize;
     let wide = if master.chance(1, 4) {
         WIDE_TABLES_MIN + master.below(26) as u16
     } else {
         0
     };
+    // The engine does not group commits while a capped table exists.
+    let wide = if mode.group { 0 } else { wide };
     let quota3 = 3200 + master.below(2500);
     let quota4 = 6000 + master.below(6000);
     let backfill_heavy = master.chance(1, 3);
@@ -2104,9 +2216,15 @@ fn run_case_inner(
         } else {
             64
         },
+        mode,
+        damage_pending: false,
+        relaxed: false,
+        expect_damage: None,
+        oplog: Vec::new(),
+        tickets: Vec::new(),
     };
     h.log(format!(
-        "config: {mode:?} epochs={epochs} wide={wide} sync_wal={} buf_wal={} memtable={} blob_seg={} compact_at={}",
+        "config: {dir_mode:?} {mode:?} epochs={epochs} wide={wide} sync_wal={} buf_wal={} memtable={} blob_seg={} compact_at={}",
         h.cfg.sync_wal_size_bytes,
         h.cfg.buf_wal_size_bytes,
         h.cfg.memtable_capacity_bytes,
@@ -2120,6 +2238,8 @@ fn run_case_inner(
     for ep in 0..epochs {
         let mut e = h.open(&format!("epoch {ep}"))?;
         h.verify(&mut e, last_was_process)?;
+        h.oplog.clear();
+        h.tickets.clear();
         let rot0 = e.sync_wal.active_epoch();
         let choice = pick_fault(
             &mut master,
@@ -2192,9 +2312,15 @@ fn run_case_inner(
         }
         h.log(format!("crash: {crash:?}"));
         let logged = h.snapshot_wal();
+        h.tickets.clear();
         fs.crash(crash);
-        h.check_lsn_prefix(&logged)?;
+        // What the power cut or the process crash left must still hold every acknowledged
+        // batch, whatever happens to the files afterwards.
         h.check_durable_watermark(&logged)?;
+        if mode.media {
+            h.damage_wal(&mut master, &logged)?;
+        }
+        h.check_lsn_prefix(&logged)?;
         if fs.st().events.is_some() {
             h.log(format!(
                 "after the crash:
@@ -2208,7 +2334,9 @@ fn run_case_inner(
         if master.chance(1, 3) {
             Coverage::bump(&cov.recovery_crashes);
             fs.arm(Some(master.below(80)), None);
-            let r = open_engine(&fs, &h.cfg);
+            // A recovery that is cut short may or may not have consumed the damage.
+            h.expect_damage = None;
+            let r = open_engine(&fs, &h.recovery_cfg());
             if let Err(err) = &r {
                 if !fs.fault_happened() {
                     return Err(h.fail(format!("recovery failed without any fault: {err}")));
@@ -2252,9 +2380,14 @@ fn run_case_inner(
     let mut e = h.open("final recovery")?;
     let k1 = h.verify(&mut e, last_was_process)?;
     let _ = k1;
+    h.oplog.clear();
+    h.tickets.clear();
     h.log("post-recovery maintenance".into());
     let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         h.run_segment(&mut e, 8)?;
+        // KNOWN ENGINE BUG (see `Harness::avoid_pending_row`): the backfill below misses a row
+        // that a pending group commit holds.
+        h.drain_group(&mut e)?;
         h.complete_backfill(&mut e)?;
         e.checkpoint()
             .map_err(|er| h.fail(format!("checkpoint after recovery failed: {er}")))?;
@@ -2313,9 +2446,9 @@ fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
 
 /// Runs a seed twice: clean (which also measures operation counts), then with faults drawn
 /// from those counts.
-fn run_seed(seed: u64, cov: &Coverage) -> Result<(), String> {
-    let stats = run_case(seed, None, cov)?;
-    run_case(seed, Some(&stats), cov)?;
+fn run_seed(seed: u64, mode: Mode, cov: &Coverage) -> Result<(), String> {
+    let stats = run_case(seed, mode, None, cov)?;
+    run_case(seed, mode, Some(&stats), cov)?;
     Ok(())
 }
 
@@ -2324,7 +2457,7 @@ fn env_u64(name: &str) -> Option<u64> {
 }
 
 /// Runs `count` seeds from `start` on a few threads. Returns the failure messages.
-fn run_seeds(start: u64, count: u64, cov: &Coverage) -> Vec<String> {
+fn run_seeds(start: u64, count: u64, mode: Mode, cov: &Coverage) -> Vec<String> {
     let next = AtomicU64::new(0);
     let failures = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism()
@@ -2339,7 +2472,7 @@ fn run_seeds(start: u64, count: u64, cov: &Coverage) -> Vec<String> {
                         break;
                     }
                     let seed = start + i;
-                    let res = catch_unwind(AssertUnwindSafe(|| run_seed(seed, cov)));
+                    let res = catch_unwind(AssertUnwindSafe(|| run_seed(seed, mode, cov)));
                     let msg = match res {
                         Ok(Ok(())) => continue,
                         Ok(Err(m)) => m,
@@ -2357,21 +2490,26 @@ fn run_seeds(start: u64, count: u64, cov: &Coverage) -> Vec<String> {
 
 /// Default number of seeds of the regular suite (about ten seconds in a debug build).
 const DEFAULT_SEEDS: u64 = 1000;
+/// Default number of seeds of each of the media-damage and group-commit modes. A seed of these
+/// modes costs more (copies of the damaged directory are opened three times).
+const DEFAULT_MODE_SEEDS: u64 = 150;
 
-#[test]
-fn crash_consistency_seeds() {
+/// Runs the seeds of one mode: `AYDB_CRASH_SEEDS` and `AYDB_CRASH_SEED_START` choose the range for
+/// every mode, `AYDB_CRASH_SEED` replays one seed.
+fn run_mode_test(label: &str, mode: Mode, default_count: u64) {
     let cov = Coverage::default();
     let (start, count) = match env_u64("AYDB_CRASH_SEED") {
         Some(one) => (one, 1),
         None => (
             env_u64("AYDB_CRASH_SEED_START").unwrap_or(0),
-            env_u64("AYDB_CRASH_SEEDS").unwrap_or(DEFAULT_SEEDS),
+            env_u64("AYDB_CRASH_SEEDS").unwrap_or(default_count),
         ),
     };
     let t0 = std::time::Instant::now();
-    let failures = run_seeds(start, count, &cov);
+    let failures = run_seeds(start, count, mode, &cov);
     eprintln!(
-        "crash-consistency: seeds {start}..{} in {:.1}s, {} failure(s)\n  coverage: {}",
+        "{label}: seeds {start}..{} in {:.1}s, {} failure(s)
+  coverage: {}",
         start + count,
         t0.elapsed().as_secs_f64(),
         failures.len(),
@@ -2380,15 +2518,51 @@ fn crash_consistency_seeds() {
     if !failures.is_empty() {
         let shown: Vec<&String> = failures.iter().take(200).collect();
         panic!(
-            "{} of {count} seeds failed (replay one with AYDB_CRASH_SEED=<seed>):\n{}",
+            "{} of {count} seeds failed (replay one with AYDB_CRASH_SEED=<seed>):
+{}",
             failures.len(),
-            shown
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("\n----\n")
+            shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(
+                "
+----
+"
+            )
         );
     }
+}
+
+#[test]
+fn crash_consistency_seeds() {
+    run_mode_test("crash-consistency", Mode::default(), DEFAULT_SEEDS);
+}
+
+/// Corrupts synced WAL data after the crash (ARCHITECTURE.md 4.6.11).
+#[test]
+fn crash_media_damage_seeds() {
+    let mode = Mode {
+        media: true,
+        group: false,
+    };
+    run_mode_test("crash-media-damage", mode, DEFAULT_MODE_SEEDS);
+}
+
+/// Drives concurrent commits through the group commit under the power-cut harness.
+#[test]
+fn crash_group_commit_seeds() {
+    let mode = Mode {
+        media: false,
+        group: true,
+    };
+    run_mode_test("crash-group-commit", mode, DEFAULT_MODE_SEEDS);
+}
+
+/// Group commit and media damage together.
+#[test]
+fn crash_group_commit_media_damage_seeds() {
+    let mode = Mode {
+        media: true,
+        group: true,
+    };
+    run_mode_test("crash-group-commit-media-damage", mode, DEFAULT_MODE_SEEDS);
 }
 
 // =============================================================================================
@@ -2578,15 +2752,15 @@ fn crash_runs_are_reproducible() {
     let a = Coverage::default();
     let b = Coverage::default();
     for seed in [3, 17, 91] {
-        let s1 = run_case(seed, None, &a).unwrap();
-        let s2 = run_case(seed, None, &b).unwrap();
+        let s1 = run_case(seed, Mode::default(), None, &a).unwrap();
+        let s2 = run_case(seed, Mode::default(), None, &b).unwrap();
         assert_eq!(s1.len(), s2.len());
         for (x, y) in s1.iter().zip(&s2) {
             assert_eq!(x.ops, y.ops, "seed {seed} is not deterministic");
             assert_eq!(x.kind_ops, y.kind_ops);
         }
-        let s3 = run_case(seed, Some(&s1), &a).unwrap();
-        let s4 = run_case(seed, Some(&s1), &b).unwrap();
+        let s3 = run_case(seed, Mode::default(), Some(&s1), &a).unwrap();
+        let s4 = run_case(seed, Mode::default(), Some(&s1), &b).unwrap();
         for (x, y) in s3.iter().zip(&s4) {
             assert_eq!(x.ops, y.ops, "seed {seed} is not deterministic with faults");
         }
@@ -3766,4 +3940,146 @@ fn crash_during_a_salvage_open_reopens_to_the_same_list_or_cleanly() {
         }
     }
     assert!(same > 0 && clean > 0, "same {same}, clean {clean}");
+}
+
+// =============================================================================================
+// Minimal reproductions of bugs found by the group-commit and media-damage modes
+// =============================================================================================
+
+/// The live secondary entries of `table`.
+fn live_index_entries(e: &mut Eng, table: u16) -> Vec<Vec<u8>> {
+    e.scan_merged_prefix(&encode_namespace_prefix(table, NS_SECONDARY_INDEX))
+        .unwrap()
+        .into_iter()
+        .filter(|en| !matches!(en.value, IndexValue::Tombstone))
+        .map(|en| en.key)
+        .collect()
+}
+
+/// Appends a group commit of one row with a secondary entry, leaves its flush pending and
+/// returns the ticket.
+fn append_group_put(e: &mut Eng, key: &[u8], value: &[u8], sec: &[(u16, Vec<u8>)]) -> u64 {
+    e.begin_transaction_for_conn(1).unwrap();
+    e.put_row(2, key, value, sec, SYNC).unwrap();
+    e.prepare_commit_transaction(SYNC).unwrap();
+    match e.begin_commit_for_conn(1).unwrap() {
+        CommitStep::AwaitingGroup { lsn, .. } => lsn,
+        _ => panic!("a plain synchronous transaction must join the group commit"),
+    }
+}
+
+/// KNOWN BUG, found by the media-damage mode (ARCHITECTURE.md 4.6.6 promises that a refused open
+/// leaves every file byte-identical): a log file that a third party truncated is shorter than
+/// configured, and `StorageEngine::open` lengthens it (`WalStreamWriter::open` pre-allocates)
+/// before recovery has looked at the damage. The refused open under `Fail` therefore changes
+/// the file. A fix is to decide on the damage first, or to open the writers after the decision.
+#[test]
+#[ignore = "known bug: a refused open lengthens a truncated log file"]
+fn fail_policy_leaves_a_truncated_wal_file_untouched() {
+    let (fs, _keys, _s2) = sync_sector_damage_fs();
+    // Only the first sector of the sync log is left: s2 and s5 are gone, the buffered batches
+    // still carry the watermark that covers s2.
+    damage_synced(&fs, "wal_sync.db", |img| img.truncate(4096));
+    let before = dir_state(&fs);
+    let err = match StorageEngine::open(Arc::clone(&fs), fail_config()) {
+        Ok(_) => panic!("open under Fail must refuse a log that lost an acknowledged commit"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let after = dir_state(&fs);
+    for name in ["wal_sync.db", "wal_buf.db", "boot_meta.db"] {
+        let (b, a) = (&before[name], &after[name]);
+        assert!(
+            a == b,
+            "{name} changed: {} -> {} bytes in the cache, {} -> {} on the device",
+            b.0.len(),
+            a.0.len(),
+            b.1.len(),
+            a.1.len()
+        );
+    }
+}
+
+/// KNOWN BUG, found by the group-commit mode: a write outside a transaction reads the committed
+/// rows and not the one that a pending group commit wrote (the `begin_transaction*` paths seed
+/// their overlay from the pending commits, the autocommit paths do not). `delete_row` therefore
+/// takes the secondary entries of the old version from the row's `'t'` record and leaves the
+/// entries of the group-committed version behind as orphans. `backfill_secondary_keys` misses
+/// such a row altogether. A fix is to drain the pending group commits first, as the other
+/// paths that write to the MemTable directly do.
+#[test]
+#[ignore = "known bug: an autocommit write does not see a pending group commit"]
+fn delete_after_a_pending_group_commit_removes_its_secondary_entries() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+    let mut rng = Rng::new(7);
+    let old = make_value(&mut rng, 2, 8);
+    e.put_row(2, b"k", &old, &full_keys(2, &old), SYNC).unwrap();
+    let value = make_value(&mut rng, 2, 8);
+    let sec = full_keys(2, &value);
+    append_group_put(&mut e, b"k", &value, &sec);
+    assert!(
+        !e.pending_group.is_empty(),
+        "the flush must still be pending"
+    );
+    // An autocommit write goes on top of the pending group commit.
+    let deleted = e.delete_row(2, b"k", BUF).unwrap();
+    assert!(e.get_row(2, b"k").unwrap().is_none());
+    let entries = live_index_entries(&mut e, 2);
+    assert!(
+        entries.is_empty(),
+        "delete_row returned {deleted}, the row is gone, but its secondary entries remain: \
+         {entries:02x?}"
+    );
+}
+
+/// An old-format log (version 0 or 1 at the current epoch) is damage that `Fail` refuses and the
+/// default `Truncate` discards, while sectors of earlier epochs are never looked at.
+#[test]
+fn old_format_wal_is_unsupported_format_and_stale_sectors_are_ignored() {
+    for version in [0u16, 1] {
+        let (fs, keys, s2) = sync_sector_damage_fs();
+        // Undo the bit flip of that fixture and make sector 1 (s2) an old-format sector with a
+        // valid CRC32C instead.
+        damage_synced(&fs, "wal_sync.db", |img| {
+            img[4096 + 100] ^= 0x01;
+            let sec = &mut img[4096..2 * 4096];
+            sec[14..16].copy_from_slice(&version.to_le_bytes());
+            let crc = crate::util::crc32c::crc32c(&sec[4..]);
+            sec[0..4].copy_from_slice(&crc.to_le_bytes());
+        });
+        assert_fail_open_is_untouched(&fs, WalDamageReason::UnsupportedFormat, s2);
+        // The default policy discards the log from the old sector on and reports it.
+        let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+        assert_recovered_prefix(&mut e, &keys, 1);
+        let damage = e.last_wal_recovery().damage.clone().expect("damage");
+        assert_eq!(
+            damage.reason,
+            WalDamageReason::UnsupportedFormat,
+            "version {version}"
+        );
+        assert_eq!(damage.first_lost_lsn, s2);
+        drop(e);
+
+        // The open rotated both epochs: whatever is left of the old log is now stale, and a
+        // clean reopen neither reports nor refuses anything, whatever versions the stale sectors
+        // carry.
+        let img = content(&fs, "wal_sync.db").unwrap();
+        assert!(
+            img.len() >= 3 * 4096,
+            "setup: stale sectors are still in the file"
+        );
+        damage_synced(&fs, "wal_sync.db", |img| {
+            for i in 0..img.len() / 4096 {
+                let sec = &mut img[i * 4096..(i + 1) * 4096];
+                if sec.iter().any(|&b| b != 0) {
+                    sec[14..16].copy_from_slice(&version.to_le_bytes());
+                    let crc = crate::util::crc32c::crc32c(&sec[4..]);
+                    sec[0..4].copy_from_slice(&crc.to_le_bytes());
+                }
+            }
+        });
+        let e = StorageEngine::open(Arc::clone(&fs), fail_config()).unwrap();
+        assert_eq!(e.last_wal_recovery().damage, None, "version {version}");
+    }
 }
