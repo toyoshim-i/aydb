@@ -846,11 +846,14 @@ pub struct SingleStreamRecovery {
     /// Index of the first sector after the valid log prefix (where new writes may resume).
     pub next_sector_idx: usize,
     /// Intact batches found in current-epoch sectors after the first sector the scan could not
-    /// use. They are never replayed: a batch before them may be lost. Their `prev_lsn` links and
-    /// `durable_lsn` values still bound the lost range (ARCHITECTURE.md 4.6.4).
+    /// use, up to the end of the log (a never-written or intact older-epoch sector, after which
+    /// nothing is read). They are never replayed: a batch before them may be lost. Their
+    /// `prev_lsn` links and `durable_lsn` values still bound the lost range (ARCHITECTURE.md
+    /// 4.6.4).
     pub(crate) past_stop: Vec<WalBatch>,
-    /// Current-epoch sectors that failed their CRC32C or whose contents did not parse, anywhere
-    /// in the file. After a power cut these are torn writes of the unsynced tail.
+    /// Current-epoch sectors that failed their CRC32C or whose contents did not parse, up to the
+    /// end of the log (a never-written or intact older-epoch sector, which stops the scan).
+    /// After a power cut these are torn writes of the unsynced tail.
     pub(crate) corrupt_sectors: usize,
     /// The first current-epoch sector with a valid CRC but a format version other than
     /// [`WAL_FORMAT_VERSION`].
@@ -868,7 +871,11 @@ pub(crate) struct UnsupportedWalFormat {
 enum SectorScan {
     /// The sector parsed completely.
     Usable,
-    /// Its epoch is not the expected one: an older sector, or never written.
+    /// The ordinary end of the log: a sector that was never written (all zeros), or an intact
+    /// sector (valid CRC32C) of an older epoch.
+    EndOfLog,
+    /// Its epoch is not the expected one, and it is not an intact older sector: a newer epoch,
+    /// or an older one whose CRC32C fails (a torn write).
     OtherEpoch,
     /// The CRC32C failed, or the contents did not parse (batches found before the bad spot in
     /// the same sector were still delivered).
@@ -889,11 +896,19 @@ fn scan_sector(
     partial: &mut Option<Vec<u8>>,
     out: &mut Vec<WalBatch>,
 ) -> SectorScan {
-    let sector_epoch = u64::from_le_bytes(sector[4..12].try_into().unwrap());
-    if sector_epoch != expected_epoch {
-        return SectorScan::OtherEpoch;
+    if sector.iter().all(|&b| b == 0) {
+        return SectorScan::EndOfLog;
     }
+    let sector_epoch = u64::from_le_bytes(sector[4..12].try_into().unwrap());
     let expected_crc = u32::from_le_bytes(sector[0..4].try_into().unwrap());
+    if sector_epoch != expected_epoch {
+        let intact = crc32c(&sector[4..WAL_SECTOR_SIZE]) == expected_crc;
+        return if sector_epoch < expected_epoch && intact {
+            SectorScan::EndOfLog
+        } else {
+            SectorScan::OtherEpoch
+        };
+    }
     if crc32c(&sector[4..WAL_SECTOR_SIZE]) != expected_crc {
         return SectorScan::Corrupt;
     }
@@ -961,11 +976,20 @@ fn scan_sector(
 
 /// Scans a single WAL file from Sector 0 and extracts the [`WalBatch`] items of `expected_epoch`.
 ///
-/// The valid prefix ends at the first sector with an older epoch, a torn-write CRC, an unparsable
-/// body or an unsupported format version. The scan does not stop there: it reads the whole file
-/// and collects the intact batches of later current-epoch sectors in `past_stop`, because
+/// The valid prefix ends at the first sector that is not a usable current-epoch sector: an
+/// older epoch, a newer one, a torn-write CRC, an unparsable body or an unsupported format
+/// version. The scan does not always stop reading there. Past an unusable sector it goes on and
+/// collects the intact batches of later current-epoch sectors in `past_stop`, because
 /// write-back reordering can persist a later sector while losing an earlier one. After a stop it
 /// also forgets any half-read batch, since the rest of it lies in the sector that was lost.
+///
+/// The one exception is the ordinary end of the log: a sector that is all zeros (never written)
+/// or an older-epoch sector with a valid CRC32C (left over from before the last epoch rotation).
+/// It ends the scan for good, wherever it comes, and the rest of the file is not read. After a
+/// clean shutdown and an epoch rotation that is sector 0, so a clean open reads one window
+/// instead of the whole file. The price: a sector that was lost and still holds intact older
+/// content, or zeros, ends the scan like the end of the log, so that loss goes unreported. The
+/// replay is still a correct prefix.
 pub fn recover_single_wal_stream<F: PlatformFile>(
     file: &F,
     expected_epoch: u64,
@@ -982,7 +1006,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
     let mut window_buf = vec![0u8; WINDOW_SECTORS * WAL_SECTOR_SIZE];
 
     let mut sec_idx = 0usize;
-    while sec_idx < total_sectors {
+    'scan: while sec_idx < total_sectors {
         let count = (total_sectors - sec_idx).min(WINDOW_SECTORS);
         let byte_len = count * WAL_SECTOR_SIZE;
         file.read_exact_at(
@@ -1004,6 +1028,7 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
                     }
                     continue;
                 }
+                SectorScan::EndOfLog => break 'scan,
                 SectorScan::OtherEpoch => {}
                 SectorScan::Corrupt => rec.corrupt_sectors += 1,
                 SectorScan::OtherVersion(version) => {

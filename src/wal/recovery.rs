@@ -103,7 +103,9 @@ impl std::error::Error for WalDamage {}
 pub struct WalRecoveryReport {
     /// Current-epoch sectors that failed their CRC32C or did not parse. Informational: after a
     /// power cut these are torn writes of the unsynced tail, which are not damage. The ordinary
-    /// end of the log (a sector of an older epoch) is not counted.
+    /// end of the log (a never-written sector, or an intact sector of an older epoch) is not
+    /// counted, and the scan reads nothing past it: a lost sector that still holds such content
+    /// is not reported either.
     pub torn_tail_sectors: StreamCounts,
     /// Batches handed to replay, per stream (batches without a record to apply, such as a lone
     /// transaction marker, are not counted).

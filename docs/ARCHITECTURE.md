@@ -243,6 +243,10 @@ Consequences:
 * If the batch whose LSN equals `floor` is not itself found, an acknowledged batch is gone: the tail beyond the last chain-valid batch reaches below `floor` (reason `AcknowledgedTailLost`).
 * A valid sector after a stop is **not** damage by itself. Its only roles are to contribute its `durable_lsn` to `floor` and to bound the lost range (it is the proof that something at or after the stop existed). Treating "valid data after a hole" as damage would flag every power cut that persisted buffered pages out of order, which is the false positive the watermark exists to avoid.
 
+**Where the scan of a file ends.** Each file is scanned from sector 0 in 64-sector (256 KB) windows. A sector that is not a usable current-epoch sector (CRC32C failure, unparsable body, unsupported format version, a newer epoch, or an older epoch whose CRC32C fails, which is a torn write) stops the valid prefix, but the scan reads on and collects the later intact current-epoch batches, for the reasons above. Only the **ordinary end of the log** ends the scan itself, wherever it comes: a sector that is all zeros (never written), or a sector of an older epoch whose CRC32C is valid (left over from before the last epoch rotation). Nothing is read past it. Since both epochs rotate on every `open`, after a clean shutdown sector 0 of each file is already of an older epoch, so a clean open reads one window per file instead of 8 MB plus 16 MB.
+
+*Accepted limitation:* a sector that was lost and now holds intact older-epoch content, or zeros, is indistinguishable from the end of the log. It ends the scan, the batches behind it are not read, and the loss is neither counted in `torn_tail_sectors` nor used for `floor`, so damage of that kind can go unreported. The replay is still a correct prefix of the log. A lost sector that fails its CRC32C (a torn write, bit rot) is not affected and is still reported.
+
 Example (buffered stream persisted out of order; power cut):
 
 ```
@@ -399,7 +403,7 @@ pub enum WalDamageReason {
 
 #### 4.6.9 Concurrency and cost
 
-Recovery already reads both files completely; the chain walk is a linear pass over the merged batches and keeps only the previous LSN. Normal operation adds two `u64` per batch (4.6.5) and two engine fields (`last_appended_lsn`, `durable_lsn`), both guarded by the engine lock that already serializes appends. No extra sync is introduced: the watermark records what the existing flush ordering already established.
+Recovery reads each file in 64-sector windows and stops at the ordinary end of the log (a never-written sector or an intact older-epoch sector, 4.6.4), so a clean open reads one window per file rather than both files completely (8 MB plus 16 MB by default). Reading both files completely on every open, as an earlier revision of the scan did, cost a clean reopen about 6.0 ms; with the early end it is about 3.0 ms. Measured against 97075fb with the stop rule changed only in `recover_single_wal_stream`: `StorageEngine::open` with `EngineConfig::default()` on a directory holding 20 rows, release build, Windows, warm cache, median of 25 opens, repeated runs gave 5.7 to 6.2 ms before and 2.9 to 3.1 ms after. Past an unusable sector the scan still reads to the end of the file or to the first end-of-log sector, so damaged logs cost what they did. The chain walk is a linear pass over the merged batches and keeps only the previous LSN. Normal operation adds two `u64` per batch (4.6.5) and two engine fields (`last_appended_lsn`, `durable_lsn`), both guarded by the engine lock that already serializes appends. No extra sync is introduced: the watermark records what the existing flush ordering already established.
 
 #### 4.6.10 Alternatives considered
 

@@ -298,8 +298,9 @@ fn out_of_order_buffered_persistence() -> Logs {
     // Appended after the sync of 10 completed: they carry watermark 10.
     l.buf(&put(11, 10, 10));
     l.buf(&put(12, 11, 10));
-    // Batch 11 lived in sector 0 of the buffered log, and write-back lost it.
-    Logs::zero(&l.buf, 0);
+    // Batch 11 lived in sector 0 of the buffered log, and write-back left it torn. (A sector
+    // that came back as zeros would end the scan instead, and 12 would not be found.)
+    Logs::flip_bit(&l.buf, 0);
     l
 }
 
@@ -330,7 +331,8 @@ fn a_later_sync_batch_turns_the_same_loss_into_damage() {
     let r = l.recover(9);
     assert_eq!(lsns(&r), vec![10]);
     let d = r.report.damage.expect("damage");
-    assert_eq!(d.reason, WalDamageReason::MissingPredecessor);
+    // The loss is a sector that fails its CRC32C, which the reason names (4.6.6).
+    assert_eq!(d.reason, WalDamageReason::CorruptSector);
     assert_eq!(d.first_lost_lsn, 11);
     assert_eq!(d.last_lsn_seen, 13);
     assert_eq!(
@@ -352,8 +354,8 @@ fn a_lost_power_cut_tail_above_floor_is_silent() {
     l.buf(&put(12, 11, 10));
     l.buf(&put(13, 12, 10));
     // The last two buffered sectors never reached the disk (torn, then zero).
-    Logs::flip_bit(&l.buf, 2);
-    Logs::zero(&l.buf, 1);
+    Logs::flip_bit(&l.buf, 1);
+    Logs::zero(&l.buf, 2);
     let r = l.recover(9);
     assert_eq!(lsns(&r), vec![10, 11]);
     assert_eq!(r.report.damage, None);
@@ -605,4 +607,182 @@ fn stale_epoch_sectors_past_the_tail_are_ignored() {
     assert!(r.merged_batches.is_empty());
     assert_eq!(r.report.damage, None);
     assert_eq!(r.max_recovered_lsn, 0);
+}
+
+// ---- Where the scan of a file ends (ARCHITECTURE.md 4.6.4, 4.6.9) ----
+
+/// Rewrites the epoch of a sector and, when `reseal` is set, its CRC32C as well. A resealed
+/// sector with a lower epoch looks like a leftover of an earlier epoch; an unsealed one like a
+/// torn write.
+fn set_epoch(w: &WalStreamWriter<File>, sector: usize, epoch: u64, reseal: bool) {
+    let off = (sector * WAL_SECTOR_SIZE) as u64;
+    let mut sec = vec![0u8; WAL_SECTOR_SIZE];
+    w.file().read_exact_at(&mut sec, off).unwrap();
+    sec[4..12].copy_from_slice(&epoch.to_le_bytes());
+    if reseal {
+        let crc = crc32c(&sec[4..]);
+        sec[0..4].copy_from_slice(&crc.to_le_bytes());
+    }
+    w.file().write_all_at(&sec, off).unwrap();
+}
+
+fn sync_log_of_three(name: &str) -> Logs {
+    let mut l = logs(name);
+    l.sync(&put(1, 0, 0));
+    l.sync(&put(2, 1, 1));
+    l.sync(&put(3, 2, 2));
+    l
+}
+
+fn scan_sync(l: &Logs) -> SingleStreamRecovery {
+    recover_single_wal_stream(&**l.sync.file(), 1).unwrap()
+}
+
+fn past_lsns(rec: &SingleStreamRecovery) -> Vec<u64> {
+    rec.past_stop.iter().map(|b| b.lsn).collect()
+}
+
+#[test]
+fn an_intact_older_epoch_sector_ends_the_scan() {
+    let l = sync_log_of_three("wal_end_stale");
+    set_epoch(&l.sync, 1, 0, true);
+    let rec = scan_sync(&l);
+    assert_eq!(rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(), [1]);
+    assert_eq!(
+        past_lsns(&rec),
+        Vec::<u64>::new(),
+        "nothing is read past the end"
+    );
+    assert_eq!(rec.corrupt_sectors, 0);
+    assert_eq!(rec.next_sector_idx, 1);
+
+    // Batch 3 must not reach the report, the floor or the LSN high-water mark either.
+    let r = l.recover(0);
+    assert_eq!(lsns(&r), vec![1]);
+    assert_eq!(r.report.damage, None);
+    assert_eq!(r.max_recovered_lsn, 1);
+}
+
+#[test]
+fn an_all_zero_sector_ends_the_scan() {
+    let l = sync_log_of_three("wal_end_zero");
+    Logs::zero(&l.sync, 1);
+    let rec = scan_sync(&l);
+    assert_eq!(rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(), [1]);
+    assert_eq!(
+        past_lsns(&rec),
+        Vec::<u64>::new(),
+        "nothing is read past the end"
+    );
+    assert_eq!(rec.corrupt_sectors, 0);
+
+    let r = l.recover(0);
+    assert_eq!(lsns(&r), vec![1]);
+    assert_eq!(r.report.damage, None);
+    assert_eq!(r.max_recovered_lsn, 1);
+}
+
+#[test]
+fn a_crc_failure_does_not_end_the_scan() {
+    // Guard: a corrupt sector is damage, not an end; the intact batch behind it is still found.
+    let l = sync_log_of_three("wal_read_on_crc");
+    Logs::flip_bit(&l.sync, 1);
+    let rec = scan_sync(&l);
+    assert_eq!(rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(), [1]);
+    assert_eq!(past_lsns(&rec), vec![3]);
+    assert_eq!(rec.corrupt_sectors, 1);
+}
+
+#[test]
+fn a_torn_older_epoch_sector_does_not_end_the_scan() {
+    // An older epoch whose CRC32C fails cannot be told from a torn write: it is read past.
+    let l = sync_log_of_three("wal_read_on_torn_stale");
+    set_epoch(&l.sync, 1, 0, false);
+    let rec = scan_sync(&l);
+    assert_eq!(rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(), [1]);
+    assert_eq!(past_lsns(&rec), vec![3]);
+    assert_eq!(
+        rec.corrupt_sectors, 0,
+        "an epoch mismatch was never counted as corruption"
+    );
+}
+
+#[test]
+fn a_newer_epoch_sector_does_not_end_the_scan() {
+    let l = sync_log_of_three("wal_read_on_newer");
+    set_epoch(&l.sync, 1, 2, true);
+    let rec = scan_sync(&l);
+    assert_eq!(rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(), [1]);
+    assert_eq!(past_lsns(&rec), vec![3]);
+}
+
+/// A file that counts what is read from it.
+struct CountingFile {
+    inner: Arc<File>,
+    reads: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl PlatformFile for CountingFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(buf, offset)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.inner.write_all_at(buf, offset)
+    }
+    fn file_len(&self) -> io::Result<u64> {
+        self.inner.file_len()
+    }
+    fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+        self.inner.preallocate(target_len, strategy)
+    }
+    fn sync_barrier(&self) -> io::Result<()> {
+        self.inner.sync_barrier()
+    }
+    fn sync_durable(&self) -> io::Result<()> {
+        self.inner.sync_durable()
+    }
+    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.evict_os_cache(offset, len)
+    }
+}
+
+#[test]
+fn a_file_left_over_from_an_older_epoch_is_read_one_window_at_most() {
+    // What a clean reopen sees: the epoch was rotated, so sector 0 is of the epoch before.
+    let tmp = TempTestDir::new("wal_clean_reopen_reads");
+    let fs = OsFs::open(&tmp.path, true).unwrap();
+    let mut w = WalStreamWriter::open(
+        &fs,
+        WAL_BUF_FILE_NAME,
+        16 * 1024 * 1024,
+        1,
+        WalStreamMode::BufferedImmediateOsCache,
+    )
+    .unwrap();
+    w.append_batch(&put(1, 0, 0)).unwrap();
+    w.seal_open_sector_for_durability().unwrap();
+    set_epoch(&w, 0, 0, true);
+    let counting = CountingFile {
+        inner: Arc::clone(w.file()),
+        reads: Default::default(),
+        bytes: Default::default(),
+    };
+    let rec = recover_single_wal_stream(&counting, 1).unwrap();
+    assert!(rec.batches.is_empty());
+    let reads = counting.reads.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = counting.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(reads, 1);
+    assert!(bytes <= 64 * WAL_SECTOR_SIZE, "read {bytes} bytes");
 }
