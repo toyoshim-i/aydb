@@ -30,8 +30,9 @@ pub(super) struct ParsedVtabDdl {
     /// The key column is a rowid alias: declared exactly `INTEGER PRIMARY KEY` (not `DESC`).
     /// Only then does a NULL key mean "assign the next key".
     pub(super) pk_rowid_alias: bool,
-    /// Some column has a `CHECK` constraint, which this adapter cannot enforce.
-    pub(super) has_check: bool,
+    /// Why some column cannot be honoured (`CHECK`, `DEFAULT`), as the error message for
+    /// `xCreate` and for every write.
+    pub(super) unsupported: Option<&'static str>,
     pub(super) pk_collation: ColCollation,
     pub(super) secondary_indexes: Vec<(usize, u16)>,
 }
@@ -226,6 +227,11 @@ fn token_keyword(token: &str) -> Option<String> {
     }
 }
 
+/// Why a clause that an older build accepted cannot be honoured: creating such a table is
+/// refused, and a table that has one refuses INSERT and UPDATE.
+pub(super) const CHECK_UNSUPPORTED: &str = "CHECK constraints are not supported by aydb tables";
+pub(super) const DEFAULT_UNSUPPORTED: &str = "DEFAULT values are not supported by aydb tables";
+
 /// Words that start a column constraint and therefore end the type name.
 const CONSTRAINT_KEYWORDS: [&str; 11] = [
     "CONSTRAINT",
@@ -255,7 +261,7 @@ struct ColumnDef {
     primary_key: bool,
     /// `INTEGER PRIMARY KEY` that SQLite treats as an alias of the rowid.
     rowid_alias: bool,
-    check: bool,
+    unsupported: Option<&'static str>,
     /// The definition as declared to SQLite. A `PRIMARY KEY` that is not a rowid alias and
     /// `UNIQUE` are left out: SQLite would build an automatic index for each, and it walks those
     /// when it checks the database, finding pages that a virtual table does not have
@@ -293,7 +299,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         unique: false,
         primary_key: false,
         rowid_alias: false,
-        check: false,
+        unsupported: None,
         declared: String::new(),
     };
     let mut i = 1usize;
@@ -370,8 +376,30 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
             // Parsed so that the rest of the definition is read correctly. The adapter cannot
             // evaluate it, so `xCreate` rejects it and a table that has one refuses writes.
             "CHECK" => {
-                def.check = true;
+                def.unsupported.get_or_insert(CHECK_UNSUPPORTED);
                 i = skip_paren_group(tokens, i).ok_or(SQLITE_ERROR)?;
+            }
+            // `DEFAULT value`, `DEFAULT(expr)` or `DEFAULT 'text'`: skipped like CHECK. A write
+            // that leaves the column out would store NULL, not the default, so a table that has
+            // one is read-only for inserts and updates (see `unsupported`).
+            "DEFAULT" => {
+                def.unsupported.get_or_insert(DEFAULT_UNSUPPORTED);
+                let word_len = tokens[i]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                if tokens[i].len() > word_len {
+                    i += 1;
+                } else {
+                    i += 1;
+                    if matches!(tokens.get(i), Some(&"+") | Some(&"-")) {
+                        i += 1;
+                    }
+                    if i >= tokens.len() {
+                        return Err(SQLITE_ERROR);
+                    }
+                    i += 1;
+                }
             }
             "COLLATE" => {
                 let Some(name) = tokens.get(i + 1) else {
@@ -395,7 +423,8 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                 }
                 i = skip_foreign_key_actions(tokens, i)?;
             }
-            // DEFAULT values and generated columns are not supported.
+            // Generated columns cannot even be declared to SQLite for a virtual table, so no
+            // table with one exists.
             _ => return Err(SQLITE_ERROR),
         }
         let leaves_index = keyword == "UNIQUE" || (keyword == "PRIMARY" && !def.rowid_alias);
@@ -525,7 +554,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
         let mut pk_rowid_alias = false;
-        let mut has_check = false;
+        let mut unsupported: Option<&'static str> = None;
         let mut declared_columns: Vec<String> = Vec::new();
         for col_def in split_top_level_commas(&columns_spec) {
             let trimmed = col_def.trim();
@@ -551,7 +580,9 @@ pub(super) unsafe fn parse_vtab_ddl(
                 pk_col_idx = col_names.len();
                 pk_rowid_alias = def.rowid_alias;
             }
-            has_check |= def.check;
+            if unsupported.is_none() {
+                unsupported = def.unsupported;
+            }
             declared_columns.push(def.declared);
             col_names.push(def.name);
             col_affinities.push(def.affinity);
@@ -605,7 +636,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             pk_col_idx,
             pk_affinity,
             pk_rowid_alias,
-            has_check,
+            unsupported,
             pk_collation,
             secondary_indexes,
         })
@@ -822,13 +853,12 @@ mod tests {
     #[test]
     fn unsupported_column_clauses_stay_rejected() {
         for spec in [
-            "k TEXT PRIMARY KEY, v INT DEFAULT 1",
-            "k TEXT PRIMARY KEY, v INT DEFAULT(1)",
             "k TEXT PRIMARY KEY, v INT UNIQUE ON CONFLICT IGNORE",
             "k TEXT PRIMARY KEY, v INT GENERATED ALWAYS AS (1)",
             "k TEXT PRIMARY KEY, v INT AS (1)",
             "k TEXT PRIMARY KEY, v INT COLLATE UNKNOWN",
             "k TEXT PRIMARY KEY, v INT CHECK",
+            "k TEXT PRIMARY KEY, v INT DEFAULT",
         ] {
             assert_eq!(
                 parse(&[&format!("columns='{spec}'")]).err(),
@@ -895,5 +925,53 @@ mod tests {
         ] {
             assert_eq!(cols(spec).declared_columns, declared, "{spec}");
         }
+    }
+
+    #[test]
+    fn default_clauses_are_skipped_and_flagged() {
+        for (spec, reason) in [
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT 5 UNIQUE",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT -1",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT - 1 NOT NULL",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT (1 + 1)",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x TEXT DEFAULT 'a b' COLLATE NOCASE",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT(3) UNIQUE",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT DEFAULT CURRENT_TIMESTAMP",
+                DEFAULT_UNSUPPORTED,
+            ),
+            (
+                "k INTEGER PRIMARY KEY, x INT CHECK (x > 0)",
+                CHECK_UNSUPPORTED,
+            ),
+        ] {
+            let d = cols(spec);
+            assert_eq!(d.unsupported, Some(reason), "{spec}");
+            assert_eq!(d.col_names, vec!["k", "x"], "{spec}");
+        }
+        // The columns after the clause are still read.
+        let d = cols("k INTEGER PRIMARY KEY, x INT DEFAULT 5 UNIQUE NOT NULL, y TEXT");
+        assert_eq!(d.col_unique, vec![false, true, false]);
+        assert_eq!(d.col_not_null, vec![false, true, false]);
+        assert_eq!(d.col_names.len(), 3);
+        assert_eq!(cols("k TEXT PRIMARY KEY, v INT").unsupported, None);
     }
 }

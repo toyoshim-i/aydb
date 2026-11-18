@@ -394,8 +394,9 @@ pub(super) struct AydbVTab {
     /// happened since, so `max key + 1` is still the next key. Otherwise the key is derived from
     /// the rows again.
     auto_key_cache: std::sync::Mutex<(u64, i64)>,
-    /// The declaration has a `CHECK` that is not enforced: every write that stores a row fails.
-    has_check: bool,
+    /// The declaration has a clause that is not honoured (`CHECK`, `DEFAULT`):
+    /// every write that stores a row fails with this message.
+    unsupported: Option<&'static str>,
     pub(super) pk_collation: ColCollation,
     /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
     secondary_indexes: Vec<(usize, u16)>,
@@ -705,7 +706,6 @@ thread_local! {
 }
 
 const RENAME_NEEDS_WRITE: &str = "ALTER TABLE RENAME of an aydb table inside a transaction needs an earlier write to an aydb table in that transaction";
-const CHECK_UNSUPPORTED: &str = "CHECK constraints are not supported by aydb tables";
 
 /// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
 /// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
@@ -779,12 +779,12 @@ unsafe fn vtab_create_or_connect(
             Ok(d) => d,
             Err(rc) => return rc,
         };
-        // A new table may not have a CHECK it cannot enforce. An existing one (written by an
-        // older build) must still connect so that it can be read and dropped; its
-        // writes are refused instead.
-        if is_create && ddl.has_check {
+        // A new table may not have a CHECK or DEFAULT it cannot honour. An existing one (written
+        // by an older build) must still connect so that it can be read and dropped; its writes
+        // are refused instead.
+        if let (true, Some(reason)) = (is_create, ddl.unsupported) {
             if !pz_err.is_null() {
-                *pz_err = sqlite_error_message(CHECK_UNSUPPORTED);
+                *pz_err = sqlite_error_message(reason);
             }
             return SQLITE_ERROR;
         }
@@ -910,7 +910,7 @@ unsafe fn vtab_create_or_connect(
             pk_affinity: ddl.pk_affinity,
             pk_rowid_alias: ddl.pk_rowid_alias,
             auto_key_cache: std::sync::Mutex::new((u64::MAX, 0)),
-            has_check: ddl.has_check,
+            unsupported: ddl.unsupported,
             pk_collation: ddl.pk_collation,
             secondary_indexes: ddl.secondary_indexes,
         });
@@ -2064,15 +2064,15 @@ unsafe extern "system" fn vtab_update(
         }
 
         // Case 2: INSERT or UPDATE (`argc == 2 + num_cols`)
-        if vtab.has_check {
-            // A row cannot be checked, so none may be stored. SQLITE_CONSTRAINT would be
-            // resolved by the statement's conflict mode (OR IGNORE would skip the row and report
-            // success, OR REPLACE would delete conflicting rows first), so this is a plain
-            // error that every mode reports as such.
+        if let Some(reason) = vtab.unsupported {
+            // A row cannot be checked (CHECK) or completed (DEFAULT), so none may be stored.
+            // SQLITE_CONSTRAINT would be resolved by the statement's conflict mode (OR IGNORE
+            // would skip the row and report success, OR REPLACE would delete conflicting rows
+            // first), so this is a plain error that every mode reports as such.
             if !(*p_vtab).zErrMsg.is_null() {
                 crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
             }
-            (*p_vtab).zErrMsg = sqlite_error_message(CHECK_UNSUPPORTED);
+            (*p_vtab).zErrMsg = sqlite_error_message(reason);
             return SQLITE_ERROR;
         }
         let num_cols = vtab.col_names.len();

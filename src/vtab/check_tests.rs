@@ -184,3 +184,139 @@ fn a_table_with_a_stored_check_still_allows_delete_and_drop() {
     .unwrap();
     conn.execute_batch("INSERT INTO t VALUES (5, -1)").unwrap();
 }
+
+/// DEFAULT clauses, which an older build accepted and this one cannot honour. For each: the column
+/// definition it is spliced into, the message that creating or writing it gives, and the plain
+/// SQLite definition used for comparison.
+const UNSUPPORTED_CLAUSES: [(&str, &str); 7] = [
+    ("x INT DEFAULT 5 UNIQUE", "DEFAULT values are not supported"),
+    (
+        "x INT DEFAULT (1 + 1) UNIQUE",
+        "DEFAULT values are not supported",
+    ),
+    (
+        "x INT DEFAULT -1 UNIQUE",
+        "DEFAULT values are not supported",
+    ),
+    (
+        "x INT DEFAULT NULL UNIQUE",
+        "DEFAULT values are not supported",
+    ),
+    (
+        "x INT DEFAULT 'a b' UNIQUE",
+        "DEFAULT values are not supported",
+    ),
+    (
+        "x INT DEFAULT CURRENT_TIMESTAMP UNIQUE",
+        "DEFAULT values are not supported",
+    ),
+    (
+        "x INT UNIQUE DEFAULT(3)",
+        "DEFAULT values are not supported",
+    ),
+];
+
+fn legacy_table_with(name: &str, column: &str) -> Fixture {
+    let fixture = legacy_check_table(name);
+    // Replace the CHECK that `legacy_check_table` spliced in by the clause under test.
+    let conn = fixture.open();
+    conn.execute_batch(&format!(
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master SET sql = replace(sql, 'x INT CHECK(x > 0) UNIQUE', '{}') WHERE name = 't';",
+        column.replace("'", "''")
+    ))
+    .unwrap();
+    drop(conn);
+    fixture
+}
+
+#[test]
+fn creating_a_table_with_default_columns_is_refused_with_a_message() {
+    let fixture = legacy_check_table("unsupported_create");
+    let conn = fixture.open();
+    for (column, message) in UNSUPPORTED_CLAUSES {
+        let err = conn
+            .execute_batch(&format!(
+                "CREATE VIRTUAL TABLE c USING aydb(table_id=9, columns='k INTEGER PRIMARY KEY, {}')",
+                column.replace("'", "''")
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(message), "[{column}] {err}");
+    }
+}
+
+#[test]
+fn a_stored_table_with_default_columns_connects_and_reads_like_sqlite() {
+    for (i, (column, _)) in UNSUPPORTED_CLAUSES.iter().enumerate() {
+        let fixture = legacy_table_with(&format!("unsupported_read{i}"), column);
+        let conn = fixture.open();
+        // A plain SQLite table with the same definition and data.
+        conn.execute_batch(&format!(
+            "CREATE TABLE n(k INTEGER PRIMARY KEY, {column}); INSERT INTO n(k, x) VALUES (1, 10), (2, 20)"
+        ))
+        .unwrap();
+        assert_eq!(rows(&conn), original_rows(), "[{column}]");
+        assert_eq!(
+            conn.query_all("SELECT k, x FROM n ORDER BY k", &[])
+                .unwrap(),
+            rows(&conn),
+            "[{column}]"
+        );
+        assert_eq!(
+            conn.query_all("SELECT x FROM t WHERE k = 2", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(20)]],
+            "[{column}]"
+        );
+    }
+}
+
+#[test]
+fn a_stored_table_with_default_columns_refuses_every_write() {
+    for (i, (column, message)) in UNSUPPORTED_CLAUSES.iter().enumerate() {
+        let fixture = legacy_table_with(&format!("unsupported_write{i}"), column);
+        for mode in [
+            "",
+            "OR ABORT",
+            "OR FAIL",
+            "OR IGNORE",
+            "OR REPLACE",
+            "OR ROLLBACK",
+        ] {
+            for stmt in [
+                format!("INSERT {mode} INTO t(k) VALUES (3)"),
+                format!("INSERT {mode} INTO t VALUES (1, 99)"),
+                format!("UPDATE {mode} t SET x = 5 WHERE k = 1"),
+                format!("UPDATE {mode} t SET k = 7 WHERE k = 1"),
+            ] {
+                let conn = fixture.open();
+                let err = conn.execute_batch(&stmt).unwrap_err().to_string();
+                assert!(err.contains(message), "[{column}] {stmt}: {err}");
+                assert_eq!(rows(&conn), original_rows(), "[{column}] {stmt}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stored_table_with_default_columns_can_be_deleted_from_renamed_and_dropped() {
+    for (i, (column, _)) in UNSUPPORTED_CLAUSES.iter().enumerate() {
+        let fixture = legacy_table_with(&format!("unsupported_manage{i}"), column);
+        let conn = fixture.open();
+        conn.execute_batch("DELETE FROM t WHERE k = 1").unwrap();
+        assert_eq!(rows(&conn), original_rows()[1..].to_vec(), "[{column}]");
+        drop(conn);
+
+        let conn = fixture.open();
+        conn.execute_batch("ALTER TABLE t RENAME TO t2").unwrap();
+        drop(conn);
+        let conn = fixture.open();
+        assert_eq!(
+            conn.query_all("SELECT k, x FROM t2", &[]).unwrap(),
+            original_rows()[1..].to_vec(),
+            "[{column}]"
+        );
+        conn.execute_batch("DROP TABLE t2").unwrap();
+        assert!(conn.query_all("SELECT k FROM t2", &[]).is_err());
+    }
+}
