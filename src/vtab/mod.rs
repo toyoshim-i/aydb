@@ -24,6 +24,8 @@ pub mod ffi;
 mod key_null_tests;
 #[cfg(test)]
 mod pk_update_tests;
+#[cfg(test)]
+mod rename_tests;
 pub mod row_codec;
 pub mod rowid_map;
 #[cfg(test)]
@@ -47,7 +49,7 @@ pub(crate) mod unique_migration;
 mod unique_migration_tests;
 
 use core::ffi::{c_char, c_int, c_void};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -67,10 +69,11 @@ use crate::vtab::ffi::{
     SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
     SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
     SQLITE_TEXT, SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
-    sqlite3_index_info, sqlite3_int64, sqlite3_malloc, sqlite3_module, sqlite3_result_error_code,
-    sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes, sqlite3_value_double,
-    sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type, sqlite3_vtab,
-    sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
+    sqlite3_get_autocommit, sqlite3_index_info, sqlite3_int64, sqlite3_malloc, sqlite3_module,
+    sqlite3_result_error_code, sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes,
+    sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type,
+    sqlite3_vtab, sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor,
+    sqlite3_vtab_on_conflict,
 };
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
@@ -394,7 +397,7 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xCommit: Some(vtab_commit_tx),
     xRollback: Some(vtab_rollback_tx),
     xFindFunction: None,
-    xRename: None,
+    xRename: Some(vtab_rename),
     xSavepoint: Some(vtab_savepoint),
     xRelease: Some(vtab_release),
     xRollbackTo: Some(vtab_rollback_to),
@@ -416,7 +419,8 @@ pub(super) struct AydbVTab {
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
     table_id: u16,
-    table_name: String,
+    /// Normalised at use. Changes when the table is renamed.
+    table_name: std::sync::Mutex<String>,
     durability: WriteDurability,
     /// Set once the rowid migration marker has been observed in the committed view.
     rowids_committed: AtomicBool,
@@ -446,6 +450,16 @@ pub(super) struct AydbVTab {
     secondary_indexes: Vec<(usize, u16)>,
     /// Next monotonically increasing auto-assigned rowid for `INTEGER PRIMARY KEY`.
     next_auto_rowid: AtomicI64,
+}
+
+impl AydbVTab {
+    /// The table's current name.
+    fn name(&self) -> String {
+        self.table_name
+            .lock()
+            .map(|name| name.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[repr(C)]
@@ -750,6 +764,7 @@ thread_local! {
     static FAIL_CONNECT_AFTER_REGISTRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+const RENAME_NEEDS_WRITE: &str = "ALTER TABLE RENAME of an aydb table inside a transaction needs an earlier write to an aydb table in that transaction";
 const CHECK_UNSUPPORTED: &str = "CHECK constraints are not supported by aydb tables";
 
 /// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
@@ -877,7 +892,7 @@ unsafe fn vtab_create_or_connect(
             engine: aux.engine.clone(),
             read_session: Arc::clone(&aux.read_session),
             table_id,
-            table_name: ddl.table_name,
+            table_name: std::sync::Mutex::new(ddl.table_name),
             durability: ddl.durability,
             rowids_committed: AtomicBool::new(rowids_committed),
             unique_def: unique_key::UniqueDef::from_columns(
@@ -914,9 +929,49 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
                 if let Ok(mut eng) = vtab.engine.write() {
-                    eng.unregister_vtab(vtab.table_id, &vtab.table_name);
+                    eng.unregister_vtab(vtab.table_id, &vtab.name());
                 }
             }
+        }
+        SQLITE_OK
+    }))
+    .unwrap_or(SQLITE_ERROR)
+}
+
+/// `ALTER TABLE ... RENAME TO`: moves the catalog entry to the new name. Without this SQLite
+/// only rewrites the stored definition, and the table (looked up by name) could no longer be found.
+unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c_char) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        if p_vtab.is_null() || z_new.is_null() {
+            return SQLITE_ERROR;
+        }
+        let vtab = &*(p_vtab as *const AydbVTab);
+        let new_name = CStr::from_ptr(z_new).to_string_lossy().into_owned();
+        let mut eng = match vtab.engine.write() {
+            Ok(g) => g,
+            Err(_) => return SQLITE_ERROR,
+        };
+        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
+            return io_err_to_sqlite_rc(&e);
+        }
+        // SQLite does not call `xBegin` for a rename, so inside a user transaction the catalog
+        // change joins the engine transaction only if an earlier write opened one. Otherwise it
+        // would be committed at once, and a ROLLBACK of the SQL transaction (which restores the
+        // old name in the schema) would leave the catalog under the new name, so the table
+        // would appear empty. Refuse that case instead.
+        if sqlite3_get_autocommit(vtab.db) == 0 && !eng.conn_has_open_transaction(vtab.db as usize)
+        {
+            if !(*p_vtab).zErrMsg.is_null() {
+                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
+            }
+            (*p_vtab).zErrMsg = sqlite_error_message(RENAME_NEEDS_WRITE);
+            return SQLITE_ERROR;
+        }
+        if let Err(e) = eng.rename_vtab(vtab.table_id, &vtab.name(), &new_name, vtab.durability) {
+            return io_err_to_sqlite_rc(&e);
+        }
+        if let Ok(mut name) = vtab.table_name.lock() {
+            *name = new_name;
         }
         SQLITE_OK
     }))
@@ -936,7 +991,7 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
                     if let Err(e) = eng.check_write_allowed_for_conn(vtab_ref.db as usize) {
                         return io_err_to_sqlite_rc(&e);
                     }
-                    if let Err(e) = eng.drop_table(vtab_ref.table_id, Some(&vtab_ref.table_name)) {
+                    if let Err(e) = eng.drop_table(vtab_ref.table_id, Some(&vtab_ref.name())) {
                         return io_err_to_sqlite_rc(&e);
                     }
                 }

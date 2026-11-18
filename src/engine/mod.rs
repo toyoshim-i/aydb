@@ -1131,6 +1131,73 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    /// Renames a live virtual table in the catalog (`xRename` / `ALTER TABLE ... RENAME TO`): the
+    /// entry of `old_name` moves to `new_name` and keeps its `table_id`. Both catalog writes and
+    /// the live registration follow the enclosing transaction, so a rollback restores the old
+    /// name. Fails if another table already holds `new_name`.
+    pub(crate) fn rename_vtab(
+        &mut self,
+        table_id: u16,
+        old_name: &str,
+        new_name: &str,
+        durability: WriteDurability,
+    ) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        let old_norm = old_name.trim().to_ascii_lowercase();
+        let new_norm = new_name.trim().to_ascii_lowercase();
+        if old_norm == new_norm {
+            return Ok(());
+        }
+        let catalog_key = |name: &str| {
+            let mut key = Vec::with_capacity(3 + name.len());
+            key.extend_from_slice(&[0u8, 0u8, b'c']);
+            key.extend_from_slice(name.as_bytes());
+            key
+        };
+        let new_key = catalog_key(&new_norm);
+        if !IndexEntry::inline_fits_in_block(new_key.len(), 2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual table name exceeds maximum catalog key length",
+            ));
+        }
+        for entry in self.scan_merged_prefix(&[0u8, 0u8, b'c'])? {
+            let IndexValue::Inline(val) = entry.value else {
+                continue;
+            };
+            if val.len() == 2 && entry.key[3..] == *new_norm.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("a virtual table named '{new_norm}' already exists"),
+                ));
+            }
+        }
+        if let Some(live) = self.active_vtab_ids.iter().find_map(|(id, name)| {
+            (name.as_ref() == new_norm.as_str() && *id != table_id).then_some(*id)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a virtual table named '{new_norm}' is live as table_id {live}"),
+            ));
+        }
+        let mut records = Vec::with_capacity(2);
+        let old_key = catalog_key(&old_norm);
+        if !matches!(
+            self.check_existing_row(&old_key)?,
+            ExistingRowStatus::NotFound
+        ) {
+            records.push(WalRecord::Delete { key: old_key });
+        }
+        records.push(WalRecord::PutInline {
+            key: new_key,
+            value: table_id.to_be_bytes().to_vec(),
+        });
+        self.commit_wal_and_memtable(records, durability)?;
+        self.active_vtab_ids
+            .insert(table_id, Arc::from(new_norm.as_str()));
+        Ok(())
+    }
+
     /// Drops a table (`xDestroy` / `DROP TABLE`), deleting all primary rows (`'r'`), secondary
     /// index entries (`'i'`), row metadata (`'t'`), LRU queue entries (`'l'`), capped table
     /// quota registrations, and system catalog entries.

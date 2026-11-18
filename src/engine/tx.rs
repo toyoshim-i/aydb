@@ -400,6 +400,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Whether `conn_id` has a transaction open in the engine (it has written since `BEGIN`).
+    pub(crate) fn conn_has_open_transaction(&self, conn_id: usize) -> bool {
+        self.tx_depth > 0 && self.tx_owner_conn == Some(conn_id)
+    }
+
     /// Checks whether `conn_id` is permitted to mutate this `StorageEngine`.
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection holds an active transaction.
     #[inline]
