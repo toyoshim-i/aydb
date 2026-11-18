@@ -9,6 +9,7 @@ Start here to use `aydb`, look up an API, or understand its design. User documen
 | Choose the application-facing interface | [Public API boundaries](reference/PUBLIC_API.md) |
 | Store and retrieve bytes directly from Rust | [Native storage guide](guides/NATIVE_STORAGE.md) |
 | Use SQL through SQLite | [SQLite adapter guide](guides/SQLITE.md) |
+| Check where SQL behaves differently from SQLite tables | [Differences from SQLite tables](guides/SQLITE_DIFFERENCES.md) |
 | Find methods, configuration, and API contracts | [API reference guide](reference/README.md) |
 
 The current interfaces are native Rust storage operations and the SQLite adapter. The native SQL frontend, optional compression, and vector/hybrid search are planned work; see the [roadmap](ARCHITECTURE.md#7-phased-implementation-roadmap). Future vector primitives extend the native storage API. The native SQL frontend will receive its own execution API reference and SQL language manual when implemented.
