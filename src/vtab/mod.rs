@@ -25,6 +25,8 @@ pub mod rowid_map;
 #[cfg(test)]
 mod rowid_tests;
 #[cfg(test)]
+mod rowid_write_tests;
+#[cfg(test)]
 mod savepoint_tests;
 mod snapshot;
 #[cfg(test)]
@@ -1980,8 +1982,45 @@ unsafe extern "system" fn vtab_update(
         let pk_val_ptr = *argv.offset(2 + vtab.pk_col_idx as isize);
         let pk_val_type = sqlite3_value_type(pk_val_ptr);
 
+        // `argv[1]` is the rowid the statement asks for: the explicit rowid of an INSERT, or the
+        // new rowid of an UPDATE, which equals the old one unless the statement changed it.
+        // `new_rowid_req` is set only when the statement really asks for a rowid.
+        let new_rowid_arg = *argv.offset(1);
+        let old_rowid_arg = if is_insert {
+            None
+        } else {
+            extract_lossless_rowid_arg(arg0)
+        };
+        let new_rowid_req = if sqlite3_value_type(new_rowid_arg) == SQLITE_NULL {
+            None
+        } else {
+            match extract_lossless_rowid_arg(new_rowid_arg) {
+                Some(rowid) if is_insert || old_rowid_arg != Some(rowid) => Some(rowid),
+                Some(_) => None,
+                None => return SQLITE_MISMATCH,
+            }
+        };
+        // `INTEGER PRIMARY KEY` is the rowid: a rowid without a key of its own sets the key
+        // (INSERT with a NULL key), and an UPDATE that leaves the key alone moves it. An
+        // explicit key wins over the rowid, as on a native table.
+        let alias_rowid = match new_rowid_req {
+            Some(rowid) if vtab.pk_rowid_alias => {
+                if is_insert {
+                    (pk_val_type == SQLITE_NULL).then_some(rowid)
+                } else {
+                    (pk_val_type == SQLITE_INTEGER
+                        && Some(sqlite3_value_int64(pk_val_ptr)) == old_rowid_arg)
+                        .then_some(rowid)
+                }
+            }
+            _ => None,
+        };
+        let mut auto_assigned = false;
+
         // Handle `SQLITE_NULL` primary key
-        let pk_override = if pk_val_type == SQLITE_NULL {
+        let pk_override = if alias_rowid.is_some() {
+            alias_rowid
+        } else if pk_val_type == SQLITE_NULL {
             if is_insert && vtab.pk_rowid_alias {
                 let mut candidate = vtab.next_auto_rowid.load(Ordering::Relaxed);
                 if candidate <= 0 {
@@ -2033,6 +2072,7 @@ unsafe extern "system" fn vtab_update(
                 if let Some(next) = chosen.checked_add(1) {
                     vtab.next_auto_rowid.fetch_max(next, Ordering::Relaxed);
                 }
+                auto_assigned = true;
                 Some(chosen)
             } else {
                 return SQLITE_CONSTRAINT;
@@ -2059,7 +2099,17 @@ unsafe extern "system" fn vtab_update(
         } else {
             None
         };
-        if pk_override.is_none() {
+        // A key that is its own rowid cannot take a different one (an alias takes the key); every
+        // other key keeps its rowid in the persistent mapping, where an explicit rowid is stored
+        // as requested.
+        let mapped_rowid = match (coerced_int_pk, new_rowid_req) {
+            (Some(key_rowid), Some(rowid)) if key_rowid != rowid && !vtab.pk_rowid_alias => {
+                return SQLITE_MISMATCH;
+            }
+            (None, Some(rowid)) => Some(rowid),
+            _ => None,
+        };
+        if !auto_assigned {
             if let Some(explicit_id) = coerced_int_pk {
                 if explicit_id >= 0 {
                     if let Some(next) = explicit_id.checked_add(1) {
@@ -2105,9 +2155,16 @@ unsafe extern "system" fn vtab_update(
 
         // Integer PK values use their exact i64 as rowid. A previously allocated synthetic
         // identity owns that number until its row is deleted, just like an explicit rowid.
-        let rowid_conflict_pk = if let Some(rowid) = coerced_int_pk {
+        let rowid_conflict_pk = if let Some(rowid) = coerced_int_pk.or(mapped_rowid) {
             match eng.pk_for_rowid_view(crate::engine::ReadView::Owner, vtab.table_id, rowid) {
-                Ok(Some(pk)) if old_pk_opt.as_ref().is_none_or(|old| *old != pk) => Some(pk),
+                // The row that already owns the rowid is no conflict when it is the row being
+                // written or the row being updated.
+                Ok(Some(pk))
+                    if old_pk_opt.as_ref().is_none_or(|old| *old != pk)
+                        && (mapped_rowid.is_none() || pk != new_pk) =>
+                {
+                    Some(pk)
+                }
                 Ok(_) => None,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             }
@@ -2127,7 +2184,7 @@ unsafe extern "system" fn vtab_update(
             }
             None => false,
         };
-        let mut known_absent = pk_override.is_some();
+        let mut known_absent = auto_assigned;
         let mut pk_conflict_to_delete: Option<Vec<u8>> = None;
         let unique_conflicts = match constraints::find_unique_conflicts(
             &mut eng,
@@ -2143,7 +2200,7 @@ unsafe extern "system" fn vtab_update(
                 return SQLITE_CONSTRAINT;
             }
         }
-        if (is_insert || !same_pk) && pk_override.is_none() {
+        if (is_insert || !same_pk) && !auto_assigned {
             let existing_conflict = match find_existing_pk_or_numeric_alt(
                 &mut eng,
                 vtab.table_id,
@@ -2215,6 +2272,9 @@ unsafe extern "system" fn vtab_update(
                 Ok(auto_id)
             } else if let Some(int_id) = coerced_int_pk {
                 Ok(int_id)
+            } else if let Some(rowid) = mapped_rowid {
+                eng.set_rowid(vtab.table_id, &new_pk, rowid, vtab.durability)?;
+                Ok(rowid)
             } else {
                 rowid_map::assign_synthetic_rowid(
                     &mut eng,

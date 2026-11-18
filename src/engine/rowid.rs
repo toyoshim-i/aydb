@@ -139,6 +139,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(rowid)
     }
 
+    /// Gives `pk` exactly `rowid`, replacing the rowid it had. The caller has made sure that no
+    /// other row owns `rowid`.
+    pub(crate) fn set_rowid(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        rowid: i64,
+        durability: WriteDurability,
+    ) -> io::Result<()> {
+        let mut records = Vec::new();
+        if let Some(old) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
+            if old == rowid {
+                return Ok(());
+            }
+            records.push(WalRecord::Delete {
+                key: rowid_key(table_id, NS_PK_BY_ROWID, &old.to_le_bytes()),
+            });
+        }
+        records.push(WalRecord::PutInline {
+            key: rowid_key(table_id, NS_ROWID_BY_PK, pk),
+            value: rowid.to_le_bytes().to_vec(),
+        });
+        records.push(WalRecord::PutInline {
+            key: rowid_key(table_id, NS_PK_BY_ROWID, &rowid.to_le_bytes()),
+            value: pk.to_vec(),
+        });
+        self.commit_wal_and_memtable(records, durability)?;
+        Ok(())
+    }
+
     pub(super) fn append_rowid_deletes(
         &self,
         table_id: u16,
