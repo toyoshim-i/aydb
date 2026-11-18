@@ -19,6 +19,8 @@ pub mod connection;
 mod constraint_tests;
 mod constraints;
 mod ddl;
+#[cfg(test)]
+mod drop_tests;
 pub mod ffi;
 #[cfg(test)]
 mod key_null_tests;
@@ -983,6 +985,15 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
         if !p_vtab.is_null() {
             unsafe {
                 let vtab_ref = &*(p_vtab as *const AydbVTab);
+                // SQLite does not call `xBegin` for a DROP, and once `xDestroy` has freed the
+                // table it no longer calls `xCommit` or `xRollback` for it. The drop therefore
+                // cannot join a user transaction: it would be committed at once (or, after an
+                // earlier write to this table, leave an engine transaction that nothing ends),
+                // while a ROLLBACK restores the table in SQLite's schema. Refuse instead. SQLite
+                // does not report an `xDestroy` error message, so the caller sees only the code.
+                if sqlite3_get_autocommit(vtab_ref.db) == 0 {
+                    return SQLITE_ERROR;
+                }
                 {
                     let mut eng = match vtab_ref.engine.write() {
                         Ok(g) => g,

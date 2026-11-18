@@ -8,7 +8,7 @@ use super::*;
 use crate::engine::EngineConfig;
 use crate::util::test_util::TempTestDir;
 
-struct Fixture {
+pub(super) struct Fixture {
     schema_path: PathBuf,
     engine_dir: TempTestDir,
     engine: Option<Arc<RwLock<StorageEngine<OsFs>>>>,
@@ -16,7 +16,7 @@ struct Fixture {
     _schema_dir: TempTestDir,
 }
 
-fn open_engine(dir: &TempTestDir) -> Arc<RwLock<StorageEngine<OsFs>>> {
+pub(super) fn open_engine(dir: &TempTestDir) -> Arc<RwLock<StorageEngine<OsFs>>> {
     let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
     let mut config = EngineConfig::default();
     config.sync_wal_size_bytes = 64 * 4096;
@@ -25,7 +25,7 @@ fn open_engine(dir: &TempTestDir) -> Arc<RwLock<StorageEngine<OsFs>>> {
 }
 
 impl Fixture {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let schema_dir = TempTestDir::new(&format!("{name}_schema"));
         let engine_dir = TempTestDir::new(&format!("{name}_engine"));
         Self {
@@ -36,7 +36,7 @@ impl Fixture {
         }
     }
 
-    fn open(&self) -> SqliteConnection {
+    pub(super) fn open(&self) -> SqliteConnection {
         let conn = SqliteConnection::open_file(&self.schema_path).unwrap();
         conn.register_aydb_module_with_options(self.engine.clone().unwrap(), false)
             .unwrap();
@@ -44,14 +44,14 @@ impl Fixture {
     }
 
     /// Closes and reopens the engine, as a process restart would.
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         // No other reference to the engine may be left: the connections are dropped by now.
         drop(self.engine.take());
         self.engine = Some(open_engine(&self.engine_dir));
     }
 }
 
-fn ints(conn: &SqliteConnection, sql: &str) -> Vec<i64> {
+pub(super) fn ints(conn: &SqliteConnection, sql: &str) -> Vec<i64> {
     conn.query_all(sql, &[])
         .unwrap()
         .iter()
@@ -62,7 +62,7 @@ fn ints(conn: &SqliteConnection, sql: &str) -> Vec<i64> {
         .collect()
 }
 
-const TABLE: &str =
+pub(super) const TABLE: &str =
     "CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')";
 
 #[test]
