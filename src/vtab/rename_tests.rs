@@ -36,6 +36,10 @@ impl Fixture {
         }
     }
 
+    pub(super) fn engine(&self) -> Arc<RwLock<StorageEngine<OsFs>>> {
+        self.engine.clone().unwrap()
+    }
+
     pub(super) fn open(&self) -> SqliteConnection {
         let conn = SqliteConnection::open_file(&self.schema_path).unwrap();
         conn.register_aydb_module_with_options(self.engine.clone().unwrap(), false)

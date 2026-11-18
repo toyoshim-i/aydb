@@ -1,4 +1,7 @@
-//! Building the persistent UNIQUE index for rows written before it existed.
+//! (Re)building the persistent UNIQUE index of a table whose index does not match its UNIQUE
+//! definition: a table that is declared with UNIQUE columns over rows stored without them (or
+//! with other collations or affinities), for example when a new schema file attaches existing
+//! data.
 //!
 //! The migration runs in `xBegin`, before the engine transaction of the triggering statement
 //! starts, never at connect and never in `xUpdate`. It works in chunks, each under one hold of

@@ -1,5 +1,5 @@
-//! Persistent `rowid` identities for non-integer SQLite primary keys: migration of older rows,
-//! synthetic `rowid` assignment, and 64-bit hardware CRC32C + SplitMix64 `rowid` hashing helpers.
+//! Persistent `rowid` identities for non-integer SQLite primary keys: synthetic `rowid`
+//! assignment, and 64-bit hardware CRC32C + SplitMix64 `rowid` hashing helpers.
 
 use std::io;
 
@@ -10,57 +10,6 @@ use crate::vtab::AydbVTab;
 use crate::vtab::row_codec::{
     ColumnAffinity, decode_i64_tagged_key, extract_column_key_bytes_with_collation,
 };
-
-/// Migrates older rows in bounded batches. Each mapping pair is one atomic WAL batch, and the
-/// completion marker is written last so a failed connection can resume without changing IDs.
-///
-/// The mapping pairs are written with buffered durability whatever the table requests: a power
-/// cut that loses some of them only leaves the marker absent, and the next run assigns the rest
-/// without changing the identities already kept (`assign_rowid` is idempotent). Only the marker
-/// uses the table's `durability`. A synchronous marker commit first makes every earlier buffered
-/// batch durable (the prefix rule of `append_raw_wal_batch_with_rotation`), so a durable marker
-/// never outlives its mappings, and the migration costs one sync instead of one per row. Inside
-/// a user transaction the writes join it and `durability` only marks it for a sync at commit.
-pub(crate) fn ensure_persistent_rowids<FS: PlatformFs>(
-    engine: &mut StorageEngine<FS>,
-    table_id: u16,
-    durability: WriteDurability,
-    integer_primary_keys: bool,
-) -> io::Result<()> {
-    match engine.rowids_initialized(table_id) {
-        Ok(false) => {}
-        Ok(true) | Err(_) => return Ok(()),
-    }
-    let mut lower = None;
-    loop {
-        let keys = match engine.scan_keys_range(table_id, lower.as_deref(), None, 256) {
-            Ok(keys) => keys,
-            // Preserve SQLite's ability to connect a damaged table and report its read errors
-            // through xFilter. An absent marker makes the next connection retry discovery.
-            Err(_) => return Ok(()),
-        };
-        let mut progress = false;
-        for pk in keys {
-            if lower.as_deref() == Some(pk.as_slice()) {
-                continue;
-            }
-            if !integer_primary_keys || decode_i64_tagged_key(&pk).is_none() {
-                assign_synthetic_rowid(
-                    engine,
-                    table_id,
-                    &pk,
-                    WriteDurability::BufferedFast,
-                    integer_primary_keys,
-                )?;
-            }
-            lower = Some(pk);
-            progress = true;
-        }
-        if !progress {
-            return engine.mark_rowids_initialized(table_id, durability);
-        }
-    }
-}
 
 pub(super) fn assign_synthetic_rowid<FS: PlatformFs>(
     engine: &mut StorageEngine<FS>,

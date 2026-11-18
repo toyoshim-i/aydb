@@ -1,9 +1,8 @@
 //! Connecting and creating tables while another connection has a transaction open.
 //!
-//! `xConnect` of an existing, fully migrated table changes no durable state, so it must succeed
-//! (and must not wait) while another connection writes. `xCreate` of a new table and the
-//! migration of a legacy table do write durable state; they wait, bounded by
-//! `writer_wait_timeout_ms`, for the other transaction to end.
+//! `xConnect` of an existing table changes no durable state, so it must succeed (and must not
+//! wait) while another connection writes. `xCreate` of a new table does write durable state; it
+//! waits, bounded by `writer_wait_timeout_ms`, for the other transaction to end.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,7 +103,7 @@ fn ids(conn: &SqliteConnection, table: &str) -> Vec<i64> {
 }
 
 #[test]
-fn connect_to_a_migrated_table_succeeds_while_another_connection_writes() {
+fn connect_to_an_existing_table_succeeds_while_another_connection_writes() {
     let fx = fixture("connect_during_write", 30_000);
     let writer = fx.writer();
     writer
@@ -255,7 +254,7 @@ fn a_failed_connect_keeps_the_registration_another_connection_uses() {
 }
 
 #[test]
-fn repeated_connects_to_a_migrated_table_never_fail_against_a_busy_writer() {
+fn repeated_connects_to_an_existing_table_never_fail_against_a_busy_writer() {
     const ATTEMPTS: usize = 300;
     let fx = fixture("connect_stress", 30_000);
     let writer = fx.writer();

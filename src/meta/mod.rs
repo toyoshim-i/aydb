@@ -37,11 +37,6 @@ const FORMAT_VERSION: u16 = 1;
 /// Flag indicating that the catalog payload is stored in an external `manifest_<SeqID>.db` file.
 const FLAG_EXTERNAL_MANIFEST: u16 = 0x0001;
 
-/// Flag indicating that the database holds a `UNIQUE` index that only this version maintains.
-/// A binary that predates the index rejects the slot as carrying unknown flags, instead of
-/// writing rows without index entries. Sticky: once set it is carried by every later slot.
-const FLAG_UNIQUE_INDEX: u16 = 0x0002;
-
 const EXTERNAL_POINTER_LEN: usize = 20;
 const MANIFEST_HEADER_LEN: usize = 16;
 
@@ -174,9 +169,6 @@ pub struct BootMetaState {
     pub pending_delete_files: Vec<String>,
     /// Sequence ID of the external manifest file currently backing this state, if overflowed.
     pub active_manifest_seq_id: Option<u64>,
-    /// The `FLAG_UNIQUE_INDEX` slot flag. It is part of the slot header, not of the catalog
-    /// payload, and once true it stays true (see [`BootMetaManager::require_unique_index`]).
-    pub requires_unique_index: bool,
 }
 
 impl Default for BootMetaState {
@@ -193,7 +185,6 @@ impl Default for BootMetaState {
             table_quotas: Vec::new(),
             pending_delete_files: Vec::new(),
             active_manifest_seq_id: None,
-            requires_unique_index: false,
         }
     }
 }
@@ -501,9 +492,6 @@ pub struct BootMetaManager<F: PlatformFs> {
     state: BootMetaState,
     standby_manifest_id: Option<u64>,
     uncertain_write: Option<String>,
-    /// Both slots on disk carry `FLAG_UNIQUE_INDEX`, so no binary that predates it can fall back
-    /// to a slot without the flag.
-    unique_flag_in_both_slots: bool,
 }
 
 impl<F: PlatformFs> BootMetaManager<F> {
@@ -578,7 +566,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 state: initial_state,
                 standby_manifest_id: None,
                 uncertain_write: None,
-                unique_flag_in_both_slots: false,
             };
             mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
             mgr.active_slot = SlotIndex::SlotA;
@@ -590,11 +577,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let parsed_a = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_a_raw))?;
         let parsed_b = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_b_raw))?;
 
-        let mut flag_in_both_slots = false;
         let (winning_slot, winning_state, standby_manifest_id) = match (parsed_a, parsed_b) {
             (Ok(state_a), Ok(state_b)) => {
                 // Case 1: Both slots are valid; select the higher generation.
-                flag_in_both_slots = state_a.requires_unique_index && state_b.requires_unique_index;
                 if state_b.generation > state_a.generation {
                     let standby_mf = state_a.active_manifest_seq_id;
                     (SlotIndex::SlotB, state_b, standby_mf)
@@ -636,35 +621,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state: winning_state,
             standby_manifest_id,
             uncertain_write: None,
-            unique_flag_in_both_slots: flag_in_both_slots,
         })
-    }
-
-    /// Makes the database refuse to open in a binary that predates the UNIQUE index, durably
-    /// and in both slots, before returning. The caller writes the index's completion marker only
-    /// afterwards, so a durable marker always implies the guard.
-    ///
-    /// Both slots are needed because an old binary treats a slot with an unknown flag as
-    /// invalid and would otherwise fall back to the other, flag-less one. The first commit
-    /// changes nothing but the flag, so the two slots describe the same state at every point
-    /// of the sequence and a crash between the two commits loses nothing. Idempotent; the flag
-    /// is never cleared.
-    pub fn require_unique_index(&mut self) -> io::Result<()> {
-        if self.unique_flag_in_both_slots {
-            return Ok(());
-        }
-        if !self.state.requires_unique_index {
-            self.commit_update(|st| st.requires_unique_index = true)?;
-        }
-        if !self.unique_flag_in_both_slots {
-            self.commit_update(|_| {})?;
-        }
-        Ok(())
-    }
-
-    /// True if the newest slot carries the UNIQUE index flag.
-    pub fn requires_unique_index(&self) -> bool {
-        self.state.requires_unique_index
     }
 
     /// Durably advances `next_seq_id` past the SeqID of every managed segment or manifest file on
@@ -788,9 +745,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
             }
         }
 
-        // The slot just written and the one it replaces as newest both carry the flag.
-        self.unique_flag_in_both_slots =
-            next_state.requires_unique_index && self.state.requires_unique_index;
         self.active_slot = target_slot;
         self.state = next_state;
         self.standby_manifest_id = prev_manifest_id;
@@ -862,11 +816,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
             (FLAG_EXTERNAL_MANIFEST, ptr_buf)
         };
 
-        let flags = if state.requires_unique_index {
-            flags | FLAG_UNIQUE_INDEX
-        } else {
-            flags
-        };
         let payload_len = slot_payload_bytes.len() as u32;
         let payload_crc = crc32c(&slot_payload_bytes);
 
@@ -966,7 +915,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         }
 
         let flags = u16::from_le_bytes([slot_buf[6], slot_buf[7]]);
-        if (flags & !(FLAG_EXTERNAL_MANIFEST | FLAG_UNIQUE_INDEX)) != 0 {
+        if (flags & !FLAG_EXTERNAL_MANIFEST) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown boot_meta flags: {flags:#x}"),
@@ -1002,7 +951,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
             checkpoint_lsn,
             sync_wal_epoch,
             buf_wal_epoch,
-            requires_unique_index: (flags & FLAG_UNIQUE_INDEX) != 0,
             ..BootMetaState::default()
         };
 
@@ -1636,87 +1584,6 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
-    fn slot_flags(mgr: &BootMetaManager<OsFs>) -> (u16, u16) {
-        let mut bytes = [0u8; SLOT_SIZE * 2];
-        mgr.file().read_exact_at(&mut bytes, 0).unwrap();
-        (
-            u16::from_le_bytes([bytes[6], bytes[7]]),
-            u16::from_le_bytes([bytes[SLOT_SIZE + 6], bytes[SLOT_SIZE + 7]]),
-        )
-    }
-
-    #[test]
-    fn unique_index_flag_reaches_both_slots_and_is_sticky() {
-        let tmp = TempTestDir::new("unique_flag");
-        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
-        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
-        assert!(!mgr.requires_unique_index());
-        mgr.commit_update(|s| s.checkpoint_lsn = 5).unwrap();
-        assert_eq!(slot_flags(&mgr), (0, 0), "no flag without a UNIQUE index");
-
-        mgr.require_unique_index().unwrap();
-        assert!(mgr.requires_unique_index());
-        assert_eq!(slot_flags(&mgr), (FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX));
-        // Idempotent: no further commit.
-        let generation = mgr.state().generation;
-        mgr.require_unique_index().unwrap();
-        assert_eq!(mgr.state().generation, generation);
-
-        // Later commits, a catalog that spills into an external manifest, and a reopen keep it.
-        for lsn in [10, 20] {
-            mgr.commit_update(|s| s.checkpoint_lsn = lsn).unwrap();
-            assert_eq!(slot_flags(&mgr), (FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX));
-        }
-        mgr.commit_update(|s| {
-            for i in 0..300u16 {
-                s.table_quotas.push(TableQuotaMeta {
-                    table_id: 1000 + i,
-                    eviction_policy: EvictionPolicy::Lru,
-                    max_bytes: 1 << 40,
-                    current_logical_bytes: 0,
-                });
-            }
-        })
-        .unwrap();
-        assert!(mgr.state().active_manifest_seq_id.is_some());
-        let (a, b) = slot_flags(&mgr);
-        assert_eq!(a & FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX);
-        assert_eq!(b & FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX);
-        assert!((a | b) & FLAG_EXTERNAL_MANIFEST != 0);
-        drop(mgr);
-
-        let mut reopened = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
-        assert!(reopened.requires_unique_index());
-        reopened.commit_update(|s| s.checkpoint_lsn = 30).unwrap();
-        let (a, b) = slot_flags(&reopened);
-        assert!(a & FLAG_UNIQUE_INDEX != 0 && b & FLAG_UNIQUE_INDEX != 0);
-        // Already in both slots after reopen: nothing to write.
-        let generation = reopened.state().generation;
-        reopened.require_unique_index().unwrap();
-        assert_eq!(reopened.state().generation, generation);
-    }
-
-    #[test]
-    fn a_crash_between_the_two_flag_commits_leaves_identical_states_and_completes_later() {
-        let tmp = TempTestDir::new("unique_flag_half");
-        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
-        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
-        mgr.commit_update(|s| s.checkpoint_lsn = 5).unwrap();
-        // Only the first commit of the sequence.
-        mgr.commit_update(|s| s.requires_unique_index = true)
-            .unwrap();
-        let (a, b) = slot_flags(&mgr);
-        assert_eq!((a & FLAG_UNIQUE_INDEX != 0), (b & FLAG_UNIQUE_INDEX == 0));
-        drop(mgr);
-        let mut reopened = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
-        assert!(reopened.requires_unique_index());
-        assert_eq!(reopened.state().checkpoint_lsn, 5);
-        reopened.require_unique_index().unwrap();
-        assert_eq!(
-            slot_flags(&reopened),
-            (FLAG_UNIQUE_INDEX, FLAG_UNIQUE_INDEX)
-        );
-    }
 
     /// Event recorded by [`LoggingFs`] for `boot_meta.db`.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1839,29 +1706,37 @@ mod tests {
         assert_eq!(syncs, 3, "{events:?}");
     }
 
+    /// Flag bits other than the external-manifest flag are refused, including `0x0002`, which an
+    /// earlier format used for the UNIQUE index guard.
     #[test]
-    fn unknown_flag_bits_are_still_rejected() {
-        let tmp = TempTestDir::new("unknown_flag");
-        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
-        {
-            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
-            mgr.require_unique_index().unwrap();
+    fn unknown_flag_bits_are_rejected() {
+        for bit in [0x0002u16, 0x0004] {
+            let tmp = TempTestDir::new("unknown_flag");
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            {
+                let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+                mgr.commit_update(|s| s.checkpoint_lsn = 1).unwrap();
+                mgr.commit_update(|s| s.checkpoint_lsn = 2).unwrap();
+            }
+            let path = tmp.path.join(BOOT_META_FILE_NAME);
+            let mut bytes = std::fs::read(&path).unwrap();
+            for slot in 0..2 {
+                let base = slot * SLOT_SIZE;
+                let flags = u16::from_le_bytes([bytes[base + 6], bytes[base + 7]]) | bit;
+                bytes[base + 6..base + 8].copy_from_slice(&flags.to_le_bytes());
+                let header_crc = crc32c(&bytes[base..base + 60]);
+                bytes[base + 60..base + 64].copy_from_slice(&header_crc.to_le_bytes());
+                let trailer = crc32c(&bytes[base..base + 4092]);
+                bytes[base + 4092..base + 4096].copy_from_slice(&trailer.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let err = BootMetaManager::open_or_recover(fs)
+                .err()
+                .expect("must refuse");
+            assert!(
+                err.to_string().contains("unknown boot_meta flags"),
+                "{bit:#x}: {err}"
+            );
         }
-        let path = tmp.path.join(BOOT_META_FILE_NAME);
-        let mut bytes = std::fs::read(&path).unwrap();
-        for slot in 0..2 {
-            let base = slot * SLOT_SIZE;
-            let flags = u16::from_le_bytes([bytes[base + 6], bytes[base + 7]]) | 0x0004;
-            bytes[base + 6..base + 8].copy_from_slice(&flags.to_le_bytes());
-            let header_crc = crc32c(&bytes[base..base + 60]);
-            bytes[base + 60..base + 64].copy_from_slice(&header_crc.to_le_bytes());
-            let trailer = crc32c(&bytes[base..base + 4092]);
-            bytes[base + 4092..base + 4096].copy_from_slice(&trailer.to_le_bytes());
-        }
-        std::fs::write(&path, &bytes).unwrap();
-        let err = BootMetaManager::open_or_recover(fs)
-            .err()
-            .expect("must refuse");
-        assert!(err.to_string().contains("unknown boot_meta flags"), "{err}");
     }
 }

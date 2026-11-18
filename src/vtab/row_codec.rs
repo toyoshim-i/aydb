@@ -36,7 +36,6 @@ pub const KEY_TAG_NULL: u8 = 0x05;
 pub const KEY_TAG_FLOAT_LT_I64_MIN: u8 = 0x0E;
 pub const KEY_TAG_INTEGER: u8 = 0x10;
 pub const KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1: u8 = 0x12;
-const LEGACY_KEY_TAG_FLOAT: u8 = 0x18;
 pub const KEY_TAG_TEXT: u8 = 0x20;
 pub const KEY_TAG_BLOB: u8 = 0x30;
 
@@ -410,9 +409,7 @@ impl SqlValue {
                     Some(Self::Float(decode_f64_memcomparable(r_arr)))
                 }
             }
-            KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 | LEGACY_KEY_TAG_FLOAT
-                if payload.len() == 8 =>
-            {
+            KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 if payload.len() == 8 => {
                 let arr: [u8; 8] = payload.try_into().ok()?;
                 Some(Self::Float(decode_f64_memcomparable(arr)))
             }

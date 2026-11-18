@@ -1005,11 +1005,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     "virtual table name exceeds maximum catalog key length",
                 ));
             }
+            // The rowid mapping marker goes in the same batch: a table is either absent, or in
+            // the catalog with its marker, never half created.
             self.commit_wal_and_memtable(
-                vec![WalRecord::PutInline {
-                    key: cat_key,
-                    value: chosen_id.to_be_bytes().to_vec(),
-                }],
+                vec![
+                    WalRecord::PutInline {
+                        key: cat_key,
+                        value: chosen_id.to_be_bytes().to_vec(),
+                    },
+                    rowid::rowid_marker_record(chosen_id),
+                ],
                 durability,
             )?;
         }

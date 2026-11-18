@@ -144,8 +144,7 @@ fn a_synchronous_migration_syncs_once_regardless_of_row_count() {
     let many = syncs("unique_mig_sync_many", 300, sync);
     assert!(one > 0, "a synchronous migration must reach the device");
     assert_eq!(many, one, "syncs must not grow with the number of rows");
-    // A buffered table never waits for the device for its rows or its marker. The only syncs
-    // left are the two metadata commits of the downgrade guard, a constant.
+    // A buffered table never waits for the device for its rows or its marker.
     let buffered_one = syncs(
         "unique_mig_sync_buffered1",
         1,
@@ -607,79 +606,4 @@ fn a_table_without_unique_columns_never_gets_a_marker() {
     .unwrap();
     conn.execute_batch("INSERT INTO p VALUES('a','1')").unwrap();
     assert!(marker_of(&engine, 3).is_none());
-}
-
-fn guard(engine: &Engine) -> (bool, bool) {
-    engine.read().unwrap().test_unique_guard_in_slots()
-}
-
-#[test]
-fn the_downgrade_guard_is_set_with_the_first_marker_and_never_cleared() {
-    let fx = fixture("unique_guard_lifecycle", "");
-    // Connecting does not set it, and neither does reading a table that was never migrated.
-    legacy_table(&fx, 3);
-    assert_eq!(guard(&fx.engine), (false, false));
-    assert_eq!(rows_of(&fx.conn).len(), 3);
-    assert_eq!(guard(&fx.engine), (false, false));
-    assert!(marker(&fx).is_none());
-
-    drive(&fx);
-    assert_eq!(guard(&fx.engine), (true, true));
-
-    // Flush, checkpoint, compaction and further writes keep it.
-    for step in 0..6 {
-        fx.conn
-            .execute_batch(&format!(
-                "INSERT INTO t VALUES('s{step}','as{step}',{},'ns{step}','c')",
-                1000 + step
-            ))
-            .unwrap();
-        let mut eng = fx.engine.write().unwrap();
-        match step % 3 {
-            0 => eng.flush_memtable().unwrap(),
-            1 => eng.checkpoint().unwrap(),
-            _ => eng.compact().unwrap(),
-        }
-        drop(eng);
-        assert_eq!(guard(&fx.engine), (true, true), "step {step}");
-    }
-    // Dropping the table does not clear it either.
-    fx.conn.execute_batch("DROP TABLE t").unwrap();
-    assert_eq!(guard(&fx.engine), (true, true));
-
-    // Reopen.
-    let Fx {
-        dir, engine, conn, ..
-    } = fx;
-    drop(conn);
-    drop(engine);
-    let engine = open_engine(&dir);
-    assert_eq!(guard(&engine), (true, true));
-    engine.write().unwrap().checkpoint().unwrap();
-    assert_eq!(guard(&engine), (true, true));
-}
-
-#[test]
-fn a_database_without_a_unique_table_never_gets_the_guard() {
-    let dir = TempTestDir::new("unique_guard_none");
-    let engine = open_engine(&dir);
-    let conn = SqliteConnection::open_in_memory().unwrap();
-    conn.register_aydb_module_with_options(engine.clone(), false)
-        .unwrap();
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE p USING aydb(table_id=3, columns='k TEXT PRIMARY KEY, v TEXT', \
-         indexes='v')",
-    )
-    .unwrap();
-    for i in 0..20 {
-        conn.execute_batch(&format!("INSERT INTO p VALUES('k{i}','v{i}')"))
-            .unwrap();
-    }
-    {
-        let mut eng = engine.write().unwrap();
-        eng.flush_memtable().unwrap();
-        eng.checkpoint().unwrap();
-        eng.compact().unwrap();
-    }
-    assert_eq!(guard(&engine), (false, false));
 }

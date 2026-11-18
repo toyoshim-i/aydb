@@ -242,69 +242,6 @@ fn io_err_to_sqlite_rc(err: &io::Error) -> c_int {
     }
 }
 
-/// Re-establishes the persistent rowid mappings if they are not visible to this connection.
-/// Connecting a legacy table migrates it inside whatever transaction is open at that moment; if
-/// that transaction (or a savepoint) rolls back, the mappings and their completion marker roll
-/// back with it while this vtab instance stays connected. The migration is resumable and runs
-/// only when a marker has been lost. Once the marker has been seen committed, `rowids_committed`
-/// latches and no further check is made: a committed marker is removed only by `DROP TABLE`,
-/// which destroys this vtab instance.
-fn ensure_rowids_for_conn(eng: &mut StorageEngine<OsFs>, vtab: &AydbVTab) -> std::io::Result<()> {
-    if vtab.rowids_committed.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    rowid_map::ensure_persistent_rowids(
-        eng,
-        vtab.table_id,
-        vtab.durability,
-        vtab.pk_affinity == ColumnAffinity::Integer,
-    )?;
-    latch_if_marker_committed(eng, vtab);
-    Ok(())
-}
-
-/// Latches only on a marker visible in the committed view, never on one that exists solely in
-/// the owner's open transaction, which a rollback would remove.
-fn latch_if_marker_committed(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) {
-    if eng
-        .rowids_initialized_view(crate::engine::ReadView::Committed, vtab.table_id)
-        .unwrap_or(false)
-    {
-        vtab.rowids_committed.store(true, Ordering::Release);
-    }
-}
-
-/// Scan-side variant of [`ensure_rowids_for_conn`]: no lock at all once latched, a shared-lock
-/// marker check before that, and the writer lock only when the mappings must be rebuilt.
-fn ensure_rowids_before_scan(vtab: &AydbVTab) -> Result<(), c_int> {
-    if vtab.rowids_committed.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let conn_id = vtab.db as usize;
-    {
-        let eng = vtab.engine.read().map_err(|_| SQLITE_ERROR)?;
-        if eng
-            .rowids_initialized_view(crate::engine::ReadView::Committed, vtab.table_id)
-            .unwrap_or(false)
-        {
-            vtab.rowids_committed.store(true, Ordering::Release);
-            return Ok(());
-        }
-        let view = eng.read_view_for_conn(conn_id);
-        // An unreadable marker is left to the read itself to report.
-        if eng
-            .rowids_initialized_view(view, vtab.table_id)
-            .unwrap_or(true)
-        {
-            return Ok(());
-        }
-    }
-    let mut eng = vtab.engine.write().map_err(|_| SQLITE_ERROR)?;
-    eng.check_write_allowed_for_conn(conn_id)
-        .map_err(|e| io_err_to_sqlite_rc(&e))?;
-    ensure_rowids_for_conn(&mut eng, vtab).map_err(|e| io_err_to_sqlite_rc(&e))
-}
-
 unsafe fn constraint_matches_col_collation(
     p_info: *mut sqlite3_index_info,
     constraint_idx: usize,
@@ -433,8 +370,6 @@ pub(super) struct AydbVTab {
     /// Normalised at use. Changes when the table is renamed.
     table_name: std::sync::Mutex<String>,
     durability: WriteDurability,
-    /// Set once the rowid migration marker has been observed in the committed view.
-    rowids_committed: AtomicBool,
     /// The UNIQUE columns with the collation and affinity that shape their index keys.
     unique_def: unique_key::UniqueDef,
     /// Set once the UNIQUE index marker for `unique_def` has been observed in the committed
@@ -658,7 +593,6 @@ fn integer_rowid_occupied(
 /// What a successful connect resolved under the engine lock.
 struct Connected {
     table_id: u16,
-    rowids_committed: bool,
     unique_ready: bool,
     /// The catalog had no entry for the table before this connect: it is a new table.
     newly_created: bool,
@@ -667,14 +601,15 @@ struct Connected {
 /// Registers the table for a connection and prepares its runtime state, all under one engine
 /// lock. Returns `None`, having changed nothing, when the table cannot be connected without
 /// writing durable state while another connection's transaction is open: it is not yet in the
-/// catalog, its capped quota is not registered as declared, or its rowid migration is pending.
+/// catalog, or its capped quota is not registered as declared.
 ///
-/// With another transaction open, an existing migrated table is only registered as live (see
+/// With another transaction open, an existing table is only registered as live (see
 /// [`StorageEngine::activate_persisted_vtab`]) and its runtime-only settings are applied. None of
 /// that is transactional state: the corrupt policy and inline threshold are not restored by a
-/// rollback, and the live registration is added to the snapshots a rollback restores. The rowid
-/// scan reads the committed view, so the other transaction's uncommitted rows cannot leave a gap
-/// in the automatic rowid sequence if it rolls back.
+/// rollback, and the live registration is added to the snapshots a rollback restores.
+///
+/// A table that is in the catalog without its rowid mapping marker is refused with
+/// `InvalidData` (see below): it was written by an unsupported older format.
 fn connect_table(
     eng: &mut StorageEngine<OsFs>,
     conn_id: usize,
@@ -683,15 +618,26 @@ fn connect_table(
     let plan = eng.plan_vtab_registration(&ddl.table_name, ddl.explicit_table_id)?;
     let table_id = plan.table_id;
     let newly_created = !plan.persisted;
+    // A table is created together with its rowid mapping marker, in one atomic write. One
+    // without it was written by a build that predates the mapping, which is not supported.
+    // A marker that cannot be read is left to the reads of the table to report.
+    if plan.persisted
+        && !eng
+            .rowids_initialized_view(eng.read_view_for_conn(conn_id), table_id)
+            .unwrap_or(true)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "table has no persistent rowid mapping (it was written by an unsupported older \
+             format); recreate it",
+        ));
+    }
     if eng.check_write_allowed_for_conn(conn_id).is_err() {
         let quota_registered = ddl.max_bytes == 0
             || eng
                 .capped_table_state(table_id)
                 .is_some_and(|state| state.max_bytes == ddl.max_bytes);
-        let migrated = eng
-            .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
-            .unwrap_or(false);
-        if !(plan.persisted && quota_registered && migrated) {
+        if !(plan.persisted && quota_registered) {
             return Ok(None);
         }
         eng.activate_persisted_vtab(table_id, &ddl.table_name);
@@ -699,7 +645,7 @@ fn connect_table(
         // Another connection may already use this registration: a failed connect must not
         // remove it.
         let was_active = eng.is_vtab_active(table_id, &ddl.table_name);
-        if let Err(e) = register_and_migrate(eng, ddl, plan) {
+        if let Err(e) = register_table(eng, ddl, plan) {
             if !was_active {
                 eng.unregister_vtab(table_id, &ddl.table_name);
             }
@@ -715,9 +661,6 @@ fn connect_table(
         Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
         None => eng.reset_table_inline_threshold(table_id),
     }
-    let rowids_committed = eng
-        .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
-        .unwrap_or(false);
     let unique_def = unique_key::UniqueDef::from_columns(
         &ddl.col_unique,
         &ddl.col_collations,
@@ -731,15 +674,15 @@ fn connect_table(
             .is_some_and(|found| found == unique_def.marker_value());
     Ok(Some(Connected {
         table_id,
-        rowids_committed,
         unique_ready,
         newly_created,
     }))
 }
 
-/// The writing part of a connect: catalog entry, capped quota, and the rowid migration of an
-/// older table. It only runs when no other connection has a transaction open.
-fn register_and_migrate(
+/// The writing part of a connect: catalog entry (with the table's rowid mapping marker, in the
+/// same atomic write) and capped quota. It only runs when no other connection has a transaction
+/// open.
+fn register_table(
     eng: &mut StorageEngine<OsFs>,
     ddl: &ParsedVtabDdl,
     plan: crate::engine::VtabPlan,
@@ -752,14 +695,7 @@ fn register_and_migrate(
     if FAIL_CONNECT_AFTER_REGISTRATION.with(|flag| flag.replace(false)) {
         return Err(io::Error::other("injected connect failure"));
     }
-    // Older databases have no rowid index. Populate missing identities in key order once;
-    // every pair is an atomic WAL batch, so a failed connection can resume safely.
-    rowid_map::ensure_persistent_rowids(
-        eng,
-        table_id,
-        ddl.durability,
-        ddl.pk_affinity == ColumnAffinity::Integer,
-    )
+    Ok(())
 }
 
 #[cfg(test)]
@@ -871,10 +807,10 @@ unsafe fn vtab_create_or_connect(
             return rc;
         }
 
-        // Connecting an existing, migrated table writes no durable state and never waits.
-        // Creating a table, or migrating a legacy one, does: those wait for another connection's
-        // transaction to end, bounded like `xBegin`, because the same thread may hold that
-        // connection open and could never end it.
+        // Connecting an existing table writes no durable state and never waits. Creating a
+        // table does: it waits for another connection's transaction to end, bounded like
+        // `xBegin`, because the same thread may hold that connection open and could never end
+        // it.
         let mut deadline = None;
         // SQLite adds a table that `xCreate` made to the transaction without calling `xBegin`
         // for it, but still calls its `xCommit` and `xRollback`. Inside a user transaction the
@@ -932,13 +868,15 @@ unsafe fn vtab_create_or_connect(
                     if began_here {
                         let _ = eng.rollback_transaction_for_conn(db as usize);
                     }
+                    if e.kind() == io::ErrorKind::InvalidData && !pz_err.is_null() {
+                        *pz_err = sqlite_error_message(&e.to_string());
+                    }
                     return io_err_to_sqlite_rc(&e);
                 }
             }
         };
         let Connected {
             table_id,
-            rowids_committed,
             unique_ready,
             ..
         } = connected;
@@ -955,7 +893,6 @@ unsafe fn vtab_create_or_connect(
             table_id,
             table_name: std::sync::Mutex::new(ddl.table_name),
             durability: ddl.durability,
-            rowids_committed: AtomicBool::new(rowids_committed),
             unique_def: unique_key::UniqueDef::from_columns(
                 &ddl.col_unique,
                 &ddl.col_collations,
@@ -1378,9 +1315,6 @@ unsafe extern "system" fn vtab_filter(
         cursor.stream_sec_prefix.clear();
 
         let conn_id = vtab.db as usize;
-        if let Err(rc) = ensure_rowids_before_scan(vtab) {
-            return rc;
-        }
         cursor.snapshot = match vtab.read_session.for_cursor(conn_id) {
             Ok(snapshot) => snapshot,
             Err(error) => return io_err_to_sqlite_rc(&error),
@@ -2095,9 +2029,6 @@ unsafe extern "system" fn vtab_update(
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
         }
-        if let Err(e) = ensure_rowids_for_conn(&mut eng, vtab) {
-            return io_err_to_sqlite_rc(&e);
-        }
 
         // Case 1: DELETE (`argc == 1`)
         if argc == 1 {
@@ -2518,10 +2449,10 @@ unsafe extern "system" fn vtab_update(
     .unwrap_or(SQLITE_ERROR)
 }
 
-/// Builds the UNIQUE index of a table written before it existed, a bounded amount per call
-/// (`unique_migration::ROWS_PER_BEGIN`). It runs from `xBegin` before the engine transaction
-/// starts and never fails the statement: with a transaction open, or after a failure, the
-/// conflict check simply keeps using the scan.
+/// Builds the UNIQUE index of a table whose stored index does not match its declared UNIQUE
+/// columns, a bounded amount per call (`unique_migration::ROWS_PER_BEGIN`). It runs from
+/// `xBegin` before the engine transaction starts and never fails the statement: with a
+/// transaction open, or after a failure, the conflict check simply keeps using the scan.
 ///
 /// A connection that holds a read snapshot skips the migration too: its commits would make the
 /// snapshot stale and fail the write upgrade that follows. A failure (an unreadable row, an I/O

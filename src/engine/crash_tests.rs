@@ -2536,69 +2536,39 @@ fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
     assert_eq!(lru_files(&fs), e.lru_blobs.len());
 }
 
-/// The rowid migration of a legacy table writes its mappings buffered and only the completion
-/// marker with the table's durability. A power cut at every operation of a synchronous migration
-/// must leave either a marker with all of its mappings or an unfinished migration that resumes;
-/// mappings that survived keep their rowids, and an acknowledged migration is never lost.
+/// A table's catalog entry and its rowid mapping marker are one atomic write. A power cut at
+/// every operation of the registration must leave either no table or a table with its marker,
+/// and an acknowledged registration is never lost.
 #[test]
-fn power_cut_during_rowid_migration_resumes_with_stable_rowids() {
-    use crate::vtab::rowid_map::ensure_persistent_rowids;
-    use crate::vtab::{SqlValue, encode_row};
-
-    const ROWS: usize = 12;
+fn power_cut_during_table_registration_never_leaves_a_table_without_its_marker() {
     let sync = WriteDurability::SyncTransactional;
-    let pks: Vec<Vec<u8>> = (0..ROWS)
-        .map(|i| SqlValue::Text(format!("key{i:03}")).to_key_bytes())
-        .collect();
     let cfg = repro_config();
 
-    // Returns the number of operations the migration issued when it ran to completion.
+    // Returns the number of operations the registration issued when it ran to completion.
     let scenario = |seed: u64, cut: Option<u64>, keep: u64, lose: u64| -> u64 {
         let fs = Arc::new(CrashFs::new(DirMode::Unix, seed));
         let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
-        for (i, pk) in pks.iter().enumerate() {
-            let row = encode_row(&[SqlValue::Text(format!("key{i:03}")), SqlValue::Integer(0)]);
-            e.put_row(1, pk, &row, &[], sync).unwrap();
-        }
         let start = fs.op_stats().0;
         fs.arm(cut.map(|c| start + c), None);
-        let acknowledged = ensure_persistent_rowids(&mut e, 1, sync, false).is_ok();
+        let acknowledged = e
+            .register_or_resolve_vtab_with_durability("t", Some(1), sync)
+            .is_ok();
         let span = fs.op_stats().0 - start;
         fs.cut_now();
         drop(e);
         fs.crash(Crash::Power { keep, lose });
 
-        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
-        let initialized = e.rowids_initialized(1).unwrap();
+        let e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let persisted = e.plan_vtab_registration("t", Some(1)).unwrap().persisted;
         assert!(
-            initialized || !acknowledged,
-            "acknowledged migration lost (seed {seed}, cut {cut:?})"
+            persisted || !acknowledged,
+            "acknowledged registration lost (seed {seed}, cut {cut:?})"
         );
-        let mut kept = Vec::new();
-        for pk in &pks {
-            let rowid = e.rowid_for_pk_view(ReadView::Owner, 1, pk).unwrap();
-            assert!(
-                rowid.is_some() || !initialized,
-                "marker without a mapping (seed {seed}, cut {cut:?})"
-            );
-            kept.push(rowid);
-        }
-        // The migration resumes; surviving identities do not change.
-        ensure_persistent_rowids(&mut e, 1, sync, false).unwrap();
-        assert!(e.rowids_initialized(1).unwrap());
-        let mut seen = std::collections::BTreeSet::new();
-        for (pk, before) in pks.iter().zip(&kept) {
-            let rowid = e
-                .rowid_for_pk_view(ReadView::Owner, 1, pk)
-                .unwrap()
-                .expect("every row has a rowid after the resumed migration");
-            assert!(before.is_none_or(|b| b == rowid), "rowid changed");
-            assert_eq!(
-                e.pk_for_rowid_view(ReadView::Owner, 1, rowid).unwrap(),
-                Some(pk.clone())
-            );
-            assert!(seen.insert(rowid), "duplicate rowid");
-        }
+        assert_eq!(
+            e.rowids_initialized(1).unwrap(),
+            persisted,
+            "catalog entry and marker disagree (seed {seed}, cut {cut:?})"
+        );
         span
     };
 
@@ -2684,16 +2654,8 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
         drop(lock);
         fs.crash(Crash::Power { keep, lose });
 
-        // What an older binary would see, before this one opens (and possibly rewrites) it.
-        let raw = content(&fs, "boot_meta.db").unwrap();
-        let guarded = raw[6] & 2 != 0 && raw[4096 + 6] & 2 != 0;
-
         let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
         let marked = e.unique_marker_view(ReadView::Owner, 1).unwrap().is_some();
-        assert!(
-            !marked || guarded,
-            "durable marker without the downgrade guard in both slots (seed {seed}, cut {cut:?})"
-        );
         assert!(
             marked || !acknowledged,
             "acknowledged migration lost (seed {seed}, cut {cut:?})"
@@ -2709,7 +2671,6 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
         let outcome = migrate(&lock, &params, &mut None);
         assert!(matches!(outcome, Outcome::Complete), "{outcome:?}");
         let mut e = lock.into_inner().unwrap();
-        assert_eq!(e.test_unique_guard_in_slots(), (true, true));
         exact(&mut e, &format!("after resume (seed {seed}, cut {cut:?})"));
         span
     };

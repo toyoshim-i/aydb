@@ -54,9 +54,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         value: Vec<u8>,
         durability: WriteDurability,
     ) -> io::Result<()> {
-        // The downgrade guard is durable in both boot_meta slots before the marker can be, so
-        // a binary that does not know the index cannot open a database that has a marker.
-        self.meta_mgr.require_unique_index()?;
         self.commit_wal_and_memtable(
             vec![WalRecord::PutInline {
                 key: marker_key(table_id),
