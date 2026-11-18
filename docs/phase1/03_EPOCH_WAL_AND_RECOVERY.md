@@ -23,7 +23,7 @@ A conventional rolling WAL (creating a new log file per MemTable flush, appendin
    * **`wal_sync.db` (`Durability::Sync`):** Every synchronous commit batch advances to a fresh 4 KB sector boundary. Once a 4 KB sector in `wal_sync.db` is written and acknowledged, it is **never overwritten again during the same `WalEpoch`**, making torn-overwrite corruption of committed data mathematically impossible.
    * **`wal_buf.db` (`Durability::Buffered`):** Multiple buffered commits are packed back-to-back inside the current 4 KB sector buffer and written through to the OS Page Cache (`CcCopyWrite`), surviving `kill -9` / `TerminateProcess` while achieving high storage density.
 3. **Two-Stream `LSN` Merge Recovery + `Write-Blob-Before-WAL` Verification:**
-   Upon recovery, valid batches from `wal_sync.db` and `wal_buf.db` are extracted independently, filtered by `lsn > checkpoint_lsn`, and merge-sorted in ascending `LSN` order. Any `PutBlobPtr` record whose target blob range fails CRC32C verification (because a power outage occurred before the buffered blob write reached disk) is treated as an incomplete write rather than corruption. How much is discarded depends on the stream (§4).
+   Upon recovery, valid batches from `wal_sync.db` and `wal_buf.db` are extracted independently, filtered by `lsn > checkpoint_lsn`, and merge-sorted in ascending `LSN` order. Any `PutBlobPtr` record whose target blob range fails CRC32C verification (because a power outage occurred before the buffered blob write reached disk) is treated as an incomplete write rather than corruption. Replay is a strict prefix of the merged log: the first missing or unverifiable batch is the cut, and nothing at or after it is replayed in either stream (§4; [ARCHITECTURE.md §4.6](../ARCHITECTURE.md)).
 
 ---
 
@@ -52,10 +52,10 @@ Both `wal_sync.db` and `wal_buf.db` use the exact same 4096-byte sector format. 
 
 | Byte Offset | Size | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `0..4` | 4 B | `sector_crc32c` | `u32` (LE) | CRC32C checksum computed over the remaining **4092 bytes** of the sector (`sector[4..4096]`), covering `wal_epoch`, `valid_bytes`, `sector_flags`, all fragments, and zero padding through byte `4095`. |
+| `0..4` | 4 B | `sector_crc32c` | `u32` (LE) | CRC32C checksum computed over the remaining **4092 bytes** of the sector (`sector[4..4096]`), covering `wal_epoch`, `valid_bytes`, `wal_format_version`, all fragments, and zero padding through byte `4095`. |
 | `4..12` | 8 B | `wal_epoch` | `u64` (LE) | Active epoch counter when this sector was written (`>= 1`). During recovery, if `wal_epoch != expected_epoch`, the scanner has reached the end of the log. |
 | `12..14` | 2 B | `valid_bytes` | `u16` (LE) | Number of active fragment bytes inside `sector[16 .. 16 + valid_bytes]` (`0..=4080`). |
-| `14..16` | 2 B | `sector_flags` | `u16` (LE) | Reserved flags (`0`). |
+| `14..16` | 2 B | `wal_format_version` | `u16` (LE) | WAL format version, currently `2` (`0` was the reserved value of the old format). Checked only after the epoch and the CRC match, so stale sectors stay silent; another version in a current-epoch sector stops the valid prefix like a bad CRC. |
 
 > **Why Checksum All 4092 Bytes (`4..4096`) Instead of Only `16 + valid_bytes`?**
 > Covering the full 4 KB sector through byte `4095` guarantees that even if a 4 KB write is torn across 512-byte sub-sectors, any stale bytes left at the tail of the sector from a previous epoch will invalidate `sector_crc32c`. And with SSE4.2 hardware CRC32C running at ~30 GB/s, checksumming 4092 bytes takes only **~130 nanoseconds** (measured in Chapter 1.2).
@@ -108,8 +108,10 @@ Once fragments are reassembled into a complete `WalBatch` byte slice, its layout
 ```text
 WalBatch :=
   [lsn: u64 (8B LE)]           // Monotonic global Log Sequence Number for this batch
-  [batch_crc32c: u32 (4B LE)]  // End-to-end CRC32C over the encoded records below
+  [batch_crc32c: u32 (4B LE)]  // End-to-end CRC32C over everything below (bytes 12..end)
   [record_count: u32 (4B LE)]  // Number of atomic KV mutations in this batch
+  [prev_lsn: u64 (8B LE)]      // LSN of the batch appended just before, across both streams
+  [durable_lsn: u64 (8B LE)]   // Highest LSN known durable when this batch was appended
   record_count * WalRecord
 
 WalRecord :=
@@ -178,14 +180,14 @@ flowchart TD
     Reassemble --> NextIdx["idx += 1"] --> LoopCheck
 ```
 
-Recovery halts at the first torn or old-epoch sector. Because write-back can reorder, later sectors of the same epoch may already be on disk beyond that point, so after recovery the engine **always rotates both WAL epochs** (flushing the MemTable first if non-empty, otherwise rotating epochs only) regardless of whether any batch was recovered. This costs one `boot_meta.db` commit per open and guarantees no pre-crash sector can be read as part of the new stream. Likewise, at each buffered-WAL durability point the open `wal_buf.db` sector is sealed (written, then the cursor advances to a fresh sector) so a synced sector is never rewritten in place; a torn rewrite would otherwise discard batches that were already synced while a later `wal_sync.db` batch depending on them survived. The cost is at most one partly used sector per sync point.
+The valid prefix of a stream ends at the first torn, wrong-version or non-current-epoch sector, but the scan reads on (in 64-sector windows) to collect later intact batches, which bound the lost range and contribute their `durable_lsn`. Only the ordinary end of the log ends the scan: a sector that is all zeros, or an older-epoch sector with a valid CRC32C (so a clean open reads one window per file). Because write-back can reorder, later sectors of the same epoch may already be on disk beyond that point, so after recovery the engine **always rotates both WAL epochs** (flushing the MemTable first if non-empty, otherwise rotating epochs only) regardless of whether any batch was recovered. This costs one `boot_meta.db` commit per open and guarantees no pre-crash sector can be read as part of the new stream. Likewise, at each buffered-WAL durability point the open `wal_buf.db` sector is sealed (written, then the cursor advances to a fresh sector) so a synced sector is never rewritten in place; a torn rewrite would otherwise discard batches that were already synced while a later `wal_sync.db` batch depending on them survived. The cost is at most one partly used sector per sync point.
 
 If a WAL write or sync fails at runtime, the engine is poisoned: mutations fail until reopen, reads continue, and the failed commit's outcome is unknown after reopen (present or absent, never partial).
 
 Once both `sync_batches` and `buf_batches` have been recovered:
 1. Any batch with `batch.lsn <= boot_meta.checkpoint_lsn` is filtered out (already persisted in an `idx_<SeqID>.db` segment).
-2. The two sorted slices (`sync_batches` and `buf_batches`) are merged in $O(N)$ by ascending `batch.lsn`.
-3. For each `WalRecord::PutBlobPtr`, the recovery coordinator invokes a caller-supplied validator (`FnMut(&BlobPtr) -> io::Result<bool>`). Following the **`Write-Blob-Before-WAL`** protocol, `Ok(false)` means the blob never reached disk. In `wal_sync.db` only that batch is dropped, because blobs are synced before the WAL record is written. In `wal_buf.db` recovery stops at the first such batch and discards the rest of that stream, so replay never exposes a hole in the commit order. `Err` is a real I/O error and fails the open, so a transient error cannot drop a committed batch.
+2. The two sorted slices (`sync_batches` and `buf_batches`) are merged in $O(N)$ by ascending `batch.lsn`, and the `prev_lsn` chain is walked from the checkpoint. A broken link names the cut. If the batch at `floor` (the highest `durable_lsn` found) is not in the replayed prefix, acknowledged commits were lost: `EngineConfig::wal_damage_policy` then truncates (default) or fails the open, and `last_wal_recovery()` reports it. `open_with_salvage` returns the intact transactions after the cut. See [ARCHITECTURE.md §4.6](../ARCHITECTURE.md).
+3. For each `WalRecord::PutBlobPtr`, the recovery coordinator invokes a caller-supplied validator (`FnMut(&BlobPtr) -> io::Result<bool>`). Following the **`Write-Blob-Before-WAL`** protocol, `Ok(false)` means the blob never reached disk. Such a batch is the cut: it and every later batch of either stream is discarded, so replay never exposes a hole in the commit order. `Err` is a real I/O error and fails the open, so a transient error cannot drop a committed batch.
 
 ---
 
