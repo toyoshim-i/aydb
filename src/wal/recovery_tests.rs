@@ -879,18 +879,12 @@ fn tx_continue_survives_an_encode_decode_round_trip() {
     assert_eq!(bytes.len(), put(7, 6, 0).encode().len() + 1);
 }
 
-/// KNOWN BUG, found by the group-commit and media-damage modes of the crash harness. The damage
-/// rule compares the cut with `floor`, but the cut is the LSN that the first visible batch after
-/// the hole *names* (`prev_lsn`), which is the last batch of a lost run, not its first. Here
-/// batch 2 was acknowledged (batch 4 carries it as its watermark) and is gone, and batch 3, which
-/// was never durable, is gone as well, so batch 4 names 3 and the cut (3) lies above the floor
-/// (2). Nothing is reported although an acknowledged commit was lost.
-///
-/// `floor` itself proves the loss: it is the LSN of a real batch above the last chain-valid one
-/// (1) that was not found, whatever the cut says. Remove `ignore` when `judge` also reports damage
-/// for `floor > last_good`.
+/// The damage rule compares `floor`, not only the cut, with the replayed prefix. The cut is the
+/// LSN that the first visible batch after a hole *names* (`prev_lsn`), which is the last batch of
+/// a lost run, not its first. Here batch 2 was acknowledged (batch 4 carries it as its watermark)
+/// and is gone, and batch 3, which was never durable, is gone as well, so batch 4 names 3 and the
+/// cut (3) lies above the floor (2). The batch at the floor is missing all the same.
 #[test]
-#[ignore = "known bug: a lost acknowledged batch below the named cut goes unreported"]
 fn a_lost_batch_at_the_watermark_is_damage_although_the_chain_names_a_later_cut() {
     let mut l = logs("wal_floor_below_cut");
     l.sync(&put(1, 0, 0));

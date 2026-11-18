@@ -213,7 +213,7 @@ flowchart TD
     C -- end of batches --> F[No cut inside found batches]
     E --> G[floor = max durable_lsn over ALL valid batches found, including past the cut]
     F --> G
-    G --> H{Some lost LSN <= floor?}
+    G --> H{Is the batch at floor outside the replayed prefix?}
     H -- no --> I[Benign unsynced tail: replay prefix, no damage]
     H -- yes --> J[WalDamage: apply WalDamagePolicy]
 ```
@@ -235,12 +235,14 @@ floor = max(durable_lsn)   over every valid batch it finds,
 
 and applies **one rule**:
 
-> The WAL is damaged if and only if some missing or unverifiable LSN is `<= floor`.
+> The WAL is damaged if and only if the batch at `floor` is not in the replayed prefix (`floor` is above the last chain-valid batch).
+
+`floor` is the `durable_lsn` of a batch that was found, so it names a real batch. If that batch is not among the chain-valid ones it is missing, or it lies at or after the cut. This is the same as "some missing or unverifiable LSN is `<= floor`", but it does not depend on which LSN the chain names: a lost run of batches is named by its last member (the `prev_lsn` of the first batch found after it), which may lie above `floor` while an acknowledged batch at or below `floor` is gone as well.
 
 Consequences:
 
 * A missing range entirely above `floor` is the legitimate unsynced tail of a power cut, including out-of-order persistence in the buffered stream. It is never reported as damage.
-* If the batch whose LSN equals `floor` is not itself found, an acknowledged batch is gone: the tail beyond the last chain-valid batch reaches below `floor` (reason `AcknowledgedTailLost`).
+* If the batch whose LSN equals `floor` is not itself found, an acknowledged batch is gone, whether or not the chain also breaks. With no break, or a break above `floor` that is not a missing predecessor (an unverifiable blob, a batch past an unusable sector), the reason is `AcknowledgedTailLost`; with a break named by `prev_lsn` it is `MissingPredecessor`.
 * A valid sector after a stop is **not** damage by itself. Its only roles are to contribute its `durable_lsn` to `floor` and to bound the lost range (it is the proof that something at or after the stop existed). Treating "valid data after a hole" as damage would flag every power cut that persisted buffered pages out of order, which is the false positive the watermark exists to avoid.
 
 **Where the scan of a file ends.** Each file is scanned from sector 0 in 64-sector (256 KB) windows. A sector that is not a usable current-epoch sector (CRC32C failure, unparsable body, unsupported format version, a newer epoch, or an older epoch whose CRC32C fails, which is a torn write) stops the valid prefix, but the scan reads on and collects the later intact current-epoch batches, for the reasons above. Only the **ordinary end of the log** ends the scan itself, wherever it comes: a sector that is all zeros (never written), or a sector of an older epoch whose CRC32C is valid (left over from before the last epoch rotation). Nothing is read past it. Since both epochs rotate on every `open`, after a clean shutdown sector 0 of each file is already of an older epoch, so a clean open reads one window per file instead of 8 MB plus 16 MB.
@@ -386,7 +388,7 @@ pub struct WalRecoveryReport {
 
 pub struct WalDamage {
     pub reason: WalDamageReason,
-    pub first_lost_lsn: u64,               // the cut
+    pub first_lost_lsn: u64,               // lowest LSN proven lost: min(cut, floor)
     pub last_lsn_seen: u64,                // highest LSN found anywhere
     pub discarded_batches: StreamCounts,   // valid batches at or after the cut
     pub unsalvageable: u64,                // operations: schema changes, unknown tables, bad blobs

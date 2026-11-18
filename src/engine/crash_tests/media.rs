@@ -81,8 +81,6 @@ pub(super) struct MediaCov {
     pub unprovable: AtomicU64,
     /// Damage with a lost batch that had been acknowledged durable.
     pub lost_acked: AtomicU64,
-    /// Known engine bug tolerated (see [`Expect::known_floor_bug`]).
-    pub known_floor_bug: AtomicU64,
     pub salvage_checks: AtomicU64,
     pub salvaged_txs: AtomicU64,
     pub salvage_visible_discarded: AtomicU64,
@@ -97,7 +95,7 @@ impl MediaCov {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
         format!(
             "damaged={} (flip={} zero={} truncate={} stale={}) refused={} (extended_wal={}) \
-             lost_unreported={} (hidden={} unprovable={}) lost_acked={} known_floor_bug={} \
+             lost_unreported={} (hidden={} unprovable={}) lost_acked={} \
              salvage_checks={} salvaged_txs={} salvage_visible_discarded={} group_tickets={} \
              group_leads={} group_shared={} group_sync_path={}",
             g(&self.damaged),
@@ -111,7 +109,6 @@ impl MediaCov {
             g(&self.hidden),
             g(&self.unprovable),
             g(&self.lost_acked),
-            g(&self.known_floor_bug),
             g(&self.salvage_checks),
             g(&self.salvaged_txs),
             g(&self.salvage_visible_discarded),
@@ -225,46 +222,6 @@ pub(super) struct Expect {
     /// checkpoint.
     pub logged: Vec<(u64, u64, u64)>,
     pub checkpoint: u64,
-    /// The highest `durable_lsn` among the visible batches.
-    pub floor: u64,
-}
-
-impl Expect {
-    /// KNOWN ENGINE BUG (test `a_lost_batch_at_the_watermark_is_damage_although_the_chain_names`
-    /// `_a_later_cut` in `wal/recovery_tests.rs`): the damage rule compares only the LSN that
-    /// the chain names as lost with the watermark. When the first visible batch after a hole
-    /// names a lost LSN above the watermark, a lost acknowledged batch below it goes
-    /// unreported. This is exactly
-    /// that shape: the chain breaks, at an LSN above `floor`, and a lost batch lies at or below
-    /// it. Set `AYDB_CRASH_STRICT=1` to make the oracle fail on it.
-    fn known_floor_bug(&self) -> bool {
-        if std::env::var("AYDB_CRASH_STRICT").is_ok() {
-            return false;
-        }
-        let mut last = self.checkpoint;
-        for (i, b) in self
-            .visible
-            .iter()
-            .filter(|b| b.lsn > self.checkpoint)
-            .enumerate()
-        {
-            let linked = if i == 0 {
-                b.prev_lsn <= self.checkpoint
-            } else {
-                b.prev_lsn == last
-            };
-            if !linked {
-                let named = if b.prev_lsn > last && b.prev_lsn < b.lsn {
-                    b.prev_lsn
-                } else {
-                    b.lsn
-                };
-                return named > self.floor;
-            }
-            last = b.lsn;
-        }
-        false
-    }
 }
 
 /// A primary-row record: `(table id, key without prefix, put?)`; a put holds its inline value,
@@ -421,7 +378,6 @@ impl Harness<'_> {
                 v
             },
             checkpoint: m.checkpoint_lsn,
-            floor: floor_vis,
             visible,
         }))
     }
@@ -544,9 +500,7 @@ impl Harness<'_> {
             )?;
         let report = eng.last_wal_recovery().clone();
         let damage = report.damage.clone();
-        if damage.is_none() && x.required && x.known_floor_bug() {
-            Coverage::bump(&cov.known_floor_bug);
-        } else if damage.is_some() != x.required {
+        if damage.is_some() != x.required {
             return Err(self.fail(format!(
                 "recovery {} damage, but the logs {} it: a lost batch is {} the watermark of a \
                  visible batch\n  report: {report:?}\n  checkpoint {}, visible (lsn, prev, \

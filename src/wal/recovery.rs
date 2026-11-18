@@ -7,7 +7,8 @@
 //! 2. Every intact batch is merged by LSN and the predecessor chain is walked ([`walk_chain`]).
 //!    The first broken link, unverifiable blob or batch that may not be replayed is the cut.
 //! 3. `floor`, the highest `durable_lsn` found anywhere, tells damage from the benign unsynced
-//!    tail of a power cut ([`judge`]): damage if and only if the cut is `<= floor`.
+//!    tail of a power cut ([`judge`]): damage if and only if the batch at `floor` is not in the
+//!    replayed prefix.
 //! 4. The batches below the cut are replayed, except a multi-chunk transaction that the cut
 //!    interrupted ([`complete_transactions`]).
 
@@ -59,10 +60,11 @@ pub enum WalDamageReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalDamage {
     pub reason: WalDamageReason,
-    /// The cut: nothing at or after this LSN was replayed. It is the exact LSN of the first
-    /// missing or unverifiable batch. For [`WalDamageReason::AcknowledgedTailLost`] no link names
-    /// the lost range, so it is the durable watermark, the one LSN known to be lost; the real
-    /// first lost batch lies somewhere above the last replayed one and at or below it.
+    /// The lowest LSN proven lost: `min(cut, floor)`, where the cut is the exact LSN of the first
+    /// missing or unverifiable batch that the chain names and `floor` is the durable watermark.
+    /// Nothing at or after it was replayed. A lost run of batches is named by its last member, so
+    /// when the watermark lies below the cut it is the lowest lost LSN known; the real first lost
+    /// batch lies above the last replayed one and at or below it.
     pub first_lost_lsn: u64,
     /// The highest LSN found anywhere, in a batch header or as a `durable_lsn`.
     pub last_lsn_seen: u64,
@@ -242,20 +244,31 @@ pub(crate) struct StopFlags {
     pub corrupt_sector: bool,
 }
 
-/// Applies the damage rule of ARCHITECTURE.md 4.6.4: the WAL is damaged if and only if some
-/// missing or unverifiable LSN is `<= floor`. Returns the reason and the cut LSN.
+/// Applies the damage rule of ARCHITECTURE.md 4.6.4: the WAL is damaged if and only if the batch
+/// at `floor` was acknowledged and is not in the replayed prefix, that is `floor > last_good`.
+/// `floor` is the `durable_lsn` of a batch that was found, so it names a real batch; one above
+/// the last chain-valid batch is either missing or at or after the cut. This subsumes
+/// "the cut is `<= floor`" (the cut is always above `last_good`) and also catches a lost
+/// acknowledged batch when the chain names a later one as the cut, because a lost run of batches
+/// is named by its last member.
+///
+/// Returns the reason and the lowest LSN proven lost, `min(cut, floor)`.
 ///
 /// `last_good` is the LSN of the last chain-valid batch, or the checkpoint LSN. When the chain
-/// has no break but `floor` lies above it, the batch at `floor` is gone and the log ends below an
-/// acknowledged commit.
+/// has no break, the batch at `floor` is gone and the log ends below an acknowledged commit.
 pub(crate) fn judge(
     cut: Option<Cut>,
     floor: u64,
     last_good: u64,
     flags: StopFlags,
 ) -> Option<(WalDamageReason, u64)> {
+    if floor <= last_good {
+        // Nothing acknowledged is missing: the unsynced tail of a power cut, however the
+        // buffered stream was persisted.
+        return None;
+    }
     let (lost, base) = match cut {
-        Some(c) => {
+        Some(c) if c.lsn <= floor => {
             let base = match c.kind {
                 CutKind::Link => WalDamageReason::MissingPredecessor,
                 CutKind::Blob => WalDamageReason::UnverifiableBlob,
@@ -263,13 +276,10 @@ pub(crate) fn judge(
             };
             (c.lsn, base)
         }
-        None if floor > last_good => (floor, WalDamageReason::AcknowledgedTailLost),
-        None => return None,
+        // The cut lies above the batch at `floor`, which is gone on its own.
+        Some(c) if c.kind == CutKind::Link => (floor, WalDamageReason::MissingPredecessor),
+        _ => (floor, WalDamageReason::AcknowledgedTailLost),
     };
-    if lost > floor {
-        // The unsynced tail of a power cut, however the buffered stream was persisted.
-        return None;
-    }
     let reason = match base {
         // A blob that rotted is the cause whatever else is wrong with the logs.
         WalDamageReason::UnverifiableBlob => base,
