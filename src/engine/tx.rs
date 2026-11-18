@@ -355,6 +355,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the private transaction overlay (for read-your-own-writes visibility) while coalescing their
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.cleanup_read_snapshots();
         if self.tx_depth == 0 {
             self.tx_overlay.clear();
@@ -377,6 +378,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection already holds
     /// an active transaction on this `StorageEngine`.
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
@@ -689,6 +691,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn absorb_durable_through(&mut self, target: u64) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         while self
             .pending_group
             .front()
@@ -729,6 +732,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Makes a durably logged transaction visible and runs the post-commit maintenance.
     fn publish_committed_transaction(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
@@ -801,6 +805,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// SQLite invokes `xRollback` once per virtual table that took part in the transaction, so a
     /// rollback with no active transaction is a no-op: there is no start snapshot to restore.
     pub fn rollback_transaction(&mut self) -> io::Result<()> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         if self.tx_depth == 0 {
             return Ok(());
         }
@@ -918,6 +923,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// savepoint opened after the table joined; it is an error, so that a rollback is never
     /// silently skipped.
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.tx_prepared = false;
         let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
             if self.savepoints.iter().any(|s| s.sp_id < sp_id) {
@@ -948,6 +954,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Undoes everything the active transaction did while keeping it open. No undo log is
     /// needed: the overlay is rebuilt from the state the transaction started with.
     fn rollback_to_transaction_start(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.savepoints.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_bytes = 0;
@@ -990,6 +997,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn restore_tx_state(&mut self, undo_target_len: usize, snap: &TxMetaSnapshot) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = snap.next_lsn;
         for (&seq, b) in &mut self.std_blobs {

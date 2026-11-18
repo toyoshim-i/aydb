@@ -347,6 +347,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
+    /// Bumped by every change that can add or remove a row as some view sees it: each write,
+    /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
+    /// rows (a cache) stays valid exactly as long as the epoch does not move.
+    pub(super) mutation_epoch: u64,
     /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys.
     /// Standard uncapped tables without secondary indexes resolve to `false` once and skip
     /// all `'t'` negative point lookups on `UPDATE` and `DELETE`!
@@ -797,6 +801,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             vtabs_created_in_tx: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
+            mutation_epoch: 0,
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
@@ -1186,6 +1191,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .partition(|(id, name)| *name == norm || Some(*id) == table_id);
         self.vtabs_created_in_tx = kept;
         stale
+    }
+
+    /// The mutation epoch (see the field): equal values mean no row changed in between.
+    pub(crate) fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
     }
 
     /// Whether `(table_id, table_name)` is currently registered as a live virtual table.
@@ -2908,6 +2918,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         records: Vec<WalRecord>,
         durability: WriteDurability,
     ) -> io::Result<u64> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;

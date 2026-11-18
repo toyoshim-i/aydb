@@ -6,6 +6,8 @@
 //! and Capped Table (`MAX_BYTES`) LRU eviction.
 
 #[cfg(test)]
+mod auto_rowid_tests;
+#[cfg(test)]
 mod check_tests;
 #[cfg(test)]
 mod column_def_tests;
@@ -60,7 +62,7 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -452,13 +454,16 @@ pub(super) struct AydbVTab {
     pub(super) pk_affinity: ColumnAffinity,
     /// The key is `INTEGER PRIMARY KEY`, a rowid alias: NULL on insert assigns the next key.
     pk_rowid_alias: bool,
+    /// `(engine mutation epoch, next automatic key)` as left by this table's last automatic
+    /// insert. Valid only while the epoch is unchanged: no other write, commit or rollback has
+    /// happened since, so `max key + 1` is still the next key. Otherwise the key is derived from
+    /// the rows again.
+    auto_key_cache: std::sync::Mutex<(u64, i64)>,
     /// The declaration has a `CHECK` that is not enforced: every write that stores a row fails.
     has_check: bool,
     pub(super) pk_collation: ColCollation,
     /// Compact list of `(col_idx, index_id)` (`1..=N`) for secondary indexed columns.
     secondary_indexes: Vec<(usize, u16)>,
-    /// Next monotonically increasing auto-assigned rowid for `INTEGER PRIMARY KEY`.
-    next_auto_rowid: AtomicI64,
 }
 
 impl AydbVTab {
@@ -653,7 +658,6 @@ fn integer_rowid_occupied(
 /// What a successful connect resolved under the engine lock.
 struct Connected {
     table_id: u16,
-    initial_auto_rowid: i64,
     rowids_committed: bool,
     unique_ready: bool,
     /// The catalog had no entry for the table before this connect: it is a new table.
@@ -711,18 +715,6 @@ fn connect_table(
         Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
         None => eng.reset_table_inline_threshold(table_id),
     }
-    // Resume automatic rowid assignment after the largest existing integer rowid so a
-    // reconnect does not restart the sequence at 1 and fall into the random-rowid fallback.
-    // A failed scan must not prevent the table from connecting (reads report the error
-    // themselves), so it leaves the counter at its initial value.
-    let initial_auto_rowid = if ddl.pk_affinity == ColumnAffinity::Integer {
-        match max_integer_rowid(eng, conn_id, table_id) {
-            Ok(Some(m)) if m >= 0 => m.saturating_add(1),
-            _ => 0,
-        }
-    } else {
-        0
-    };
     let rowids_committed = eng
         .rowids_initialized_view(crate::engine::ReadView::Committed, table_id)
         .unwrap_or(false);
@@ -739,7 +731,6 @@ fn connect_table(
             .is_some_and(|found| found == unique_def.marker_value());
     Ok(Some(Connected {
         table_id,
-        initial_auto_rowid,
         rowids_committed,
         unique_ready,
         newly_created,
@@ -947,7 +938,6 @@ unsafe fn vtab_create_or_connect(
         };
         let Connected {
             table_id,
-            initial_auto_rowid,
             rowids_committed,
             unique_ready,
             ..
@@ -982,10 +972,10 @@ unsafe fn vtab_create_or_connect(
             pk_col_idx: ddl.pk_col_idx,
             pk_affinity: ddl.pk_affinity,
             pk_rowid_alias: ddl.pk_rowid_alias,
+            auto_key_cache: std::sync::Mutex::new((u64::MAX, 0)),
             has_check: ddl.has_check,
             pk_collation: ddl.pk_collation,
             secondary_indexes: ddl.secondary_indexes,
-            next_auto_rowid: AtomicI64::new(initial_auto_rowid),
         });
 
         *pp_vtab = Box::into_raw(vtab) as *mut sqlite3_vtab;
@@ -2216,18 +2206,40 @@ unsafe extern "system" fn vtab_update(
             _ => None,
         };
         let mut auto_assigned = false;
+        let mut cache_next_key: Option<i64> = None;
 
         // Handle `SQLITE_NULL` primary key
         let pk_override = if alias_rowid.is_some() {
             alias_rowid
         } else if pk_val_type == SQLITE_NULL {
             if is_insert && vtab.pk_rowid_alias {
-                let mut candidate = vtab.next_auto_rowid.load(Ordering::Relaxed);
-                if candidate <= 0 {
-                    candidate = 1;
-                }
+                // Like a native table: the largest key at this moment plus one (1 for an empty
+                // table). Nothing is remembered between inserts, so a failed statement, a
+                // rolled back transaction or savepoint, a delete, or another connection's
+                // insert never leave a gap or a duplicate. At `i64::MAX` the random search
+                // below takes over.
+                //
+                // The previous automatic insert of this table left `max + 1` behind together
+                // with the engine's mutation epoch. While the epoch is the same nothing else
+                // wrote, committed or rolled back since, so that value still is `max + 1`.
+                let cached = vtab
+                    .auto_key_cache
+                    .lock()
+                    .ok()
+                    .filter(|cache| cache.0 == eng.mutation_epoch())
+                    .map(|cache| cache.1);
+                let mut candidate = match cached {
+                    Some(next) => next,
+                    None => match max_integer_rowid(&mut eng, vtab.db as usize, vtab.table_id) {
+                        Ok(None) => 1,
+                        Ok(Some(max)) => max.saturating_add(1),
+                        Err(e) => return io_err_to_sqlite_rc(&e),
+                    },
+                };
+                let first_candidate = candidate;
                 let mut found_free = None;
-                // 1. Bounded sequential probe using checked arithmetic
+                // 1. Bounded sequential probe using checked arithmetic. It also steps over a
+                //    number that a synthetic rowid already owns.
                 for _ in 0..1024 {
                     match integer_rowid_occupied(&eng, vtab.table_id, candidate) {
                         Ok(false) => {
@@ -2269,10 +2281,12 @@ unsafe extern "system" fn vtab_update(
                 let Some(chosen) = found_free else {
                     return SQLITE_FULL;
                 };
-                if let Some(next) = chosen.checked_add(1) {
-                    vtab.next_auto_rowid.fetch_max(next, Ordering::Relaxed);
-                }
                 auto_assigned = true;
+                // Only a key that is `max + 1` can be remembered as such: not a number found by
+                // stepping over synthetic rowids, and not one from the random search.
+                if chosen == first_candidate {
+                    cache_next_key = chosen.checked_add(1);
+                }
                 Some(chosen)
             } else {
                 return SQLITE_CONSTRAINT;
@@ -2309,18 +2323,6 @@ unsafe extern "system" fn vtab_update(
             (None, Some(rowid)) => Some(rowid),
             _ => None,
         };
-        if !auto_assigned {
-            if let Some(explicit_id) = coerced_int_pk {
-                if explicit_id >= 0 {
-                    if let Some(next) = explicit_id.checked_add(1) {
-                        vtab.next_auto_rowid.fetch_max(next, Ordering::Relaxed);
-                    } else {
-                        vtab.next_auto_rowid.fetch_max(i64::MAX, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-
         // Resolve `old_pk` if this is an UPDATE (`!is_insert`)
         let mut old_pk_opt: Option<Vec<u8>> = None;
         if !is_insert {
@@ -2504,6 +2506,10 @@ unsafe extern "system" fn vtab_update(
             Ok(rid) => rid,
             Err(e) => return io_err_to_sqlite_rc(&e),
         };
+        if let (Some(next), Ok(mut cache)) = (cache_next_key, vtab.auto_key_cache.lock()) {
+            // After this insert's own writes: anything that happens later moves the epoch.
+            *cache = (eng.mutation_epoch(), next);
+        }
         if !p_rowid.is_null() {
             *p_rowid = rid;
         }
