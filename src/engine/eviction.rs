@@ -33,11 +33,37 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.reconcile_single_capped_table(table_id)?;
         }
         if self.tx_depth == 0 {
+            let bytes_before = self
+                .capped_tables
+                .get(&table_id)
+                .map_or(0, |ct| ct.current_logical_bytes);
             self.evict_until_within_quota(table_id, WriteDurability::BufferedFast)?;
-            let quota_metas = self.build_quota_metas();
-            self.meta_mgr.commit_update(|st| {
-                st.table_quotas = quota_metas;
-            })?;
+            let evicted = self
+                .capped_tables
+                .get(&table_id)
+                .is_some_and(|ct| ct.current_logical_bytes != bytes_before);
+            // A connect of a table that is already registered as declared changes nothing, and
+            // must not cost a metadata commit and a sync. The stored quotas are compared by
+            // registration and `max_bytes`, so a change that never reached the disk (a lost
+            // commit) is still written here. The stored byte count is not compared: it is
+            // brought up to date by every checkpoint and rebuilt from the rows when the log is
+            // replayed at open, so it may lag behind committed writes; only an eviction made
+            // here changes it and needs a commit of its own.
+            let mut quota_metas = self.build_quota_metas();
+            quota_metas.sort_by_key(|q| q.table_id);
+            let mut stored = self.meta_mgr.state().table_quotas.clone();
+            stored.sort_by_key(|q| q.table_id);
+            let same_registrations = stored.len() == quota_metas.len()
+                && stored.iter().zip(&quota_metas).all(|(old, new)| {
+                    old.table_id == new.table_id
+                        && old.eviction_policy == new.eviction_policy
+                        && old.max_bytes == new.max_bytes
+                });
+            if evicted || !same_registrations {
+                self.meta_mgr.commit_update(|st| {
+                    st.table_quotas = quota_metas;
+                })?;
+            }
         } else {
             self.quotas_modified_in_tx = true;
         }

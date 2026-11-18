@@ -23,6 +23,8 @@ pub(crate) use tx::{CommitStep, GroupRole, STATEMENT_SAVEPOINT};
 #[cfg(test)]
 mod blob_recovery_tests;
 #[cfg(test)]
+mod capped_reconnect_tests;
+#[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
 mod metadata_failure_tests;
