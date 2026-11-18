@@ -17,7 +17,9 @@ pub(super) struct ParsedVtabDdl {
     pub(super) on_corrupt: Option<CorruptPolicy>,
     /// Explicit per-table inline threshold override in bytes; `None` keeps engine default.
     pub(super) inline_max: Option<usize>,
-    pub(super) columns_spec: String,
+    /// The column list handed to `sqlite3_declare_vtab`: the definition without the constraints
+    /// that make SQLite build an index object for the table (see [`ColumnDef::declared`]).
+    pub(super) declared_columns: String,
     pub(super) col_names: Vec<String>,
     pub(super) col_affinities: Vec<ColumnAffinity>,
     pub(super) col_collations: Vec<ColCollation>,
@@ -254,6 +256,13 @@ struct ColumnDef {
     /// `INTEGER PRIMARY KEY` that SQLite treats as an alias of the rowid.
     rowid_alias: bool,
     check: bool,
+    /// The definition as declared to SQLite. A `PRIMARY KEY` that is not a rowid alias and
+    /// `UNIQUE` are left out: SQLite would build an automatic index for each, and it walks those
+    /// when it checks the database, finding pages that a virtual table does not have
+    /// ("invalid page number"). The adapter enforces both itself. Everything SQLite does use for
+    /// a virtual table stays: name, declared type, `NOT NULL`, `COLLATE`, and `INTEGER PRIMARY
+    /// KEY` (the rowid alias, which has no index).
+    declared: String,
 }
 
 /// Consumes the parenthesised group that follows keyword token `tokens[i]`, either attached to
@@ -285,6 +294,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         primary_key: false,
         rowid_alias: false,
         check: false,
+        declared: String::new(),
     };
     let mut i = 1usize;
     let mut type_words: Vec<String> = Vec::new();
@@ -310,17 +320,23 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
     }
     def.affinity = ColumnAffinity::from_type_str(&type_words.join(" "));
     let integer_typed = type_words.len() == 1 && type_words[0] == "INTEGER" && !has_size;
+    let mut declared: Vec<&str> = tokens[..i].to_vec();
+    // `CONSTRAINT name`, kept only together with the constraint that follows it.
+    let mut pending_name: Option<&[&str]> = None;
 
     while i < tokens.len() {
         let Some(keyword) = token_keyword(tokens[i]) else {
             return Err(SQLITE_ERROR);
         };
+        let start = i;
         match keyword.as_str() {
             "CONSTRAINT" => {
                 if i + 1 >= tokens.len() {
                     return Err(SQLITE_ERROR);
                 }
                 i += 2;
+                pending_name = Some(&tokens[start..i]);
+                continue;
             }
             "PRIMARY" => {
                 if !is_word(tokens.get(i + 1), "KEY") {
@@ -382,7 +398,14 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
             // DEFAULT values and generated columns are not supported.
             _ => return Err(SQLITE_ERROR),
         }
+        let leaves_index = keyword == "UNIQUE" || (keyword == "PRIMARY" && !def.rowid_alias);
+        let name = pending_name.take();
+        if !leaves_index {
+            declared.extend_from_slice(name.unwrap_or(&[]));
+            declared.extend_from_slice(&tokens[start..i]);
+        }
     }
+    def.declared = declared.join(" ");
     Ok(def)
 }
 
@@ -503,6 +526,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut pk_col_idx = 0usize;
         let mut pk_rowid_alias = false;
         let mut has_check = false;
+        let mut declared_columns: Vec<String> = Vec::new();
         for col_def in split_top_level_commas(&columns_spec) {
             let trimmed = col_def.trim();
             // The parser does not support comments or per-constraint conflict policies.
@@ -528,6 +552,7 @@ pub(super) unsafe fn parse_vtab_ddl(
                 pk_rowid_alias = def.rowid_alias;
             }
             has_check |= def.check;
+            declared_columns.push(def.declared);
             col_names.push(def.name);
             col_affinities.push(def.affinity);
             col_collations.push(def.collation);
@@ -571,7 +596,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             durability,
             on_corrupt,
             inline_max,
-            columns_spec,
+            declared_columns: declared_columns.join(", "),
             col_names,
             col_affinities,
             col_collations,
@@ -837,6 +862,38 @@ mod tests {
             ("k INTEGER, v TEXT", false),
         ] {
             assert_eq!(cols(spec).pk_rowid_alias, alias, "{spec}");
+        }
+    }
+
+    #[test]
+    fn declaration_for_sqlite_drops_what_creates_an_index() {
+        for (spec, declared) in [
+            ("k TEXT PRIMARY KEY, v INT", "k TEXT, v INT"),
+            (
+                "k INTEGER PRIMARY KEY, v INT",
+                "k INTEGER PRIMARY KEY, v INT",
+            ),
+            (
+                "k INTEGER PRIMARY KEY NOT NULL, v INT",
+                "k INTEGER PRIMARY KEY NOT NULL, v INT",
+            ),
+            ("k INT PRIMARY KEY NOT NULL, v INT", "k INT NOT NULL, v INT"),
+            ("k INTEGER PRIMARY KEY DESC, v INT", "k INTEGER, v INT"),
+            ("k TEXT CONSTRAINT p PRIMARY KEY, v INT", "k TEXT, v INT"),
+            (
+                "k TEXT PRIMARY KEY, u TEXT NOT NULL CONSTRAINT x UNIQUE COLLATE NOCASE",
+                "k TEXT, u TEXT NOT NULL COLLATE NOCASE",
+            ),
+            (
+                "\"a b\" TEXT PRIMARY KEY, `u--x` VARCHAR(10) UNIQUE, w",
+                "\"a b\" TEXT, `u--x` VARCHAR(10), w",
+            ),
+            (
+                "k TEXT PRIMARY KEY, v INT CONSTRAINT c NOT NULL REFERENCES p(id) ON DELETE CASCADE",
+                "k TEXT, v INT CONSTRAINT c NOT NULL REFERENCES p(id) ON DELETE CASCADE",
+            ),
+        ] {
+            assert_eq!(cols(spec).declared_columns, declared, "{spec}");
         }
     }
 }

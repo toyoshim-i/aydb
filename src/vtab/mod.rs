@@ -25,6 +25,8 @@ mod ddl;
 mod drop_tests;
 pub mod ffi;
 #[cfg(test)]
+mod integrity_tests;
+#[cfg(test)]
 mod key_null_tests;
 #[cfg(test)]
 mod pk_update_tests;
@@ -862,7 +864,7 @@ unsafe fn vtab_create_or_connect(
 
         // Declare the columns first: it needs no engine state, so a failure leaves nothing
         // registered.
-        let declare_sql = format!("CREATE TABLE x({})", ddl.columns_spec);
+        let declare_sql = format!("CREATE TABLE x({})", ddl.declared_columns);
         let Ok(c_sql) = CString::new(declare_sql) else {
             return SQLITE_ERROR;
         };
