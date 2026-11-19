@@ -607,3 +607,81 @@ fn a_table_without_unique_columns_never_gets_a_marker() {
     conn.execute_batch("INSERT INTO p VALUES('a','1')").unwrap();
     assert!(marker_of(&engine, 3).is_none());
 }
+
+#[test]
+fn migrate_after_pending_group_commit_preserves_new_unique_entry() {
+    use crate::engine::CommitStep;
+    use crate::vtab::unique_key::UniqueDef;
+    use crate::vtab::unique_migration::{Outcome, Params, migrate};
+
+    let dir = TempTestDir::new("unique_mig_pending_group");
+    let engine = open_engine(&dir);
+    let pk = SqlValue::Integer(1).to_key_bytes();
+    let def = UniqueDef::new(vec![(1, ColCollation::Binary, ColumnAffinity::Text)]);
+    let row_old = encode_row(&[SqlValue::Integer(1), SqlValue::Text("old".into())]);
+    let row_new = encode_row(&[SqlValue::Integer(1), SqlValue::Text("new".into())]);
+    let old_keys = def.entries(&row_old).unwrap();
+    let new_keys = def.entries(&row_new).unwrap();
+
+    {
+        let mut eng = engine.write().unwrap();
+        eng.put_row(
+            1,
+            &pk,
+            &row_old,
+            &old_keys,
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+
+        eng.begin_transaction_for_conn(1).unwrap();
+        eng.put_row(
+            1,
+            &pk,
+            &row_new,
+            &new_keys,
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+        eng.prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .unwrap();
+        assert!(matches!(
+            eng.begin_commit_for_conn(1).unwrap(),
+            CommitStep::AwaitingGroup { .. }
+        ));
+        assert_eq!(
+            eng.get_row(1, &pk).unwrap().as_deref(),
+            Some(row_old.as_slice())
+        );
+    }
+
+    let params = Params {
+        table_id: 1,
+        durability: WriteDurability::SyncTransactional,
+        def: &def,
+        chunk_rows: 16,
+        budget_rows: 100,
+    };
+    let mut cursor = None;
+    assert!(matches!(
+        migrate(&engine, &params, &mut cursor),
+        Outcome::Complete
+    ));
+
+    let eng = engine.read().unwrap();
+    assert_eq!(
+        eng.lookup_by_secondary_index(1, 0x8001, &SqlValue::Text("new".into()).to_key_bytes())
+            .unwrap(),
+        vec![pk.clone()]
+    );
+    assert!(
+        eng.lookup_by_secondary_index(1, 0x8001, &SqlValue::Text("old".into()).to_key_bytes())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        eng.unique_marker_view(ReadView::Committed, 1)
+            .unwrap()
+            .is_some()
+    );
+}

@@ -70,6 +70,9 @@ pub(crate) fn migrate<FS: PlatformFs>(
         if eng.in_active_transaction() {
             return Outcome::Skipped;
         }
+        if let Err(e) = eng.drain_group_for_autocommit() {
+            return Outcome::Failed(e);
+        }
         match eng.unique_marker_view(ReadView::Committed, p.table_id) {
             Ok(Some(found)) if found == want => return Outcome::Complete,
             Ok(Some(_)) => {

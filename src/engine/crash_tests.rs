@@ -2953,7 +2953,7 @@ fn power_cut_during_table_registration_never_leaves_a_table_without_its_marker()
         drop(e);
         fs.crash(Crash::Power { keep, lose });
 
-        let e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
         let persisted = e.plan_vtab_registration("t", Some(1)).unwrap().persisted;
         assert!(
             persisted || !acknowledged,
@@ -4143,4 +4143,89 @@ fn backfill_after_a_pending_group_commit_finds_its_row() {
         "the row exists"
     );
     assert_eq!(live_index_entries(&mut e, 2).len(), keys.len());
+}
+
+/// `compact` and `relocate_fragmented_std_blobs` must drain any pending group commit before
+/// scanning `blob_std` pointers, otherwise a relocated stale blob overwrites a group-committed
+/// update or resurrects a group-committed delete at a higher LSN.
+#[test]
+fn compact_after_pending_group_commit_does_not_resurrect_or_overwrite() {
+    for is_delete in [false, true] {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+        let mut cfg = repro_config();
+        cfg.inline_threshold_bytes = 64;
+        cfg.max_blob_segment_bytes = 2048;
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let v1 = vec![0x11; 500];
+        let v2 = vec![0x22; 500];
+        let v3_old = vec![0x33; 500];
+        let v4 = vec![0x44; 700];
+        let v3_new = vec![0x77; 500];
+
+        e.put_row(2, b"k1", &v1, &[], SYNC).unwrap();
+        e.put_row(2, b"k2", &v2, &[], SYNC).unwrap();
+        e.put_row(2, b"k3", &v3_old, &[], SYNC).unwrap();
+        // Roll the blob segment so the segment holding k1, k2, k3 is sealed.
+        e.put_row(2, b"k4", &v4, &[], SYNC).unwrap();
+        // Delete k1 and k2 so the sealed segment has >= 50% dead bytes while k3 remains live.
+        e.delete_row(2, b"k1", SYNC).unwrap();
+        e.delete_row(2, b"k2", SYNC).unwrap();
+        e.flush_memtable().unwrap();
+        assert!(e.memtable.is_empty());
+
+        e.begin_transaction_for_conn(1).unwrap();
+        if is_delete {
+            e.delete_row(2, b"k3", SYNC).unwrap();
+        } else {
+            e.put_row(2, b"k3", &v3_new, &[], SYNC).unwrap();
+        }
+        e.prepare_commit_transaction(SYNC).unwrap();
+        assert!(matches!(
+            e.begin_commit_for_conn(1).unwrap(),
+            CommitStep::AwaitingGroup { .. }
+        ));
+        assert!(!e.pending_group.is_empty());
+        assert!(e.memtable.is_empty());
+
+        e.compact().unwrap();
+
+        let want = if is_delete {
+            None
+        } else {
+            Some(v3_new.as_slice())
+        };
+        assert_eq!(e.get_row(2, b"k3").unwrap().as_deref(), want);
+        drop(e);
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+        assert_eq!(e.get_row(2, b"k3").unwrap().as_deref(), want);
+    }
+}
+
+/// An autocommit `rename_vtab` must drain any pending group commit before scanning the catalog so
+/// an old name entry written by the pending group commit is removed cleanly.
+#[test]
+fn rename_vtab_after_pending_group_commit_removes_old_catalog_entry() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
+
+    e.begin_transaction_for_conn(1).unwrap();
+    e.register_or_resolve_vtab_with_durability("a", Some(5), SYNC)
+        .unwrap();
+    e.prepare_commit_transaction(SYNC).unwrap();
+    assert!(matches!(
+        e.begin_commit_for_conn(1).unwrap(),
+        CommitStep::AwaitingGroup { .. }
+    ));
+    assert!(!e.pending_group.is_empty());
+
+    e.rename_vtab(5, "a", "b", BUF).unwrap();
+
+    let entries: Vec<String> = e
+        .scan_merged_prefix(&[0u8, 0u8, b'c'])
+        .unwrap()
+        .into_iter()
+        .filter(|en| !matches!(en.value, IndexValue::Tombstone))
+        .map(|en| String::from_utf8_lossy(&en.key[3..]).into_owned())
+        .collect();
+    assert_eq!(entries, vec!["b".to_string()]);
 }

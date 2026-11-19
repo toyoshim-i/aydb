@@ -771,6 +771,8 @@ impl Harness<'_> {
                 self.op_maintenance(e, 0)?
             } else if r < 91 {
                 self.op_maintenance(e, 1)?
+            } else if r < 94 {
+                self.op_maintenance(e, 2)?
             } else {
                 self.op_group_tx(e)?
             };

@@ -1122,14 +1122,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Decides which `table_id` a virtual table `(table_name, explicit_id)` resolves to, and
-    /// whether the committed catalog already holds it, without changing anything. Fails exactly
-    /// where [`Self::register_or_resolve_vtab_with_durability`] fails on a conflicting id.
+    /// whether the committed catalog already holds it, without changing anything except draining
+    /// any pending group commit first. Fails exactly where
+    /// [`Self::register_or_resolve_vtab_with_durability`] fails on a conflicting id.
     pub(crate) fn plan_vtab_registration(
-        &self,
+        &mut self,
         table_name: &str,
         explicit_id: Option<u16>,
     ) -> io::Result<VtabPlan> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         let norm_name = table_name.trim().to_ascii_lowercase();
         let catalog_prefix = [0u8, 0u8, b'c'];
         let entries = self.scan_merged_prefix(&catalog_prefix)?;
@@ -1342,6 +1344,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
         let old_norm = old_name.trim().to_ascii_lowercase();
         let new_norm = new_name.trim().to_ascii_lowercase();
         if old_norm == new_norm {
@@ -2479,7 +2482,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// This costs nothing when no group commit is pending. Otherwise it runs the device flush that
     /// the write's own commit would run first anyway (`commit_wal_and_memtable` drains too), so
     /// the write waits for the group's flush exactly as it did, only before its reads.
-    pub(super) fn drain_group_for_autocommit(&mut self) -> io::Result<()> {
+    pub(crate) fn drain_group_for_autocommit(&mut self) -> io::Result<()> {
         if self.tx_depth == 0 {
             self.drain_pending_durable()?;
         }

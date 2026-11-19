@@ -387,6 +387,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth > 0 {
             return Ok(0);
         }
+        self.drain_pending_durable()?;
         let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
         let fragmented_seqs: HashSet<u64> = self
             .std_blobs
@@ -471,6 +472,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_compact_on_commit = true;
             return Ok(());
         }
+        self.drain_pending_durable()?;
         if !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         }
@@ -502,6 +504,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_compact_on_commit = true;
             return Ok(());
         }
+        self.drain_pending_durable()?;
         if !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         }
@@ -892,6 +895,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Reclaims any sealed `blob_std` or `blob_lru` segment where `dead_bytes >= file_len`
     /// ($O(1)$ Copy-less Segment Deletion!).
     pub(super) fn reclaim_fully_dead_blob_segments(&mut self) -> io::Result<()> {
+        self.drain_group_for_autocommit()?;
         let (dead_std, dead_lru, deleted_files) = self.collect_fully_dead_blob_segments();
         if deleted_files.is_empty() {
             return Ok(());
