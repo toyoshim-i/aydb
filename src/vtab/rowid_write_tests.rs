@@ -376,3 +376,112 @@ fn written_rowids_persist_across_reconnect() {
         expect(&again);
     }
 }
+
+#[test]
+fn explicit_rowid_colliding_with_integer_pk_row_conflicts_and_replaces() {
+    let int_key = &SPECS[1];
+    assert!(!int_key.alias && int_key.int_key);
+    let lab = Lab::new(int_key);
+
+    lab.aydb
+        .conn
+        .execute_batch("INSERT INTO a VALUES (1, 'keep_me')")
+        .unwrap();
+
+    // 1. Explicit rowid 1 on a non-integer PK collides with row k=1.
+    assert!(
+        lab.aydb
+            .conn
+            .execute_batch("INSERT INTO a(rowid, k, v) VALUES (1, 'abc', 'other')")
+            .is_err()
+    );
+    assert_eq!(
+        lab.aydb
+            .conn
+            .query_all("SELECT rowid, k, v FROM a", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Integer(1),
+            SqlValue::Text("keep_me".into()),
+        ]]
+    );
+
+    // 2. Updating another row's rowid to 1 must fail and DELETE must target the right row.
+    lab.aydb
+        .conn
+        .execute_batch("INSERT INTO a(k, v) VALUES ('abc', 'other')")
+        .unwrap();
+    assert!(
+        lab.aydb
+            .conn
+            .execute_batch("UPDATE a SET rowid = 1 WHERE k = 'abc'")
+            .is_err()
+    );
+    lab.aydb
+        .conn
+        .execute_batch("DELETE FROM a WHERE k = 'abc'")
+        .unwrap();
+    assert_eq!(
+        lab.aydb
+            .conn
+            .query_all("SELECT rowid, k, v FROM a", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Integer(1),
+            SqlValue::Text("keep_me".into()),
+        ]]
+    );
+
+    // 3. INSERT OR REPLACE replaces (1, 'keep_me') rather than leaving duplicate rowid 1.
+    lab.aydb
+        .conn
+        .execute_batch("INSERT OR REPLACE INTO a(rowid, k, v) VALUES (1, 'abc', 'replaced')")
+        .unwrap();
+    assert_eq!(
+        lab.aydb
+            .conn
+            .query_all("SELECT rowid, k, v FROM a", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Text("abc".into()),
+            SqlValue::Text("replaced".into()),
+        ]]
+    );
+    lab.aydb
+        .conn
+        .execute_batch("DELETE FROM a WHERE k = 'abc'")
+        .unwrap();
+    assert!(
+        lab.aydb
+            .conn
+            .query_all("SELECT rowid, k, v FROM a", &[])
+            .unwrap()
+            .is_empty()
+    );
+
+    // 4. UPDATE OR REPLACE to rowid 1 also replaces (1, 'keep_me').
+    lab.aydb
+        .conn
+        .execute_batch(
+            "INSERT INTO a VALUES (1, 'keep_me'); INSERT INTO a(k, v) VALUES ('abc', 'other');",
+        )
+        .unwrap();
+    lab.aydb
+        .conn
+        .execute_batch("UPDATE OR REPLACE a SET rowid = 1 WHERE k = 'abc'")
+        .unwrap();
+    assert_eq!(
+        lab.aydb
+            .conn
+            .query_all("SELECT rowid, k, v FROM a", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Text("abc".into()),
+            SqlValue::Text("other".into()),
+        ]]
+    );
+}

@@ -2303,17 +2303,38 @@ unsafe extern "system" fn vtab_update(
         // Integer PK values use their exact i64 as rowid. A previously allocated synthetic
         // identity owns that number until its row is deleted, just like an explicit rowid.
         let rowid_conflict_pk = if let Some(rowid) = coerced_int_pk.or(mapped_rowid) {
-            match eng.pk_for_rowid_view(crate::engine::ReadView::Owner, vtab.table_id, rowid) {
-                // The row that already owns the rowid is no conflict when it is the row being
-                // written or the row being updated.
-                Ok(Some(pk))
-                    if old_pk_opt.as_ref().is_none_or(|old| *old != pk)
-                        && (mapped_rowid.is_none() || pk != new_pk) =>
-                {
-                    Some(pk)
+            let implicit_int_owner =
+                if vtab.pk_affinity == ColumnAffinity::Integer && coerced_int_pk.is_none() {
+                    let int_pk = encode_i64_tagged_key(rowid);
+                    if old_pk_opt.as_deref() != Some(int_pk.as_slice())
+                        && new_pk.as_slice() != int_pk.as_slice()
+                    {
+                        match eng.row_exists(vtab.table_id, &int_pk) {
+                            Ok(true) => Some(int_pk.to_vec()),
+                            Ok(false) => None,
+                            Err(e) => return io_err_to_sqlite_rc(&e),
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if implicit_int_owner.is_some() {
+                implicit_int_owner
+            } else {
+                match eng.pk_for_rowid_view(crate::engine::ReadView::Owner, vtab.table_id, rowid) {
+                    // The row that already owns the rowid is no conflict when it is the row being
+                    // written or the row being updated.
+                    Ok(Some(pk))
+                        if old_pk_opt.as_ref().is_none_or(|old| *old != pk)
+                            && (mapped_rowid.is_none() || pk != new_pk) =>
+                    {
+                        Some(pk)
+                    }
+                    Ok(_) => None,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
                 }
-                Ok(_) => None,
-                Err(e) => return io_err_to_sqlite_rc(&e),
             }
         } else {
             None
