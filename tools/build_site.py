@@ -48,6 +48,7 @@ BENCHES = [
     "meta_wal_bench",
     "wisckey_bench",
     "lru_engine_bench",
+    "auto_key_bench",
 ]
 COMPARED = ["standard_sql_bench", "sqlite_vs_aydb_bench"]
 

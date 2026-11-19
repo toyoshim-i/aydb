@@ -111,7 +111,8 @@ jobs:
             pal_bench \
             meta_wal_bench \
             wisckey_bench \
-            lru_engine_bench; do
+            lru_engine_bench \
+            auto_key_bench; do
             echo "::group::$name"
             start=$(date +%s)
             set +e

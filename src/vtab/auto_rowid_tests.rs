@@ -161,47 +161,6 @@ fn two_connections_and_a_reconnect_hand_out_the_same_keys_as_native() {
     assert_eq!(keys("a"), keys("n"));
 }
 
-/// Timing of the automatic-key insert path. Run with
-/// `cargo test --release --lib auto_key_insert_timing -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn auto_key_insert_timing() {
-    for (label, columns) in [
-        ("plain", "k INTEGER PRIMARY KEY, v INT"),
-        ("with UNIQUE", "k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT"),
-    ] {
-        let fixture = Fixture::new("auto_key_timing");
-        let conn = fixture.open();
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE t USING aydb(columns='{columns}')"
-        ))
-        .unwrap();
-        let sql = if columns.contains("UNIQUE") {
-            "INSERT INTO t VALUES (NULL, ?1, 1)"
-        } else {
-            "INSERT INTO t VALUES (NULL, 1)"
-        };
-        let mut best = std::time::Duration::MAX;
-        for round in 0..3 {
-            conn.execute_batch("BEGIN").unwrap();
-            let start = std::time::Instant::now();
-            let mut stmt = conn.prepare(sql).unwrap();
-            for i in 0..100_000 {
-                if columns.contains("UNIQUE") {
-                    stmt.execute(&[SqlValue::Text(format!("u{round}-{i}"))])
-                        .unwrap();
-                } else {
-                    stmt.execute(&[]).unwrap();
-                }
-            }
-            drop(stmt);
-            conn.execute_batch("COMMIT").unwrap();
-            best = best.min(start.elapsed());
-        }
-        println!("auto-key insert [{label}]: 100000 rows in one transaction, best of 3: {best:?}");
-    }
-}
-
 /// The key remembered by one connection is only good while nothing else wrote: another
 /// connection that deletes the key it left behind, or inserts above it, must be noticed.
 #[test]

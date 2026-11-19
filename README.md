@@ -169,6 +169,7 @@ aydb/
     ├── concurrent_write_bench.rs             # Group Commit & Reads During Synchronous Writes
     ├── tx_isolation_read_bench.rs            # Non-Owner Read Cost During Transactions
     ├── compaction_latency_bench.rs           # Commit Latency: Inline vs. Background Compaction
+    ├── auto_key_bench.rs                     # Automatic-Key INSERT: aydb vs. Native SQLite
     ├── reliability_bench.rs                  # Crash-Consistency, Fault-Injection, & Audit Regression Suite
     ├── sqlite_vs_aydb_bench.rs               # Step 2-2: Hybrid Workload SQLite vs. aydb benchmarks
     └── standard_sql_bench.rs                 # Step 2-3: Differential SQL check & Speedtest1/YCSB/TPC-B-style benchmarks
@@ -195,6 +196,9 @@ cargo run --release --example standard_sql_bench
 
 # Hybrid Desktop Workloads: Sync Config Updates, Bounded 16 KB Blob Cache, & LRU Reads
 cargo run --release --example sqlite_vs_aydb_bench
+
+# Automatic-Key INSERT (NULL INTEGER PRIMARY KEY), with and without a UNIQUE column
+cargo run --release --example auto_key_bench
 ```
 
 ### 3. Run Storage Subsystem Microbenchmarks (Phase 1)
