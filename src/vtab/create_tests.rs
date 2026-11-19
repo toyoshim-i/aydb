@@ -318,3 +318,142 @@ fn an_id_freed_by_an_announced_savepoint_rollback_can_be_taken_in_the_same_trans
         assert_eq!(ints(&conn, "SELECT v FROM o"), [1]);
     }
 }
+
+#[test]
+fn other_connection_create_does_not_drop_uncommitted_vtab() {
+    use crate::engine::EngineConfig;
+    use crate::util::test_util::TempTestDir;
+
+    for conn2_in_tx in [false, true] {
+        let dir = TempTestDir::new("create_other_conn_guard");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+        let mut config = EngineConfig::default();
+        config.writer_wait_timeout_ms = 20;
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(Arc::clone(&fs), config.clone()).unwrap(),
+        ));
+
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        conn1
+            .register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        conn2
+            .register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+
+        conn1
+            .execute_batch(&format!(
+                "BEGIN; {T_ID}; INSERT INTO t VALUES (1, 'a', 100)"
+            ))
+            .unwrap();
+
+        if conn2_in_tx {
+            conn2.execute_batch("BEGIN").unwrap();
+        }
+        assert!(
+            conn2.execute_batch(T_ID).is_err(),
+            "concurrent CREATE must fail with busy instead of touching conn1's table"
+        );
+        if conn2_in_tx {
+            let _ = conn2.execute_batch("ROLLBACK");
+        }
+
+        conn1.execute_batch("COMMIT").unwrap();
+        assert_eq!(ints(&conn1, "SELECT v FROM t"), [100]);
+
+        drop(conn2);
+        drop(conn1);
+        drop(engine);
+
+        let reopened = Arc::new(RwLock::new(StorageEngine::open(fs, config).unwrap()));
+        let check = SqliteConnection::open_in_memory().unwrap();
+        check
+            .register_aydb_module_with_options(reopened, false)
+            .unwrap();
+        check.execute_batch(T_ID).unwrap();
+        assert_eq!(ints(&check, "SELECT v FROM t"), [100]);
+    }
+}
+
+#[test]
+fn duplicate_table_id_in_same_tx_does_not_drop_live_table() {
+    let mut fixture = Fixture::new("create_dup_id_same_tx");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "BEGIN;
+         CREATE VIRTUAL TABLE t1 USING aydb(table_id=5, columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+         INSERT INTO t1 VALUES (1, 'a', 100);",
+    )
+    .unwrap();
+    assert!(
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t2 USING aydb(table_id=5, columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+        )
+        .is_err(),
+        "duplicate explicit table_id in active tx must be rejected"
+    );
+    conn.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(ints(&conn, "SELECT v FROM t1"), [100]);
+    assert!(conn.query_all("SELECT * FROM t2", &[]).is_err());
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t1"), [100]);
+    assert!(conn.query_all("SELECT * FROM t2", &[]).is_err());
+}
+
+#[test]
+fn savepoint_rollback_allows_reusing_explicit_table_id_with_new_name() {
+    let mut fixture = Fixture::new("create_sp_reuse_id");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "BEGIN;
+         SAVEPOINT s;
+         CREATE VIRTUAL TABLE t1 USING aydb(table_id=5, columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO t1 VALUES (1, 100);
+         ROLLBACK TO s;
+         CREATE VIRTUAL TABLE t2 USING aydb(table_id=5, columns='k INTEGER PRIMARY KEY, v INT');
+         COMMIT;",
+    )
+    .unwrap();
+
+    assert!(ints(&conn, "SELECT v FROM t2").is_empty());
+    assert!(conn.query_all("SELECT * FROM t1", &[]).is_err());
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert!(ints(&conn, "SELECT v FROM t2").is_empty());
+    assert!(conn.query_all("SELECT * FROM t1", &[]).is_err());
+}
+
+#[test]
+fn attached_db_create_with_same_name_does_not_drop_main_table() {
+    let mut fixture = Fixture::new("create_attached_same_name");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "ATTACH DATABASE ':memory:' AS aux;
+         BEGIN;
+         CREATE VIRTUAL TABLE main.t USING aydb(table_id=5, columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO main.t VALUES (1, 42);",
+    )
+    .unwrap();
+    assert!(
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE aux.t USING aydb(table_id=9, columns='k INTEGER PRIMARY KEY, v INT')",
+        )
+        .is_err(),
+        "creating aux.t when main.t holds catalog name 't' must fail instead of dropping main.t"
+    );
+    conn.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(ints(&conn, "SELECT v FROM main.t"), [42]);
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM main.t"), [42]);
+}

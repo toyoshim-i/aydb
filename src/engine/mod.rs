@@ -365,8 +365,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
-    /// `(table_id, normalised name)`.
-    pub(super) vtabs_created_in_tx: Vec<(u16, String)>,
+    /// `(table_id, normalised name, normalised sqlite schema name)`.
+    pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
@@ -1241,20 +1241,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    /// Notes that the active transaction created virtual table `(table_id, table_name)`.
-    pub(crate) fn note_vtab_created_in_tx(&mut self, table_id: u16, table_name: &str) {
+    /// Notes that the active transaction created virtual table `(table_id, table_name)` in `db_name`.
+    pub(crate) fn note_vtab_created_in_tx(
+        &mut self,
+        table_id: u16,
+        table_name: &str,
+        db_name: &str,
+    ) {
         if self.tx_depth > 0 {
-            self.vtabs_created_in_tx
-                .push((table_id, table_name.trim().to_ascii_lowercase()));
+            self.vtabs_created_in_tx.push((
+                table_id,
+                table_name.trim().to_ascii_lowercase(),
+                db_name.trim().to_ascii_lowercase(),
+            ));
         }
     }
 
-    /// Whether the active transaction created virtual table `(table_id, table_name)`.
-    pub(crate) fn is_created_in_tx(&self, table_id: u16, table_name: &str) -> bool {
+    /// Whether the active transaction created virtual table `(table_id, table_name)` in `db_name`.
+    pub(crate) fn is_created_in_tx(&self, table_id: u16, table_name: &str, db_name: &str) -> bool {
         let norm = table_name.trim().to_ascii_lowercase();
+        let norm_db = db_name.trim().to_ascii_lowercase();
         self.vtabs_created_in_tx
             .iter()
-            .any(|(id, name)| *id == table_id && *name == norm)
+            .any(|(id, name, db)| *id == table_id && *name == norm && *db == norm_db)
     }
 
     /// Drops a table that the active transaction created and that SQLite no longer has, but only
@@ -1282,20 +1291,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Removes the tables that the active transaction created under `table_name` or with
-    /// `table_id`, and returns them. SQLite only runs `xCreate` for a name its schema does not
-    /// have, so one of these is a creation that a `ROLLBACK TO` undid in the schema but, because
-    /// SQLite never announces such a savepoint to a table made inside it, not in the engine.
+    /// `table_id` for which `is_stale(prev_db, prev_name)` holds, and returns them. SQLite only
+    /// runs `xCreate` for a name its schema does not have, so one of these is a creation that a
+    /// `ROLLBACK TO` undid in the schema but, because SQLite never announces such a savepoint to a
+    /// table made inside it, not in the engine.
     pub(crate) fn take_vtabs_created_in_tx(
         &mut self,
         table_id: Option<u16>,
         table_name: &str,
+        mut is_stale: impl FnMut(&str, &str) -> bool,
     ) -> Vec<(u16, String)> {
         let norm = table_name.trim().to_ascii_lowercase();
         let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
             .into_iter()
-            .partition(|(id, name)| *name == norm || Some(*id) == table_id);
+            .partition(|(id, name, db)| {
+                (*name == norm || Some(*id) == table_id) && is_stale(db, name)
+            });
         self.vtabs_created_in_tx = kept;
-        stale
+        stale.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
     /// The mutation epoch (see the field): equal values mean no row changed in between.

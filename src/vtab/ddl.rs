@@ -9,6 +9,7 @@ use crate::vtab::row_codec::{ColCollation, ColumnAffinity};
 
 /// Parsed schema and configuration options from `CREATE VIRTUAL TABLE ... USING aydb(...)`.
 pub(super) struct ParsedVtabDdl {
+    pub(super) db_name: String,
     pub(super) table_name: String,
     pub(super) explicit_table_id: Option<u16>,
     pub(super) max_bytes: u64,
@@ -475,7 +476,20 @@ pub(super) unsafe fn parse_vtab_ddl(
     argv: *const *const c_char,
 ) -> Result<ParsedVtabDdl, c_int> {
     unsafe {
-        // Extract virtual table name from argv[2]
+        // Extract SQLite schema name from argv[1] and virtual table name from argv[2]
+        let db_name = if argc > 1 && !(*argv.offset(1)).is_null() {
+            let s = CStr::from_ptr(*argv.offset(1))
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            if s.is_empty() {
+                String::from("main")
+            } else {
+                s
+            }
+        } else {
+            String::from("main")
+        };
         let table_name = if argc > 2 && !(*argv.offset(2)).is_null() {
             CStr::from_ptr(*argv.offset(2))
                 .to_string_lossy()
@@ -621,6 +635,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         }
 
         Ok(ParsedVtabDdl {
+            db_name,
             table_name,
             explicit_table_id,
             max_bytes,

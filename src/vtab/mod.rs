@@ -367,6 +367,7 @@ pub(super) struct AydbVTab {
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
     table_id: u16,
+    db_name: String,
     /// Normalised at use. Changes when the table is renamed.
     table_name: std::sync::Mutex<String>,
     durability: WriteDurability,
@@ -824,7 +825,7 @@ unsafe fn vtab_create_or_connect(
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
-            if join_user_tx && !began_here && !eng.in_active_transaction() {
+            if join_user_tx && !began_here && !eng.conn_has_open_transaction(db as usize) {
                 match eng.begin_transaction_for_conn(db as usize) {
                     Ok(()) => began_here = true,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -839,11 +840,19 @@ unsafe fn vtab_create_or_connect(
             // A table that this transaction created under this name or id, and that SQLite is
             // creating again, was undone in SQLite's schema by a `ROLLBACK TO` that the table
             // never heard of (it was not announced the savepoint it was created in). Remove
-            // what is left of it before the new table starts.
-            if is_create && eng.in_active_transaction() {
-                for (id, name) in
-                    eng.take_vtabs_created_in_tx(ddl.explicit_table_id, &ddl.table_name)
-                {
+            // what is left of it only if this connection owns the transaction and SQLite's
+            // schema no longer has that table.
+            if is_create && eng.conn_has_open_transaction(db as usize) {
+                let cur_norm_name = ddl.table_name.trim().to_ascii_lowercase();
+                let cur_norm_db = ddl.db_name.trim().to_ascii_lowercase();
+                for (id, name) in eng.take_vtabs_created_in_tx(
+                    ddl.explicit_table_id,
+                    &ddl.table_name,
+                    |prev_db, prev_name| {
+                        (prev_db == cur_norm_db && prev_name == cur_norm_name)
+                            || !schema_has_table(db, prev_db, prev_name)
+                    },
+                ) {
                     if let Err(e) = eng.drop_stale_created_vtab(id, &name) {
                         if began_here {
                             let _ = eng.rollback_transaction_for_conn(db as usize);
@@ -855,7 +864,11 @@ unsafe fn vtab_create_or_connect(
             match connect_table(&mut eng, db as usize, &ddl) {
                 Ok(Some(connected)) => {
                     if is_create && connected.newly_created {
-                        eng.note_vtab_created_in_tx(connected.table_id, &ddl.table_name);
+                        eng.note_vtab_created_in_tx(
+                            connected.table_id,
+                            &ddl.table_name,
+                            &ddl.db_name,
+                        );
                     }
                     break connected;
                 }
@@ -891,6 +904,7 @@ unsafe fn vtab_create_or_connect(
             engine: aux.engine.clone(),
             read_session: Arc::clone(&aux.read_session),
             table_id,
+            db_name: ddl.db_name,
             table_name: std::sync::Mutex::new(ddl.table_name),
             durability: ddl.durability,
             unique_def: unique_key::UniqueDef::from_columns(
@@ -2538,16 +2552,25 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     .unwrap_or(SQLITE_ERROR)
 }
 
-/// Whether SQLite's schema still has a table of this name. Any doubt counts as "yes": a table is
-/// only removed on a definite "no such table".
-unsafe fn schema_has_table(db: *mut sqlite3, name: &str) -> bool {
+/// Whether SQLite's schema (`db_name`, or any attached schema if empty) still has a table of
+/// this name. Any doubt counts as "yes": a table is only removed on a definite "no such table".
+unsafe fn schema_has_table(db: *mut sqlite3, db_name: &str, name: &str) -> bool {
     let Ok(c_name) = CString::new(name) else {
         return true;
     };
+    let c_db = if db_name.trim().is_empty() {
+        None
+    } else {
+        let Ok(c_db) = CString::new(db_name.trim()) else {
+            return true;
+        };
+        Some(c_db)
+    };
+    let z_db = c_db.as_ref().map_or(core::ptr::null(), |s| s.as_ptr());
     let rc = unsafe {
         sqlite3_table_column_metadata(
             db,
-            core::ptr::null(),
+            z_db,
             c_name.as_ptr(),
             core::ptr::null(),
             core::ptr::null_mut(),
@@ -2573,8 +2596,12 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         // A table this transaction created whose creation a `ROLLBACK TO` has since undone in
         // SQLite's schema (nothing tells the table) must not be committed.
         let name = vtab.name();
-        if eng.is_created_in_tx(vtab.table_id, &name) && !schema_has_table(vtab.db, &name) {
-            let _ = eng.take_vtabs_created_in_tx(Some(vtab.table_id), &name);
+        if eng.is_created_in_tx(vtab.table_id, &name, &vtab.db_name)
+            && !schema_has_table(vtab.db, &vtab.db_name, &name)
+        {
+            let _ = eng.take_vtabs_created_in_tx(Some(vtab.table_id), &name, |prev_db, _| {
+                prev_db.eq_ignore_ascii_case(&vtab.db_name)
+            });
             if let Err(e) = eng.drop_stale_created_vtab(vtab.table_id, &name) {
                 return io_err_to_sqlite_rc(&e);
             }

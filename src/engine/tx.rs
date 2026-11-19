@@ -728,6 +728,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_preparing = false;
         self.pending_tx_bytes = 0;
         self.savepoints.clear();
+        self.vtabs_created_in_tx.clear();
         self.tx_start_meta = TxMetaSnapshot::default();
         self.commit_gate.tx_ended();
     }
