@@ -164,7 +164,7 @@ A synchronous SQL commit (`xCommit`) has three steps, and only the first and las
 
 ### 4.6 WAL Damage Detection and Ordered Recovery (implemented)
 
-This subsection describes the implemented behaviour (`src/wal/recovery.rs`, `src/engine/salvage.rs`), together with the rationale, the alternatives that were rejected and the limitations that were accepted. Remaining open points are in 4.6.12.
+This subsection describes the implemented behaviour (`src/wal/recovery.rs`, `src/engine/salvage.rs`), together with the rationale, the alternatives that were rejected and the limitations that were accepted. The decided exceptions are listed in 4.6.12.
 
 #### 4.6.1 The problem
 
@@ -407,11 +407,11 @@ pub enum WalDamageReason {
 
 When several reasons apply, the reported one is chosen by priority: `UnverifiableBlob` (a rotted blob is the cause whatever else is wrong), then `UnsupportedFormat`, then `CorruptSector`, then the reason the chain gave (`MissingPredecessor` or `AcknowledgedTailLost`). So when a broken link and a corrupt current-epoch sector are both present the reason is `CorruptSector`, because the log cannot tell them apart. `AcknowledgedTailLost` is reached when the batch at `floor` is gone and the chain names nothing at or below `floor`: no break at all, or a break above `floor` that is not a link (for example a batch past an unusable sector, or an unverifiable blob). `first_lost_lsn` is `min(cut, floor)`: a lost run of batches is named by its last member, so when `floor` lies below the cut it is the lowest LSN proven lost, not necessarily the first lost batch.
 
-`torn_tail_sectors` counts the current-epoch sectors that failed their CRC32C or did not parse, which are silently ignored and are **not** damage by themselves; the ordinary end of the log is not counted. Under the default `Truncate`, the report is the only trace of a loss. It costs little, and it lets an application put the loss in its own logs or crash reports, which is how a developer can learn that it happens in the field. The report is plain Rust data. Exposing it through SQL (a pragma or a table-valued function) is deferred.
+`torn_tail_sectors` counts the current-epoch sectors that failed their CRC32C or did not parse, which are silently ignored and are **not** damage by themselves; the ordinary end of the log is not counted. Under the default `Truncate`, the report is the only trace of a loss. It costs little, and it lets an application put the loss in its own logs or crash reports, which is how a developer can learn that it happens in the field. The report is plain Rust data and, by decision, is not exposed through SQL (4.6.12).
 
 #### 4.6.9 Concurrency and cost
 
-Recovery reads each file in 64-sector windows and stops at the ordinary end of the log (a never-written sector or an intact older-epoch sector, 4.6.4), so a clean open reads one window per file rather than both files completely (8 MB plus 16 MB by default). Reading both files completely on every open, as an earlier revision of the scan did, cost a clean reopen about 6.0 ms; with the early end it is about 3.0 ms. Measured against 97075fb with the stop rule changed only in `recover_single_wal_stream`: `StorageEngine::open` with `EngineConfig::default()` on a directory holding 20 rows, release build, Windows, warm cache, median of 25 opens, repeated runs gave 5.7 to 6.2 ms before and 2.9 to 3.1 ms after. Past an unusable sector the scan still reads to the end of the file or to the first end-of-log sector, so damaged logs cost what they did. The chain walk is a linear pass over the merged batches and keeps only the previous LSN. Normal operation adds two `u64` per batch, 16 bytes (measured in 4.6.5), and two engine fields (`last_appended_lsn`, `durable_lsn`), both guarded by the engine lock that already serializes appends. No extra sync is introduced: the watermark records what the existing flush ordering already established.
+Recovery reads each file in 64-sector windows and stops at the ordinary end of the log (a never-written sector or an intact older-epoch sector, 4.6.4), so a clean open reads one window per file rather than both files completely (8 MB plus 16 MB by default). Reading both files completely on every open, as an earlier revision of the scan did, cost a clean reopen about 6.0 ms; with the early end it is about 3.0 ms. Measured against 97075fb with the stop rule changed only in `recover_single_wal_stream`: `StorageEngine::open` with `EngineConfig::default()` on a directory holding 20 rows, release build, Windows, warm cache, median of 25 opens, repeated runs gave 5.7 to 6.2 ms before and 2.9 to 3.1 ms after. Moving the preallocation behind the `Fail` check (7a4ff05) did not add to this: measured the same way at ec1920e against 5eb761c, with the two builds run alternately three times (four medians each), a clean reopen took 3.2 to 3.5 ms against 3.5 to 3.8 ms. These figures are higher than the ones above because the machine state differed, so only figures from the same session can be compared. Past an unusable sector the scan still reads to the end of the file or to the first end-of-log sector, so damaged logs cost what they did. The chain walk is a linear pass over the merged batches and keeps only the previous LSN. Normal operation adds two `u64` per batch, 16 bytes (measured in 4.6.5), and two engine fields (`last_appended_lsn`, `durable_lsn`), both guarded by the engine lock that already serializes appends. No extra sync is introduced: the watermark records what the existing flush ordering already established.
 
 #### 4.6.10 Alternatives considered
 
@@ -435,15 +435,15 @@ Recovery reads each file in 64-sector windows and stops at the ordinary end of t
 * **Crash during recovery:** a crash before the rotation reopens to the same result and the same salvage list; a crash after the rotation reopens cleanly, with nothing left to salvage.
 * **Old format:** a current-epoch sector of version 0 or 1 is `UnsupportedFormat` when acknowledged data lies beyond it; stale sectors from earlier epochs are ignored (4.6.5).
 
-#### 4.6.12 Open items
+#### 4.6.12 Decisions and known exceptions
 
-The design was built in eight separately committed steps (reproductions and oracle, format, engine tracking, ordered recovery, policy, salvage, harness extension, docs). What is still open:
+The design was built in eight separately committed steps (reproductions and oracle, format, engine tracking, ordered recovery, policy, salvage, harness extension, docs). No further work on it is planned. These are the behaviours that were decided rather than left open:
 
-* **A missing log file is created before the `Fail` decision.** `wal_sync.db` or `wal_buf.db` that does not exist is created empty when the streams are opened, so a refused open on such a directory still leaves a new, empty file. A truncated existing file is no longer lengthened (7a4ff05). The combination `Fail` with a missing file has no test of its own.
-* **The report is not exposed through SQL.** It is plain Rust data from `last_wal_recovery()`; a pragma or table-valued function is deferred.
+* **A missing log file is created before the `Fail` decision.** `wal_sync.db` or `wal_buf.db` that does not exist is created empty when the streams are opened, so a refused open on such a directory still leaves a new, empty file. Every other file stays as it was, and a truncated existing file is not lengthened (7a4ff05). Pinned by `fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty`.
+* **The report is not exposed through SQL.** The SQLite adapter takes an engine that the application has opened, and the application reads `last_wal_recovery()` there (see the SQLite guide). There is no pragma or table-valued function for it.
 * **The salvage list is memory-only** (4.6.7), and a transaction that lost a chunk, or the good operations of a transaction dropped for an unsalvageable one, are not counted individually.
-* **The cost of the preallocation reorder was not re-measured.** 7a4ff05 runs the same allocation after the `Fail` check instead of before recovery, so a clean open should cost the same, but only the numbers of 4.6.9 (5eb761c against 97075fb) were measured.
-* **Accepted limitations** stay as stated: a lost sector that holds intact stale content or zeros is not reported (4.6.4), and a WAL written entirely in an old format is replayed as empty without a report (4.6.5).
+* **A WAL in an older format** takes the same path as any file in an unknown format (4.6.5); it has no handling of its own.
+* **A lost sector that holds intact stale content or zeros** ends the scan and is not reported (4.6.4).
 
 ---
 

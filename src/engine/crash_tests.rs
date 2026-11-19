@@ -3987,6 +3987,40 @@ fn fail_policy_leaves_a_truncated_wal_file_untouched() {
     }
 }
 
+/// A log file that is missing altogether is the one exception to "a refused `Fail` open changes
+/// no file" (ARCHITECTURE.md 4.6.6): the streams are opened before the damage decision, and
+/// opening creates the file, empty. Everything else stays as it was, and the open still refuses,
+/// because the buffered batches carry a watermark that covers the lost sync batches.
+#[test]
+fn fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty() {
+    let (fs, _keys, _s2) = sync_sector_damage_fs();
+    fs.st().dir.remove("wal_sync.db");
+    let before = dir_state(&fs);
+    assert!(!before.contains_key("wal_sync.db"));
+    let err = match StorageEngine::open(Arc::clone(&fs), fail_config()) {
+        Ok(_) => panic!("open under Fail must refuse a log that lost an acknowledged commit"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<WalDamage>())
+            .is_some(),
+        "{err}"
+    );
+    let mut after = dir_state(&fs);
+    let created = after
+        .remove("wal_sync.db")
+        .expect("the missing log file is created");
+    assert!(
+        created.0.is_empty() && created.1.is_empty(),
+        "created with {} bytes in the cache, {} on the device",
+        created.0.len(),
+        created.1.len()
+    );
+    assert!(after == before, "a file other than the missing log changed");
+}
+
 /// A write outside a transaction must see the row that a pending group commit wrote: it reads
 /// the old row's `'t'` record to maintain the secondary entries, and a stale read leaves the
 /// entries of the group-committed version behind as orphans.
