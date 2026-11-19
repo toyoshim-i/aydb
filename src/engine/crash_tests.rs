@@ -390,6 +390,18 @@ impl SimState {
     }
 
     fn crash(&mut self, how: Crash) {
+        if matches!(how, Crash::Process) {
+            self.note(|| {
+                "      fs: crash Process (keeping OS cache, pending writes, and dir state)".into()
+            });
+            self.ops = 0;
+            self.kind_ops = [0; KIND_COUNT];
+            self.cut_at = None;
+            self.fail_at = None;
+            self.cut = false;
+            self.fail_fired = false;
+            return;
+        }
         let old = std::mem::take(&mut self.inodes);
         self.dir.clear();
         // The directory operations that took effect: the flushed ones plus a random prefix of
@@ -3095,6 +3107,7 @@ fn damage_synced(fs: &CrashFs, name: &str, f: impl Fn(&mut Vec<u8>)) {
     let ino = &mut st.inodes[id];
     f(&mut ino.cache);
     f(&mut ino.durable);
+    ino.pending.clear();
 }
 
 /// LSNs of the batches `recover_single_wal_stream` finds in a log file, in log order. The epoch
@@ -4228,4 +4241,49 @@ fn rename_vtab_after_pending_group_commit_removes_old_catalog_entry() {
         .map(|en| String::from_utf8_lossy(&en.key[3..]).into_owned())
         .collect();
     assert_eq!(entries, vec!["b".to_string()]);
+}
+
+/// After a process crash (`kill -9`), buffered `blob_std` and `blob_lru` tails exist only in
+/// the OS page cache. Reopen must sync them before cataloging lengths and checkpointing them into
+/// `idx` segments, so a subsequent power cut never leaves `idx` pointing at lost blob bytes.
+#[test]
+fn process_crash_recovery_syncs_buffered_blobs_before_checkpoint() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut cfg = repro_config();
+    cfg.inline_threshold_bytes = 64;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(3, 64 * 1024).unwrap();
+    let v_std = vec![0xA1; 512];
+    let v_lru = vec![0xB2; 512];
+    e.put_row(2, b"std_k", &v_std, &[], BUF).unwrap();
+    e.put_row(3, b"lru_k", &v_lru, &[], BUF).unwrap();
+    drop(e);
+
+    // Process crash preserves OS cache without making unsynced blob writes durable.
+    fs.crash(Crash::Process);
+
+    // Recovery replays the buffered WAL, syncs dirty blobs, flushes `idx`, and rotates WALs.
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    assert_eq!(
+        e.get_row(2, b"std_k").unwrap().as_deref(),
+        Some(v_std.as_slice())
+    );
+    assert_eq!(
+        e.get_row(3, b"lru_k").unwrap().as_deref(),
+        Some(v_lru.as_slice())
+    );
+    drop(e);
+
+    // A subsequent power cut with zero keep wipes any never-synced OS page-cache bytes.
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(
+        e.get_row(2, b"std_k").unwrap().as_deref(),
+        Some(v_std.as_slice())
+    );
+    assert_eq!(
+        e.get_row(3, b"lru_k").unwrap().as_deref(),
+        Some(v_lru.as_slice())
+    );
 }

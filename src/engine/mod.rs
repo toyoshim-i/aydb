@@ -38,7 +38,7 @@ mod tests;
 #[cfg(test)]
 mod wal_link_tests;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -480,10 +480,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 2. Open active `blob_std_<SeqID>.db` segments
         let mut std_blobs = BTreeMap::new();
         let mut std_valid_end = BTreeMap::new();
+        let mut dirty_std_blobs: HashSet<u64> = HashSet::new();
         for bmeta in &state_snapshot.std_blob_segments {
             let fname = format_std_blob_file_name(bmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
+            if physical_len > bmeta.file_len {
+                dirty_std_blobs.insert(bmeta.seq_id);
+            }
             let file_len = physical_len.max(bmeta.file_len);
             // The catalog already accounts for every byte below its length, so only bytes beyond
             // it can be unaccounted garbage. A file shorter than the catalog (its tail never
@@ -503,10 +507,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 3. Open active `blob_lru_<TblID>_<SeqID>.db` segments
         let mut lru_blobs = BTreeMap::new();
         let mut lru_valid_end = BTreeMap::new();
+        let mut dirty_lru_blobs: HashSet<(u16, u64)> = HashSet::new();
         for lmeta in &state_snapshot.lru_blob_segments {
             let fname = format_lru_blob_file_name(lmeta.table_id, lmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
+            if physical_len > lmeta.file_len {
+                dirty_lru_blobs.insert((lmeta.table_id, lmeta.seq_id));
+            }
             let file_len = physical_len.max(lmeta.file_len);
             // See the `blob_std` loop above.
             lru_valid_end.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
@@ -541,6 +549,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if !std_blobs.contains_key(&seq_id) {
                         if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                             let flen = file.file_len()?;
+                            dirty_std_blobs.insert(seq_id);
                             std_valid_end.insert(seq_id, 0);
                             std_blobs.insert(
                                 seq_id,
@@ -565,6 +574,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         if !lru_blobs.contains_key(&(tbl_id, seq_id)) {
                             if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                                 let flen = file.file_len()?;
+                                dirty_lru_blobs.insert((tbl_id, seq_id));
                                 lru_valid_end.insert((tbl_id, seq_id), 0);
                                 lru_blobs.insert(
                                     (tbl_id, seq_id),
@@ -706,11 +716,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
                     match ptr.kind {
                         BlobKind::Standard => {
+                            dirty_std_blobs.insert(ptr.seg_id);
                             if let Some(ve) = std_valid_end.get_mut(&ptr.seg_id) {
                                 *ve = (*ve).max(end);
                             }
                         }
                         BlobKind::Lru => {
+                            dirty_lru_blobs.insert((ptr.table_id, ptr.seg_id));
                             if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id)) {
                                 *ve = (*ve).max(end);
                             }
@@ -820,6 +832,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lru_persist_dead.insert((tid, seq_id), persisted);
             true
         });
+
+        // Sync every surviving dirty or replayed blob segment before cataloging lengths or
+        // flushing `idx` segments: after a process crash those tails may exist only in the OS
+        // page cache, and no active writer owns them during post-recovery checkpointing.
+        for (seq_id, b) in &std_blobs {
+            if dirty_std_blobs.contains(seq_id) {
+                b.reader.file().sync_durable()?;
+            }
+        }
+        for (key, b) in &lru_blobs {
+            if dirty_lru_blobs.contains(key) {
+                b.reader.file().sync_durable()?;
+            }
+        }
 
         // Catalog uncataloged blob segments that turned out to hold live records. Their SeqIDs are
         // already below `next_seq_id` (see `reserve_seq_ids_above_existing_files`).
