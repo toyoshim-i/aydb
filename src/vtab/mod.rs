@@ -565,22 +565,48 @@ fn max_integer_rowid(
     table_id: u16,
 ) -> io::Result<Option<i64>> {
     let lower = [KEY_TAG_INTEGER];
-    let upper = [KEY_TAG_INTEGER + 1];
     eng.with_committed_read_for_conn(conn_id, |reader| {
+        let mut upper = vec![KEY_TAG_INTEGER + 1];
+        let mut upper_inclusive = false;
+        let mut limit = 1usize;
         let (mut pks, mut slab, mut spans) = (Vec::new(), Vec::new(), Vec::new());
-        reader.scan_range_into_slab(
-            table_id,
-            Some((&lower, true)),
-            Some((&upper, false)),
-            true,
-            1,
-            true,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            None,
-        )?;
-        Ok(pks.first().and_then(|k| decode_i64_tagged_key(k)))
+        loop {
+            pks.clear();
+            slab.clear();
+            spans.clear();
+            reader.scan_range_into_slab(
+                table_id,
+                Some((&lower, true)),
+                Some((&upper, upper_inclusive)),
+                true,
+                limit,
+                true,
+                &mut pks,
+                &mut slab,
+                &mut spans,
+                None,
+            )?;
+            for k in &pks {
+                if let Some(id) = decode_i64_tagged_key(k) {
+                    return Ok(Some(id));
+                }
+            }
+            if pks.len() < limit {
+                return Ok(None);
+            }
+            let last = pks.last().expect("limit >= 1 and pks.len() >= limit");
+            // Floats in [-2^63, 2^63) share `KEY_TAG_INTEGER` as 17-byte keys sorting strictly
+            // after their 9-byte `floor(f)` integer key with no integer keys in between; jumping to
+            // `last[..9]` inclusive skips every float in that bucket in one step.
+            if last.len() > 9 && last[0] == KEY_TAG_INTEGER {
+                upper = last[..9].to_vec();
+                upper_inclusive = true;
+            } else {
+                upper = last.clone();
+                upper_inclusive = false;
+            }
+            limit = 64;
+        }
     })
 }
 

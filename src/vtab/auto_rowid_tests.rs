@@ -227,3 +227,66 @@ fn cached_automatic_keys_match_native_inside_a_transaction() {
     };
     assert_eq!(rows("a"), rows("n"));
 }
+
+#[test]
+fn float_keys_above_integers_do_not_reset_automatic_rowids() {
+    let fixture = Fixture::new("auto_rowid_float_keys");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE a USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO a VALUES (1, 'one'), (10, 'ten'), (10.5, 'half'), (10.75, 'three_quarters'), (100.25, 'big_float');",
+    )
+    .unwrap();
+
+    // Gaps (2..9) must not be reused just because float keys sit above integer 10.
+    conn.execute_batch("INSERT INTO a VALUES (NULL, 'auto1'), (NULL, 'auto2')")
+        .unwrap();
+    assert_eq!(
+        conn.query_all(
+            "SELECT k FROM a WHERE v IN ('auto1', 'auto2') ORDER BY k",
+            &[]
+        )
+        .unwrap(),
+        vec![vec![SqlValue::Integer(11)], vec![SqlValue::Integer(12)],]
+    );
+
+    // Clear auto_key_cache via an explicit float batch spanning >64 distinct floors above 12.
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 20..120i64 {
+        conn.execute_batch(&format!("INSERT INTO a VALUES ({i}.5, 'f{i}')"))
+            .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    conn.execute_batch("INSERT INTO a VALUES (NULL, 'after_many_floats')")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k FROM a WHERE v = 'after_many_floats'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(13)]]
+    );
+
+    // Deleting the highest integer while floats remain above still picks the new max integer + 1.
+    conn.execute_batch(
+        "DELETE FROM a WHERE k = 13;
+         INSERT INTO a VALUES (NULL, 'reuse_top');",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k FROM a WHERE v = 'reuse_top'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(13)]]
+    );
+
+    // A table containing only float keys starts automatic integer keys at 1.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE b USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO b VALUES (5.5, 'f1'), (10.5, 'f2');
+         INSERT INTO b VALUES (NULL, 'first_int');",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k FROM b WHERE v = 'first_int'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(1)]]
+    );
+}
