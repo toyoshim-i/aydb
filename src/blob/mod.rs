@@ -93,6 +93,12 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         self.buf_start_offset
     }
 
+    /// Returns the file offset up to which `sync_durable` has completed successfully.
+    #[inline]
+    pub fn synced_offset(&self) -> u64 {
+        self.synced_offset
+    }
+
     pub fn file(&self) -> &Arc<F> {
         &self.file
     }

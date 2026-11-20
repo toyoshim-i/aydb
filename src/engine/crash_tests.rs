@@ -3005,6 +3005,148 @@ fn reclaimed_lru_segment_with_pre_checkpoint_dead_bytes_is_swept_after_crash() {
     );
 }
 
+/// Regression test for [H8]: when table 2 rolls over its LRU blob segment during buffered
+/// writes, `boot_meta.db` must only record the durable (`synced_offset`) length of table 1's
+/// active LRU writer, never an unsynced tail.
+#[test]
+fn lru_rollover_on_one_table_does_not_persist_unsynced_len_of_another_table() {
+    let mut cfg = repro_config();
+    cfg.max_blob_segment_bytes = 2500;
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let buf = WriteDurability::BufferedFast;
+    e.register_capped_table(1, 50_000).unwrap();
+    e.register_capped_table(2, 50_000).unwrap();
+
+    // Table 2 opens segment 2a, table 1 opens segment 1a and buffers an unsynced blob.
+    e.put_row(2, b"t2_a", &[2u8; 1500], &[], buf).unwrap();
+    e.put_row(1, b"t1_a", &[1u8; 1500], &[], buf).unwrap();
+    // Second buffered write to table 2 forces table 2's segment to roll over and commits
+    // `lru_blob_segments` to `boot_meta.db`.
+    e.put_row(2, b"t2_b", &[3u8; 1500], &[], buf).unwrap();
+
+    let t1_meta = e
+        .meta_mgr
+        .state()
+        .lru_blob_segments
+        .iter()
+        .find(|m| m.table_id == 1)
+        .expect("table 1 segment must be cataloged");
+    assert_eq!(
+        t1_meta.file_len, 0,
+        "unsynced buffered bytes on table 1 leaked into boot_meta.db on table 2 rollover"
+    );
+
+    // After a power cut that drops unsynced writes, reopening must see file_len == 0 (no phantom length).
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    for m in e
+        .meta_mgr
+        .state()
+        .lru_blob_segments
+        .iter()
+        .filter(|m| m.table_id == 1)
+    {
+        assert_eq!(m.file_len, 0);
+    }
+}
+
+/// Regression test for [H8]: a pre-slot `commit_update` failure (when overflowing to an external
+/// manifest) during blob rollover or dead-segment reclaim must neither leave 0-byte zombie entries
+/// / leaked files behind nor drop still-cataloged segments from in-memory maps.
+#[test]
+fn pre_slot_meta_failure_on_blob_rollover_and_reclaim_keeps_maps_consistent() {
+    let mut cfg = repro_config();
+    cfg.max_blob_segment_bytes = 2500;
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+
+    e.register_capped_table(7, 100_000).unwrap();
+
+    // Force every subsequent `commit_update` to write an external `manifest_*.db` (> 4028B).
+    e.meta_mgr
+        .commit_update(|st| {
+            for tid in 100..360u16 {
+                st.table_quotas.push(crate::meta::TableQuotaMeta {
+                    table_id: tid,
+                    eviction_policy: crate::meta::EvictionPolicy::None,
+                    max_bytes: 0,
+                    current_logical_bytes: 0,
+                });
+            }
+        })
+        .unwrap();
+    assert!(e.meta_mgr.state().active_manifest_seq_id.is_some());
+
+    let arm_manifest_fail = |fs: &Arc<CrashFs>| {
+        let mut st = fs.st();
+        st.fail_fired = false;
+        st.cut = false;
+        let next = st.kind_ops[FileKind::Manifest as usize];
+        st.fail_at = Some((FileKind::Manifest, next));
+    };
+    let blob_files = |fs: &Arc<CrashFs>, prefix: &str| -> usize {
+        fs.list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with(prefix))
+            .count()
+    };
+
+    // 1. Standard blob rollover pre-slot failure: no zombie entry and no leaked file.
+    arm_manifest_fail(&fs);
+    assert!(e.put_row(1, b"s1", &[0x11u8; 1500], &[], sync).is_err());
+    assert!(!e.is_poisoned());
+    assert!(e.std_blobs.is_empty());
+    assert_eq!(blob_files(&fs, "blob_std_"), 0);
+
+    // Retry succeeds; seal `s1`'s segment with `s2`, then delete `s1` so `seg1` is 100% dead.
+    fs.arm(None, None);
+    e.put_row(1, b"s1", &[0x11u8; 1500], &[], sync).unwrap();
+    let seg1_seq = *e.std_blobs.keys().next().unwrap();
+    e.put_row(1, b"s2", &[0x22u8; 1500], &[], sync).unwrap();
+    e.delete_row(1, b"s1", sync).unwrap();
+
+    // 2. reclaim_fully_dead_blob_segments pre-slot failure keeps `seg1` in `std_blobs`.
+    arm_manifest_fail(&fs);
+    assert!(e.reclaim_fully_dead_blob_segments().is_err());
+    assert!(!e.is_poisoned());
+    assert!(e.std_blobs.contains_key(&seg1_seq));
+
+    fs.arm(None, None);
+    e.reclaim_fully_dead_blob_segments().unwrap();
+    assert!(!e.std_blobs.contains_key(&seg1_seq));
+
+    // 3. LRU blob rollover & reclaim_fully_dead_lru_blob_segments pre-slot failures.
+    e.put_row(7, b"l1", &[0x33u8; 1500], &[], sync).unwrap();
+    let lru_seg1_seq = e.lru_blobs.keys().find(|&&(tid, _)| tid == 7).unwrap().1;
+
+    arm_manifest_fail(&fs);
+    assert!(e.put_row(7, b"l2", &[0x44u8; 1500], &[], sync).is_err());
+    assert!(!e.is_poisoned());
+    assert_eq!(e.active_lru_blob_segment_count(7), 1);
+    assert_eq!(blob_files(&fs, "blob_lru_"), 1);
+
+    fs.arm(None, None);
+    e.put_row(7, b"l2", &[0x44u8; 1500], &[], sync).unwrap();
+    assert_eq!(e.active_lru_blob_segment_count(7), 2);
+    e.delete_row(7, b"l1", sync).unwrap();
+
+    arm_manifest_fail(&fs);
+    assert!(e.reclaim_fully_dead_lru_blob_segments(7).is_err());
+    assert!(!e.is_poisoned());
+    assert!(e.lru_blobs.contains_key(&(7, lru_seg1_seq)));
+    assert!(e.unlink_after_wal_rotation.is_empty());
+
+    fs.arm(None, None);
+    e.reclaim_fully_dead_lru_blob_segments(7).unwrap();
+    assert!(!e.lru_blobs.contains_key(&(7, lru_seg1_seq)));
+    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
+}
+
 /// A table's catalog entry and its rowid mapping marker are one atomic write. A power cut at
 /// every operation of the registration must leave either no table or a table with its marker,
 /// and an acknowledged registration is never lost.

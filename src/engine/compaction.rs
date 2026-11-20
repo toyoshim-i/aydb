@@ -875,18 +875,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // This also syncs the active blob writers that the buffered batches may reference.
         self.make_buf_wal_durable(true)?;
 
-        let mut deleted_files = Vec::with_capacity(dead_lru.len());
+        let deleted_files: Vec<String> = dead_lru
+            .iter()
+            .map(|&(tid, seq)| format_lru_blob_file_name(tid, seq))
+            .collect();
+
+        let mut lru_metas = self.build_checkpointed_lru_blob_metas();
+        lru_metas.retain(|m| !dead_lru.contains(&(m.table_id, m.seq_id)));
+        self.meta_mgr.commit_update(|st| {
+            st.lru_blob_segments = lru_metas;
+        })?;
+
         for &(tid, seq) in &dead_lru {
-            deleted_files.push(format_lru_blob_file_name(tid, seq));
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
             self.lru_blobs.remove(&(tid, seq));
         }
-
-        let lru_metas = self.build_checkpointed_lru_blob_metas();
-        self.meta_mgr.commit_update(|st| {
-            st.lru_blob_segments = lru_metas;
-        })?;
         // The files are not queued for deletion yet: the evicted rows' `Put` batches may still be
         // in the WAL, and recovery must be able to verify their blobs. If the unlink happened
         // here, it would drop each such batch (and in `wal_buf.db` every later one) although a
@@ -906,6 +910,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // The catalog records segment lengths: make them durable first (see `install_compaction`).
         self.sync_active_blob_writers()?;
 
+        let mut std_metas = self.build_checkpointed_std_blob_metas();
+        std_metas.retain(|m| !dead_std.contains(&m.seq_id));
+        let mut lru_metas = self.build_checkpointed_lru_blob_metas();
+        lru_metas.retain(|m| !dead_lru.contains(&(m.table_id, m.seq_id)));
+        self.meta_mgr.commit_update(|st| {
+            st.std_blob_segments = std_metas;
+            st.lru_blob_segments = lru_metas;
+            for fname in &deleted_files {
+                st.queue_pending_delete(fname.clone());
+            }
+        })?;
+
         for seq in dead_std {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
@@ -916,16 +932,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
-
-        let std_metas = self.build_checkpointed_std_blob_metas();
-        let lru_metas = self.build_checkpointed_lru_blob_metas();
-        self.meta_mgr.commit_update(|st| {
-            st.std_blob_segments = std_metas;
-            st.lru_blob_segments = lru_metas;
-            for fname in &deleted_files {
-                st.queue_pending_delete(fname.clone());
-            }
-        })?;
         self.meta_mgr.try_process_pending_deletes();
         Ok(())
     }
@@ -955,13 +961,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn build_checkpointed_std_blob_metas(&self) -> Vec<StdBlobSegmentMeta> {
         let prev = &self.meta_mgr.state().std_blob_segments;
+        let active = self
+            .active_std_writer
+            .as_ref()
+            .map(|w| (w.seq_id(), w.synced_offset()));
         let mut metas = self.build_std_blob_metas();
         for m in &mut metas {
-            m.dead_bytes = prev
-                .iter()
-                .find(|p| p.seq_id == m.seq_id)
-                .map(|p| p.dead_bytes)
-                .unwrap_or(0);
+            let prev_meta = prev.iter().find(|p| p.seq_id == m.seq_id);
+            m.dead_bytes = prev_meta.map(|p| p.dead_bytes).unwrap_or(0);
+            if let Some((active_seq, synced)) = active {
+                if active_seq == m.seq_id {
+                    let prev_len = prev_meta.map(|p| p.file_len).unwrap_or(0);
+                    m.file_len = prev_len.max(synced);
+                }
+            }
         }
         metas
     }
@@ -970,11 +983,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let prev = &self.meta_mgr.state().lru_blob_segments;
         let mut metas = self.build_lru_blob_metas();
         for m in &mut metas {
-            m.dead_bytes = prev
+            let prev_meta = prev
                 .iter()
-                .find(|p| p.table_id == m.table_id && p.seq_id == m.seq_id)
-                .map(|p| p.dead_bytes)
-                .unwrap_or(0);
+                .find(|p| p.table_id == m.table_id && p.seq_id == m.seq_id);
+            m.dead_bytes = prev_meta.map(|p| p.dead_bytes).unwrap_or(0);
+            if let Some(w) = self.active_lru_writers.get(&m.table_id) {
+                if w.seq_id() == m.seq_id {
+                    let prev_len = prev_meta.map(|p| p.file_len).unwrap_or(0);
+                    m.file_len = prev_len.max(w.synced_offset());
+                }
+            }
         }
         metas
     }

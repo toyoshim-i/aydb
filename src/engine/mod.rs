@@ -3030,18 +3030,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
+                    let reader = BlobSegmentReader::new(writer.file().clone(), seq_id);
+                    let mut std_metas = self.build_checkpointed_std_blob_metas();
+                    std_metas.push(StdBlobSegmentMeta {
+                        seq_id,
+                        file_len: 0,
+                        dead_bytes: 0,
+                    });
+                    std_metas.sort_by_key(|m| m.seq_id);
+                    if let Err(e) = self.meta_mgr.commit_update(|st| {
+                        st.std_blob_segments = std_metas;
+                    }) {
+                        drop(reader);
+                        drop(writer);
+                        if !self.meta_mgr.is_poisoned() {
+                            let _ = self.fs.remove_file(&format_std_blob_file_name(seq_id));
+                        }
+                        return Err(e);
+                    }
                     self.std_blobs.insert(
                         seq_id,
                         TrackedStdBlob {
-                            reader: BlobSegmentReader::new(writer.file().clone(), seq_id),
+                            reader,
                             file_len: 0,
                             dead_bytes: 0,
                         },
                     );
-                    let std_metas = self.build_checkpointed_std_blob_metas();
-                    self.meta_mgr.commit_update(|st| {
-                        st.std_blob_segments = std_metas;
-                    })?;
                     self.active_std_writer = Some(writer);
                 }
                 let writer = self.active_std_writer.as_mut().unwrap();
@@ -3070,19 +3084,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
+                    let reader = BlobSegmentReader::new(writer.file().clone(), seq_id);
+                    let mut lru_metas = self.build_checkpointed_lru_blob_metas();
+                    lru_metas.push(LruBlobSegmentMeta {
+                        seq_id,
+                        file_len: 0,
+                        dead_bytes: 0,
+                        table_id,
+                    });
+                    lru_metas.sort_by_key(|m| (m.table_id, m.seq_id));
+                    if let Err(e) = self.meta_mgr.commit_update(|st| {
+                        st.lru_blob_segments = lru_metas;
+                    }) {
+                        drop(reader);
+                        drop(writer);
+                        if !self.meta_mgr.is_poisoned() {
+                            let _ = self
+                                .fs
+                                .remove_file(&format_lru_blob_file_name(table_id, seq_id));
+                        }
+                        return Err(e);
+                    }
                     self.lru_blobs.insert(
                         (table_id, seq_id),
                         TrackedLruBlob {
                             table_id,
-                            reader: BlobSegmentReader::new(writer.file().clone(), seq_id),
+                            reader,
                             file_len: 0,
                             dead_bytes: 0,
                         },
                     );
-                    let lru_metas = self.build_checkpointed_lru_blob_metas();
-                    self.meta_mgr.commit_update(|st| {
-                        st.lru_blob_segments = lru_metas;
-                    })?;
                     self.active_lru_writers.insert(table_id, writer);
                 }
                 let writer = self.active_lru_writers.get_mut(&table_id).unwrap();
