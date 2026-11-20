@@ -667,7 +667,12 @@ impl PlatformFs for WinPlatformFs {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(OsStr::new(rel_name));
         match std::fs::remove_file(full_path) {
-            Ok(()) => self.sync_dir_if_unc(),
+            Ok(()) => {
+                // The unlink has already succeeded; a best-effort UNC parent-dir flush failure
+                // must not make callers believe the file still exists.
+                let _ = self.sync_dir_if_unc();
+                Ok(())
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
