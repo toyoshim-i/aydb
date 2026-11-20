@@ -371,6 +371,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
+    /// Monotonic registration token counter for live virtual table instances.
+    next_vtab_token: u64,
+    /// Live virtual table holder tokens per `table_id` (reference-counted across connections).
+    active_vtab_holders: HashMap<u16, Vec<u64>>,
     /// Bumped by every change that can add or remove a row as some view sees it: each write,
     /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
     /// rows (a cache) stays valid exactly as long as the epoch does not move.
@@ -1042,6 +1046,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             vtabs_created_in_tx: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
+            next_vtab_token: 1,
+            active_vtab_holders: HashMap::new(),
             mutation_epoch: 0,
             data_generation: 0,
             table_has_row_meta: BTreeMap::new(),
@@ -1250,23 +1256,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<u16> {
         let plan = self.plan_vtab_registration(table_name, explicit_id)?;
-        self.register_vtab_plan(plan, durability)
+        self.register_vtab_plan(plan, durability).map(|(id, _)| id)
+    }
+
+    fn add_vtab_holder(&mut self, table_id: u16) -> u64 {
+        let tok = self.next_vtab_token;
+        self.next_vtab_token = self.next_vtab_token.wrapping_add(1).max(1);
+        self.active_vtab_holders
+            .entry(table_id)
+            .or_default()
+            .push(tok);
+        tok
     }
 
     /// Registers a virtual table resolved by [`Self::plan_vtab_registration`] as live and, if the
-    /// catalog does not hold it yet, persists its catalog entry.
+    /// catalog does not hold it yet, persists its catalog entry. Returns `(table_id, reg_token)`.
     pub(crate) fn register_vtab_plan(
         &mut self,
         plan: VtabPlan,
         durability: WriteDurability,
-    ) -> io::Result<u16> {
+    ) -> io::Result<(u16, u64)> {
         let VtabPlan {
             norm_name,
             table_id: chosen_id,
             persisted,
         } = plan;
-        self.active_vtab_ids
-            .insert(chosen_id, Arc::from(norm_name.as_str()));
         if !persisted {
             let catalog_prefix = [0u8, 0u8, b'c'];
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());
@@ -1291,7 +1305,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 durability,
             )?;
         }
-        Ok(chosen_id)
+        self.active_vtab_ids
+            .insert(chosen_id, Arc::from(norm_name.as_str()));
+        let token = self.add_vtab_holder(chosen_id);
+        Ok((chosen_id, token))
     }
 
     /// Decides which `table_id` a virtual table `(table_name, explicit_id)` resolves to, and
@@ -1417,7 +1434,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the active transaction. Unlike a registration made by the transaction owner, it must
     /// survive that transaction's rollback, so it is also recorded in the snapshots a rollback
     /// restores without clobbering any uncommitted rename/drop already recorded by the owner.
-    pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) {
+    pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
         let name: Arc<str> = Arc::from(table_name.trim().to_ascii_lowercase().as_str());
         if self.tx_start_meta.active {
             let orig = self.tx_start_meta.active_vtab_ids.get(&table_id).cloned();
@@ -1436,6 +1453,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             self.active_vtab_ids.insert(table_id, name);
         }
+        self.add_vtab_holder(table_id)
     }
 
     /// Notes that the active transaction created virtual table `(table_id, table_name)` in `db_name`.
@@ -1523,18 +1541,51 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.mutation_epoch
     }
 
-    /// Whether `(table_id, table_name)` is currently registered as a live virtual table.
-    pub(crate) fn is_vtab_active(&self, table_id: u16, table_name: &str) -> bool {
-        let norm_name = table_name.trim().to_ascii_lowercase();
-        self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) == Some(norm_name.as_str())
+    /// Unregisters a live virtual table handle identified by `(table_id, token)`, removing the
+    /// catalog entry from `active_vtab_ids` only when the last live holder disconnects.
+    pub(crate) fn unregister_vtab_token(&mut self, table_id: u16, token: u64) {
+        let Some(holders) = self.active_vtab_holders.get_mut(&table_id) else {
+            return;
+        };
+        let Some(pos) = holders.iter().position(|&t| t == token) else {
+            return;
+        };
+        holders.swap_remove(pos);
+        if !holders.is_empty() {
+            return;
+        }
+        self.active_vtab_holders.remove(&table_id);
+        let removed = self.active_vtab_ids.remove(&table_id);
+        if let Some(removed_name) = removed {
+            if self.tx_start_meta.active
+                && self.tx_start_meta.active_vtab_ids.get(&table_id) == Some(&removed_name)
+            {
+                self.tx_start_meta.active_vtab_ids.remove(&table_id);
+                for marker in &mut self.savepoints {
+                    if marker.meta_snapshot.active_vtab_ids.get(&table_id) == Some(&removed_name) {
+                        marker.meta_snapshot.active_vtab_ids.remove(&table_id);
+                    }
+                }
+            }
+        }
     }
 
     /// Unregisters a disconnected virtual table `(table_id, table_name)` from the live registry.
     pub fn unregister_vtab(&mut self, table_id: u16, table_name: &str) {
         let norm_name = table_name.trim().to_ascii_lowercase();
-        if self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) == Some(norm_name.as_str()) {
-            self.active_vtab_ids.remove(&table_id);
+        if self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) != Some(norm_name.as_str()) {
+            return;
         }
+        if let Some(holders) = self.active_vtab_holders.get_mut(&table_id) {
+            if !holders.is_empty() {
+                holders.pop();
+                if !holders.is_empty() {
+                    return;
+                }
+            }
+            self.active_vtab_holders.remove(&table_id);
+        }
+        self.active_vtab_ids.remove(&table_id);
     }
 
     /// Renames a live virtual table in the catalog (`xRename` / `ALTER TABLE ... RENAME TO`): the
@@ -1744,6 +1795,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if internal_tx {
             self.commit_transaction()?;
         }
+        self.active_vtab_holders.remove(&table_id);
         Ok(())
     }
 

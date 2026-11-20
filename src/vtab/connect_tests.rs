@@ -379,3 +379,55 @@ fn connecting_during_uncommitted_rename_does_not_poison_rollback() {
     );
     assert_eq!(ids(&conn5, "t2"), vec![1, 2, 3, 100]);
 }
+
+#[test]
+fn disconnecting_one_connection_keeps_shared_table_registered_until_last_disconnects() {
+    let fx = fixture("refcount_shared", 30_000);
+    let conn1 = fx.open();
+    let conn2 = fx.open();
+    assert_eq!(ids(&conn1, "t"), vec![1, 2, 3]);
+    assert_eq!(ids(&conn2, "t"), vec![1, 2, 3]);
+    assert!(fx.is_registered(1, "t"));
+
+    // Closing conn1 must leave table_id 1 registered while conn2 still uses it.
+    drop(conn1);
+    assert!(fx.is_registered(1, "t"));
+    conn2
+        .execute_batch("INSERT INTO t VALUES (4, 'd')")
+        .unwrap();
+    conn2
+        .execute_batch("ALTER TABLE t RENAME TO t_renamed")
+        .unwrap();
+    assert_eq!(ids(&conn2, "t_renamed"), vec![1, 2, 3, 4]);
+    assert!(fx.is_registered(1, "t_renamed"));
+
+    // Closing the final connection removes the live registration even after rename.
+    drop(conn2);
+    assert!(!fx.engine.read().unwrap().active_vtab_ids.contains_key(&1));
+}
+
+#[test]
+fn stale_disconnect_after_drop_and_recreate_does_not_unregister_new_table() {
+    let fx = fixture("stale_disconnect", 30_000);
+    let conn_live = fx.open();
+    let conn_stale = fx.open();
+    assert_eq!(ids(&conn_live, "t"), vec![1, 2, 3]);
+    assert_eq!(ids(&conn_stale, "t"), vec![1, 2, 3]);
+
+    // Drop and recreate table_id 1 on `conn_live` while `conn_stale` still holds the old handle.
+    conn_live.execute_batch("DROP TABLE t").unwrap();
+    conn_live.execute_batch(T_DDL).unwrap();
+    conn_live
+        .execute_batch("INSERT INTO t VALUES (10, 'fresh')")
+        .unwrap();
+    assert!(fx.is_registered(1, "t"));
+
+    // Dropping conn_stale disconnects its stale table_id=1 instance with an old reg_token;
+    // the newly created table's live registration must stay intact.
+    drop(conn_stale);
+    assert!(fx.is_registered(1, "t"));
+    assert_eq!(ids(&conn_live, "t"), vec![10]);
+
+    drop(conn_live);
+    assert!(!fx.engine.read().unwrap().active_vtab_ids.contains_key(&1));
+}

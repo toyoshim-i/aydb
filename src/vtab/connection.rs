@@ -29,7 +29,7 @@ use crate::vtab::{AYDB_VTAB_MODULE, ModuleAuxContext, destroy_aux_context};
 /// Virtual Table registration support.
 pub struct SqliteConnection {
     db: *mut sqlite3,
-    read_trace: Box<ReadTrace>,
+    read_trace: *mut ReadTrace,
 }
 
 impl SqliteConnection {
@@ -58,18 +58,19 @@ impl SqliteConnection {
                 "sqlite3_open failed with rc={rc}"
             )));
         }
-        let mut read_trace = Box::new(ReadTrace::new(db));
+        let read_trace = Box::into_raw(Box::new(ReadTrace::new(db)));
         let rc = unsafe {
             crate::vtab::ffi::sqlite3_trace_v2(
                 db,
                 TRACE_STATEMENT | TRACE_PROFILE,
                 Some(trace_reads),
-                (&mut *read_trace as *mut ReadTrace).cast(),
+                read_trace.cast(),
             )
         };
         if rc != SQLITE_OK {
             unsafe {
                 sqlite3_close(db);
+                drop(Box::from_raw(read_trace));
             }
             return Err(io::Error::other(
                 "could not register SQLite read lifecycle trace",
@@ -103,7 +104,9 @@ impl SqliteConnection {
             None
         };
         let read_session = Arc::new(ReadSession::new(Arc::clone(&engine)));
-        self.read_trace.add_session(&read_session);
+        unsafe {
+            (*self.read_trace).add_session(&read_session);
+        }
         let aux = Box::new(ModuleAuxContext {
             engine,
             read_session,
@@ -189,11 +192,19 @@ impl SqliteConnection {
 impl Drop for SqliteConnection {
     fn drop(&mut self) {
         if !self.db.is_null() {
-            self.read_trace.clear();
             unsafe {
                 crate::vtab::ffi::sqlite3_trace_v2(self.db, 0, None, core::ptr::null_mut());
+                if !self.read_trace.is_null() {
+                    (*self.read_trace).clear();
+                }
                 sqlite3_close(self.db);
             }
+        }
+        if !self.read_trace.is_null() {
+            unsafe {
+                drop(Box::from_raw(self.read_trace));
+            }
+            self.read_trace = core::ptr::null_mut();
         }
     }
 }

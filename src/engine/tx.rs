@@ -1041,6 +1041,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.capped_tables = snap.capped_tables.clone();
         self.active_vtab_ids = snap.active_vtab_ids.clone();
+        self.active_vtab_holders
+            .retain(|id, _| self.active_vtab_ids.contains_key(id));
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
         self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();

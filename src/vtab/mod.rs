@@ -291,9 +291,9 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
         SQLITE_INTEGER => Some(unsafe { sqlite3_value_int64(val) }),
         SQLITE_FLOAT => f64_to_lossless_i64(unsafe { sqlite3_value_double(val) }),
         SQLITE_TEXT => {
-            let bytes = unsafe { sqlite3_value_bytes(val) } as usize;
+            let bytes = unsafe { sqlite3_value_bytes(val) }.max(0) as usize;
             let text_ptr = unsafe { sqlite3_value_text(val) };
-            if text_ptr.is_null() {
+            if text_ptr.is_null() || bytes == 0 {
                 return None;
             }
             let slice = unsafe { core::slice::from_raw_parts(text_ptr, bytes) };
@@ -385,6 +385,7 @@ pub(super) struct AydbVTab {
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
     table_id: u16,
+    reg_token: u64,
     db_name: String,
     /// Normalised at use. Changes when the table is renamed.
     table_name: std::sync::Mutex<String>,
@@ -642,6 +643,7 @@ fn integer_rowid_occupied(
 /// What a successful connect resolved under the engine lock.
 struct Connected {
     table_id: u16,
+    reg_token: u64,
     unique_ready: bool,
     /// The catalog had no entry for the table before this connect: it is a new table.
     newly_created: bool,
@@ -678,7 +680,7 @@ fn connect_table(
              format); recreate it",
         ));
     }
-    if eng.check_write_allowed_for_conn(conn_id).is_err() {
+    let reg_token = if eng.check_write_allowed_for_conn(conn_id).is_err() {
         let quota_registered = ddl.max_bytes == 0
             || eng
                 .capped_table_state_view(view, table_id)
@@ -686,18 +688,10 @@ fn connect_table(
         if !(plan.persisted && quota_registered) {
             return Ok(None);
         }
-        eng.activate_persisted_vtab(table_id, &ddl.table_name);
+        eng.activate_persisted_vtab(table_id, &ddl.table_name)
     } else {
-        // Another connection may already use this registration: a failed connect must not
-        // remove it.
-        let was_active = eng.is_vtab_active(table_id, &ddl.table_name);
-        if let Err(e) = register_table(eng, ddl, plan) {
-            if !was_active {
-                eng.unregister_vtab(table_id, &ddl.table_name);
-            }
-            return Err(e);
-        }
-    }
+        register_table(eng, ddl, plan)?
+    };
     // Runtime-only settings: re-derived from the DDL on every connect.
     match ddl.on_corrupt {
         Some(policy) => eng.set_table_corrupt_policy(table_id, policy),
@@ -720,6 +714,7 @@ fn connect_table(
             .is_some_and(|found| found == unique_def.marker_value());
     Ok(Some(Connected {
         table_id,
+        reg_token,
         unique_ready,
         newly_created,
     }))
@@ -727,21 +722,25 @@ fn connect_table(
 
 /// The writing part of a connect: catalog entry (with the table's rowid mapping marker, in the
 /// same atomic write) and capped quota. It only runs when no other connection has a transaction
-/// open.
+/// open. Returns the new holder registration token.
 fn register_table(
     eng: &mut StorageEngine<OsFs>,
     ddl: &ParsedVtabDdl,
     plan: crate::engine::VtabPlan,
-) -> io::Result<()> {
-    let table_id = eng.register_vtab_plan(plan, ddl.durability)?;
+) -> io::Result<u64> {
+    let (table_id, reg_token) = eng.register_vtab_plan(plan, ddl.durability)?;
     if ddl.max_bytes > 0 {
-        eng.register_capped_table(table_id, ddl.max_bytes)?;
+        if let Err(e) = eng.register_capped_table(table_id, ddl.max_bytes) {
+            eng.unregister_vtab_token(table_id, reg_token);
+            return Err(e);
+        }
     }
     #[cfg(test)]
     if FAIL_CONNECT_AFTER_REGISTRATION.with(|flag| flag.replace(false)) {
+        eng.unregister_vtab_token(table_id, reg_token);
         return Err(io::Error::other("injected connect failure"));
     }
-    Ok(())
+    Ok(reg_token)
 }
 
 #[cfg(test)]
@@ -942,6 +941,7 @@ unsafe fn vtab_create_or_connect(
         };
         let Connected {
             table_id,
+            reg_token,
             unique_ready,
             ..
         } = connected;
@@ -956,6 +956,7 @@ unsafe fn vtab_create_or_connect(
             engine: aux.engine.clone(),
             read_session: Arc::clone(&aux.read_session),
             table_id,
+            reg_token,
             db_name: ddl.db_name,
             table_name: std::sync::Mutex::new(ddl.table_name),
             pre_tx_name: std::sync::Mutex::new(None),
@@ -994,16 +995,7 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
                 if let Ok(mut eng) = vtab.engine.write() {
-                    let name = vtab.name();
-                    if eng.is_vtab_active(vtab.table_id, &name) {
-                        eng.unregister_vtab(vtab.table_id, &name);
-                    } else if !eng.in_active_transaction() {
-                        if let Ok(prev) = vtab.pre_tx_name.lock() {
-                            if let Some(prev_name) = prev.as_deref() {
-                                eng.unregister_vtab(vtab.table_id, prev_name);
-                            }
-                        }
-                    }
+                    eng.unregister_vtab_token(vtab.table_id, vtab.reg_token);
                 }
             }
         }
@@ -1105,11 +1097,25 @@ unsafe extern "system" fn vtab_best_index(
     p_info: *mut sqlite3_index_info,
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
+        if p_vtab.is_null() || p_info.is_null() {
+            return SQLITE_ERROR;
+        }
         let vtab = &*(p_vtab as *const AydbVTab);
         let info = &mut *p_info;
-        let n = info.nConstraint as usize;
-        let constraints = core::slice::from_raw_parts(info.aConstraint, n);
-        let usages = core::slice::from_raw_parts_mut(info.aConstraintUsage, n);
+        let n = usize::try_from(info.nConstraint).unwrap_or(0);
+        let (constraints, usages): (
+            &[crate::vtab::ffi::sqlite3_index_constraint],
+            &mut [crate::vtab::ffi::sqlite3_index_constraint_usage],
+        ) = if n == 0 {
+            (&[], &mut [])
+        } else if info.aConstraint.is_null() || info.aConstraintUsage.is_null() {
+            return SQLITE_ERROR;
+        } else {
+            (
+                core::slice::from_raw_parts(info.aConstraint, n),
+                core::slice::from_raw_parts_mut(info.aConstraintUsage, n),
+            )
+        };
 
         // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected
         let can_use_keys_only = info.colUsed == 0
@@ -1214,7 +1220,7 @@ unsafe extern "system" fn vtab_best_index(
         // Check if `ORDER BY pk ASC` or `ORDER BY pk DESC` can be satisfied directly by the memcomparable PK scan
         let mut order_by_pk_consumed = false;
         let mut order_by_pk_reverse = false;
-        if info.nOrderBy == 1 {
+        if info.nOrderBy == 1 && !info.aOrderBy.is_null() {
             let ob = &*info.aOrderBy;
             // Integer affinity also accepts REAL/TEXT/BLOB keys with synthetic rowids. Another
             // connection can insert one after planning, so only PK order is guaranteed here.

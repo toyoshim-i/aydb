@@ -2977,3 +2977,66 @@ fn concurrent_sync_writers_queue_without_busy_or_lost_updates() {
         vec![vec![SqlValue::Integer(WRITERS as i64 * INCREMENTS)]]
     );
 }
+
+#[test]
+fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
+    let tmp = TempTestDir::new("best_index_null");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let mut vtab = AydbVTab {
+        base: sqlite3_vtab {
+            pModule: &AYDB_VTAB_MODULE,
+            nRef: 0,
+            zErrMsg: core::ptr::null_mut(),
+        },
+        db: core::ptr::null_mut(),
+        engine: Arc::clone(&engine),
+        read_session: Arc::new(snapshot::ReadSession::new(engine)),
+        table_id: 1,
+        reg_token: 1,
+        db_name: "main".to_string(),
+        table_name: std::sync::Mutex::new("t".to_string()),
+        pre_tx_name: std::sync::Mutex::new(None),
+        durability: WriteDurability::BufferedFast,
+        unique_def: unique_key::UniqueDef::from_columns(&[], &[], &[]),
+        unique_ready: AtomicBool::new(true),
+        unique_migration_failed: AtomicBool::new(false),
+        unique_cursor: std::sync::Mutex::new(None),
+        col_names: vec!["k".into(), "v".into()],
+        col_affinities: vec![ColumnAffinity::Integer, ColumnAffinity::Text],
+        col_not_null: vec![true, false],
+        col_unique: vec![false, false],
+        col_collations: vec![ColCollation::Binary, ColCollation::Binary],
+        pk_col_idx: 0,
+        pk_affinity: ColumnAffinity::Integer,
+        pk_rowid_alias: true,
+        auto_key_cache: std::sync::Mutex::new((u64::MAX, 0)),
+        unsupported: None,
+        pk_collation: ColCollation::Binary,
+        secondary_indexes: Vec::new(),
+    };
+
+    for n_order_by in [0, 1] {
+        let mut info = sqlite3_index_info {
+            nConstraint: 0,
+            aConstraint: core::ptr::null(),
+            nOrderBy: n_order_by,
+            aOrderBy: core::ptr::null(),
+            aConstraintUsage: core::ptr::null_mut(),
+            idxNum: 0,
+            idxStr: core::ptr::null_mut(),
+            needToFreeIdxStr: 0,
+            orderByConsumed: 0,
+            estimatedCost: 0.0,
+            estimatedRows: 0,
+            idxFlags: 0,
+            colUsed: 1,
+        };
+        let rc = unsafe { vtab_best_index(&mut vtab.base, &mut info) };
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(info.idxNum & 0xFF, PLAN_FULL_SCAN);
+        assert_eq!(info.orderByConsumed, 0);
+    }
+}
