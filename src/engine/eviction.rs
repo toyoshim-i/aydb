@@ -97,6 +97,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn eager_promote_lru_on_read(&mut self, table_id: u16, pk: &[u8]) -> io::Result<()> {
+        if self.tx_depth > 0 {
+            self.access_tracker.record_read_hit(table_id, pk);
+            return Ok(());
+        }
+        self.drain_group_for_autocommit()?;
         let meta_key = encode_row_meta_key(table_id, pk);
         let Some((mut meta, old_m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? else {
             return Ok(());
@@ -116,8 +121,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             value: Vec::new(),
         });
         let meta_bytes = meta.to_bytes();
+        let mut new_m_ptr = None;
         if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
+            new_m_ptr = Some(ptr);
             records.push(WalRecord::PutBlobPtr {
                 key: meta_key,
                 blob_ptr: ptr,
@@ -128,7 +135,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 value: meta_bytes,
             });
         }
-        self.commit_wal_and_memtable(records, WriteDurability::BufferedFast)?;
+        if let Err(e) = self.commit_wal_and_memtable_with_data_flag(
+            records,
+            WriteDurability::BufferedFast,
+            false,
+        ) {
+            if let Some(p) = new_m_ptr {
+                self.record_dead_blob_bytes(&p);
+            }
+            return Err(e);
+        }
         if let Some(m_ptr) = old_m_ptr {
             self.record_dead_blob_bytes(&m_ptr);
         }

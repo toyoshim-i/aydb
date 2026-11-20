@@ -22,6 +22,7 @@ pub(crate) struct ReadSnapshotToken {
 
 pub(super) struct ReadSnapshot<F: PlatformFile> {
     token: Weak<()>,
+    data_generation: u64,
     memtable: MemTable,
     idx_segments: Vec<Arc<IdxSegmentReader<F>>>,
     std_blobs: BTreeMap<u64, BlobSegmentReader<F>>,
@@ -98,6 +99,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
         let snapshot = Arc::new(ReadSnapshot {
             token: Arc::downgrade(&token.keep_alive),
+            data_generation: self.data_generation,
             memtable: self.memtable.clone(),
             idx_segments: self.idx_segments.clone(),
             std_blobs: self
@@ -141,18 +143,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    /// Executes a read closure against a pinned `ReadSnapshotToken` with exclusive engine access
+    /// so `EagerWriteOnRead` promotions can be persisted outside active transactions.
+    pub(crate) fn with_snapshot_read<R>(
+        &mut self,
+        token: &ReadSnapshotToken,
+        mut f: impl FnMut(&EngineReader<'_, FS>) -> R,
+    ) -> R {
+        self.run_read(ReadView::Snapshot(token.id), |eng, cx| {
+            f(&EngineReader {
+                eng,
+                cx: CxRef::Borrowed(cx),
+            })
+        })
+        .0
+    }
+
     /// A snapshot is current while no committed data was published since capture. This compares
-    /// the memtable publication generation, not LSNs: a flush inside a commit can make the
-    /// checkpoint LSN equal an in-flight transaction's LSN and hide its later publication.
+    /// the data publication generation (ignoring internal `EagerWriteOnRead` LRU promotions),
+    /// rather than LSNs or `MemTable::generation`: a flush inside a commit can make the
+    /// checkpoint LSN equal an in-flight transaction's LSN, and an eager LRU promotion bumps the
+    /// `MemTable` generation without changing user data.
     pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken) -> bool {
         self.pending_group.is_empty()
             && self
                 .read_snapshots
                 .read()
                 .get(&token.id)
-                .is_some_and(|snapshot| {
-                    snapshot.memtable.generation() == self.memtable.generation()
-                })
+                .is_some_and(|snapshot| snapshot.data_generation == self.data_generation)
     }
 
     pub(crate) fn check_snapshot_write_upgrade(

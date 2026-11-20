@@ -34,6 +34,8 @@ pub(crate) struct ReadCtx {
     /// True when the caller holds exclusive access (so eager LRU promotions can be queued and
     /// buffered blobs flushed on request).
     pub(super) eager_ok: bool,
+    /// False for internal constraint checks that must not mutate LRU tracking state.
+    pub(super) track_hits: bool,
     /// Set when the read hit a blob still in an active writer's buffer (owner view only).
     pub(super) need_flush: Cell<bool>,
     pub(super) eager_hits: RefCell<Vec<(u16, Vec<u8>)>>,
@@ -41,9 +43,14 @@ pub(crate) struct ReadCtx {
 
 impl ReadCtx {
     pub(super) fn new(view: ReadView, eager_ok: bool) -> Self {
+        Self::new_with_tracking(view, eager_ok, true)
+    }
+
+    pub(super) fn new_with_tracking(view: ReadView, eager_ok: bool, track_hits: bool) -> Self {
         Self {
             view,
             eager_ok,
+            track_hits,
             need_flush: Cell::new(false),
             eager_hits: RefCell::new(Vec::new()),
         }

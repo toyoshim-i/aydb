@@ -375,6 +375,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
     /// rows (a cache) stays valid exactly as long as the epoch does not move.
     pub(super) mutation_epoch: u64,
+    /// Monotonic counter of committed user-data publications, incremented when committed batches
+    /// (other than internal `EagerWriteOnRead` LRU tick updates) enter the `MemTable`. Used by
+    /// read snapshots to detect concurrent writes without false write-upgrade aborts.
+    pub(super) data_generation: u64,
     /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys.
     /// Standard uncapped tables without secondary indexes resolve to `false` once and skip
     /// all `'t'` negative point lookups on `UPDATE` and `DELETE`!
@@ -1036,6 +1040,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
             mutation_epoch: 0,
+            data_generation: 0,
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
             last_buf_synced_lsn: 0,
@@ -2115,6 +2120,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.owner_read(|eng, cx| eng.get_row_cx(cx, table_id, pk))
     }
 
+    /// Point lookup of a row (`pk`) in `table_id` without recording any LRU read hit or queuing
+    /// eager promotions. Used by internal constraint checks inside writes.
+    pub(crate) fn get_row_untracked(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        self.owner_read_with_tracking(false, |eng, cx| eng.get_row_cx(cx, table_id, pk))
+    }
+
     pub(super) fn get_row_cx(
         &self,
         cx: &ReadCtx,
@@ -2148,17 +2163,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(resolved)
     }
 
-    /// Records an LRU read hit for capped tables: queued for an eager WAL promotion when the
-    /// reader has exclusive access and `EagerWriteOnRead` is configured, otherwise coalesced
-    /// in RAM (interior-mutable tracker, safe under a shared lock).
+    /// Records an LRU read hit for capped tables: queued for an eager WAL promotion only outside
+    /// any active transaction when the reader has exclusive access and `EagerWriteOnRead` is
+    /// configured; otherwise coalesced in RAM (interior-mutable tracker, safe under a shared
+    /// lock and inside transactions).
     #[inline]
     pub(super) fn track_read_hit(&self, cx: &ReadCtx, table_id: u16, pk: &[u8]) {
-        if !self.capped_tables.contains_key(&table_id) {
+        if !cx.track_hits || !self.capped_tables.contains_key(&table_id) {
             return;
         }
         if cx.eager_ok
-            && cx.view == ReadView::Owner
+            && self.tx_depth == 0
             && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+            && matches!(cx.view, ReadView::Owner | ReadView::Snapshot(_))
         {
             cx.eager_hits.borrow_mut().push((table_id, pk.to_vec()));
         } else {
@@ -2247,16 +2264,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// True if a shared-lock read by `conn_id` on `table_id` must upgrade to an exclusive lock
     /// before attempting [`Self::reader_for_conn`]: either `EagerWriteOnRead` tracking applies to
-    /// a capped table, or `conn_id` owns an active transaction that currently has buffered
-    /// (unflushed) blob bytes.
+    /// a capped table outside any transaction, or `conn_id` owns an active transaction that
+    /// currently has buffered (unflushed) blob bytes.
     #[inline]
     pub fn vtab_read_needs_exclusive(&self, conn_id: usize, table_id: u16) -> bool {
         if self.read_view_for_conn(conn_id) == ReadView::Committed {
             return false;
         }
         (self.tx_depth > 0 && self.any_blob_unflushed())
-            || (self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+            || (self.tx_depth == 0
+                && !self.is_poisoned()
+                && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
                 && self.capped_tables.contains_key(&table_id))
+    }
+
+    /// True if a snapshot read on `table_id` should upgrade to an exclusive lock so
+    /// `EagerWriteOnRead` can persist LRU promotions outside active transactions.
+    #[inline]
+    pub(crate) fn snapshot_read_needs_exclusive(&self, table_id: u16) -> bool {
+        self.tx_depth == 0
+            && !self.is_poisoned()
+            && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
+            && self.capped_tables.contains_key(&table_id)
     }
 
     /// Shared-access reader for `conn_id` (see [`EngineReader`]). Must only be used when
@@ -2275,11 +2304,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(super) fn run_read<R>(
         &mut self,
         view: ReadView,
+        f: impl FnMut(&Self, &ReadCtx) -> R,
+    ) -> (R, Option<io::Error>) {
+        self.run_read_with_tracking(view, true, f)
+    }
+
+    pub(super) fn run_read_with_tracking<R>(
+        &mut self,
+        view: ReadView,
+        track_hits: bool,
         mut f: impl FnMut(&Self, &ReadCtx) -> R,
     ) -> (R, Option<io::Error>) {
         let mut attempts = 0;
         loop {
-            let cx = ReadCtx::new(view, true);
+            let cx = ReadCtx::new_with_tracking(view, track_hits, track_hits);
             let r = f(&*self, &cx);
             if cx.need_flush.get() && attempts < 2 {
                 attempts += 1;
@@ -2289,17 +2327,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 continue;
             }
             // The promotions are an optimisation of the read, never part of its result: a
-            // poisoned engine cannot write them, and a write that fails must not fail the read.
-            // A hit that is not written is still noted in RAM, so the LRU order learns it
-            // lazily as for any coalesced read; the on-disk queue and the row metadata stay as
-            // they were, consistent with each other.
+            // poisoned engine cannot write them, and a write that fails must not fail the read,
+            // though a failure on a non-poisoned engine is recorded via `record_maintenance_failure`.
+            // Inside an active transaction (`tx_depth > 0`) eager promotions must never mutate the
+            // transaction overlay/budget. A hit that is not written is still noted in RAM, so the
+            // LRU order learns it lazily as for any coalesced read.
             let hits = cx.eager_hits.take();
-            let mut write_failed = self.is_poisoned();
+            let mut write_failed = self.is_poisoned() || self.tx_depth > 0;
             for (table_id, pk) in hits {
-                if !write_failed && self.eager_promote_lru_on_read(table_id, &pk).is_err() {
-                    write_failed = true;
+                if !write_failed {
+                    if let Err(e) = self.eager_promote_lru_on_read(table_id, &pk) {
+                        self.record_maintenance_failure(&e);
+                        write_failed = true;
+                    }
                 }
-                if write_failed {
+                if write_failed && track_hits {
                     self.access_tracker.record_read_hit(table_id, &pk);
                 }
             }
@@ -2311,7 +2353,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         &mut self,
         f: impl FnMut(&Self, &ReadCtx) -> io::Result<R>,
     ) -> io::Result<R> {
-        let (r, extra) = self.run_read(ReadView::Owner, f);
+        self.owner_read_with_tracking(true, f)
+    }
+
+    pub(super) fn owner_read_with_tracking<R>(
+        &mut self,
+        track_hits: bool,
+        f: impl FnMut(&Self, &ReadCtx) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let (r, extra) = self.run_read_with_tracking(ReadView::Owner, track_hits, f);
         match (r, extra) {
             (Ok(v), None) => Ok(v),
             (Ok(_), Some(e)) => Err(e),
@@ -3332,7 +3382,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         records: Vec<WalRecord>,
         durability: WriteDurability,
     ) -> io::Result<u64> {
-        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.commit_wal_and_memtable_with_data_flag(records, durability, true)
+    }
+
+    pub(super) fn commit_wal_and_memtable_with_data_flag(
+        &mut self,
+        records: Vec<WalRecord>,
+        durability: WriteDurability,
+        count_as_data_write: bool,
+    ) -> io::Result<u64> {
+        if count_as_data_write || self.tx_depth > 0 {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        }
         self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;
@@ -3378,6 +3439,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(lsn);
         }
 
+        let has_records = !records.is_empty();
         self.drain_pending_durable()?;
         let mut batch = WalBatch::new(lsn, records);
         self.flush_active_blob_buffers()?;
@@ -3390,6 +3452,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         res?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
         self.memtable.apply_wal_batch_owned(batch);
+        if count_as_data_write && has_records {
+            self.data_generation += 1;
+        }
         // The batch is committed; a failed flush is retried because `should_flush` stays true.
         if self.memtable.should_flush() {
             if let Err(e) = self.flush_memtable() {

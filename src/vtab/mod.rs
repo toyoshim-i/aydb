@@ -220,12 +220,17 @@ fn with_snapshot_read_access<R>(
     conn_id: usize,
     table_id: u16,
     snapshot: Option<&crate::engine::ReadSnapshotToken>,
-    f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
+    mut f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
 ) -> Option<R> {
     if let Some(snapshot) = snapshot {
-        let engine = engine.read().ok()?;
-        let mut f = f;
-        Some(f(&engine.reader_for_snapshot(snapshot)))
+        {
+            let guard = engine.read().ok()?;
+            if !guard.snapshot_read_needs_exclusive(table_id) {
+                return Some(f(&guard.reader_for_snapshot(snapshot)));
+            }
+        }
+        let mut guard = engine.write().ok()?;
+        Some(guard.with_snapshot_read(snapshot, f))
     } else {
         with_read_access(engine, conn_id, table_id, f)
     }

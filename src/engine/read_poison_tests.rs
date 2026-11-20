@@ -198,11 +198,65 @@ fn a_read_whose_promotion_write_fails_still_returns_its_row() {
         engine.get_row(CAPPED, &[b'k', 2]).unwrap(),
         Some(vec![b'v'; 100])
     );
-    // The failed write poisoned the engine, as any failed WAL write does; reads go on.
+    // The failed write poisoned the engine, as any failed WAL write does; reads go on, and
+    // the non-poisoned promotion failure was recorded once.
     assert!(engine.is_poisoned());
+    assert_eq!(engine.maintenance_failures(), 1);
+    assert!(engine.last_maintenance_error().is_some());
     read_everything(&mut engine, CAPPED);
+    assert_eq!(engine.maintenance_failures(), 1);
     drop(engine);
     let mut engine = StorageEngine::open(fs, config()).unwrap();
     assert!(!engine.is_poisoned());
     read_everything(&mut engine, CAPPED);
+}
+
+#[test]
+fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
+    let dir = TempTestDir::new("read_eager_active_tx");
+    let flag = Arc::new(AtomicBool::new(false));
+    let fs = Arc::new(FaultFs {
+        inner: OsFs::open(&dir.path, true).unwrap(),
+        fail_next_wal_write: Arc::clone(&flag),
+    });
+    let mut cfg = config();
+    cfg.max_transaction_bytes = 512;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    seed(&mut engine);
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine.savepoint_for_conn(1, 1).unwrap();
+    engine
+        .put_row(
+            UNCAPPED,
+            b"tx_k",
+            b"tx_v",
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+
+    let rec_count = engine.pending_tx_record_count;
+    let tx_bytes = engine.pending_tx_bytes;
+    let epoch = engine.mutation_epoch;
+    let overlay_len = engine.tx_overlay.map.len();
+    let undo_len = engine.tx_overlay.undo.len();
+
+    for _ in 0..20 {
+        for k in 0..5u8 {
+            assert_eq!(
+                engine.get_row(CAPPED, &[b'k', k]).unwrap(),
+                Some(vec![b'v'; 100])
+            );
+        }
+    }
+    assert_eq!(engine.pending_tx_record_count, rec_count);
+    assert_eq!(engine.pending_tx_bytes, tx_bytes);
+    assert_eq!(engine.mutation_epoch, epoch);
+    assert_eq!(engine.tx_overlay.map.len(), overlay_len);
+    assert_eq!(engine.tx_overlay.undo.len(), undo_len);
+
+    engine.rollback_to_savepoint_for_conn(1, 1).unwrap();
+    assert_eq!(engine.get_row(UNCAPPED, b"tx_k").unwrap(), None);
+    engine.commit_transaction_for_conn(1).unwrap();
 }

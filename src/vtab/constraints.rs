@@ -73,7 +73,7 @@ fn find_conflicts_by_index(
                 continue;
             }
             if digest {
-                let Some(existing) = engine.get_row(vtab.table_id, &pk)? else {
+                let Some(existing) = engine.get_row_untracked(vtab.table_id, &pk)? else {
                     continue;
                 };
                 let existing_key = unique_key_of_row(&existing, probe.col, probe.collation)?;

@@ -705,6 +705,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .is_some_and(|(lsn, _)| *lsn <= target)
         {
             if let Some((_, entries)) = self.pending_group.pop_front() {
+                if !entries.is_empty() {
+                    self.data_generation += 1;
+                }
                 self.memtable.absorb(entries);
             }
         }
@@ -747,6 +750,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.vtabs_created_in_tx.clear();
         let overlay = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
+        if !overlay.is_empty() {
+            self.data_generation += 1;
+        }
         self.memtable.absorb(overlay);
         self.finalize_tx_state();
 
