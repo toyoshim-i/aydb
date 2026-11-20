@@ -268,58 +268,19 @@ fn integer_primary_key_rowid_writes_match_native() {
     differential(&SPECS[0], &statements(&SPECS[0], true));
 }
 
-/// Keys that keep their rowid in the persistent mapping: an explicit rowid is stored as given,
-/// a taken rowid conflicts. (An omitted rowid gets an arbitrary one, so it is not compared.)
+/// Keys that keep their rowid in the persistent mapping (`INT PRIMARY KEY`, `TEXT`, capped):
+/// an explicit rowid is stored as given and a taken rowid conflicts.
 #[test]
 fn mapped_key_rowid_writes_match_native() {
-    for spec in &SPECS[2..] {
+    for spec in &SPECS[1..] {
         differential(spec, &statements(spec, false));
     }
-}
-
-/// A key that is itself the rowid (`INT PRIMARY KEY`, not an alias on a native table) cannot
-/// take a rowid of its own: such a request fails instead of being dropped.
-#[test]
-fn integer_key_rejects_a_rowid_that_differs_from_the_key() {
-    for stmt in [
-        "INSERT INTO {t}(rowid, k, v) VALUES(31, 32, 'x')",
-        "INSERT OR IGNORE INTO {t}(rowid, k, v) VALUES(31, 32, 'x')",
-        "INSERT OR REPLACE INTO {t}(rowid, k, v) VALUES(10, 32, 'x')",
-        "UPDATE {t} SET rowid = 60 WHERE v = 'a'",
-        "UPDATE OR IGNORE {t} SET rowid = 20 WHERE v = 'a'",
-        "UPDATE {t} SET rowid = 61, k = 62 WHERE v = 'a'",
-    ] {
-        let lab = Lab::new(&SPECS[1]);
-        lab.seed();
-        let before = lab.aydb.rows();
-        let (_, aydb) = lab.run(stmt);
-        assert!(aydb.contains("ok=false"), "{stmt}: {aydb}");
-        assert_eq!(lab.aydb.rows(), before, "{stmt}");
-    }
-    // Equal rowid and key is fine, and so is leaving the rowid alone.
-    let lab = Lab::new(&SPECS[1]);
-    lab.seed();
-    for stmt in [
-        "INSERT INTO a(rowid, k, v) VALUES(30, 30, 'x')",
-        "UPDATE a SET v = 'y' WHERE v = 'a'",
-        "UPDATE a SET k = 40 WHERE v = 'y'",
-    ] {
-        lab.aydb.conn.execute_batch(stmt).unwrap();
-    }
-    assert_eq!(
-        lab.aydb
-            .conn
-            .query_all("SELECT rowid, k FROM a ORDER BY k", &[])
-            .unwrap(),
-        [(20, 20), (30, 30), (40, 40)]
-            .map(|(r, k)| vec![SqlValue::Integer(r), SqlValue::Integer(k)])
-    );
 }
 
 /// Explicit and changed rowids survive a reconnect and are found by `WHERE rowid = ?`.
 #[test]
 fn written_rowids_persist_across_reconnect() {
-    for spec in &SPECS[2..] {
+    for spec in &SPECS[1..] {
         let lab = Lab::new(spec);
         lab.aydb
             .conn
@@ -379,9 +340,9 @@ fn written_rowids_persist_across_reconnect() {
 
 #[test]
 fn explicit_rowid_colliding_with_integer_pk_row_conflicts_and_replaces() {
-    let int_key = &SPECS[1];
-    assert!(!int_key.alias && int_key.int_key);
-    let lab = Lab::new(int_key);
+    let alias_key = &SPECS[0];
+    assert!(alias_key.alias && alias_key.int_key);
+    let lab = Lab::new(alias_key);
 
     lab.aydb
         .conn

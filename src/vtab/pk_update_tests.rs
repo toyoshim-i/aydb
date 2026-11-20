@@ -15,12 +15,11 @@ struct Spec {
     options: &'static str,
     /// The key is an integer: `k` is written as a number.
     int_key: bool,
-    /// The rowid of an aydb row is the key, whatever the native table keeps (`INT PRIMARY KEY`
-    /// is not a rowid alias on a native table): rowids are left out of the comparison.
+    /// Whether the adapter derives rowid from the key while native SQLite keeps a separate one.
     rowid_is_key: bool,
-    /// The key is its own rowid (both flavours above): a row whose key moves onto the key of
-    /// a row that is still queued makes SQLite visit the moved row, with values computed for
-    /// the replaced one. That cannot be reproduced, so such statements are not generated.
+    /// The key is its own rowid (`INTEGER PRIMARY KEY` rowid alias): a row whose key moves onto
+    /// the key of a row that is still queued makes SQLite visit the moved row, with values computed
+    /// for the replaced one. That cannot be reproduced, so such statements are not generated.
     key_is_rowid: bool,
 }
 
@@ -54,8 +53,8 @@ const SPECS: [Spec; 5] = [
         columns: "k INT PRIMARY KEY, u TEXT UNIQUE, v INT",
         options: "",
         int_key: true,
-        rowid_is_key: true,
-        key_is_rowid: true,
+        rowid_is_key: false,
+        key_is_rowid: false,
     },
     Spec {
         name: "capped",
@@ -337,7 +336,7 @@ fn plain_rows(n: i64) -> Vec<Row> {
 /// accepted difference; rows and rowids still agree.
 #[test]
 fn a_queued_row_removed_by_replace_is_skipped_but_counted() {
-    for spec in [&SPECS[0], &SPECS[1], &SPECS[4]] {
+    for spec in [&SPECS[0], &SPECS[1], &SPECS[3], &SPECS[4]] {
         let lab = Lab::new(spec, &plain_rows(2));
         let stmt = format!(
             "UPDATE OR REPLACE {{t}} SET k = CASE k WHEN {} THEN {} ELSE {} END",
@@ -349,11 +348,12 @@ fn a_queued_row_removed_by_replace_is_skipped_but_counted() {
         assert!(native.ok && aydb.ok, "{}", spec.name);
         // The first row takes the key of the second and keeps its own rowid 1.
         assert_eq!(native.rows, aydb.rows, "{}", spec.name);
-        assert!(
-            native
-                .rows
-                .contains("Integer(1), Text(\"k2\"), Text(\"u1\")")
-        );
+        let expected_row = if spec.int_key {
+            "Integer(1), Integer(2), Text(\"u1\")"
+        } else {
+            "Integer(1), Text(\"k2\"), Text(\"u1\")"
+        };
+        assert!(native.rows.contains(expected_row), "{}", native.rows);
         assert_eq!(native.changes, 1, "{}", spec.name);
         assert_eq!(aydb.changes, 2, "{}", spec.name);
     }
@@ -399,10 +399,10 @@ fn key_that_is_its_rowid_moves_onto_a_queued_rowid() {
     assert!(aydb.rows.contains("Integer(5), Integer(5), Text(\"u2\")"));
 }
 
-/// `INT PRIMARY KEY` is not a rowid alias on a native table, but the adapter derives the rowid
-/// from the key: after a key change the rowid is the new key where native keeps the old one.
+/// `INT PRIMARY KEY` is not a rowid alias, so updating `k` keeps the row's existing rowid
+/// just like native SQLite.
 #[test]
-fn integer_key_is_its_rowid_after_an_update() {
+fn int_primary_key_keeps_rowid_after_key_update_like_native() {
     let spec = &SPECS[3];
     let lab = Lab::new(spec, &plain_rows(2));
     let stmt = "UPDATE {t} SET k = 7 WHERE k = 1";
@@ -413,5 +413,122 @@ fn integer_key_is_its_rowid_after_an_update() {
     }
     let rowid = |side: &Side| side.int(&format!("SELECT rowid FROM {} WHERE k = 7", side.table));
     assert_eq!(rowid(&lab.native), 1);
-    assert_eq!(rowid(&lab.aydb), 7);
+    assert_eq!(rowid(&lab.aydb), 1);
+}
+
+#[test]
+fn int_pk_multi_row_update_or_replace_preserves_replaced_row_like_native() {
+    let spec = &SPECS[3];
+
+    // 1. Disjoint keys where updating row 1 to key 2 must not treat row 2's rowid=2 as a conflict.
+    let rows = [(10, "'u1'".to_string(), 10), (20, "'u2'".to_string(), 20)];
+    let dir = TempTestDir::new("int_pk_replace_no_rowid_clash");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let aydb = SqliteConnection::open_in_memory().unwrap();
+    aydb.register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    aydb.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE a USING aydb(table_id=1, columns='{}')",
+        spec.columns
+    ))
+    .unwrap();
+    let native = SqliteConnection::open_in_memory().unwrap();
+    native
+        .execute_batch(&format!("CREATE TABLE n({})", spec.columns))
+        .unwrap();
+    for (conn, table) in [(&native, "n"), (&aydb, "a")] {
+        for (i, (k, u, v)) in rows.iter().enumerate() {
+            let rowid = i as i64 + 1;
+            conn.execute_batch(&format!(
+                "INSERT INTO {table}(rowid, k, u, v) VALUES({rowid}, {k}, {u}, {v})"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(&format!(
+            "UPDATE OR REPLACE {table} SET k = CASE k WHEN 10 THEN 2 WHEN 20 THEN 5 END"
+        ))
+        .unwrap();
+    }
+    let expected = native
+        .query_all("SELECT rowid, k, u, v FROM n ORDER BY k", &[])
+        .unwrap();
+    let actual = aydb
+        .query_all("SELECT rowid, k, u, v FROM a ORDER BY k", &[])
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 2);
+
+    // 2. Normal inserts without explicit rowid + colliding UPDATE OR REPLACE match native keys/values.
+    aydb.execute_batch(
+        "CREATE VIRTUAL TABLE a2 USING aydb(table_id=2, columns='k INT PRIMARY KEY, u TEXT UNIQUE, v INT');
+         INSERT INTO a2 VALUES (1, 'u1', 10), (2, 'u2', 20);
+         UPDATE OR REPLACE a2 SET k = CASE k WHEN 1 THEN 2 WHEN 2 THEN 5 ELSE k END;",
+    )
+    .unwrap();
+    native
+        .execute_batch(
+            "CREATE TABLE n2(k INT PRIMARY KEY, u TEXT UNIQUE, v INT);
+             INSERT INTO n2 VALUES (1, 'u1', 10), (2, 'u2', 20);
+             UPDATE OR REPLACE n2 SET k = CASE k WHEN 1 THEN 2 WHEN 2 THEN 5 ELSE k END;",
+        )
+        .unwrap();
+    assert_eq!(
+        aydb.query_all("SELECT k, u, v FROM a2 ORDER BY k", &[])
+            .unwrap(),
+        native
+            .query_all("SELECT k, u, v FROM n2 ORDER BY k", &[])
+            .unwrap()
+    );
+
+    // 3. Legacy INT PRIMARY KEY row without persistent NS_ROWID_BY_PK/NS_PK_BY_ROWID entries
+    //    remains readable and preserves rowid=k across in-place and key-changing updates.
+    aydb.execute_batch(
+        "CREATE VIRTUAL TABLE legacy USING aydb(table_id=9, columns='k INT PRIMARY KEY, v TEXT')",
+    )
+    .unwrap();
+    engine
+        .write()
+        .unwrap()
+        .put_row(
+            9,
+            &encode_i64_tagged_key(1),
+            &encode_row(&[SqlValue::Integer(1), SqlValue::Text("old".into())]),
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert_eq!(
+        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Integer(1),
+            SqlValue::Text("old".into()),
+        ]]
+    );
+    aydb.execute_batch("UPDATE legacy SET v = 'mid' WHERE k = 1")
+        .unwrap();
+    assert_eq!(
+        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Integer(1),
+            SqlValue::Text("mid".into()),
+        ]]
+    );
+    aydb.execute_batch("UPDATE legacy SET k = 7 WHERE k = 1")
+        .unwrap();
+    assert_eq!(
+        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Integer(7),
+            SqlValue::Text("mid".into()),
+        ]]
+    );
 }

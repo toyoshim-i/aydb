@@ -314,10 +314,11 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
 fn resolve_pk_for_rowid(
     vtab: &AydbVTab,
     target_rid: i64,
-    row_exists: impl FnOnce(u16, &[u8]) -> io::Result<bool>,
+    mut row_exists: impl FnMut(u16, &[u8]) -> io::Result<bool>,
     lookup: impl FnOnce(u16, i64) -> io::Result<Option<Vec<u8>>>,
+    rowid_for_pk: impl FnOnce(u16, &[u8]) -> io::Result<Option<i64>>,
 ) -> io::Result<Option<Vec<u8>>> {
-    if vtab.pk_affinity == ColumnAffinity::Integer {
+    if vtab.pk_rowid_alias {
         let integer_pk = encode_i64_tagged_key(target_rid);
         if row_exists(vtab.table_id, &integer_pk)? {
             return Ok(Some(integer_pk.to_vec()));
@@ -325,8 +326,20 @@ fn resolve_pk_for_rowid(
     }
     // A local cache may contain a deleted or reused identity from another connection.
     // Resolve against the same persisted read view used for the row itself.
-    let found = lookup(vtab.table_id, target_rid)?;
-    Ok(found)
+    if let Some(found) = lookup(vtab.table_id, target_rid)? {
+        return Ok(Some(found));
+    }
+    // Backward compatibility: older builds did not write persistent rowid mappings for
+    // non-alias INT PRIMARY KEY rows whose keys were i64 integers.
+    if !vtab.pk_rowid_alias && vtab.pk_affinity == ColumnAffinity::Integer {
+        let integer_pk = encode_i64_tagged_key(target_rid);
+        if row_exists(vtab.table_id, &integer_pk)?
+            && rowid_for_pk(vtab.table_id, &integer_pk)?.is_none()
+        {
+            return Ok(Some(integer_pk.to_vec()));
+        }
+    }
+    Ok(None)
 }
 
 /// Static `sqlite3_module` method table registered with `sqlite3_create_module_v2`.
@@ -1423,6 +1436,7 @@ unsafe extern "system" fn vtab_filter(
                                     rid,
                                     |t, pk| eng.row_exists(t, pk),
                                     |t, rid| eng.pk_for_rowid(t, rid),
+                                    |t, pk| eng.rowid_for_pk(t, pk),
                                 ) {
                                     Ok(Some(mapped_pk)) => {
                                         match point_fetch(
@@ -2116,6 +2130,7 @@ unsafe extern "system" fn vtab_update(
                     rid,
                     |t, pk| eng.row_exists(t, pk),
                     |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
+                    |t, pk| eng.rowid_for_pk_view(crate::engine::ReadView::Owner, t, pk),
                 ) {
                     Ok(opt) => opt,
                     Err(e) => return io_err_to_sqlite_rc(&e),
@@ -2316,20 +2331,18 @@ unsafe extern "system" fn vtab_update(
             return io_err_to_sqlite_rc(&e);
         }
 
-        let coerced_int_pk = if vtab.pk_affinity == ColumnAffinity::Integer {
+        let coerced_int_pk = if vtab.pk_rowid_alias {
             decode_i64_tagged_key(&new_pk)
         } else {
             None
         };
-        // A key that is its own rowid cannot take a different one (an alias takes the key); every
-        // other key keeps its rowid in the persistent mapping, where an explicit rowid is stored
-        // as requested.
-        let mapped_rowid = match (coerced_int_pk, new_rowid_req) {
-            (Some(key_rowid), Some(rowid)) if key_rowid != rowid && !vtab.pk_rowid_alias => {
-                return SQLITE_MISMATCH;
-            }
-            (None, Some(rowid)) => Some(rowid),
-            _ => None,
+        // Only a true `INTEGER PRIMARY KEY` rowid alias derives its rowid from an integer key;
+        // every other key (including non-alias `INT PRIMARY KEY`) keeps an independent persistent
+        // rowid, where an explicit rowid is stored as requested.
+        let mapped_rowid = if coerced_int_pk.is_none() {
+            new_rowid_req
+        } else {
+            None
         };
         // Resolve `old_pk` if this is an UPDATE (`!is_insert`)
         let mut old_pk_opt: Option<Vec<u8>> = None;
@@ -2340,6 +2353,7 @@ unsafe extern "system" fn vtab_update(
                     rid,
                     |t, pk| eng.row_exists(t, pk),
                     |t, rid| eng.pk_for_rowid_view(crate::engine::ReadView::Owner, t, rid),
+                    |t, pk| eng.rowid_for_pk_view(crate::engine::ReadView::Owner, t, pk),
                 ) {
                     Ok(opt) => opt,
                     Err(e) => return io_err_to_sqlite_rc(&e),
@@ -2363,8 +2377,9 @@ unsafe extern "system" fn vtab_update(
             }
         }
 
-        // Integer PK values use their exact i64 as rowid. A previously allocated synthetic
-        // identity owns that number until its row is deleted, just like an explicit rowid.
+        // Integer rowid aliases (and unmapped legacy `INT PRIMARY KEY` rows) own their exact
+        // integer as a rowid; a previously allocated persistent identity owns its number until
+        // its row is deleted.
         let rowid_conflict_pk = if let Some(rowid) = coerced_int_pk.or(mapped_rowid) {
             let implicit_int_owner =
                 if vtab.pk_affinity == ColumnAffinity::Integer && coerced_int_pk.is_none() {
@@ -2372,10 +2387,30 @@ unsafe extern "system" fn vtab_update(
                     if old_pk_opt.as_deref() != Some(int_pk.as_slice())
                         && new_pk.as_slice() != int_pk.as_slice()
                     {
-                        match eng.row_exists(vtab.table_id, &int_pk) {
-                            Ok(true) => Some(int_pk.to_vec()),
-                            Ok(false) => None,
+                        let exists = match eng.row_exists(vtab.table_id, &int_pk) {
+                            Ok(b) => b,
                             Err(e) => return io_err_to_sqlite_rc(&e),
+                        };
+                        if exists {
+                            let is_implicit = if vtab.pk_rowid_alias {
+                                true
+                            } else {
+                                match eng.rowid_for_pk_view(
+                                    crate::engine::ReadView::Owner,
+                                    vtab.table_id,
+                                    &int_pk,
+                                ) {
+                                    Ok(mapped) => mapped.is_none(),
+                                    Err(e) => return io_err_to_sqlite_rc(&e),
+                                }
+                            };
+                            if is_implicit {
+                                Some(int_pk.to_vec())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
@@ -2456,11 +2491,13 @@ unsafe extern "system" fn vtab_update(
 
         // A row whose key changes keeps its rowid, as on a native table. SQLite addresses the
         // rows it still has queued by their old rowids, so a rowid that moved to another row
-        // (or a new one derived from the new key) would make them hit the wrong row.
+        // (or a new one derived from the new key) would make them hit the wrong row. Also preserve
+        // a legacy unmapped INT PRIMARY KEY row's implicit rowid across an in-place update.
         let kept_rowid = old_rowid_arg.filter(|_| {
-            old_pk_opt
-                .as_ref()
-                .is_some_and(|old| old.as_slice() != new_pk.as_slice())
+            old_pk_opt.as_ref().is_some_and(|old| {
+                old.as_slice() != new_pk.as_slice()
+                    || (vtab.pk_affinity == ColumnAffinity::Integer && !vtab.pk_rowid_alias)
+            })
         });
 
         // Everything below mutates the engine. A statement that removes rows (REPLACE conflict
