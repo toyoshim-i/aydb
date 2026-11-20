@@ -1025,29 +1025,10 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             .first()
             .map(|fp| fp.first_key.to_vec())
             .unwrap_or_default();
-        let max_key = if slice.is_empty() {
-            if num_blocks > 0 {
-                let last_block_idx = num_blocks - 1;
-                let mut block_buf = [0u8; IDX_BLOCK_SIZE];
-                file.read_exact_at(
-                    &mut block_buf,
-                    (last_block_idx as u64) * (IDX_BLOCK_SIZE as u64),
-                )?;
-                let reader = IdxBlockReader::open_verified(&block_buf)?;
-                if reader.num_entries() == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "empty last block in legacy idx segment",
-                    ));
-                }
-                reader.key_at(reader.num_entries() - 1)?.to_vec()
-            } else {
-                Vec::new()
-            }
-        } else if slice.len() == 1 {
+        let max_key = if slice.len() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "truncated max_key in idx segment metadata",
+                "missing or truncated max_key in idx segment metadata",
             ));
         } else {
             let max_klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
@@ -2050,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn idx_open_rejects_mismatched_or_unsorted_fence_pointers_and_corrupt_legacy_tail() {
+    fn idx_open_rejects_mismatched_unsorted_or_missing_max_key_metadata() {
         let tmp = TempTestDir::new("idx_fence_validate");
         let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
 
@@ -2093,12 +2074,8 @@ mod tests {
             fps.push((fk, bidx));
         }
 
-        let write_crafted = |data: &[u8], new_meta: &[u8], corrupt_last_block: bool| {
+        let write_crafted = |data: &[u8], new_meta: &[u8]| {
             let mut raw = data.to_vec();
-            if corrupt_last_block {
-                let last_block_start = ((num_blocks - 1) as usize) * IDX_BLOCK_SIZE;
-                raw[last_block_start] ^= 0xFF;
-            }
             raw.truncate(meta_offset);
             raw.extend_from_slice(new_meta);
             let mut crafted_footer = footer;
@@ -2126,7 +2103,7 @@ mod tests {
 
         // 1. Mismatched `fp_count < num_blocks` must fail with InvalidData.
         let short_meta = encode_fps(&fps[..1], Some(&[2, 0, b'z', b'z']));
-        write_crafted(&orig_bytes, &short_meta, false);
+        write_crafted(&orig_bytes, &short_meta);
         assert_eq!(
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
@@ -2140,11 +2117,7 @@ mod tests {
         let mut normal_tail = Vec::new();
         normal_tail.extend_from_slice(&(expected_max_key.len() as u16).to_le_bytes());
         normal_tail.extend_from_slice(&expected_max_key);
-        write_crafted(
-            &orig_bytes,
-            &encode_fps(&swapped, Some(&normal_tail)),
-            false,
-        );
+        write_crafted(&orig_bytes, &encode_fps(&swapped, Some(&normal_tail)));
         assert_eq!(
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
@@ -2153,28 +2126,23 @@ mod tests {
         // 3. Trailing garbage bytes after `max_key` must fail with InvalidData.
         let mut garbage_tail = normal_tail.clone();
         garbage_tail.push(0xAA);
-        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&garbage_tail)), false);
+        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&garbage_tail)));
         assert_eq!(
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
 
         // 4. Single truncated length byte in `max_key` tail must fail with InvalidData.
-        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&[1u8])), false);
+        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&[1u8])));
         assert_eq!(
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
 
-        // 5. Legacy format omitting trailing `max_key` cleanly falls back when last block is
-        //    intact, and rejects corruption when the last block fails verification.
+        // 5. Segment omitting trailing `max_key` (pre-release legacy shape) must fail with
+        //    InvalidData even when the last data block is intact.
         let legacy_meta = encode_fps(&fps, None);
-        write_crafted(&orig_bytes, &legacy_meta, false);
-        let legacy_seg = IdxSegmentReader::open(&fs, 1).expect("intact legacy tail opens");
-        assert_eq!(legacy_seg.max_key(), expected_max_key.as_slice());
-        drop(legacy_seg);
-
-        write_crafted(&orig_bytes, &legacy_meta, true);
+        write_crafted(&orig_bytes, &legacy_meta);
         assert_eq!(
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
