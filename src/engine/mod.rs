@@ -492,6 +492,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 2. Open active `blob_std_<SeqID>.db` segments
         let mut std_blobs = BTreeMap::new();
         let mut std_valid_end = BTreeMap::new();
+        let mut cataloged_std_len: HashMap<u64, u64> =
+            HashMap::with_capacity(state_snapshot.std_blob_segments.len());
         let mut dirty_std_blobs: HashSet<u64> = HashSet::new();
         for bmeta in &state_snapshot.std_blob_segments {
             let fname = format_std_blob_file_name(bmeta.seq_id);
@@ -505,6 +507,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // it can be unaccounted garbage. A file shorter than the catalog (its tail never
             // reached the device) must not make the missing bytes count as garbage a second
             // time: recovery has to give the same result however often it runs.
+            cataloged_std_len.insert(bmeta.seq_id, bmeta.file_len);
             std_valid_end.insert(bmeta.seq_id, bmeta.file_len);
             std_blobs.insert(
                 bmeta.seq_id,
@@ -519,6 +522,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // 3. Open active `blob_lru_<TblID>_<SeqID>.db` segments
         let mut lru_blobs = BTreeMap::new();
         let mut lru_valid_end = BTreeMap::new();
+        let mut cataloged_lru_len: HashMap<(u16, u64), u64> =
+            HashMap::with_capacity(state_snapshot.lru_blob_segments.len());
         let mut dirty_lru_blobs: HashSet<(u16, u64)> = HashSet::new();
         for lmeta in &state_snapshot.lru_blob_segments {
             let fname = format_lru_blob_file_name(lmeta.table_id, lmeta.seq_id);
@@ -529,6 +534,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             let file_len = physical_len.max(lmeta.file_len);
             // See the `blob_std` loop above.
+            cataloged_lru_len.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
             lru_valid_end.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
             lru_blobs.insert(
                 (lmeta.table_id, lmeta.seq_id),
@@ -751,13 +757,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
                     match ptr.kind {
                         BlobKind::Standard => {
-                            dirty_std_blobs.insert(ptr.seg_id);
+                            let cataloged_len =
+                                cataloged_std_len.get(&ptr.seg_id).copied().unwrap_or(0);
+                            if end > cataloged_len {
+                                dirty_std_blobs.insert(ptr.seg_id);
+                            }
                             if let Some(ve) = std_valid_end.get_mut(&ptr.seg_id) {
                                 *ve = (*ve).max(end);
                             }
                         }
                         BlobKind::Lru => {
-                            dirty_lru_blobs.insert((ptr.table_id, ptr.seg_id));
+                            let cataloged_len = cataloged_lru_len
+                                .get(&(ptr.table_id, ptr.seg_id))
+                                .copied()
+                                .unwrap_or(0);
+                            if end > cataloged_len {
+                                dirty_lru_blobs.insert((ptr.table_id, ptr.seg_id));
+                            }
                             if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id)) {
                                 *ve = (*ve).max(end);
                             }

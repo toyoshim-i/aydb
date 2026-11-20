@@ -7035,3 +7035,157 @@ fn multiple_capped_tables_simultaneous_lru_blob_rollover_preserves_durability_an
         assert_eq!(survivors_after, survivors_before);
     }
 }
+
+#[test]
+fn reopen_skips_blob_fsync_when_replayed_pointers_are_within_cataloged_len() {
+    use std::path::Path;
+
+    struct CountingSyncFile {
+        rel_name: String,
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+
+    impl PlatformFile for CountingSyncFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(
+            &self,
+            target_len: u64,
+            strategy: crate::pal::PreallocStrategy,
+        ) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            *self
+                .sync_counts
+                .lock()
+                .unwrap()
+                .entry(self.rel_name.clone())
+                .or_insert(0) += 1;
+            self.inner.sync_durable()
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct CountingSyncFs {
+        inner: OsFs,
+        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+
+    impl PlatformFs for CountingSyncFs {
+        type File = CountingSyncFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(CountingSyncFile {
+                rel_name: rel_name.to_string(),
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                sync_counts: Arc::clone(&self.sync_counts),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("skip_cataloged_blob_sync");
+    let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let fs = Arc::new(CountingSyncFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        sync_counts: Arc::clone(&sync_counts),
+    });
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 300;
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+
+    let (seg1, seg2) = {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine
+            .put_row(1, b"k1", &[0xAAu8; 200], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        // Rolling over the active blob segment syncs `seg1` and catalogs its `file_len`
+        // in `boot_meta`, while opening `seg2` with cataloged `file_len == 0`. Both rows'
+        // `PutBlobPtr` records remain in `wal_buf.db` for replay on reopen.
+        engine
+            .put_row(1, b"k2", &[0xBBu8; 200], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        engine.flush_active_blob_buffers().unwrap();
+        let seg1 = match engine
+            .memtable
+            .get(&crate::lru::encode_primary_row_key(1, b"k1"))
+            .unwrap()
+            .value
+        {
+            IndexValue::Blob(p) => p.seg_id,
+            ref other => panic!("expected Blob pointer for k1, got {other:?}"),
+        };
+        let seg2 = match engine
+            .memtable
+            .get(&crate::lru::encode_primary_row_key(1, b"k2"))
+            .unwrap()
+            .value
+        {
+            IndexValue::Blob(p) => p.seg_id,
+            ref other => panic!("expected Blob pointer for k2, got {other:?}"),
+        };
+        assert_ne!(seg1, seg2);
+        (seg1, seg2)
+    };
+
+    sync_counts.lock().unwrap().clear();
+    let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(
+        reopened.get_row(1, b"k1").unwrap().unwrap(),
+        vec![0xAAu8; 200]
+    );
+    assert_eq!(
+        reopened.get_row(1, b"k2").unwrap().unwrap(),
+        vec![0xBBu8; 200]
+    );
+    let counts = sync_counts.lock().unwrap();
+    let seg1_syncs = counts
+        .get(&format_std_blob_file_name(seg1))
+        .copied()
+        .unwrap_or(0);
+    let seg2_syncs = counts
+        .get(&format_std_blob_file_name(seg2))
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        seg1_syncs, 0,
+        "already-cataloged sealed blob within bmeta.file_len should not be fsynced at open: {counts:?}"
+    );
+    assert!(
+        seg2_syncs >= 1,
+        "replayed blob extending past cataloged file_len must still be fsynced at open: {counts:?}"
+    );
+}
