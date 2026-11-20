@@ -3,12 +3,27 @@
 
 use std::io;
 
-use crate::engine::{StorageEngine, WriteDurability};
+use crate::engine::StorageEngine;
+#[cfg(test)]
+use crate::engine::WriteDurability;
 use crate::pal::PlatformFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::AydbVTab;
 use crate::vtab::row_codec::{decode_i64_tagged_key, extract_column_key_bytes_with_collation};
+use crate::wal::WalRecord;
 
+pub(super) fn plan_synthetic_rowid<FS: PlatformFs>(
+    engine: &mut StorageEngine<FS>,
+    table_id: u16,
+    pk: &[u8],
+    pk_rowid_alias: bool,
+) -> io::Result<(i64, Vec<WalRecord>)> {
+    engine.plan_assign_rowid(table_id, pk, hash_pk_to_rowid(pk), |eng, rowid| {
+        Ok(pk_rowid_alias && eng.row_exists(table_id, &super::encode_i64_tagged_key(rowid))?)
+    })
+}
+
+#[cfg(test)]
 pub(super) fn assign_synthetic_rowid<FS: PlatformFs>(
     engine: &mut StorageEngine<FS>,
     table_id: u16,

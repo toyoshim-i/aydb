@@ -7,7 +7,9 @@ use crate::lru::encode_namespace_prefix;
 use crate::pal::PlatformFs;
 use crate::wal::WalRecord;
 
-use super::{EngineReader, ReadView, StorageEngine, WriteDurability};
+#[cfg(test)]
+use super::WriteDurability;
+use super::{EngineReader, ReadView, StorageEngine};
 
 pub(super) const NS_ROWID_BY_PK: u8 = b'u';
 pub(super) const NS_PK_BY_ROWID: u8 = b'v';
@@ -93,19 +95,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    /// Keeps a row's identity stable across connections, cache eviction and recovery. A collision
-    /// is resolved against the persistent reverse index while the engine writer lock is held.
-    pub(crate) fn assign_rowid(
+    /// Computes the `(rowid, wal_records)` needed to ensure `pk` has a persistent rowid without
+    /// mutating the WAL or MemTable yet, so callers can commit the row and its rowid atomically
+    /// in a single batch.
+    pub(crate) fn plan_assign_rowid(
         &mut self,
         table_id: u16,
         pk: &[u8],
         preferred: i64,
-        durability: WriteDurability,
         reserved: impl Fn(&Self, i64) -> io::Result<bool>,
-    ) -> io::Result<i64> {
+    ) -> io::Result<(i64, Vec<WalRecord>)> {
         self.drain_group_for_autocommit()?;
         if let Some(rowid) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
-            return Ok(rowid);
+            return Ok((rowid, Vec::new()));
         }
         let mut rowid = preferred;
         loop {
@@ -118,7 +120,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Err(io::Error::other("SQLite rowid space exhausted"));
             }
         }
-        self.commit_wal_and_memtable(
+        Ok((
+            rowid,
             vec![
                 WalRecord::PutInline {
                     key: rowid_key(table_id, NS_ROWID_BY_PK, pk),
@@ -129,25 +132,40 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     value: pk.to_vec(),
                 },
             ],
-            durability,
-        )?;
+        ))
+    }
+
+    /// Keeps a row's identity stable across connections, cache eviction and recovery. A collision
+    /// is resolved against the persistent reverse index while the engine writer lock is held.
+    #[cfg(test)]
+    pub(crate) fn assign_rowid(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        preferred: i64,
+        durability: WriteDurability,
+        reserved: impl Fn(&Self, i64) -> io::Result<bool>,
+    ) -> io::Result<i64> {
+        let (rowid, records) = self.plan_assign_rowid(table_id, pk, preferred, reserved)?;
+        if !records.is_empty() {
+            self.commit_wal_and_memtable(records, durability)?;
+        }
         Ok(rowid)
     }
 
-    /// Gives `pk` exactly `rowid`, replacing the rowid it had. The caller has made sure that no
-    /// other row owns `rowid`.
-    pub(crate) fn set_rowid(
+    /// Computes the WAL records needed to assign `pk` exactly `rowid`, replacing any previous
+    /// mapping without mutating WAL or MemTable yet. Caller has verified no other row owns `rowid`.
+    pub(crate) fn plan_set_rowid(
         &mut self,
         table_id: u16,
         pk: &[u8],
         rowid: i64,
-        durability: WriteDurability,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<WalRecord>> {
         self.drain_group_for_autocommit()?;
         let mut records = Vec::new();
         if let Some(old) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             if old == rowid {
-                return Ok(());
+                return Ok(Vec::new());
             }
             records.push(WalRecord::Delete {
                 key: rowid_key(table_id, NS_PK_BY_ROWID, &old.to_le_bytes()),
@@ -161,8 +179,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             key: rowid_key(table_id, NS_PK_BY_ROWID, &rowid.to_le_bytes()),
             value: pk.to_vec(),
         });
-        self.commit_wal_and_memtable(records, durability)?;
-        Ok(())
+        Ok(records)
     }
 
     pub(super) fn append_rowid_deletes(

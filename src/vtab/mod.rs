@@ -2462,21 +2462,20 @@ unsafe extern "system" fn vtab_update(
         });
 
         // Everything below mutates the engine. A statement that removes rows (REPLACE conflict
-        // resolution, or a PK-changing UPDATE) or writes a secondary persistent rowid mapping
-        // (`set_rowid` / `assign_synthetic_rowid`) after `put_row_owned_with_hint` and then fails
-        // must leave every row and mapping intact. SQLite cannot be relied on for that: it opens
-        // a statement journal only for statements that may write several rows, so a single-row
-        // statement that fails inside `BEGIN` keeps whatever `xUpdate` already did. Multi-write
-        // updates are therefore bracketed by an engine savepoint that is rolled back on failure.
-        let writes_rowid = pk_override.is_none() && coerced_int_pk.is_none();
-        let needs_savepoint = pk_conflict_to_delete.is_some()
+        // resolution, or a PK-changing UPDATE) and then fails to store the new row must leave
+        // every row and mapping intact. SQLite cannot be relied on for that: it opens a statement
+        // journal only for statements that may write several rows, so a single-row statement that
+        // fails inside `BEGIN` keeps whatever `xUpdate` already did. Rowid allocation or updates
+        // are folded into the single atomic `put_row_owned_with_hint_and_extra` WAL batch so
+        // inserts and in-place updates never need a per-row statement savepoint.
+        let in_place_same_pk = !is_insert && old_pk_opt.as_deref() == Some(new_pk.as_slice());
+        let removes_rows = pk_conflict_to_delete.is_some()
             || !unique_conflicts.is_empty()
             || rowid_conflict_pk.is_some()
             || old_pk_opt
                 .as_ref()
-                .is_some_and(|old_pk| old_pk.as_slice() != new_pk.as_slice())
-            || writes_rowid;
-        if needs_savepoint {
+                .is_some_and(|old_pk| old_pk.as_slice() != new_pk.as_slice());
+        if removes_rows {
             if let Err(e) = eng.savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT) {
                 return io_err_to_sqlite_rc(&e);
             }
@@ -2500,33 +2499,46 @@ unsafe extern "system" fn vtab_update(
                 }
             }
 
-            eng.put_row_owned_with_hint(
+            let (rid, extra_records) = if let Some(auto_id) = pk_override {
+                (auto_id, Vec::new())
+            } else if let Some(int_id) = coerced_int_pk {
+                (int_id, Vec::new())
+            } else if let Some(rowid) = mapped_rowid.or(kept_rowid) {
+                let extra = eng.plan_set_rowid(vtab.table_id, &new_pk, rowid)?;
+                (rowid, extra)
+            } else if in_place_same_pk {
+                if let Some(old_rid) = old_rowid_arg {
+                    (old_rid, Vec::new())
+                } else {
+                    rowid_map::plan_synthetic_rowid(
+                        &mut eng,
+                        vtab.table_id,
+                        &new_pk,
+                        vtab.pk_rowid_alias,
+                    )?
+                }
+            } else {
+                rowid_map::plan_synthetic_rowid(
+                    &mut eng,
+                    vtab.table_id,
+                    &new_pk,
+                    vtab.pk_rowid_alias,
+                )?
+            };
+
+            eng.put_row_owned_with_hint_and_extra(
                 vtab.table_id,
                 &new_pk,
                 row_bytes,
                 &sec_keys,
+                extra_records,
                 vtab.durability,
                 known_absent,
             )?;
 
-            if let Some(auto_id) = pk_override {
-                Ok(auto_id)
-            } else if let Some(int_id) = coerced_int_pk {
-                Ok(int_id)
-            } else if let Some(rowid) = mapped_rowid.or(kept_rowid) {
-                eng.set_rowid(vtab.table_id, &new_pk, rowid, vtab.durability)?;
-                Ok(rowid)
-            } else {
-                rowid_map::assign_synthetic_rowid(
-                    &mut eng,
-                    vtab.table_id,
-                    &new_pk,
-                    vtab.durability,
-                    vtab.pk_rowid_alias,
-                )
-            }
+            Ok(rid)
         })();
-        if needs_savepoint {
+        if removes_rows {
             if applied.is_err() {
                 let _ = eng.rollback_to_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);
                 let _ = eng.release_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);

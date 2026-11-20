@@ -632,3 +632,79 @@ fn non_integer_pk_exceeding_max_transaction_bytes_leaves_row_and_rowid_intact() 
         vec![vec![SqlValue::Text("ok".into())]]
     );
 }
+
+#[test]
+fn non_alias_pk_insert_and_in_place_update_use_single_wal_batch_without_savepoint() {
+    let dir = TempTestDir::new("atomic_row_and_rowid_batch");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY NOT NULL, v INT');
+         CREATE VIRTUAL TABLE i USING aydb(table_id=2, columns='k INT PRIMARY KEY NOT NULL, v INT');",
+    )
+    .unwrap();
+
+    conn.execute_batch("BEGIN;").unwrap();
+    let lsn0 = engine.read().unwrap().next_lsn();
+    conn.execute_batch("INSERT INTO t VALUES ('a', 1);")
+        .unwrap();
+    let lsn1 = engine.read().unwrap().next_lsn();
+    assert_eq!(
+        lsn1 - lsn0,
+        1,
+        "TEXT PK INSERT must emit row + rowid in a single WAL batch"
+    );
+
+    conn.execute_batch("INSERT INTO i VALUES (10, 100);")
+        .unwrap();
+    let lsn2 = engine.read().unwrap().next_lsn();
+    assert_eq!(
+        lsn2 - lsn1,
+        1,
+        "INT PK INSERT must emit row + rowid in a single WAL batch"
+    );
+
+    let t_rid = match conn
+        .query_all("SELECT rowid FROM t WHERE k = 'a'", &[])
+        .unwrap()[0][0]
+    {
+        SqlValue::Integer(r) => r,
+        ref other => panic!("unexpected rowid {other:?}"),
+    };
+    let i_rid = match conn
+        .query_all("SELECT rowid FROM i WHERE k = 10", &[])
+        .unwrap()[0][0]
+    {
+        SqlValue::Integer(r) => r,
+        ref other => panic!("unexpected rowid {other:?}"),
+    };
+
+    let lsn_before_upd_t = engine.read().unwrap().next_lsn();
+    conn.execute_batch("UPDATE t SET v = 2 WHERE k = 'a';")
+        .unwrap();
+    assert_eq!(engine.read().unwrap().next_lsn() - lsn_before_upd_t, 1);
+
+    let lsn_before_upd_i = engine.read().unwrap().next_lsn();
+    conn.execute_batch("UPDATE i SET v = 200 WHERE k = 10;")
+        .unwrap();
+    assert_eq!(engine.read().unwrap().next_lsn() - lsn_before_upd_i, 1);
+
+    conn.execute_batch("COMMIT;").unwrap();
+    assert_eq!(
+        conn.query_all("SELECT rowid, v FROM t WHERE k = 'a'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(t_rid), SqlValue::Integer(2)]]
+    );
+    assert_eq!(
+        conn.query_all("SELECT rowid, v FROM i WHERE k = 10", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(i_rid), SqlValue::Integer(200)]]
+    );
+}

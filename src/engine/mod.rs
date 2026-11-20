@@ -1839,6 +1839,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
         known_absent: bool,
     ) -> io::Result<()> {
+        self.put_row_owned_with_hint_and_extra(
+            table_id,
+            pk,
+            value,
+            secondary_keys,
+            Vec::new(),
+            durability,
+            known_absent,
+        )
+    }
+
+    /// Atomically inserts or overwrites a row (`pk` -> `value`) together with additional derived
+    /// `extra_records` (such as persistent SQLite rowid mappings) in a single WAL/MemTable batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn put_row_owned_with_hint_and_extra(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        value: Vec<u8>,
+        secondary_keys: &[(u16, Vec<u8>)],
+        extra_records: Vec<WalRecord>,
+        durability: WriteDurability,
+        known_absent: bool,
+    ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
@@ -1932,8 +1956,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let inline_thresh = self.effective_inline_threshold(table_id);
         let store_as_blob = value.len() >= inline_thresh
             || !IndexEntry::inline_fits_in_block(row_key.len(), value.len());
+        let extra_bytes: usize = extra_records
+            .iter()
+            .map(|r| match r {
+                WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
+                WalRecord::PutBlobPtr { key, blob_ptr } => 28 + key.len() + (blob_ptr.len as usize),
+                WalRecord::Delete { key } => 5 + key.len(),
+                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
+            })
+            .sum();
         if self.tx_depth > 0 && !self.tx_preparing && self.config.max_transaction_bytes > 0 {
-            let est_row_bytes = (if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len();
+            let est_row_bytes =
+                ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
+                    .saturating_add(extra_bytes);
             if self.pending_tx_bytes.saturating_add(est_row_bytes)
                 > self.config.max_transaction_bytes
             {
@@ -1943,6 +1978,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 ));
             }
         }
+        let mut new_row_blob_ptr = None;
         if store_as_blob {
             let blob_kind = if is_capped {
                 BlobKind::Lru
@@ -1950,10 +1986,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 BlobKind::Standard
             };
             let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, &value)?;
+            new_row_blob_ptr = Some(ptr);
             if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                match blob_kind {
-                    BlobKind::Standard => self.sync_active_std_writer()?,
-                    BlobKind::Lru => self.sync_active_lru_writer(table_id)?,
+                let sync_res = match blob_kind {
+                    BlobKind::Standard => self.sync_active_std_writer(),
+                    BlobKind::Lru => self.sync_active_lru_writer(table_id),
+                };
+                if let Err(e) = sync_res {
+                    if let Some(ref p) = new_row_blob_ptr {
+                        self.record_dead_blob_bytes(p);
+                    }
+                    return Err(e);
                 }
             }
             records.push(WalRecord::PutBlobPtr {
@@ -1989,15 +2032,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let need_meta = is_capped || !secondary_keys.is_empty();
+        let mut new_meta_blob_ptr = None;
         if need_meta {
-            self.table_has_row_meta.insert(table_id, true);
             let meta_bytes =
                 RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys);
             if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                let ptr =
-                    self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
+                let ptr = match self.append_to_blob_segment(
+                    BlobKind::Standard,
+                    0,
+                    &meta_key,
+                    &meta_bytes,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if let Some(ref p) = new_row_blob_ptr {
+                            self.record_dead_blob_bytes(p);
+                        }
+                        return Err(e);
+                    }
+                };
+                new_meta_blob_ptr = Some(ptr);
                 if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                    self.sync_active_std_writer()?;
+                    if let Err(e) = self.sync_active_std_writer() {
+                        if let Some(ref p) = new_row_blob_ptr {
+                            self.record_dead_blob_bytes(p);
+                        }
+                        if let Some(ref p) = new_meta_blob_ptr {
+                            self.record_dead_blob_bytes(p);
+                        }
+                        return Err(e);
+                    }
                 }
                 records.push(WalRecord::PutBlobPtr {
                     key: meta_key,
@@ -2013,8 +2077,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             records.push(WalRecord::Delete { key: meta_key });
         }
 
+        records.extend(extra_records);
+
         // 5. Append atomic batch to WAL and apply to MemTable
-        self.commit_wal_and_memtable(records, durability)?;
+        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+            if let Some(ref p) = new_row_blob_ptr {
+                self.record_dead_blob_bytes(p);
+            }
+            if let Some(ref p) = new_meta_blob_ptr {
+                self.record_dead_blob_bytes(p);
+            }
+            return Err(e);
+        }
+        if need_meta {
+            self.table_has_row_meta.insert(table_id, true);
+        }
 
         // 6. Apply dead blob byte accounting and update Capped Table logical byte counter after WAL succeeds
         if let Some(old_ptr) = old_blob_ptr {
