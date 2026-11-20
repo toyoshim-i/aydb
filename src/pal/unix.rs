@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::path::{normalize_db_root_path, validate_flat_file_name};
@@ -36,8 +36,16 @@ unsafe extern "C" {
     #[cfg(target_os = "macos")]
     fn fsync(fd: c_int) -> c_int;
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        all(target_pointer_width = "32", target_env = "gnu"),
+        link_name = "posix_fallocate64"
+    )]
     fn posix_fallocate(fd: c_int, offset: i64, len: i64) -> c_int;
     #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        all(target_pointer_width = "32", target_env = "gnu"),
+        link_name = "posix_fadvise64"
+    )]
     fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
 }
 
@@ -106,6 +114,28 @@ fn macos_sync_file_durable(file: &File) -> io::Result<()> {
             }
         },
     )
+}
+
+/// Calls `posix_fallocate` (retrying `EINTR`), falling back to `ftruncate` (`set_len`) only when
+/// the filesystem/kernel reports `EOPNOTSUPP` / `EINVAL`. Real allocation or hardware errors
+/// (`ENOSPC`, `EDQUOT`, `EIO`) are propagated immediately.
+#[cfg(any(target_os = "linux", test))]
+fn fallocate_or_fallback(
+    mut falloc: impl FnMut() -> c_int,
+    mut fallback: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    loop {
+        let rc = falloc();
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::from_raw_os_error(rc);
+        match err.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput => return fallback(),
+            _ => return Err(err),
+        }
+    }
 }
 
 /// Tells the kernel how the file will be accessed. Advisory, so a failure is ignored. Blob files
@@ -212,16 +242,27 @@ impl HandlePool {
         }
 
         // Close the oldest unpinned open handle. Unpinned means the only owner besides the local
-        // upgraded Arc is the engine or caller (strong_count <= 2) and the file has not been
-        // unlinked. The handle stays tracked so that a later reopen counts against the cap.
+        // upgraded Arc is the engine or caller (strong_count <= 2), the file has not been
+        // unlinked, and it has no unsynced dirty writes (closing an unsynced Linux fd risks
+        // losing writeback errors in `errseq_t` on reopen). Re-check all guards after taking the
+        // handle's write lock to eliminate the TOCTOU window with `pin_open_before_unlink`.
         for th in &inner.tracked {
             let Some(arc) = th.file.upgrade() else {
                 continue;
             };
-            if arc.keep_open.load(Ordering::Acquire) || Arc::strong_count(&arc) > 2 {
+            if arc.keep_open.load(Ordering::Acquire)
+                || arc.has_unsynced_writes()
+                || Arc::strong_count(&arc) > 2
+            {
                 continue;
             }
             if let Ok(mut guard) = arc.file.try_write() {
+                if arc.keep_open.load(Ordering::Acquire)
+                    || arc.has_unsynced_writes()
+                    || Arc::strong_count(&arc) > 2
+                {
+                    continue;
+                }
                 if guard.is_some() {
                     *guard = None;
                     arc.descriptor_open.store(false, Ordering::Release);
@@ -268,7 +309,21 @@ pub struct UnixPlatformFile {
     /// Set once the file is about to be unlinked while still referenced: the descriptor must
     /// stay open because the path can no longer be reopened.
     keep_open: AtomicBool,
+    /// Number of writes/preallocations currently executing against this handle.
+    active_writers: AtomicUsize,
+    /// Monotonic counter incremented before each write/preallocation so dirty handles with
+    /// unsynced writes are never evicted (preserving Linux `errseq_t` writeback errors).
+    write_seq: AtomicU64,
+    synced_seq: AtomicU64,
     pool: Option<Arc<HandlePool>>,
+}
+
+struct ActiveWriteGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl core::fmt::Debug for UnixPlatformFile {
@@ -307,8 +362,37 @@ impl UnixPlatformFile {
             file: RwLock::new(Some(file)),
             descriptor_open: AtomicBool::new(true),
             keep_open: AtomicBool::new(false),
+            active_writers: AtomicUsize::new(0),
+            write_seq: AtomicU64::new(0),
+            synced_seq: AtomicU64::new(0),
             pool,
         })
+    }
+
+    #[inline]
+    fn has_unsynced_writes(&self) -> bool {
+        self.active_writers.load(Ordering::Acquire) > 0
+            || self.write_seq.load(Ordering::Acquire) != self.synced_seq.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_write_start(&self) -> ActiveWriteGuard<'_> {
+        self.active_writers.fetch_add(1, Ordering::AcqRel);
+        self.write_seq.fetch_add(1, Ordering::AcqRel);
+        ActiveWriteGuard(&self.active_writers)
+    }
+
+    fn sync_with(&self, f: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+        let seq = self.write_seq.load(Ordering::Acquire);
+        let active_before = self.active_writers.load(Ordering::Acquire);
+        self.with_file(f)?;
+        if active_before == 0
+            && self.active_writers.load(Ordering::Acquire) == 0
+            && self.write_seq.load(Ordering::Acquire) == seq
+        {
+            self.synced_seq.store(seq, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub(crate) fn with_file<R>(&self, f: impl FnOnce(&File) -> io::Result<R>) -> io::Result<R> {
@@ -356,6 +440,7 @@ impl PlatformFile for UnixPlatformFile {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let _guard = self.mark_write_start();
         self.with_file(|f| FileExt::write_all_at(f, buf, offset))
     }
 
@@ -366,14 +451,16 @@ impl PlatformFile for UnixPlatformFile {
     fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
         let current_len = self.file_len()?;
         if current_len < target_len {
+            let _guard = self.mark_write_start();
             #[cfg(target_os = "linux")]
             {
                 if let Ok(len_i64) = i64::try_from(target_len) {
-                    let rc = self
-                        .with_file(|f| Ok(unsafe { posix_fallocate(f.as_raw_fd(), 0, len_i64) }))?;
-                    if rc != 0 {
-                        self.with_file(|f| f.set_len(target_len))?;
-                    }
+                    self.with_file(|f| {
+                        fallocate_or_fallback(
+                            || unsafe { posix_fallocate(f.as_raw_fd(), 0, len_i64) },
+                            || f.set_len(target_len),
+                        )
+                    })?;
                 } else {
                     self.with_file(|f| f.set_len(target_len))?;
                 }
@@ -399,18 +486,18 @@ impl PlatformFile for UnixPlatformFile {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.with_file(|f| f.sync_data())
+            self.sync_with(|f| f.sync_data())
         }
     }
 
     fn sync_durable(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            self.with_file(macos_sync_file_durable)
+            self.sync_with(macos_sync_file_durable)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.with_file(|f| f.sync_all())
+            self.sync_with(|f| f.sync_all())
         }
     }
 
@@ -501,7 +588,13 @@ impl PlatformFs for UnixPlatformFs {
         if use_pool {
             self.pool.register(&full_path, &file);
         }
-        if create && (!existed || hint == OpenHint::MutableSyncLog) {
+        if create
+            && (!existed
+                || matches!(
+                    hint,
+                    OpenHint::MutableSyncLog | OpenHint::MutableBufferedLog
+                ))
+        {
             self.sync_dir()?;
         }
         Ok(file)
@@ -622,11 +715,13 @@ mod tests {
             .open_file("idx_0001.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         f1.write_all_at(b"hello", 0).unwrap();
+        f1.sync_durable().unwrap();
 
         let f2 = fs
             .open_file("idx_0002.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         f2.write_all_at(b"world", 0).unwrap();
+        f2.sync_durable().unwrap();
 
         assert!(f1.is_descriptor_open());
         assert!(f2.is_descriptor_open());
@@ -636,6 +731,7 @@ mod tests {
             .open_file("idx_0003.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         f3.write_all_at(b"aydb!", 0).unwrap();
+        f3.sync_durable().unwrap();
 
         assert!(
             !f1.is_descriptor_open(),
@@ -658,6 +754,7 @@ mod tests {
             .open_file("idx_0004.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         f4.write_all_at(b"more!", 0).unwrap();
+        f4.sync_durable().unwrap();
 
         assert!(
             f2.is_descriptor_open(),
@@ -679,6 +776,7 @@ mod tests {
                 .open_file(name, true, true, OpenHint::ImmutableRandom)
                 .unwrap();
             f.write_all_at(b"data!", 0).unwrap();
+            f.sync_durable().unwrap();
             f
         };
         let f1 = mk("idx_0001.db");
@@ -710,6 +808,7 @@ mod tests {
             .open_file("idx_0001.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         f1.write_all_at(b"hello", 0).unwrap();
+        f1.sync_durable().unwrap();
         let f2 = fs
             .open_file("idx_0002.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
@@ -733,5 +832,89 @@ mod tests {
         let mut buf = [0u8; 5];
         f1.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn dirty_writable_handle_is_not_evicted_before_sync() {
+        let tmp = TempTestDir::new("handle_pool_dirty");
+        let fs = UnixPlatformFs::open_with_pool_cap(&tmp.path, true, 1).expect("open fs");
+
+        let f1 = fs
+            .open_file("idx_0001.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f1.write_all_at(b"dirty", 0).unwrap();
+        assert!(f1.is_descriptor_open());
+
+        // While f1 holds unsynced dirty writes, opening f2 must keep f1 open so kernel
+        // writeback errors (Linux `errseq_t`) are never lost across descriptor reopen.
+        let f2 = fs
+            .open_file("idx_0002.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        assert!(f1.is_descriptor_open());
+        assert!(f2.is_descriptor_open());
+
+        f1.sync_durable().unwrap();
+        let _f3 = fs
+            .open_file("idx_0003.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        assert!(!f1.is_descriptor_open());
+    }
+
+    #[test]
+    fn fallocate_or_fallback_propagates_enospc_and_falls_back_only_when_unsupported() {
+        #[cfg(target_os = "linux")]
+        const UNSUPPORTED_ERRNO: c_int = 95;
+        #[cfg(not(target_os = "linux"))]
+        const UNSUPPORTED_ERRNO: c_int = MACOS_ENOTSUP;
+        const EINTR_ERRNO: c_int = 4;
+        const EINVAL_ERRNO: c_int = 22;
+        const ENOSPC_ERRNO: c_int = 28;
+        const EIO_ERRNO: c_int = 5;
+
+        // 1. Success or EINTR retry never invokes fallback.
+        let mut attempts = 0usize;
+        let mut fb_calls = 0usize;
+        fallocate_or_fallback(
+            || {
+                attempts += 1;
+                if attempts == 1 { EINTR_ERRNO } else { 0 }
+            },
+            || {
+                fb_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(fb_calls, 0);
+
+        // 2. EOPNOTSUPP / EINVAL trigger `set_len` fallback.
+        for errno in [UNSUPPORTED_ERRNO, EINVAL_ERRNO] {
+            let mut fb = 0usize;
+            fallocate_or_fallback(
+                || errno,
+                || {
+                    fb += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(fb, 1, "errno {errno}");
+        }
+
+        // 3. ENOSPC and EIO propagate immediately without calling fallback.
+        for errno in [ENOSPC_ERRNO, EIO_ERRNO] {
+            let mut fb = 0usize;
+            let err = fallocate_or_fallback(
+                || errno,
+                || {
+                    fb += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(errno));
+            assert_eq!(fb, 0, "fallback must not run on errno {errno}");
+        }
     }
 }
