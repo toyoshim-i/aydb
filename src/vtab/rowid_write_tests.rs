@@ -485,3 +485,94 @@ fn explicit_rowid_colliding_with_integer_pk_row_conflicts_and_replaces() {
         ]]
     );
 }
+
+#[test]
+fn failed_rowid_write_rolls_back_primary_row_atomically() {
+    let dir = TempTestDir::new("rowid_write_atomicity");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    cfg.max_transaction_bytes = 512;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, v TEXT');
+         INSERT INTO t VALUES ('seed', 'ok');",
+    )
+    .unwrap();
+    let seed_rows = conn
+        .query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+        .unwrap();
+    assert_eq!(seed_rows.len(), 1);
+
+    // 1. Non-integer PK INSERT whose secondary rowid allocation fails `max_transaction_bytes`
+    //    after `put_row_owned_with_hint` has already succeeded must not leave an unmapped row.
+    let mut saw_insert_ok = false;
+    let mut saw_insert_err = false;
+    for len in (380..=520).step_by(2) {
+        let val = "x".repeat(len);
+        conn.execute_batch("BEGIN").unwrap();
+        let res = conn.execute_batch(&format!("INSERT INTO t VALUES ('k{len}', '{val}')"));
+        if res.is_ok() {
+            saw_insert_ok = true;
+            conn.execute_batch("ROLLBACK").unwrap();
+        } else {
+            saw_insert_err = true;
+            assert_eq!(
+                conn.query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+                    .unwrap(),
+                seed_rows
+            );
+            conn.execute_batch("COMMIT").unwrap();
+            assert_eq!(
+                conn.query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+                    .unwrap(),
+                seed_rows
+            );
+            assert_eq!(
+                conn.query_all("PRAGMA integrity_check", &[]).unwrap(),
+                vec![vec![SqlValue::Text("ok".into())]]
+            );
+            break;
+        }
+    }
+    assert!(saw_insert_ok && saw_insert_err);
+
+    // 2. Explicit `UPDATE SET rowid` whose `set_rowid` fails `max_transaction_bytes` after
+    //    `put_row_owned_with_hint` updated the primary row must roll back atomically too.
+    let mut saw_update_ok = false;
+    let mut saw_update_err = false;
+    for len in (380..=520).step_by(2) {
+        let val = "y".repeat(len);
+        conn.execute_batch("BEGIN").unwrap();
+        let res = conn.execute_batch(&format!(
+            "UPDATE t SET rowid = 999, v = '{val}' WHERE k = 'seed'"
+        ));
+        if res.is_ok() {
+            saw_update_ok = true;
+            conn.execute_batch("ROLLBACK").unwrap();
+        } else {
+            saw_update_err = true;
+            assert_eq!(
+                conn.query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+                    .unwrap(),
+                seed_rows
+            );
+            conn.execute_batch("COMMIT").unwrap();
+            assert_eq!(
+                conn.query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+                    .unwrap(),
+                seed_rows
+            );
+            assert_eq!(
+                conn.query_all("PRAGMA integrity_check", &[]).unwrap(),
+                vec![vec![SqlValue::Text("ok".into())]]
+            );
+            break;
+        }
+    }
+    assert!(saw_update_ok && saw_update_err);
+}
