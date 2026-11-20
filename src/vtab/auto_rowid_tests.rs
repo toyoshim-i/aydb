@@ -290,3 +290,68 @@ fn float_keys_above_integers_do_not_reset_automatic_rowids() {
         vec![vec![SqlValue::Integer(1)]]
     );
 }
+
+#[test]
+fn integer_pk_with_mixed_floats_text_and_blob_keys_allocates_monotonic_rowids() {
+    let mut fixture = Fixture::new("auto_rowid_mixed_types");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE a USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO a VALUES (1, 'i1'), (5, 'i5'),
+                              (-1e30, 'neg_huge'), (-2.5, 'neg_f'),
+                              (5.25, 'f1'), (5.75, 'f2'), (1e30, 'pos_huge'),
+                              ('alpha', 't1'), (X'0102', 'b1');
+         INSERT INTO a(rowid, k, v) VALUES (6, 'beta', 't_rowid6');
+         INSERT INTO a VALUES (NULL, 'auto1'), (NULL, 'auto2');",
+    )
+    .unwrap();
+
+    assert_eq!(
+        conn.query_all(
+            "SELECT k FROM a WHERE v IN ('auto1', 'auto2') ORDER BY v",
+            &[]
+        )
+        .unwrap(),
+        vec![vec![SqlValue::Integer(7)], vec![SqlValue::Integer(8)]]
+    );
+    let counts = conn
+        .query_all("SELECT count(*), count(DISTINCT rowid) FROM a", &[])
+        .unwrap();
+    assert_eq!(counts[0][0], counts[0][1]);
+    assert_eq!(counts[0][0], SqlValue::Integer(12));
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    conn.execute_batch("INSERT INTO a VALUES (NULL, 'auto3')")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k FROM a WHERE v = 'auto3'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(9)]]
+    );
+    let counts_after = conn
+        .query_all("SELECT count(*), count(DISTINCT rowid) FROM a", &[])
+        .unwrap();
+    assert_eq!(counts_after[0][0], counts_after[0][1]);
+    assert_eq!(counts_after[0][0], SqlValue::Integer(13));
+
+    assert_eq!(
+        conn.query_all(
+            "SELECT k, v FROM a WHERE v IN ('neg_huge', 'f1', 'pos_huge', 't1', 'b1', 't_rowid6', 'auto1', 'auto2', 'auto3') ORDER BY v",
+            &[]
+        )
+        .unwrap(),
+        vec![
+            vec![SqlValue::Integer(7), SqlValue::Text("auto1".into())],
+            vec![SqlValue::Integer(8), SqlValue::Text("auto2".into())],
+            vec![SqlValue::Integer(9), SqlValue::Text("auto3".into())],
+            vec![SqlValue::Blob(vec![1, 2]), SqlValue::Text("b1".into())],
+            vec![SqlValue::Float(5.25), SqlValue::Text("f1".into())],
+            vec![SqlValue::Float(-1e30), SqlValue::Text("neg_huge".into())],
+            vec![SqlValue::Float(1e30), SqlValue::Text("pos_huge".into())],
+            vec![SqlValue::Text("alpha".into()), SqlValue::Text("t1".into())],
+            vec![SqlValue::Text("beta".into()), SqlValue::Text("t_rowid6".into())],
+        ]
+    );
+}

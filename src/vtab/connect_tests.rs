@@ -431,3 +431,86 @@ fn stale_disconnect_after_drop_and_recreate_does_not_unregister_new_table() {
     drop(conn_live);
     assert!(!fx.engine.read().unwrap().active_vtab_ids.contains_key(&1));
 }
+
+#[test]
+fn concurrent_create_rename_and_connect_across_connections_stay_consistent() {
+    let fx = fixture("concurrent_ddl_connect", 2_000);
+    let (writer_ready_tx, writer_ready_rx) = mpsc::channel();
+    let (reader_done_tx, reader_done_rx) = mpsc::channel();
+
+    let fx_engine = fx.engine.clone();
+    let fx_schema = fx.schema_path.clone();
+    let writer_thread = std::thread::spawn(move || {
+        let conn = SqliteConnection::open_file(&fx_schema).unwrap();
+        conn.register_aydb_module_with_options(fx_engine, false)
+            .unwrap();
+        conn.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        conn.execute_batch("BEGIN; INSERT INTO t VALUES (4, 'd');")
+            .unwrap();
+        writer_ready_tx.send(()).unwrap();
+        reader_done_rx.recv().unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+
+        // Now run rename + create concurrently with another thread creating a different table.
+        conn.execute_batch(
+            "ALTER TABLE t RENAME TO t_renamed;
+             CREATE VIRTUAL TABLE m USING aydb(table_id=5, columns='id INTEGER PRIMARY KEY, v TEXT');
+             INSERT INTO m VALUES (100, 'm1');",
+        )
+        .unwrap();
+    });
+
+    writer_ready_rx.recv().unwrap();
+    let fx_engine_r = fx.engine.clone();
+    let fx_schema_r = fx.schema_path.clone();
+    let reader_thread = std::thread::spawn(move || {
+        let reader = SqliteConnection::open_file(&fx_schema_r).unwrap();
+        reader
+            .register_aydb_module_with_options(fx_engine_r, false)
+            .unwrap();
+        reader.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        let started = Instant::now();
+        assert_eq!(ids(&reader, "t"), vec![1, 2, 3]);
+        assert!(ids(&reader, "c").is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "existing table xConnect must not wait on active writer"
+        );
+        reader_done_tx.send(()).unwrap();
+    });
+    reader_thread.join().unwrap();
+
+    // Spawn a concurrent DDL connection alongside the writer's rename/create phase.
+    let fx_engine_c = fx.engine.clone();
+    let fx_schema_c = fx.schema_path.clone();
+    let creator_thread = std::thread::spawn(move || {
+        let creator = SqliteConnection::open_file(&fx_schema_c).unwrap();
+        creator
+            .register_aydb_module_with_options(fx_engine_c, false)
+            .unwrap();
+        creator
+            .execute_batch("PRAGMA busy_timeout = 5000;")
+            .unwrap();
+        creator
+            .execute_batch(
+                "CREATE VIRTUAL TABLE n USING aydb(table_id=4, columns='id INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO n VALUES (200, 'n1');",
+            )
+            .unwrap();
+    });
+
+    writer_thread.join().unwrap();
+    creator_thread.join().unwrap();
+
+    let verify = fx.open();
+    assert_eq!(ids(&verify, "t_renamed"), vec![1, 2, 3, 4]);
+    assert!(verify.query_all("SELECT id FROM t", &[]).is_err());
+    assert_eq!(ids(&verify, "m"), vec![100]);
+    assert_eq!(ids(&verify, "n"), vec![200]);
+    assert!(fx.is_registered(1, "t_renamed"));
+    assert!(fx.is_registered(4, "n"));
+    assert!(fx.is_registered(5, "m"));
+
+    drop(verify);
+    assert!(fx.engine.read().unwrap().active_vtab_ids.is_empty());
+}

@@ -412,3 +412,79 @@ fn a_rename_rolled_back_via_another_table_leaves_no_orphan_catalog_entry() {
         .unwrap();
     assert_eq!(ints(&conn, "SELECT v FROM t"), [99]);
 }
+
+#[test]
+fn nested_savepoints_with_create_rename_and_writes_match_expected_state() {
+    let mut fixture = Fixture::new("nested_savepoint_rename");
+    let conn = fixture.open();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+
+    // Transaction 1: nested savepoints combining INSERT, RENAME TO, CREATE VIRTUAL TABLE, and partial rollbacks.
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t VALUES (2, 'b', 20);
+         SAVEPOINT sp1;
+         INSERT INTO t VALUES (3, 'c', 30);
+         ALTER TABLE t RENAME TO t1;
+         SAVEPOINT sp2;
+         INSERT INTO t1 VALUES (4, 'd', 40);
+         ALTER TABLE t1 RENAME TO t2;
+         CREATE VIRTUAL TABLE extra USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO extra VALUES (1, 99);
+         ROLLBACK TO sp2;",
+    )
+    .unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t1 ORDER BY k"), [10, 20, 30]);
+    assert!(conn.query_all("SELECT v FROM t2", &[]).is_err());
+    assert!(conn.query_all("SELECT v FROM extra", &[]).is_err());
+
+    conn.execute_batch(
+        "INSERT INTO t1 VALUES (5, 'e', 50);
+         RELEASE sp2;",
+    )
+    .unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t1 ORDER BY k"), [10, 20, 30, 50]);
+
+    conn.execute_batch("ROLLBACK TO sp1;").unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+    assert!(conn.query_all("SELECT v FROM t1", &[]).is_err());
+
+    conn.execute_batch("RELEASE sp1; COMMIT;").unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+
+    // Transaction 2: nested savepoint rollback followed by outer rename commit.
+    // Write first inside the transaction so SQLite opens the vtab tx before RENAME.
+    conn.execute_batch(
+        "BEGIN;
+         SAVEPOINT sp1;
+         INSERT INTO t VALUES (6, 'f', 60);
+         ALTER TABLE t RENAME TO t_final;
+         SAVEPOINT sp2;
+         ALTER TABLE t_final RENAME TO t_tmp;
+         INSERT INTO t_tmp VALUES (7, 'g', 70);
+         ROLLBACK TO sp2;
+         RELEASE sp2;
+         RELEASE sp1;
+         COMMIT;",
+    )
+    .unwrap();
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(
+        ints(&conn, "SELECT v FROM t_final ORDER BY k"),
+        [10, 20, 60]
+    );
+
+    // Verify no leaked catalog entries for any rolled-back names.
+    for rolled_back_name in ["t", "t1", "t2", "t_tmp", "extra"] {
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {rolled_back_name} USING aydb(columns='k INTEGER PRIMARY KEY, v INT')"
+        ))
+        .unwrap();
+        assert!(ints(&conn, &format!("SELECT v FROM {rolled_back_name}")).is_empty());
+    }
+}

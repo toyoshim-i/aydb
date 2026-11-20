@@ -6935,3 +6935,103 @@ fn install_compaction_discards_output_file_when_blob_sync_fails() {
         "failed install_compaction must unlink {out_name} instead of leaking it"
     );
 }
+
+#[test]
+fn multiple_capped_tables_simultaneous_lru_blob_rollover_preserves_durability_and_quotas() {
+    let tmp = TempTestDir::new("multi_capped_rollover");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4 * 1024;
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    cfg.memtable_capacity_bytes = 16 * 1024;
+
+    let tables = [(10u16, 8 * 1024u64), (11, 12 * 1024), (12, 6 * 1024)];
+    let mut all_keys: HashMap<u16, Vec<Vec<u8>>> = HashMap::new();
+    let mut expected: HashMap<(u16, Vec<u8>), Vec<u8>> = HashMap::new();
+
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for &(tid, max_bytes) in &tables {
+            engine.register_capped_table(tid, max_bytes).unwrap();
+        }
+
+        for round in 0..60usize {
+            for &(tid, _) in &tables {
+                let pk = format!("k_{tid}_{round:03}").into_bytes();
+                let len = match tid {
+                    10 => 300 + (round % 31),
+                    11 => 360 + (round % 31),
+                    _ => 420 + (round % 31),
+                };
+                let fill = (tid as u8).wrapping_mul(17).wrapping_add(round as u8);
+                let mut val = vec![fill; len];
+                let tag = format!("t{tid}_r{round:03}_");
+                val[..tag.len()].copy_from_slice(tag.as_bytes());
+                let durability = if (round + tid as usize).is_multiple_of(2) {
+                    WriteDurability::BufferedFast
+                } else {
+                    WriteDurability::SyncTransactional
+                };
+                engine.put_row(tid, &pk, &val, &[], durability).unwrap();
+                all_keys.entry(tid).or_default().push(pk.clone());
+                expected.insert((tid, pk), val);
+            }
+            if round % 15 == 14 {
+                engine.flush_memtable().unwrap();
+            }
+            if round == 30 {
+                engine.compact().unwrap();
+            }
+            if round == 45 {
+                engine.checkpoint().unwrap();
+            }
+        }
+
+        let mut survivors_before: HashMap<(u16, Vec<u8>), Vec<u8>> = HashMap::new();
+        for &(tid, max_bytes) in &tables {
+            let ct = engine.capped_table_state(tid).unwrap();
+            assert!(
+                ct.current_logical_bytes <= max_bytes,
+                "table {tid} exceeded quota: {} > {max_bytes}",
+                ct.current_logical_bytes
+            );
+            let mut surviving_count = 0usize;
+            for pk in &all_keys[&tid] {
+                if let Some(got) = engine.get_row(tid, pk).unwrap() {
+                    let exp = expected.get(&(tid, pk.clone())).unwrap();
+                    assert_eq!(&got, exp, "corrupted payload for table {tid}");
+                    survivors_before.insert((tid, pk.clone()), got);
+                    surviving_count += 1;
+                }
+            }
+            assert!(
+                (1..60).contains(&surviving_count),
+                "expected partial eviction on table {tid}, got {surviving_count}/60"
+            );
+        }
+        drop(engine);
+
+        let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+        for &(tid, max_bytes) in &tables {
+            reopened.register_capped_table(tid, max_bytes).unwrap();
+            let ct = reopened.capped_table_state(tid).unwrap();
+            assert!(
+                ct.current_logical_bytes <= max_bytes,
+                "reopened table {tid} exceeded quota: {} > {max_bytes}",
+                ct.current_logical_bytes
+            );
+        }
+
+        let mut survivors_after: HashMap<(u16, Vec<u8>), Vec<u8>> = HashMap::new();
+        for &(tid, _) in &tables {
+            for pk in &all_keys[&tid] {
+                if let Some(got) = reopened.get_row(tid, pk).unwrap() {
+                    survivors_after.insert((tid, pk.clone()), got);
+                }
+            }
+        }
+        assert_eq!(survivors_after, survivors_before);
+    }
+}

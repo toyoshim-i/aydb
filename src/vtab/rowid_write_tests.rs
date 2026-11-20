@@ -537,3 +537,98 @@ fn failed_rowid_write_rolls_back_primary_row_atomically() {
     }
     assert!(saw_update_ok && saw_update_err);
 }
+
+#[test]
+fn non_integer_pk_exceeding_max_transaction_bytes_leaves_row_and_rowid_intact() {
+    let dir = TempTestDir::new("non_int_pk_max_tx_bytes");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    cfg.max_transaction_bytes = 640;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY NOT NULL, u TEXT UNIQUE, v TEXT');
+         CREATE VIRTUAL TABLE b USING aydb(table_id=2, columns='k BLOB PRIMARY KEY NOT NULL, v TEXT');
+         INSERT INTO t VALUES ('k1', 'u1', 'v1'), ('k2', 'u2', 'v2');
+         INSERT INTO b VALUES (X'0102', 'bv1');",
+    )
+    .unwrap();
+
+    let big_val = "z".repeat(1024);
+
+    // Subcase A: multi-stmt + SAVEPOINT + oversized TEXT PK INSERT must fail atomically and leave
+    // no orphan UNIQUE index entry.
+    conn.execute_batch("BEGIN; INSERT INTO t VALUES ('k3', 'u3', 'small'); SAVEPOINT s;")
+        .unwrap();
+    assert!(
+        conn.execute_batch(&format!(
+            "INSERT INTO t VALUES ('k_big', 'u_big', '{big_val}');"
+        ))
+        .is_err()
+    );
+    conn.execute_batch("ROLLBACK TO s; RELEASE s; COMMIT;")
+        .unwrap();
+
+    let t_rows = conn
+        .query_all("SELECT rowid, k, u, v FROM t ORDER BY k", &[])
+        .unwrap();
+    assert_eq!(t_rows.len(), 3);
+    assert_eq!(t_rows[0][1], SqlValue::Text("k1".into()));
+    assert_eq!(t_rows[1][1], SqlValue::Text("k2".into()));
+    assert_eq!(t_rows[2][1], SqlValue::Text("k3".into()));
+    conn.execute_batch("INSERT INTO t VALUES ('k_big_ok', 'u_big', 'tiny');")
+        .unwrap();
+    conn.execute_batch("DELETE FROM t WHERE k = 'k_big_ok';")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("PRAGMA integrity_check", &[]).unwrap(),
+        vec![vec![SqlValue::Text("ok".into())]]
+    );
+
+    // Subcase B: PK-changing UPDATE exceeding max_transaction_bytes leaves primary row, rowid, and UNIQUE intact.
+    let snap_t = conn
+        .query_all("SELECT rowid, k, u, v FROM t ORDER BY k", &[])
+        .unwrap();
+    conn.execute_batch("BEGIN;").unwrap();
+    assert!(
+        conn.execute_batch(&format!(
+            "UPDATE t SET k = 'k1_moved', u = 'u1_moved', v = '{big_val}' WHERE k = 'k1';"
+        ))
+        .is_err()
+    );
+    conn.execute_batch("COMMIT;").unwrap();
+    assert_eq!(
+        conn.query_all("SELECT rowid, k, u, v FROM t ORDER BY k", &[])
+            .unwrap(),
+        snap_t
+    );
+    assert_eq!(
+        conn.query_all("PRAGMA integrity_check", &[]).unwrap(),
+        vec![vec![SqlValue::Text("ok".into())]]
+    );
+
+    // Subcase C: BLOB PRIMARY KEY INSERT exceeding max_transaction_bytes rolls back cleanly.
+    let snap_b = conn
+        .query_all("SELECT rowid, k, v FROM b ORDER BY k", &[])
+        .unwrap();
+    conn.execute_batch("BEGIN;").unwrap();
+    assert!(
+        conn.execute_batch(&format!("INSERT INTO b VALUES (X'aabb', '{big_val}');"))
+            .is_err()
+    );
+    conn.execute_batch("COMMIT;").unwrap();
+    assert_eq!(
+        conn.query_all("SELECT rowid, k, v FROM b ORDER BY k", &[])
+            .unwrap(),
+        snap_b
+    );
+    assert_eq!(
+        conn.query_all("PRAGMA integrity_check", &[]).unwrap(),
+        vec![vec![SqlValue::Text("ok".into())]]
+    );
+}
