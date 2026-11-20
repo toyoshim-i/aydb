@@ -2525,9 +2525,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// only deleted if its record still points to the same corrupt `BlobPtr` (it may have been
     /// overwritten or deleted since). Deletes use `BufferedFast` durability.
     pub(super) fn drain_corrupt_evictions(&mut self) -> io::Result<()> {
-        if self.tx_depth > 0 || self.poisoned.is_some() {
+        if self.tx_depth > 0 || self.poisoned.is_some() || !self.has_pending_corrupt_evictions() {
             return Ok(());
         }
+        self.drain_pending_durable()?;
         let pending: Vec<((u16, Vec<u8>), PendingCorruptEviction)> =
             match self.pending_corrupt_evictions.lock() {
                 Ok(mut q) if !q.is_empty() => q.drain().collect(),

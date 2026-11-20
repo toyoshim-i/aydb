@@ -4287,3 +4287,55 @@ fn process_crash_recovery_syncs_buffered_blobs_before_checkpoint() {
         Some(v_lru.as_slice())
     );
 }
+
+/// `checkpoint` and `flush_memtable` must drain any pending group commit before draining
+/// `pending_corrupt_evictions`, so a queued eviction captured against an older corrupt pointer
+/// does not overwrite/delete the healthy value written by the pending group commit.
+#[test]
+fn checkpoint_and_flush_do_not_evict_row_replaced_by_pending_group_commit() {
+    for use_flush in [false, true] {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+        let mut cfg = repro_config();
+        cfg.inline_threshold_bytes = 64;
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        e.set_table_corrupt_policy(2, CorruptPolicy::Evict);
+
+        let v_bad = vec![0xAA; 512];
+        let v_good = vec![0xBB; 512];
+        e.put_row(2, b"k", &v_bad, &[], SYNC).unwrap();
+        e.flush_memtable().unwrap();
+
+        let blob_name = fs
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.starts_with("blob_std_"))
+            .unwrap();
+        damage_synced(&fs, &blob_name, |img| img[64] ^= 0xFF);
+
+        // Replace `k` with a healthy value in a pending group commit.
+        append_group_put(&mut e, b"k", &v_good, &[]);
+        assert!(!e.pending_group.is_empty());
+
+        // A committed reader still sees the old corrupt pointer and queues corrupt eviction.
+        assert_eq!(e.reader_for_conn(99).get_row(2, b"k").unwrap(), None);
+        assert!(e.has_pending_corrupt_evictions());
+
+        if use_flush {
+            e.flush_memtable().unwrap();
+        } else {
+            e.checkpoint().unwrap();
+        }
+
+        assert_eq!(
+            e.get_row(2, b"k").unwrap().as_deref(),
+            Some(v_good.as_slice())
+        );
+        drop(e);
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+        assert_eq!(
+            e.get_row(2, b"k").unwrap().as_deref(),
+            Some(v_good.as_slice())
+        );
+    }
+}

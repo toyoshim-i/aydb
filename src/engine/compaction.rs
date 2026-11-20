@@ -97,6 +97,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_flush_on_commit = true;
             return Ok(());
         }
+        self.drain_pending_durable()?;
         self.drain_corrupt_evictions()?;
         self.flush_memtable_no_auto_compact()?;
         // This flush also covers any compaction owed by an earlier full-WAL rotation.
@@ -164,8 +165,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 "checkpoint is not allowed while a transaction is active",
             ));
         }
-        self.drain_corrupt_evictions()?;
         self.drain_pending_durable()?;
+        self.drain_corrupt_evictions()?;
         if !self.memtable.is_empty() {
             return self.flush_memtable();
         }
