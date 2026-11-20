@@ -2943,6 +2943,68 @@ fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
     assert_eq!(lru_files(&fs), e.lru_blobs.len());
 }
 
+/// Regression test for [H7]: if a `blob_lru` segment accumulated pre-checkpoint dead bytes and
+/// was then reclaimed (moving into `unlink_after_wal_rotation`, outside `boot_meta.db`), a crash
+/// before WAL rotation must not re-adopt it as a permanent zombie by scanning stale pointers in
+/// older `idx` segments.
+#[test]
+fn reclaimed_lru_segment_with_pre_checkpoint_dead_bytes_is_swept_after_crash() {
+    let mut cfg = repro_config();
+    cfg.max_blob_segment_bytes = 3500;
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let lru_files = |fs: &Arc<CrashFs>| -> Vec<String> {
+        fs.list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with("blob_lru_"))
+            .collect()
+    };
+    let sync = WriteDurability::SyncTransactional;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(1, 4000).unwrap();
+
+    // Two 1500-byte values share a single `blob_lru` segment.
+    e.put_row(1, b"y1", &[1u8; 1500], &[], sync).unwrap();
+    e.put_row(1, b"y2", &[2u8; 1500], &[], sync).unwrap();
+    let files_after_y = lru_files(&fs);
+    assert_eq!(files_after_y.len(), 1);
+    let reclaimed_name = files_after_y[0].clone();
+
+    // Persist pre-checkpoint dead bytes for `y1` while `y2` remains in `idx`.
+    e.delete_row(1, b"y1", sync).unwrap();
+    e.flush_memtable().unwrap();
+
+    // Inserting `z1` rolls over to a new LRU segment; `z2` exceeds the 4000-byte cap and evicts
+    // `y2`, making the first segment 100% dead and placing it into `unlink_after_wal_rotation`.
+    e.put_row(1, b"z1", &[3u8; 1500], &[], sync).unwrap();
+    e.put_row(1, b"z2", &[4u8; 1500], &[], sync).unwrap();
+    assert!(e.get_row(1, b"y1").unwrap().is_none());
+    assert!(e.get_row(1, b"y2").unwrap().is_none());
+    assert_eq!(e.unlink_after_wal_rotation, vec![reclaimed_name.clone()]);
+    assert!(lru_files(&fs).contains(&reclaimed_name));
+
+    // Crash BEFORE WAL rotation so `reclaimed_name` lingers on disk while uncataloged.
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Process);
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert!(row_is(&mut e, 1, b"z1", &[3u8; 1500]));
+    assert!(row_is(&mut e, 1, b"z2", &[4u8; 1500]));
+    assert!(e.get_row(1, b"y1").unwrap().is_none());
+    assert!(e.get_row(1, b"y2").unwrap().is_none());
+    assert!(
+        !lru_files(&fs).contains(&reclaimed_name),
+        "reclaimed LRU segment {reclaimed_name} leaked as a zombie after crash"
+    );
+    assert_eq!(lru_files(&fs).len(), e.lru_blobs.len());
+    assert!(
+        !e.meta_mgr.state().lru_blob_segments.iter().any(
+            |m| crate::meta::format_lru_blob_file_name(m.table_id, m.seq_id) == reclaimed_name
+        )
+    );
+}
+
 /// A table's catalog entry and its rowid mapping marker are one atomic write. A power cut at
 /// every operation of the registration must leave either no table or a table with its marker,
 /// and an acknowledged registration is never lost.

@@ -592,15 +592,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // For any blob segment whose physical `file_len` exceeds its cataloged `bmeta.file_len`
-        // (or is uncataloged), also scan `idx_segments` in case an `idx` segment already
-        // references blobs in that segment (e.g. if `boot_meta.db` fell back to an older slot).
-        let needs_idx_blob_scan = std_blobs
+        let cataloged_std_seqs: std::collections::HashSet<u64> = state_snapshot
+            .std_blob_segments
             .iter()
-            .any(|(&seq, b)| b.file_len > std_valid_end.get(&seq).copied().unwrap_or(0))
-            || lru_blobs
-                .iter()
-                .any(|(&k, b)| b.file_len > lru_valid_end.get(&k).copied().unwrap_or(0));
+            .map(|s| s.seq_id)
+            .collect();
+        let cataloged_lru_keys: std::collections::HashSet<(u16, u64)> = state_snapshot
+            .lru_blob_segments
+            .iter()
+            .map(|s| (s.table_id, s.seq_id))
+            .collect();
+
+        // For any cataloged blob segment whose physical `file_len` exceeds its cataloged
+        // `bmeta.file_len`, also scan `idx_segments` in case an `idx` segment already
+        // references blobs in that segment (e.g. if `boot_meta.db` fell back to an older slot).
+        let needs_idx_blob_scan = std_blobs.iter().any(|(&seq, b)| {
+            cataloged_std_seqs.contains(&seq)
+                && b.file_len > std_valid_end.get(&seq).copied().unwrap_or(0)
+        }) || lru_blobs.iter().any(|(&k, b)| {
+            cataloged_lru_keys.contains(&k)
+                && b.file_len > lru_valid_end.get(&k).copied().unwrap_or(0)
+        });
         if needs_idx_blob_scan {
             for seg in &idx_segments {
                 let mut cur = seg.cursor_all()?;
@@ -608,17 +620,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if let IndexValue::Blob(ptr) = entry.value {
                         let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
                         match ptr.kind {
-                            BlobKind::Standard => {
+                            BlobKind::Standard if cataloged_std_seqs.contains(&ptr.seg_id) => {
                                 if let Some(ve) = std_valid_end.get_mut(&ptr.seg_id) {
                                     *ve = (*ve).max(end);
                                 }
                             }
-                            BlobKind::Lru => {
+                            BlobKind::Lru
+                                if cataloged_lru_keys.contains(&(ptr.table_id, ptr.seg_id)) =>
+                            {
                                 if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id))
                                 {
                                     *ve = (*ve).max(end);
                                 }
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -774,19 +789,93 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // Reconcile unreferenced uncommitted tail bytes and prune any uncataloged
-        // blob segment that had zero valid references.
-        let cataloged_std_seqs: std::collections::HashSet<u64> = state_snapshot
-            .std_blob_segments
-            .iter()
-            .map(|s| s.seq_id)
-            .collect();
-        let cataloged_lru_keys: std::collections::HashSet<(u16, u64)> = state_snapshot
-            .lru_blob_segments
-            .iter()
-            .map(|s| (s.table_id, s.seq_id))
-            .collect();
+        // Compute exact currently-live bytes for any uncataloged blob segment across `memtable` and
+        // unshadowed `idx_segments`. Stale pointers in older `idx` segments (including those
+        // already overwritten or deleted before the last checkpoint) do not count as live: if an
+        // uncataloged `blob_lru` was reclaimed before a crash while only lingering until WAL
+        // rotation, computing exact live bytes avoids re-adopting it as a zombie segment.
+        let has_uncataloged_std = std_blobs
+            .keys()
+            .any(|seq| !cataloged_std_seqs.contains(seq));
+        let has_uncataloged_lru = lru_blobs.keys().any(|k| !cataloged_lru_keys.contains(k));
+        let mut uncataloged_std_live: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut uncataloged_lru_live: BTreeMap<(u16, u64), u64> = BTreeMap::new();
+        if has_uncataloged_std || has_uncataloged_lru {
+            for (_k, entry) in
+                memtable.iter_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            {
+                if let IndexValue::Blob(ptr) = entry.value {
+                    match ptr.kind {
+                        BlobKind::Standard
+                            if !cataloged_std_seqs.contains(&ptr.seg_id)
+                                && std_blobs.contains_key(&ptr.seg_id) =>
+                        {
+                            let e = uncataloged_std_live.entry(ptr.seg_id).or_default();
+                            *e = e.saturating_add(ptr.len as u64);
+                        }
+                        BlobKind::Lru
+                            if !cataloged_lru_keys.contains(&(ptr.table_id, ptr.seg_id))
+                                && lru_blobs.contains_key(&(ptr.table_id, ptr.seg_id)) =>
+                        {
+                            let e = uncataloged_lru_live
+                                .entry((ptr.table_id, ptr.seg_id))
+                                .or_default();
+                            *e = e.saturating_add(ptr.len as u64);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for (seg_idx, seg) in idx_segments.iter().enumerate() {
+                let mut cur = seg.cursor_all()?;
+                while let Some(entry) = cur.next_entry()? {
+                    let IndexValue::Blob(ptr) = entry.value else {
+                        continue;
+                    };
+                    let is_target = match ptr.kind {
+                        BlobKind::Standard => {
+                            !cataloged_std_seqs.contains(&ptr.seg_id)
+                                && std_blobs.contains_key(&ptr.seg_id)
+                        }
+                        BlobKind::Lru => {
+                            !cataloged_lru_keys.contains(&(ptr.table_id, ptr.seg_id))
+                                && lru_blobs.contains_key(&(ptr.table_id, ptr.seg_id))
+                        }
+                    };
+                    if !is_target {
+                        continue;
+                    }
+                    if memtable.get(&entry.key).is_some() {
+                        continue;
+                    }
+                    let mut shadowed = false;
+                    for newer in &idx_segments[seg_idx + 1..] {
+                        if newer.get(&entry.key)?.is_some() {
+                            shadowed = true;
+                            break;
+                        }
+                    }
+                    if shadowed {
+                        continue;
+                    }
+                    match ptr.kind {
+                        BlobKind::Standard => {
+                            let e = uncataloged_std_live.entry(ptr.seg_id).or_default();
+                            *e = e.saturating_add(ptr.len as u64);
+                        }
+                        BlobKind::Lru => {
+                            let e = uncataloged_lru_live
+                                .entry((ptr.table_id, ptr.seg_id))
+                                .or_default();
+                            *e = e.saturating_add(ptr.len as u64);
+                        }
+                    }
+                }
+            }
+        }
 
+        // Reconcile unreferenced uncommitted tail bytes and prune any uncataloged
+        // blob segment that holds zero currently-live bytes.
         // Invariant: persisted dead_bytes must only reflect mutations at or below checkpoint_lsn
         // (plus idempotent tail garbage). The open-time commit below does not advance
         // checkpoint_lsn, so it must NOT persist the WAL-replay increments: a crash before the
@@ -799,13 +888,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut lru_persist_dead: BTreeMap<(u16, u64), u64> = BTreeMap::new();
         let mut had_uncataloged_live_blobs = false;
         std_blobs.retain(|&seq_id, b| {
-            let valid_end = std_valid_end.get(&seq_id).copied().unwrap_or(0);
-            if !cataloged_std_seqs.contains(&seq_id) && valid_end == 0 {
-                return false;
-            }
             if !cataloged_std_seqs.contains(&seq_id) {
+                let live = uncataloged_std_live.get(&seq_id).copied().unwrap_or(0);
+                if live == 0 {
+                    return false;
+                }
                 had_uncataloged_live_blobs = true;
+                let wal_dead_delta = b.dead_bytes;
+                let total_dead = b.file_len.saturating_sub(live);
+                let persisted = total_dead.saturating_sub(wal_dead_delta);
+                b.dead_bytes = total_dead;
+                std_persist_dead.insert(seq_id, persisted);
+                return true;
             }
+            let valid_end = std_valid_end.get(&seq_id).copied().unwrap_or(0);
             let mut persisted = std_base_dead.get(&seq_id).copied().unwrap_or(0);
             if b.file_len > valid_end {
                 let tail_garbage = b.file_len - valid_end;
@@ -816,13 +912,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true
         });
         lru_blobs.retain(|&(tid, seq_id), b| {
-            let valid_end = lru_valid_end.get(&(tid, seq_id)).copied().unwrap_or(0);
-            if !cataloged_lru_keys.contains(&(tid, seq_id)) && valid_end == 0 {
-                return false;
-            }
             if !cataloged_lru_keys.contains(&(tid, seq_id)) {
+                let live = uncataloged_lru_live
+                    .get(&(tid, seq_id))
+                    .copied()
+                    .unwrap_or(0);
+                if live == 0 {
+                    return false;
+                }
                 had_uncataloged_live_blobs = true;
+                let wal_dead_delta = b.dead_bytes;
+                let total_dead = b.file_len.saturating_sub(live);
+                let persisted = total_dead.saturating_sub(wal_dead_delta);
+                b.dead_bytes = total_dead;
+                lru_persist_dead.insert((tid, seq_id), persisted);
+                return true;
             }
+            let valid_end = lru_valid_end.get(&(tid, seq_id)).copied().unwrap_or(0);
             let mut persisted = lru_base_dead.get(&(tid, seq_id)).copied().unwrap_or(0);
             if b.file_len > valid_end {
                 let tail_garbage = b.file_len - valid_end;
