@@ -36,17 +36,24 @@ const GENERIC_READ: DWORD = 0x8000_0000;
 const GENERIC_WRITE: DWORD = 0x4000_0000;
 
 const FILE_SHARE_NONE: DWORD = 0;
+const FILE_SHARE_READ: DWORD = 1;
+const FILE_SHARE_WRITE: DWORD = 2;
+const FILE_SHARE_DELETE: DWORD = 4;
 
 const CREATE_ALWAYS: DWORD = 2;
 const OPEN_EXISTING: DWORD = 3;
 const OPEN_ALWAYS: DWORD = 4;
 
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
+const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
 const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x0800_0000;
 const FILE_FLAG_RANDOM_ACCESS: DWORD = 0x1000_0000;
 
+const ERROR_INVALID_FUNCTION: DWORD = 1;
+const ERROR_ACCESS_DENIED: DWORD = 5;
 const ERROR_SHARING_VIOLATION: DWORD = 32;
+const ERROR_NOT_SUPPORTED: DWORD = 50;
 
 /// Number of retries after a first `ERROR_SHARING_VIOLATION` on open.
 const SHARING_VIOLATION_RETRIES: u32 = 10;
@@ -363,14 +370,26 @@ impl PlatformFile for WinPlatformFile {
                     self.handle,
                     buf.as_mut_ptr(),
                     chunk_len,
-                    &mut bytes_read,
+                    ptr::null_mut(),
                     &mut overlapped,
                 )
             };
 
             if res != FALSE {
-                // Fast path: completed synchronously in the Windows Cache Manager!
-                return Ok(bytes_read as usize);
+                // Fast path: completed synchronously in the Windows Cache Manager. Use
+                // `GetOverlappedResult(..., 0)` so an overlapped call never relies on
+                // `lpNumberOfBytesRead`.
+                let sync_ok = unsafe {
+                    GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 0)
+                };
+                if sync_ok != FALSE {
+                    return Ok(bytes_read as usize);
+                }
+                let sync_err = unsafe { GetLastError() };
+                if sync_err == ERROR_HANDLE_EOF {
+                    return Ok(0);
+                }
+                return Err(io::Error::from_raw_os_error(sync_err as i32));
             }
 
             let err = unsafe { GetLastError() };
@@ -438,13 +457,19 @@ impl PlatformFile for WinPlatformFile {
                         self.handle,
                         buf.as_ptr(),
                         chunk_len,
-                        &mut bytes_written,
+                        ptr::null_mut(),
                         &mut overlapped,
                     )
                 };
 
                 if res != FALSE {
-                    return Ok(bytes_written as usize);
+                    let sync_ok = unsafe {
+                        GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_written, 0)
+                    };
+                    if sync_ok != FALSE {
+                        return Ok(bytes_written as usize);
+                    }
+                    return Err(io::Error::last_os_error());
                 }
 
                 let err = unsafe { GetLastError() };
@@ -492,7 +517,7 @@ impl PlatformFile for WinPlatformFile {
 
     fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
         let current_len = self.file_len()?;
-        if current_len >= target_len && strategy == PreallocStrategy::LogicalExtendOnly {
+        if current_len >= target_len {
             return Ok(());
         }
 
@@ -501,7 +526,7 @@ impl PlatformFile for WinPlatformFile {
 
         // 2. If PhysicalZeroFill is requested, write zeros sequentially across [current_len, target_len)
         //    so NTFS ValidDataLength (VDL) advances all the way to `target_len`.
-        if strategy == PreallocStrategy::PhysicalZeroFill && current_len < target_len {
+        if strategy == PreallocStrategy::PhysicalZeroFill {
             super::preallocate_physical_zero_fill(self, current_len, target_len)?;
         }
 
@@ -534,11 +559,81 @@ pub struct WinPlatformFs {
     root: PathBuf,
 }
 
+fn is_unc_extended_path(path: &Path) -> bool {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.len() < 8 {
+        return false;
+    }
+    let pfx = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if wide[0..4] != pfx {
+        return false;
+    }
+    let unc_eq = |a: u16, upper: u8| a == upper as u16 || a == upper.to_ascii_lowercase() as u16;
+    unc_eq(wide[4], b'U')
+        && unc_eq(wide[5], b'N')
+        && unc_eq(wide[6], b'C')
+        && wide[7] == b'\\' as u16
+}
+
 impl WinPlatformFs {
     /// Opens or initializes a database directory at `root`, normalizing the path with `\\?\`.
     pub fn open(root: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let normalized = normalize_db_root_path(root.as_ref(), create)?;
         Ok(Self { root: normalized })
+    }
+
+    /// Best-effort parent directory metadata flush for SMB/CIFS UNC shares (`\\?\UNC\...`) so
+    /// newly created or unlinked directory entries survive remote server power loss.
+    fn sync_dir_if_unc(&self) -> io::Result<()> {
+        if !is_unc_extended_path(&self.root) {
+            return Ok(());
+        }
+        let wide_dir: Vec<u16> = self
+            .root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide_dir.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            if matches!(
+                err,
+                ERROR_ACCESS_DENIED | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
+            ) {
+                return Ok(());
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        let ok = unsafe { FlushFileBuffers(handle) };
+        let err = if ok == FALSE {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if ok != FALSE
+            || matches!(
+                err,
+                ERROR_ACCESS_DENIED | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
+            )
+        {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(err as i32))
+        }
     }
 }
 
@@ -554,7 +649,17 @@ impl PlatformFs for WinPlatformFs {
     ) -> io::Result<Arc<Self::File>> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(OsStr::new(rel_name));
+        let existed = full_path.exists();
         let file = WinPlatformFile::open_internal(&full_path, create, writable, false, hint)?;
+        if create
+            && (!existed
+                || matches!(
+                    hint,
+                    OpenHint::MutableSyncLog | OpenHint::MutableBufferedLog
+                ))
+        {
+            self.sync_dir_if_unc()?;
+        }
         Ok(Arc::new(file))
     }
 
@@ -562,7 +667,7 @@ impl PlatformFs for WinPlatformFs {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(OsStr::new(rel_name));
         match std::fs::remove_file(full_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => self.sync_dir_if_unc(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
@@ -580,6 +685,14 @@ impl PlatformFs for WinPlatformFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_unc_extended_path_detects_only_unc_paths() {
+        assert!(is_unc_extended_path(Path::new(r"\\?\UNC\server\share\dir")));
+        assert!(is_unc_extended_path(Path::new(r"\\?\unc\server\share\dir")));
+        assert!(!is_unc_extended_path(Path::new(r"\\?\C:\dir")));
+        assert!(!is_unc_extended_path(Path::new(r"C:\dir")));
+    }
 
     #[test]
     fn sharing_violation_backoff_is_bounded_exponential_of_about_one_second() {

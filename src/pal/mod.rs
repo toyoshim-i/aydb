@@ -126,10 +126,11 @@ pub(crate) fn preallocate_physical_zero_fill<F: PlatformFile + ?Sized>(
         return Ok(());
     }
     const CHUNK_SIZE: usize = 256 * 1024;
-    let zero_buf = vec![0u8; CHUNK_SIZE.min((target_len - current_len) as usize)];
+    let initial_len = (target_len - current_len).min(CHUNK_SIZE as u64) as usize;
+    let zero_buf = vec![0u8; initial_len];
     let mut pos = current_len;
     while pos < target_len {
-        let to_write = ((target_len - pos) as usize).min(zero_buf.len());
+        let to_write = (target_len - pos).min(zero_buf.len() as u64) as usize;
         file.write_all_at(&zero_buf[..to_write], pos)?;
         pos += to_write as u64;
     }
@@ -156,15 +157,25 @@ pub(crate) fn coalesced_read_many_at<F: PlatformFile + ?Sized>(
     while i < indices.len() {
         let first_idx = indices[i];
         let cluster_start = requests[first_idx].0;
-        let mut cluster_end = cluster_start.saturating_add(requests[first_idx].1.len() as u64);
         let mut j = i + 1;
+        let mut cluster_end = match cluster_start.checked_add(requests[first_idx].1.len() as u64) {
+            Some(end) => end,
+            None => {
+                let (off, buf) = &mut requests[first_idx];
+                file.read_exact_at(buf, *off)?;
+                i = j;
+                continue;
+            }
+        };
 
         while j < indices.len() {
             let next_idx = indices[j];
             let next_start = requests[next_idx].0;
-            let next_end = next_start.saturating_add(requests[next_idx].1.len() as u64);
+            let Some(next_end) = next_start.checked_add(requests[next_idx].1.len() as u64) else {
+                break;
+            };
             let gap = next_start.saturating_sub(cluster_end);
-            let new_span = next_end.max(cluster_end).saturating_sub(cluster_start);
+            let new_span = next_end.max(cluster_end) - cluster_start;
 
             if gap <= 16 * 1024 && new_span <= 64 * 1024 {
                 cluster_end = cluster_end.max(next_end);
@@ -257,6 +268,10 @@ mod tests {
         );
         assert!(
             fs.open_file(r"sub\file.db", true, true, OpenHint::MutableBufferedLog)
+                .is_err()
+        );
+        assert!(
+            fs.open_file("boot_meta.db\0x", true, true, OpenHint::MutableBufferedLog)
                 .is_err()
         );
     }
@@ -419,5 +434,56 @@ mod tests {
         assert_eq!(buf2, &data[500..700]);
         assert_eq!(buf3, &data[1200..1250]);
         assert_eq!(buf4, &data[20000..21000]);
+    }
+
+    #[test]
+    fn preallocate_physical_zero_fill_never_truncates_larger_file() {
+        let tmp = TempTestDir::new("prealloc_no_truncate");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let file = fs
+            .open_file("wal_sync.db", true, true, OpenHint::MutableSyncLog)
+            .expect("open file");
+        file.preallocate(64 * 1024, PreallocStrategy::PhysicalZeroFill)
+            .unwrap();
+        let marker = [0xC7u8; 4096];
+        file.write_all_at(&marker, 48 * 1024).unwrap();
+        file.sync_durable().unwrap();
+
+        file.preallocate(16 * 1024, PreallocStrategy::PhysicalZeroFill)
+            .unwrap();
+        file.preallocate(16 * 1024, PreallocStrategy::LogicalExtendOnly)
+            .unwrap();
+        assert_eq!(file.file_len().unwrap(), 64 * 1024);
+
+        let mut read_back = [0u8; 4096];
+        file.read_exact_at(&mut read_back, 48 * 1024).unwrap();
+        assert_eq!(read_back, marker);
+    }
+
+    #[test]
+    fn coalesced_read_many_at_handles_u64_max_overflow_without_panicking() {
+        let tmp = TempTestDir::new("read_many_overflow");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let file = fs
+            .open_file("small.db", true, true, OpenHint::ImmutableRandom)
+            .expect("open file");
+        file.write_all_at(b"abcd", 0).unwrap();
+
+        let mut b1 = [0u8; 16];
+        let mut b2 = [0u8; 16];
+        let mut reqs = [
+            (u64::MAX - 8, b1.as_mut_slice()),
+            (u64::MAX - 4, b2.as_mut_slice()),
+        ];
+        let err = coalesced_read_many_at(file.as_ref(), &mut reqs).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidInput
+            ),
+            "unexpected error kind: {err:?}"
+        );
     }
 }

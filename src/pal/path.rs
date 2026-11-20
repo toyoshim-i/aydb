@@ -15,6 +15,8 @@ use std::path::{Component, Path, PathBuf};
 pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> {
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
+    } else if matches!(path.components().next(), Some(Component::Prefix(_))) {
+        std::path::absolute(path)?
     } else {
         std::env::current_dir()?.join(path)
     };
@@ -78,12 +80,18 @@ pub fn ensure_extended_length_prefix(path: PathBuf) -> PathBuf {
 }
 
 /// Validates that `rel_name` is a single, flat file name inside the database directory
-/// (rejecting empty names, parent directory `..` traversal, or path separators).
+/// (rejecting empty names, interior NUL bytes, parent directory `..` traversal, or path separators).
 pub fn validate_flat_file_name(rel_name: &str) -> io::Result<()> {
     if rel_name.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file name must not be empty",
+        ));
+    }
+    if rel_name.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file name must not contain NUL bytes",
         ));
     }
     if rel_name.contains('/') || rel_name.contains('\\') || rel_name.contains(':') {
@@ -106,6 +114,32 @@ pub fn validate_flat_file_name(rel_name: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_flat_file_name_rejects_interior_nul() {
+        let err = validate_flat_file_name("a\0b.db").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_db_root_path_resolves_drive_relative_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(Component::Prefix(pfx)) = cwd.components().next() else {
+            return;
+        };
+        let prefix_str = pfx.as_os_str().to_string_lossy();
+        if let Some(drive) = prefix_str.strip_suffix(':') {
+            if drive.len() == 1 {
+                let drive_rel = PathBuf::from(format!("{drive}:."));
+                let normalized = normalize_db_root_path(&drive_rel, false).unwrap();
+                assert!(normalized.exists());
+                let norm_str = normalized.to_string_lossy();
+                assert!(norm_str.starts_with(r"\\?\"));
+                assert_ne!(norm_str, format!(r"\\?\{drive}:."));
+            }
+        }
+    }
 
     #[test]
     fn normalize_db_root_path_creates_deep_long_paths_exceeding_max_path() {
