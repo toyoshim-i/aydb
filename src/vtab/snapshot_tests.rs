@@ -199,3 +199,62 @@ fn outer_savepoint_release_and_rollback_end_the_snapshot() {
         vec![vec![SqlValue::Text("three".into())]]
     );
 }
+
+#[test]
+fn stale_read_transaction_cannot_upgrade_via_create_virtual_table() {
+    let tmp = TempTestDir::new("vtab_snapshot_upgrade_create");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let (a, b) = connections(engine);
+    a.execute_batch("INSERT INTO t VALUES ('a', 'old', NULL)")
+        .unwrap();
+    a.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        query(&a, "SELECT s FROM t WHERE k='a'"),
+        vec![vec![SqlValue::Text("old".into())]]
+    );
+    b.execute_batch("UPDATE t SET s='new' WHERE k='a'").unwrap();
+    let error = a
+        .execute_batch(
+            "CREATE VIRTUAL TABLE extra USING aydb(table_id=3, columns='k TEXT PRIMARY KEY, v TEXT')",
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("snapshot")
+            || error.to_string().contains("locked")
+            || error.to_string().contains("busy"),
+        "{error}"
+    );
+    assert_eq!(
+        query(&a, "SELECT s FROM t WHERE k='a'"),
+        vec![vec![SqlValue::Text("old".into())]]
+    );
+    a.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        query(&b, "SELECT s FROM t WHERE k='a'"),
+        vec![vec![SqlValue::Text("new".into())]]
+    );
+
+    // A fresh read transaction whose snapshot is still current can upgrade via CREATE VIRTUAL TABLE.
+    a.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        query(&a, "SELECT s FROM t WHERE k='a'"),
+        vec![vec![SqlValue::Text("new".into())]]
+    );
+    a.execute_batch(
+        "CREATE VIRTUAL TABLE extra USING aydb(table_id=3, columns='k TEXT PRIMARY KEY, v TEXT');
+         INSERT INTO extra VALUES ('k1', 'v1');
+         COMMIT;",
+    )
+    .unwrap();
+    b.execute_batch(
+        "CREATE VIRTUAL TABLE extra USING aydb(table_id=3, columns='k TEXT PRIMARY KEY, v TEXT')",
+    )
+    .unwrap();
+    assert_eq!(
+        query(&b, "SELECT v FROM extra WHERE k='k1'"),
+        vec![vec![SqlValue::Text("v1".into())]]
+    );
+}

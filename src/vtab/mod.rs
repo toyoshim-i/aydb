@@ -857,6 +857,14 @@ unsafe fn vtab_create_or_connect(
                 Err(_) => return SQLITE_ERROR,
             };
             if join_user_tx && !began_here && !eng.conn_has_open_transaction(db as usize) {
+                if let Some(snapshot) = aux.read_session.current() {
+                    if let Err(error) = eng.check_snapshot_write_upgrade(db as usize, &snapshot) {
+                        if !pz_err.is_null() {
+                            *pz_err = sqlite_error_message(&error.to_string());
+                        }
+                        return io_err_to_sqlite_rc(&error);
+                    }
+                }
                 match eng.begin_transaction_for_conn(db as usize) {
                     Ok(()) => began_here = true,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
