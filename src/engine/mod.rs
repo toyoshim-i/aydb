@@ -1590,24 +1590,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    /// Unregisters a disconnected virtual table `(table_id, table_name)` from the live registry.
-    pub fn unregister_vtab(&mut self, table_id: u16, table_name: &str) {
-        let norm_name = table_name.trim().to_ascii_lowercase();
-        if self.active_vtab_ids.get(&table_id).map(|s| s.as_ref()) != Some(norm_name.as_str()) {
-            return;
-        }
-        if let Some(holders) = self.active_vtab_holders.get_mut(&table_id) {
-            if !holders.is_empty() {
-                holders.pop();
-                if !holders.is_empty() {
-                    return;
-                }
-            }
-            self.active_vtab_holders.remove(&table_id);
-        }
-        self.active_vtab_ids.remove(&table_id);
-    }
-
     /// Renames a live virtual table in the catalog (`xRename` / `ALTER TABLE ... RENAME TO`): the
     /// entry of `old_name` moves to `new_name` and keeps its `table_id`. Both catalog writes and
     /// the live registration follow the enclosing transaction, so a rollback restores the old

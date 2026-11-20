@@ -25,7 +25,7 @@ Rust `pub` visibility currently exposes more than the intended application subse
 
 | Surface | Intended audience |
 | :--- | :--- |
-| `*_for_conn`, connection read views, `register_or_resolve_vtab*`, `unregister_vtab` | SQLite adapter and other engine integrations that manage connection ownership/catalog lifecycles |
+| `*_for_conn`, connection read views, `register_or_resolve_vtab*` | SQLite adapter and other engine integrations that manage connection ownership/catalog lifecycles |
 | `put_row_owned_with_hint`, compaction hooks, shared-reader retry protocols | Integrations that can uphold the relevant engine-lock and visibility invariants |
 | `CompactionJob`, `CompactionOutput`, `prepare_compaction`, `install_compaction` | Custom maintenance schedulers; consume the documented prepare/run/install protocol |
 | `PlatformFs`, `PlatformFile` | Custom filesystem backends and fault-injection implementations |

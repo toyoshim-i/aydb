@@ -4265,11 +4265,15 @@ fn explicit_table_id_cannot_alias_or_remap_a_persisted_table() {
     let tmp = TempTestDir::new("explicit_table_id_alias");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
-    let id = engine.register_or_resolve_vtab("alpha", Some(5)).unwrap();
+    let plan = engine.plan_vtab_registration("alpha", Some(5)).unwrap();
+    let (id, token) = engine
+        .register_vtab_plan(plan, WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(id, 5);
     engine
         .put_row(id, b"k", b"alpha-data", &[], WriteDurability::BufferedFast)
         .unwrap();
-    engine.unregister_vtab(id, "alpha");
+    engine.unregister_vtab_token(id, token);
 
     // Another name must not take over the persisted id.
     let err = engine
