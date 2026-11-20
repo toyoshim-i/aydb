@@ -7,6 +7,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::meta::{format_lru_blob_file_name, format_std_blob_file_name};
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
@@ -38,6 +39,8 @@ pub struct BlobSegmentWriter<F: PlatformFile> {
     seq_id: u64,
     write_offset: u64,
     buf_start_offset: u64,
+    /// Monotonically updated flushed file length shared with paired [`BlobSegmentReader`] handles.
+    known_file_len: Arc<AtomicU64>,
     /// File offset up to which `sync_durable` has completed successfully. Bytes below this
     /// offset need no further OS sync; the value starts at zero so that the first sync after
     /// open also covers a tail written by a previous process.
@@ -70,9 +73,19 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             seq_id,
             write_offset,
             buf_start_offset: write_offset,
+            known_file_len: Arc::new(AtomicU64::new(write_offset)),
             synced_offset: 0,
             write_buf: Vec::with_capacity(64 * 1024),
         })
+    }
+
+    /// Creates a [`BlobSegmentReader`] sharing this writer's handle and live flushed length.
+    pub fn reader(&self) -> BlobSegmentReader<F> {
+        BlobSegmentReader {
+            file: Arc::clone(&self.file),
+            seq_id: self.seq_id,
+            known_file_len: Arc::clone(&self.known_file_len),
+        }
     }
 
     pub fn seq_id(&self) -> u64 {
@@ -110,6 +123,8 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             self.file
                 .write_all_at(&self.write_buf, self.buf_start_offset)?;
             self.buf_start_offset += self.write_buf.len() as u64;
+            self.known_file_len
+                .fetch_max(self.buf_start_offset, Ordering::Release);
             self.write_buf.clear();
         }
         Ok(())
@@ -205,21 +220,31 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
 pub struct BlobSegmentReader<F: PlatformFile> {
     file: Arc<F>,
     seq_id: u64,
+    known_file_len: Arc<AtomicU64>,
 }
 
 impl<F: PlatformFile> Clone for BlobSegmentReader<F> {
-    /// Cheap clone: bumps the `Arc` refcount of the underlying file handle (pins the open file).
+    /// Cheap clone: bumps the `Arc` refcount of the underlying file handle and shared length cache.
     fn clone(&self) -> Self {
         Self {
             file: Arc::clone(&self.file),
             seq_id: self.seq_id,
+            known_file_len: Arc::clone(&self.known_file_len),
         }
     }
 }
 
 impl<F: PlatformFile> BlobSegmentReader<F> {
     pub fn new(file: Arc<F>, seq_id: u64) -> Self {
-        Self { file, seq_id }
+        Self::new_with_len(file, seq_id, 0)
+    }
+
+    pub fn new_with_len(file: Arc<F>, seq_id: u64, file_len: u64) -> Self {
+        Self {
+            file,
+            seq_id,
+            known_file_len: Arc::new(AtomicU64::new(file_len)),
+        }
     }
 
     pub fn open(
@@ -233,7 +258,8 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             BlobKind::Lru => format_lru_blob_file_name(table_id, seq_id),
         };
         let file = fs.open_file(&file_name, false, false, OpenHint::ImmutableSequential)?;
-        Ok(Self { file, seq_id })
+        let file_len = file.file_len()?;
+        Ok(Self::new_with_len(file, seq_id, file_len))
     }
 
     pub fn seq_id(&self) -> u64 {
@@ -339,12 +365,15 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             return Ok(false);
         }
 
-        let file_len = self.file.file_len()?;
         let Some(end_offset) = (ptr.offset as u64).checked_add(ptr.len as u64) else {
             return Ok(false);
         };
-        if end_offset > file_len {
-            return Ok(false);
+        if end_offset > self.known_file_len.load(Ordering::Acquire) {
+            let file_len = self.file.file_len()?;
+            self.known_file_len.fetch_max(file_len, Ordering::Release);
+            if end_offset > file_len {
+                return Ok(false);
+            }
         }
 
         let orig_len = out.len();
@@ -704,5 +733,132 @@ mod tests {
             reader.read_blob(&ptr2, Some(b"k2")).unwrap().as_deref(),
             Some(val2.as_slice())
         );
+    }
+
+    #[test]
+    fn append_blob_into_skips_file_len_syscall_on_known_range_and_still_rejects_oversized_ptr() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingLenFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            file_len_calls: Arc<AtomicUsize>,
+        }
+
+        impl PlatformFile for CountingLenFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.file_len_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.file_len()
+            }
+            fn preallocate(
+                &self,
+                target_len: u64,
+                strategy: crate::pal::PreallocStrategy,
+            ) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        struct CountingLenFs {
+            inner: OsFs,
+            file_len_calls: Arc<AtomicUsize>,
+        }
+
+        impl PlatformFs for CountingLenFs {
+            type File = CountingLenFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(CountingLenFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    file_len_calls: Arc::clone(&self.file_len_calls),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let dir = TempTestDir::new("blob_cached_len");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fs = CountingLenFs {
+            inner: OsFs::open(&dir.path, true).unwrap(),
+            file_len_calls: Arc::clone(&calls),
+        };
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let reader = writer.reader();
+        let val = vec![0x77u8; 256];
+        let ptr1 = writer.append_blob(b"k1", &val).unwrap();
+        let ptr2 = writer.append_blob(b"k2", &val).unwrap();
+        writer.flush_buffer().unwrap();
+
+        // Repeated reads covered by the flushed writer length must issue 0 file_len() calls.
+        calls.store(0, Ordering::SeqCst);
+        let mut out = Vec::new();
+        assert!(reader.read_blob_into(&ptr1, Some(b"k1"), &mut out).unwrap());
+        assert_eq!(out, val);
+        assert!(
+            reader
+                .append_blob_into(&ptr2, Some(b"k2"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out.len(), 512);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // A corrupt oversized ptr.len > known_file_len falls back to 1 file_len() check and returns Ok(false).
+        let bad_ptr = BlobPtr {
+            len: u32::MAX,
+            ..ptr1
+        };
+        assert!(
+            !reader
+                .append_blob_into(&bad_ptr, Some(b"k1"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out.len(), 512);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Freshly opened reader initializes known_file_len once at open and avoids per-read calls.
+        drop(reader);
+        drop(writer);
+        let opened = BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        calls.store(0, Ordering::SeqCst);
+        assert!(opened.read_blob_into(&ptr1, Some(b"k1"), &mut out).unwrap());
+        assert!(
+            opened
+                .append_blob_into(&ptr2, Some(b"k2"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

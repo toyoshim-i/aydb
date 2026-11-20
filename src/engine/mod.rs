@@ -505,7 +505,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             std_blobs.insert(
                 bmeta.seq_id,
                 TrackedStdBlob {
-                    reader: BlobSegmentReader::new(file, bmeta.seq_id),
+                    reader: BlobSegmentReader::new_with_len(file, bmeta.seq_id, physical_len),
                     file_len,
                     dead_bytes: bmeta.dead_bytes,
                 },
@@ -530,7 +530,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 (lmeta.table_id, lmeta.seq_id),
                 TrackedLruBlob {
                     table_id: lmeta.table_id,
-                    reader: BlobSegmentReader::new(file, lmeta.seq_id),
+                    reader: BlobSegmentReader::new_with_len(file, lmeta.seq_id, physical_len),
                     file_len,
                     dead_bytes: lmeta.dead_bytes,
                 },
@@ -562,7 +562,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             std_blobs.insert(
                                 seq_id,
                                 TrackedStdBlob {
-                                    reader: BlobSegmentReader::new(file, seq_id),
+                                    reader: BlobSegmentReader::new_with_len(file, seq_id, flen),
                                     file_len: flen,
                                     dead_bytes: 0,
                                 },
@@ -588,7 +588,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                     (tbl_id, seq_id),
                                     TrackedLruBlob {
                                         table_id: tbl_id,
-                                        reader: BlobSegmentReader::new(file, seq_id),
+                                        reader: BlobSegmentReader::new_with_len(file, seq_id, flen),
                                         file_len: flen,
                                         dead_bytes: 0,
                                     },
@@ -3210,7 +3210,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
-                    let reader = BlobSegmentReader::new(writer.file().clone(), seq_id);
+                    let reader = writer.reader();
                     let mut std_metas = self.build_checkpointed_std_blob_metas();
                     std_metas.push(StdBlobSegmentMeta {
                         seq_id,
@@ -3264,7 +3264,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
-                    let reader = BlobSegmentReader::new(writer.file().clone(), seq_id);
+                    let reader = writer.reader();
                     let mut lru_metas = self.build_checkpointed_lru_blob_metas();
                     lru_metas.push(LruBlobSegmentMeta {
                         seq_id,
