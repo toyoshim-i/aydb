@@ -44,19 +44,68 @@ unsafe extern "C" {
 /// macOS `ENOTTY` ("inappropriate ioctl for device").
 #[cfg(any(target_os = "macos", test))]
 const MACOS_ENOTTY: i32 = 25;
-/// macOS `ENOTSUP` (also `EOPNOTSUPP`).
+/// macOS `ENOTSUP` ("operation not supported").
 #[cfg(any(target_os = "macos", test))]
 const MACOS_ENOTSUP: i32 = 45;
+/// macOS `EOPNOTSUPP` ("operation not supported on socket", distinct from `ENOTSUP` on Darwin).
+#[cfg(any(target_os = "macos", test))]
+const MACOS_EOPNOTSUPP: i32 = 102;
 
 /// Decides whether a failed `fcntl(F_FULLFSYNC)` means "this filesystem cannot do it" (so a plain
-/// `fsync` is the best available) rather than a real flush failure. Only `ENOTSUP` (SMB and some
-/// other network or FUSE mounts; the case Go's `File.Sync` handles) and `ENOTTY` (the filesystem
-/// has no ioctl handler; seen with OpenJDK and Bitcoin Core) qualify. Any other errno, notably
-/// `EIO`, must be returned: after a failed flush the kernel may drop the dirty pages, and a later
-/// `fsync` would then report success for data that never reached the disk.
+/// `fsync` is the best available) rather than a real flush failure. Only `ENOTSUP`, `EOPNOTSUPP`
+/// (SMB and some other network or FUSE mounts; the case Go's `File.Sync` handles), and `ENOTTY`
+/// (the filesystem has no ioctl handler; seen with OpenJDK and Bitcoin Core) qualify. Any other
+/// errno, notably `EIO`, must be returned: after a failed flush the kernel may drop the dirty
+/// pages, and a later `fsync` would then report success for data that never reached the disk.
 #[cfg(any(target_os = "macos", test))]
 fn full_fsync_unsupported(errno: i32) -> bool {
-    errno == MACOS_ENOTSUP || errno == MACOS_ENOTTY
+    matches!(errno, MACOS_ENOTSUP | MACOS_EOPNOTSUPP | MACOS_ENOTTY)
+}
+
+/// Runs a full-sync primitive (`fcntl(F_FULLFSYNC)`) with `EINTR` retries, falling back to a
+/// plain `fsync` (also retrying `EINTR`) only when the error code indicates the filesystem
+/// does not support `F_FULLFSYNC` (`ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`).
+#[cfg(any(target_os = "macos", test))]
+fn sync_full_or_fallback(
+    mut full: impl FnMut() -> io::Result<()>,
+    mut fallback: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    loop {
+        match full() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if full_fsync_unsupported(e.raw_os_error().unwrap_or(0)) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    loop {
+        match fallback() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sync_file_durable(file: &File) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    sync_full_or_fallback(
+        || {
+            if unsafe { fcntl(fd, F_FULLFSYNC) } == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        || {
+            if unsafe { fsync(fd) } == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Tells the kernel how the file will be accessed. Advisory, so a failure is ignored. Blob files
@@ -343,41 +392,26 @@ impl PlatformFile for UnixPlatformFile {
     fn sync_barrier(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            if self.hint == OpenHint::MutableSyncLog {
-                return self.sync_durable();
-            }
+            // Rust std's `File::sync_data` calls `fcntl(F_FULLFSYNC)` on macOS without falling
+            // back to `fsync`, which fails on SMB/FUSE mounts. Route all macOS barriers through
+            // `sync_durable` so `EINTR` retries and `ENOTSUP`/`EOPNOTSUPP`/`ENOTTY` fallback apply.
+            self.sync_durable()
         }
-        self.with_file(|f| f.sync_data())
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.with_file(|f| f.sync_data())
+        }
     }
 
     fn sync_durable(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
-        #[allow(clippy::needless_return)]
         {
-            // errno must be read inside the closure, right after the call.
-            let res = self.with_file(|f| {
-                if unsafe { fcntl(f.as_raw_fd(), F_FULLFSYNC) } != -1 {
-                    return Ok(None);
-                }
-                Ok(Some(io::Error::last_os_error()))
-            })?;
-            let Some(err) = res else {
-                return Ok(());
-            };
-            if !full_fsync_unsupported(err.raw_os_error().unwrap_or(0)) {
-                return Err(err);
-            }
-            // std's `sync_all` itself issues F_FULLFSYNC on macOS, so call `fsync` directly.
-            return self.with_file(|f| {
-                if unsafe { fsync(f.as_raw_fd()) } == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
+            self.with_file(macos_sync_file_durable)
         }
         #[cfg(not(target_os = "macos"))]
-        self.with_file(|f| f.sync_all())
+        {
+            self.with_file(|f| f.sync_all())
+        }
     }
 
     fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
@@ -426,7 +460,14 @@ impl UnixPlatformFs {
     /// segment/manifest directory entries survive sudden power loss.
     pub fn sync_dir(&self) -> io::Result<()> {
         let dir = File::open(&self.root)?;
-        dir.sync_all()
+        #[cfg(target_os = "macos")]
+        {
+            macos_sync_file_durable(&dir)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            dir.sync_all()
+        }
     }
 }
 
@@ -497,10 +538,79 @@ mod tests {
     #[test]
     fn full_fsync_falls_back_only_for_unsupported_filesystems() {
         assert!(full_fsync_unsupported(MACOS_ENOTSUP));
+        assert!(full_fsync_unsupported(MACOS_EOPNOTSUPP));
         assert!(full_fsync_unsupported(MACOS_ENOTTY));
         for errno in [5, 9, 22, 28, 0] {
             assert!(!full_fsync_unsupported(errno), "errno {errno}");
         }
+    }
+
+    #[test]
+    fn sync_full_or_fallback_retries_eintr_and_falls_back_only_when_unsupported() {
+        // 1. EINTR on F_FULLFSYNC retries and succeeds without calling fallback.
+        let mut full_calls = 0usize;
+        let mut fallback_calls = 0usize;
+        sync_full_or_fallback(
+            || {
+                full_calls += 1;
+                if full_calls == 1 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                fallback_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(full_calls, 2);
+        assert_eq!(fallback_calls, 0);
+
+        // 2. ENOTSUP, EOPNOTSUPP, and ENOTTY trigger fallback `fsync`, which also retries EINTR.
+        for errno in [MACOS_ENOTSUP, MACOS_EOPNOTSUPP, MACOS_ENOTTY] {
+            let mut full_attempts = 0usize;
+            let mut fb_attempts = 0usize;
+            sync_full_or_fallback(
+                || {
+                    full_attempts += 1;
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+                || {
+                    fb_attempts += 1;
+                    if fb_attempts == 1 {
+                        Err(io::Error::from(io::ErrorKind::Interrupted))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(full_attempts, 1, "errno {errno}");
+            assert_eq!(fb_attempts, 2, "errno {errno}");
+        }
+
+        // 3. Hardware I/O error (EIO=5) on full must fail without calling fallback.
+        let mut fb_after_eio = false;
+        let err = sync_full_or_fallback(
+            || Err(io::Error::from_raw_os_error(5)),
+            || {
+                fb_after_eio = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert!(!fb_after_eio);
+
+        // 4. Error on fallback after unsupported F_FULLFSYNC is propagated.
+        let err = sync_full_or_fallback(
+            || Err(io::Error::from_raw_os_error(MACOS_EOPNOTSUPP)),
+            || Err(io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
     }
 
     #[test]
