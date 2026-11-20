@@ -748,8 +748,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
         self.vtabs_created_in_tx.clear();
-        let overlay = core::mem::take(&mut self.tx_overlay.map);
+        let first_own_lsn = if self.tx_start_meta.active {
+            self.tx_start_meta.next_lsn
+        } else {
+            0
+        };
+        let mut overlay = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
+        overlay.retain(|_, entry| entry.lsn >= first_own_lsn);
         if !overlay.is_empty() {
             self.data_generation += 1;
         }

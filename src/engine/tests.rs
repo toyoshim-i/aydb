@@ -4957,6 +4957,120 @@ fn buffered_commit_first_makes_earlier_group_commits_durable() {
 }
 
 #[test]
+fn publish_committed_transaction_does_not_reabsorb_flushed_pending_group_entries() {
+    let seeded_row_key = encode_primary_row_key(1, b"seeded_k");
+
+    // 1. Direct commit path (`BufferedFast` WAL rotation flushes `pending_group` entries into an `idx` segment).
+    {
+        let tmp = TempTestDir::new("pending_group_no_reabsorb_buf");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 8192;
+        cfg.sync_wal_size_bytes = 8 * 4096;
+        cfg.buf_wal_size_bytes = 8 * 4096;
+        let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+        for i in 0..9u32 {
+            engine
+                .put_row(
+                    1,
+                    format!("pre_{i}").as_bytes(),
+                    &[b'p'; 2500],
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+        }
+        let ticket = commit_into_group(&mut engine, 1, b"seeded_k", b"v1");
+        engine.begin_transaction_for_conn(2).unwrap();
+        assert!(engine.tx_overlay.map.contains_key(&seeded_row_key));
+        for i in 0..4u32 {
+            let k = format!("tx2_{i:02}");
+            engine
+                .put_row(
+                    1,
+                    k.as_bytes(),
+                    &[b'x'; 2500],
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+        }
+        engine.commit_transaction_for_conn(2).unwrap();
+
+        assert!(
+            !engine.idx_segments.is_empty(),
+            "RingFull during buffered WAL append must flush MemTable to an idx segment"
+        );
+        assert!(
+            engine.memtable.get(&seeded_row_key).is_none(),
+            "seeded entry already flushed to idx must not be re-absorbed into MemTable"
+        );
+        assert_eq!(
+            engine.get_row(1, b"seeded_k").unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert!(engine.get_row(1, b"tx2_00").unwrap().is_some());
+        assert!(matches!(
+            ticket.2.join_group(ticket.0).unwrap(),
+            GroupRole::Durable
+        ));
+    }
+
+    // 2. Two-phase non-groupable `AwaitingSync` + `finish_commit_for_conn` path.
+    {
+        let tmp = TempTestDir::new("pending_group_no_reabsorb_sync");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 8192;
+        cfg.sync_wal_size_bytes = 8 * 4096;
+        cfg.buf_wal_size_bytes = 8 * 4096;
+        let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+        for i in 0..6u32 {
+            engine
+                .put_row(
+                    1,
+                    format!("pre_{i}").as_bytes(),
+                    &[b'p'; 2500],
+                    &[],
+                    GROUP_SYNC,
+                )
+                .unwrap();
+        }
+        let ticket = commit_into_group(&mut engine, 1, b"seeded_k", b"v1");
+        engine.begin_transaction_for_conn(2).unwrap();
+        engine.register_capped_table(9, 100_000).unwrap();
+        for i in 0..3u32 {
+            let k = format!("tx2_{i:02}");
+            engine
+                .put_row(1, k.as_bytes(), &[b'y'; 2500], &[], GROUP_SYNC)
+                .unwrap();
+        }
+        engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+        let CommitStep::AwaitingSync(file) = engine.begin_commit_for_conn(2).unwrap() else {
+            panic!("tx with non-empty capped_tables must take AwaitingSync path");
+        };
+        engine.finish_commit_for_conn(file.sync_barrier()).unwrap();
+
+        assert!(!engine.idx_segments.is_empty());
+        assert!(
+            engine.memtable.get(&seeded_row_key).is_none(),
+            "finish_commit_for_conn must not re-absorb flushed pending_group entries"
+        );
+        assert_eq!(
+            engine.get_row(1, b"seeded_k").unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert!(engine.get_row(1, b"tx2_00").unwrap().is_some());
+        assert!(matches!(
+            ticket.2.join_group(ticket.0).unwrap(),
+            GroupRole::Durable
+        ));
+    }
+}
+
+#[test]
 fn transaction_without_writes_does_not_publish_undurable_commits() {
     let tmp = TempTestDir::new("group_read_only");
     let mut engine = open_group_engine(&tmp);
