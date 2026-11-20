@@ -2699,8 +2699,18 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
+        // SQLite invokes `xCommit` once per virtual table in `aVTrans`. Once an earlier table's
+        // commit ends the engine transaction and notifies `commit_gate`, another connection may
+        // immediately start a new transaction before SQLite calls `xCommit` on the remaining
+        // tables; skip `begin_commit_for_conn` when this connection no longer owns a tx.
         let step = match vtab.engine.write() {
-            Ok(mut eng) => eng.begin_commit_for_conn(vtab.db as usize),
+            Ok(mut eng) => {
+                if !eng.conn_has_open_transaction(vtab.db as usize) {
+                    Ok(CommitStep::Done)
+                } else {
+                    eng.begin_commit_for_conn(vtab.db as usize)
+                }
+            }
             Err(_) => return SQLITE_ERROR,
         };
         // The device flush runs without the engine lock so that readers are not held up by it.
@@ -2744,20 +2754,25 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.write() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
+        let restored_name = {
+            let mut eng = match vtab.engine.write() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if eng.conn_has_open_transaction(vtab.db as usize) {
+                if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
+                    return io_err_to_sqlite_rc(&e);
+                }
+                eng.active_vtab_name(vtab.table_id)
+            } else {
+                None
+            }
         };
-        if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
-            return io_err_to_sqlite_rc(&e);
-        }
-        if let Some(actual) = eng.active_vtab_name(vtab.table_id) {
+        let prev_name = vtab.pre_tx_name.lock().ok().and_then(|mut p| p.take());
+        if let Some(actual) = prev_name.or(restored_name) {
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = actual;
             }
-        }
-        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
-            *prev = None;
         }
         SQLITE_OK
     }))
@@ -2786,6 +2801,9 @@ unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
+        if !eng.conn_has_open_transaction(vtab.db as usize) {
+            return SQLITE_OK;
+        }
         if let Err(e) = eng.release_savepoint_for_conn(vtab.db as usize, i_savepoint) {
             return io_err_to_sqlite_rc(&e);
         }

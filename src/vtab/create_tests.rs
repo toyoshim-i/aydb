@@ -519,3 +519,99 @@ fn a_create_before_savepoint_and_rename_inside_rolled_back_savepoint_keeps_origi
     assert_eq!(ints(&conn, "SELECT v FROM t"), [10]);
     assert!(conn.query_all("SELECT * FROM t2", &[]).is_err());
 }
+
+#[test]
+fn concurrent_writer_does_not_cause_busy_on_multi_table_commit_or_rollback() {
+    use crate::engine::EngineConfig;
+    use crate::util::test_util::TempTestDir;
+    use std::sync::Barrier;
+
+    let tmp = TempTestDir::new("multi_table_tx_race");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    cfg.writer_wait_timeout_ms = 5_000;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let conn1 = SqliteConnection::open_in_memory().unwrap();
+    conn1
+        .register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    conn1
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t1 USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, v INT');
+             CREATE VIRTUAL TABLE t2 USING aydb(table_id=2, columns='k INTEGER PRIMARY KEY, v INT');
+             CREATE VIRTUAL TABLE u  USING aydb(table_id=3, columns='k INTEGER PRIMARY KEY, v INT');",
+        )
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(Barrier::new(2));
+    let competitor = {
+        let engine = engine.clone();
+        let stop = stop.clone();
+        let ready = ready.clone();
+        std::thread::spawn(move || {
+            let conn2 = SqliteConnection::open_in_memory().unwrap();
+            conn2
+                .register_aydb_module_with_options(engine, false)
+                .unwrap();
+            conn2
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE u USING aydb(table_id=3, columns='k INTEGER PRIMARY KEY, v INT');",
+                )
+                .unwrap();
+            ready.wait();
+            let mut n = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                conn2
+                    .execute_batch(&format!("BEGIN; INSERT INTO u VALUES ({n}, {n}); COMMIT;"))
+                    .unwrap_or_else(|e| panic!("competitor commit {n} failed: {e}"));
+            }
+            n
+        })
+    };
+    ready.wait();
+
+    // A: Multi-table ROLLBACK under continuous writer contention.
+    for i in 0..40i64 {
+        conn1
+            .execute_batch(&format!(
+                "BEGIN; INSERT INTO t1 VALUES ({i}, {i}); INSERT INTO t2 VALUES ({i}, {i}); ROLLBACK;"
+            ))
+            .unwrap_or_else(|e| panic!("multi-table rollback {i} failed: {e}"));
+    }
+
+    // B: Multi-table transactional CREATE VIRTUAL TABLE + COMMIT under contention.
+    for i in 0..20i64 {
+        let a = format!("a_{i}");
+        let b = format!("b_{i}");
+        conn1
+            .execute_batch(&format!(
+                "BEGIN;
+                 CREATE VIRTUAL TABLE {a} USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+                 CREATE VIRTUAL TABLE {b} USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+                 COMMIT;"
+            ))
+            .unwrap_or_else(|e| panic!("multi-table create commit {i} failed: {e}"));
+    }
+
+    // C: Multi-table implicit SAVEPOINT + RELEASE under contention.
+    for i in 0..40i64 {
+        let k = 1000 + i;
+        conn1
+            .execute_batch(&format!(
+                "SAVEPOINT sp; INSERT INTO t1 VALUES ({k}, {k}); INSERT INTO t2 VALUES ({k}, {k}); RELEASE sp;"
+            ))
+            .unwrap_or_else(|e| panic!("multi-table release {i} failed: {e}"));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let competitor_rows = competitor.join().unwrap();
+    assert!(competitor_rows > 0);
+    assert_eq!(ints(&conn1, "SELECT count(*) FROM t1"), [40]);
+    assert_eq!(ints(&conn1, "SELECT count(*) FROM t2"), [40]);
+    assert_eq!(ints(&conn1, "SELECT count(*) FROM u"), [competitor_rows]);
+}
