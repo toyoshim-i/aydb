@@ -861,6 +861,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.scan_merged_prefix_from(prefix, prefix, usize::MAX)
     }
 
+    pub(super) fn scan_merged_prefix_view(
+        &self,
+        view: ReadView,
+        prefix: &[u8],
+    ) -> io::Result<Vec<IndexEntry>> {
+        let mut out = Vec::new();
+        self.visit_merged_prefix_range_view(
+            view,
+            prefix,
+            prefix,
+            true,
+            None,
+            usize::MAX,
+            |key, lsn, val| {
+                let value = match val {
+                    MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
+                    MergedValueRef::Blob(ptr) => IndexValue::Blob(ptr),
+                };
+                out.push(IndexEntry {
+                    key: key.to_vec(),
+                    lsn,
+                    value,
+                });
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
     pub(super) fn scan_merged_prefix_from(
         &self,
         prefix: &[u8],

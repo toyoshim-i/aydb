@@ -294,3 +294,88 @@ fn repeated_connects_to_an_existing_table_never_fail_against_a_busy_writer() {
     );
     assert_eq!(failures, 0);
 }
+
+#[test]
+fn connecting_uncommitted_created_table_waits_instead_of_reporting_corrupt() {
+    for ddl in [
+        "CREATE VIRTUAL TABLE n USING aydb(columns='id INTEGER PRIMARY KEY, v TEXT')",
+        NEW_DDL,
+    ] {
+        let fx = fixture("connect_uncommitted_create", 150);
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        conn1
+            .register_aydb_module_with_options(fx.engine.clone(), false)
+            .unwrap();
+        conn1.execute_batch("BEGIN").unwrap();
+        conn1.execute_batch(ddl).unwrap();
+
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        conn2
+            .register_aydb_module_with_options(fx.engine.clone(), false)
+            .unwrap();
+        let started = Instant::now();
+        let err = conn2.execute_batch(ddl).unwrap_err().to_string();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(!err.contains("unsupported older format"), "{err}");
+        assert!(!err.contains("malformed"), "{err}");
+
+        conn1.execute_batch("ROLLBACK").unwrap();
+
+        conn2.execute_batch(ddl).unwrap();
+        conn2
+            .execute_batch("INSERT INTO n VALUES (1, 'hello')")
+            .unwrap();
+        assert_eq!(ids(&conn2, "n"), vec![1]);
+    }
+}
+
+#[test]
+fn connecting_during_uncommitted_rename_does_not_poison_rollback() {
+    let fx = fixture("connect_uncommitted_rename", 150);
+    let conn1 = fx.writer();
+    conn1
+        .execute_batch("BEGIN; INSERT INTO t VALUES (100, 'dirty'); ALTER TABLE t RENAME TO t2;")
+        .unwrap();
+
+    // Connecting under the uncommitted new name must wait and fail busy rather than poison
+    // `tx_start_meta.active_vtab_ids`.
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    conn2
+        .register_aydb_module_with_options(fx.engine.clone(), false)
+        .unwrap();
+    let started = Instant::now();
+    assert!(
+        conn2
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t2 USING aydb(columns='id INTEGER PRIMARY KEY, v TEXT')"
+            )
+            .is_err()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(100));
+
+    // A connection against the committed schema still reads committed `t` without waiting or
+    // clobbering Conn 1's live `"t2"`.
+    let conn3 = fx.open();
+    assert_eq!(ids(&conn3, "t"), vec![1, 2, 3]);
+    assert!(fx.is_registered(1, "t2"));
+
+    conn1.execute_batch("ROLLBACK").unwrap();
+    let conn4 = fx.open();
+    assert_eq!(ids(&conn4, "t"), vec![1, 2, 3]);
+    drop(conn4);
+
+    // Commit path after a concurrent read of committed `t`.
+    conn1
+        .execute_batch(
+            "BEGIN; INSERT INTO t VALUES (100, 'committed'); ALTER TABLE t RENAME TO t2;",
+        )
+        .unwrap();
+    assert_eq!(ids(&conn3, "t"), vec![1, 2, 3]);
+    conn1.execute_batch("COMMIT").unwrap();
+
+    let conn5 = memory_connection(
+        &fx.engine,
+        "CREATE VIRTUAL TABLE t2 USING aydb(columns='id INTEGER PRIMARY KEY, v TEXT')",
+    );
+    assert_eq!(ids(&conn5, "t2"), vec![1, 2, 3, 100]);
+}

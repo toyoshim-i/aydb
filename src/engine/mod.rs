@@ -1173,11 +1173,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Decides which `table_id` a virtual table `(table_name, explicit_id)` resolves to, and
-    /// whether the committed catalog already holds it, without changing anything except draining
-    /// any pending group commit first. Fails exactly where
-    /// [`Self::register_or_resolve_vtab_with_durability`] fails on a conflicting id.
+    /// whether the catalog visible in [`ReadView::Owner`] holds it, without changing anything
+    /// except draining any pending group commit first.
     pub(crate) fn plan_vtab_registration(
         &mut self,
+        table_name: &str,
+        explicit_id: Option<u16>,
+    ) -> io::Result<VtabPlan> {
+        self.plan_vtab_registration_view(ReadView::Owner, table_name, explicit_id)
+    }
+
+    /// View-scoped variant of [`Self::plan_vtab_registration`]. A connection that does not own
+    /// the active transaction uses [`ReadView::Committed`] so uncommitted `CREATE`/`RENAME`
+    /// mutations are hidden and live registrations come from `tx_start_meta`.
+    pub(crate) fn plan_vtab_registration_view(
+        &mut self,
+        view: ReadView,
         table_name: &str,
         explicit_id: Option<u16>,
     ) -> io::Result<VtabPlan> {
@@ -1185,7 +1196,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.drain_group_for_autocommit()?;
         let norm_name = table_name.trim().to_ascii_lowercase();
         let catalog_prefix = [0u8, 0u8, b'c'];
-        let entries = self.scan_merged_prefix(&catalog_prefix)?;
+        let entries = self.scan_merged_prefix_view(view, &catalog_prefix)?;
         let mut persisted_name_to_id: HashMap<String, u16> = HashMap::new();
         let mut persisted_id_to_name: HashMap<u16, String> = HashMap::new();
         for entry in entries {
@@ -1201,6 +1212,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        let active_vtab_ids = if view == ReadView::Committed && self.tx_start_meta.active {
+            &self.tx_start_meta.active_vtab_ids
+        } else {
+            &self.active_vtab_ids
+        };
+
         let chosen_id = match explicit_id {
             Some(id) => {
                 if id == 0 {
@@ -1209,7 +1226,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         "table_id 0 is reserved for engine system catalog",
                     ));
                 }
-                if let Some(existing_name) = self.active_vtab_ids.get(&id) {
+                if let Some(existing_name) = active_vtab_ids.get(&id) {
                     if existing_name.as_ref() != norm_name.as_str() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -1243,7 +1260,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             None => {
                 if let Some(&id) = persisted_name_to_id.get(&norm_name) {
-                    if let Some(existing_name) = self.active_vtab_ids.get(&id) {
+                    if let Some(existing_name) = active_vtab_ids.get(&id) {
                         if existing_name.as_ref() != norm_name.as_str() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -1257,7 +1274,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 } else {
                     let mut candidate = 1u16;
                     while candidate < u16::MAX
-                        && (self.active_vtab_ids.contains_key(&candidate)
+                        && (active_vtab_ids.contains_key(&candidate)
                             || persisted_id_to_name.contains_key(&candidate))
                     {
                         candidate += 1;
@@ -1277,20 +1294,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Registers an already persisted virtual table as live for a connection that does not own
     /// the active transaction. Unlike a registration made by the transaction owner, it must
     /// survive that transaction's rollback, so it is also recorded in the snapshots a rollback
-    /// restores.
+    /// restores without clobbering any uncommitted rename/drop already recorded by the owner.
     pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) {
         let name: Arc<str> = Arc::from(table_name.trim().to_ascii_lowercase().as_str());
-        self.active_vtab_ids.insert(table_id, name.clone());
         if self.tx_start_meta.active {
-            self.tx_start_meta
-                .active_vtab_ids
-                .insert(table_id, name.clone());
-        }
-        for marker in &mut self.savepoints {
-            marker
-                .meta_snapshot
-                .active_vtab_ids
-                .insert(table_id, name.clone());
+            let orig = self.tx_start_meta.active_vtab_ids.get(&table_id).cloned();
+            if self.active_vtab_ids.get(&table_id) == orig.as_ref() {
+                self.active_vtab_ids.insert(table_id, name.clone());
+            }
+            for marker in &mut self.savepoints {
+                if marker.meta_snapshot.active_vtab_ids.get(&table_id) == orig.as_ref() {
+                    marker
+                        .meta_snapshot
+                        .active_vtab_ids
+                        .insert(table_id, name.clone());
+                }
+            }
+            self.tx_start_meta.active_vtab_ids.insert(table_id, name);
+        } else {
+            self.active_vtab_ids.insert(table_id, name);
         }
     }
 

@@ -83,6 +83,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.capped_tables.get(&table_id)
     }
 
+    /// Returns the [`CappedTableState`] visible in `view`.
+    pub(crate) fn capped_table_state_view(
+        &self,
+        view: ReadView,
+        table_id: u16,
+    ) -> Option<&CappedTableState> {
+        if view == ReadView::Committed && self.tx_start_meta.active {
+            self.tx_start_meta.capped_tables.get(&table_id)
+        } else {
+            self.capped_tables.get(&table_id)
+        }
+    }
+
     pub(super) fn eager_promote_lru_on_read(&mut self, table_id: u16, pk: &[u8]) -> io::Result<()> {
         let meta_key = encode_row_meta_key(table_id, pk);
         let Some((mut meta, old_m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? else {

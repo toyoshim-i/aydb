@@ -620,17 +620,14 @@ fn connect_table(
     conn_id: usize,
     ddl: &ParsedVtabDdl,
 ) -> io::Result<Option<Connected>> {
-    let plan = eng.plan_vtab_registration(&ddl.table_name, ddl.explicit_table_id)?;
+    let view = eng.read_view_for_conn(conn_id);
+    let plan = eng.plan_vtab_registration_view(view, &ddl.table_name, ddl.explicit_table_id)?;
     let table_id = plan.table_id;
     let newly_created = !plan.persisted;
     // A table is created together with its rowid mapping marker, in one atomic write. One
     // without it was written by a build that predates the mapping, which is not supported.
     // A marker that cannot be read is left to the reads of the table to report.
-    if plan.persisted
-        && !eng
-            .rowids_initialized_view(eng.read_view_for_conn(conn_id), table_id)
-            .unwrap_or(true)
-    {
+    if plan.persisted && !eng.rowids_initialized_view(view, table_id).unwrap_or(true) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "table has no persistent rowid mapping (it was written by an unsupported older \
@@ -640,7 +637,7 @@ fn connect_table(
     if eng.check_write_allowed_for_conn(conn_id).is_err() {
         let quota_registered = ddl.max_bytes == 0
             || eng
-                .capped_table_state(table_id)
+                .capped_table_state_view(view, table_id)
                 .is_some_and(|state| state.max_bytes == ddl.max_bytes);
         if !(plan.persisted && quota_registered) {
             return Ok(None);
