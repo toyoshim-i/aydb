@@ -567,7 +567,8 @@ enum SlotLoadError {
     /// manifest: safe to demote and fall back to the opposite valid slot.
     Corrupt(io::Error),
     /// CRC-verified slot or external manifest carrying an unsupported format version, unknown flag
-    /// bits, or non-zero reserved header bytes: must abort open without falling back.
+    /// bits, non-zero reserved header bytes, invalid header bounds, invalid catalog payload, or
+    /// self-contradictory `pending_delete_files`: must abort open without falling back.
     Incompatible(io::Error),
     /// Potentially transient I/O error: must abort open so nothing is swept.
     Io(io::Error),
@@ -1163,7 +1164,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             || buf_wal_epoch == u64::MAX
             || payload_len > MAX_INLINE_PAYLOAD_LEN
         {
-            return Err(SlotLoadError::Corrupt(io::Error::new(
+            return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid generation, bounds, or payload_len in boot_meta slot",
             )));
@@ -1171,7 +1172,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         let slot_payload = &slot_buf[64..64 + payload_len];
         if crc32c(slot_payload) != expected_payload_crc {
-            return Err(SlotLoadError::Corrupt(io::Error::new(
+            return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload CRC32C mismatch in boot_meta slot",
             )));
@@ -1190,10 +1191,10 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state.active_manifest_seq_id = None;
             state
                 .decode_catalog_payload(slot_payload)
-                .map_err(SlotLoadError::Corrupt)?;
+                .map_err(SlotLoadError::Incompatible)?;
         } else {
             if slot_payload.len() != EXTERNAL_POINTER_LEN {
-                return Err(SlotLoadError::Corrupt(io::Error::new(
+                return Err(SlotLoadError::Incompatible(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid external manifest pointer length in boot_meta slot",
                 )));
@@ -1201,6 +1202,20 @@ impl<F: PlatformFs> BootMetaManager<F> {
             let mf_seq_id = u64::from_le_bytes(slot_payload[0..8].try_into().unwrap());
             let mf_file_len = u64::from_le_bytes(slot_payload[8..16].try_into().unwrap());
             let mf_expected_crc = u32::from_le_bytes(slot_payload[16..20].try_into().unwrap());
+
+            if mf_file_len < MANIFEST_HEADER_LEN as u64 || mf_file_len > MAX_EXTERNAL_MANIFEST_BYTES
+            {
+                return Err(SlotLoadError::Incompatible(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "external manifest length out of supported bounds",
+                )));
+            }
+            let mf_len_usize = usize::try_from(mf_file_len).map_err(|_| {
+                SlotLoadError::Incompatible(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "external manifest length overflow",
+                ))
+            })?;
 
             let map_mf_io = |e: io::Error| match e.kind() {
                 io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof => SlotLoadError::Corrupt(e),
@@ -1211,25 +1226,16 @@ impl<F: PlatformFs> BootMetaManager<F> {
             let mf_file = fs
                 .open_file(&mf_name, false, false, OpenHint::ImmutableSequential)
                 .map_err(map_mf_io)?;
-            if mf_file.file_len().map_err(map_mf_io)? != mf_file_len
-                || mf_file_len < MANIFEST_HEADER_LEN as u64
-                || mf_file_len > MAX_EXTERNAL_MANIFEST_BYTES
-            {
+            if mf_file.file_len().map_err(map_mf_io)? != mf_file_len {
                 return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "external manifest file length mismatch or exceeds budget",
+                    "external manifest file length mismatch",
                 )));
             }
-            let mf_len_usize = usize::try_from(mf_file_len).map_err(|_| {
-                SlotLoadError::Corrupt(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "external manifest length overflow",
-                ))
-            })?;
             let mut mf_buf = Vec::new();
             mf_buf.try_reserve_exact(mf_len_usize).map_err(|_| {
-                SlotLoadError::Corrupt(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                SlotLoadError::Io(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
                     "external manifest allocation overflow",
                 ))
             })?;
@@ -1284,7 +1290,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state.active_manifest_seq_id = Some(mf_seq_id);
             state
                 .decode_catalog_payload(catalog_slice)
-                .map_err(SlotLoadError::Corrupt)?;
+                .map_err(SlotLoadError::Incompatible)?;
         }
 
         let referenced = state.referenced_file_names();
@@ -1293,7 +1299,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             .iter()
             .any(|fname| referenced.contains(fname))
         {
-            return Err(SlotLoadError::Corrupt(io::Error::new(
+            return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pending_delete_files references an active segment or manifest",
             )));
@@ -2377,16 +2383,30 @@ mod tests {
         assert!(tmp.path.join("user_keep.txt").exists());
         assert!(tmp.path.join(&active_idx).exists());
 
-        // Now craft Slot A (Gen 99) claiming both `idx_segments=[1]` and `pending_delete=[idx_1]`
-        // on disk; reopen must demote Slot A and fall back cleanly to Gen 2 in Slot B.
+        // Now craft Slot A (Gen 99) claiming `idx_segments=[1, 2]` and `pending_delete=[idx_1]` on
+        // disk while `idx_2` exists only in Gen 99; reopen must abort with `InvalidData` rather
+        // than falling back to Gen 2 Slot B and sweeping `idx_2`.
         drop(mgr);
+        let newer_idx = format_idx_file_name(2);
+        let _newer_f = fs
+            .open_file(&newer_idx, true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        drop(_newer_f);
         let mut state = BootMetaState {
-            idx_segments: vec![IdxSegmentMeta {
-                seq_id: 1,
-                file_len: 4096,
-                level: 0,
-                record_count: 1,
-            }],
+            idx_segments: vec![
+                IdxSegmentMeta {
+                    seq_id: 1,
+                    file_len: 4096,
+                    level: 0,
+                    record_count: 1,
+                },
+                IdxSegmentMeta {
+                    seq_id: 2,
+                    file_len: 4096,
+                    level: 0,
+                    record_count: 1,
+                },
+            ],
             pending_delete_files: vec![active_idx.clone()],
             ..BootMetaState::default()
         };
@@ -2405,10 +2425,13 @@ mod tests {
         raw_slots[4092..4096].copy_from_slice(&t_crc.to_le_bytes());
         std::fs::write(&meta_path, &raw_slots).unwrap();
 
-        let recovered = BootMetaManager::open_or_recover(fs).unwrap();
-        assert_eq!(recovered.active_slot(), SlotIndex::SlotB);
-        assert_eq!(recovered.state().generation, 2);
+        let err = match BootMetaManager::open_or_recover(Arc::clone(&fs)) {
+            Ok(_) => panic!("CRC-valid self-contradictory slot must abort open without fallback"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(tmp.path.join(&active_idx).exists());
+        assert!(tmp.path.join(&newer_idx).exists());
     }
 
     #[test]
@@ -2431,6 +2454,8 @@ mod tests {
                 mgr.commit_update(|s| s.checkpoint_lsn = 42).unwrap();
                 assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
             }
+            let extra_idx = format_idx_file_name(99);
+            std::fs::write(tmp.path.join(&extra_idx), b"gen99").unwrap();
             let meta_path = tmp.path.join(BOOT_META_FILE_NAME);
             let mut raw = std::fs::read(&meta_path).unwrap();
             // Rewrite Slot A (generation=99) with the extreme header value and valid CRCs.
@@ -2442,14 +2467,19 @@ mod tests {
             raw[4092..4096].copy_from_slice(&t_crc.to_le_bytes());
             std::fs::write(&meta_path, &raw).unwrap();
 
-            let reopened = BootMetaManager::open_or_recover(fs).unwrap();
+            let err = match BootMetaManager::open_or_recover(Arc::clone(&fs)) {
+                Ok(_) => panic!("offset={offset} val={val:#x}: CRC-valid slot must abort open"),
+                Err(e) => e,
+            };
             assert_eq!(
-                reopened.active_slot(),
-                SlotIndex::SlotB,
-                "offset={offset} val={val:#x}"
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "offset={offset} val={val:#x}: {err}"
             );
-            assert_eq!(reopened.state().generation, 2);
-            assert_eq!(reopened.state().checkpoint_lsn, 42);
+            assert!(
+                tmp.path.join(&extra_idx).exists(),
+                "offset={offset} val={val:#x}: fallback must not sweep {extra_idx}"
+            );
         }
 
         // An orphan file at SeqID u64::MAX must fail cleanly instead of panicking on next allocate.
@@ -2588,5 +2618,110 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("manifest_"))
         );
+    }
+
+    #[test]
+    fn crc_valid_duplicate_seq_id_slot_and_manifest_abort_without_fallback() {
+        // Part 1: inline Slot A (Gen 99) with valid CRCs and duplicate idx seq_id must abort
+        // open without falling back to Slot B (Gen 2) or sweeping newer-generation segments.
+        let tmp1 = TempTestDir::new("dup_seq_inline");
+        let fs1 = Arc::new(OsFs::open(&tmp1.path, true).expect("open OsFs"));
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs1)).unwrap();
+            mgr.commit_update(|s| s.checkpoint_lsn = 10).unwrap();
+            assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
+        }
+        let newer_idx1 = format_idx_file_name(50);
+        std::fs::write(tmp1.path.join(&newer_idx1), b"gen99").unwrap();
+
+        let mut dup_payload = Vec::new();
+        dup_payload.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            dup_payload.extend_from_slice(&50u64.to_le_bytes());
+            dup_payload.extend_from_slice(&4096u64.to_le_bytes());
+            dup_payload.extend_from_slice(&0u16.to_le_bytes());
+            dup_payload.extend_from_slice(&0u16.to_le_bytes());
+            dup_payload.extend_from_slice(&1u32.to_le_bytes());
+        }
+        dup_payload.extend_from_slice(&[0u8; 16]);
+
+        let meta_path1 = tmp1.path.join(BOOT_META_FILE_NAME);
+        let mut raw1 = std::fs::read(&meta_path1).unwrap();
+        raw1[6..8].copy_from_slice(&0u16.to_le_bytes());
+        raw1[8..16].copy_from_slice(&99u64.to_le_bytes());
+        raw1[48..52].copy_from_slice(&(dup_payload.len() as u32).to_le_bytes());
+        raw1[52..56].copy_from_slice(&crc32c(&dup_payload).to_le_bytes());
+        let h_crc1 = crc32c(&raw1[0..60]);
+        raw1[60..64].copy_from_slice(&h_crc1.to_le_bytes());
+        raw1[64..64 + dup_payload.len()].copy_from_slice(&dup_payload);
+        let t_crc1 = crc32c(&raw1[0..4092]);
+        raw1[4092..4096].copy_from_slice(&t_crc1.to_le_bytes());
+        std::fs::write(&meta_path1, &raw1).unwrap();
+
+        let err1 = match BootMetaManager::open_or_recover(Arc::clone(&fs1)) {
+            Ok(_) => panic!("CRC-valid duplicate seq_id inline slot must abort open"),
+            Err(e) => e,
+        };
+        assert_eq!(err1.kind(), io::ErrorKind::InvalidData);
+        assert!(tmp1.path.join(&newer_idx1).exists());
+
+        // Part 2: external manifest (Gen 99) with valid CRCs and duplicate idx seq_id must also
+        // abort open without falling back to Slot B or sweeping newer-generation segments.
+        let tmp2 = TempTestDir::new("dup_seq_manifest");
+        let fs2 = Arc::new(OsFs::open(&tmp2.path, true).expect("open OsFs"));
+        {
+            let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs2)).unwrap();
+            mgr.commit_update(|s| s.checkpoint_lsn = 10).unwrap();
+            assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
+        }
+        let newer_idx2 = format_idx_file_name(60);
+        std::fs::write(tmp2.path.join(&newer_idx2), b"gen99").unwrap();
+        let mf_seq = 61u64;
+        let mf_name = format_manifest_file_name(mf_seq);
+        let mut mf_cat = Vec::new();
+        mf_cat.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            mf_cat.extend_from_slice(&60u64.to_le_bytes());
+            mf_cat.extend_from_slice(&4096u64.to_le_bytes());
+            mf_cat.extend_from_slice(&0u16.to_le_bytes());
+            mf_cat.extend_from_slice(&0u16.to_le_bytes());
+            mf_cat.extend_from_slice(&1u32.to_le_bytes());
+        }
+        mf_cat.extend_from_slice(&[0u8; 16]);
+        let mf_crc = crc32c(&mf_cat);
+        let mut mf_bytes = Vec::with_capacity(MANIFEST_HEADER_LEN + mf_cat.len());
+        mf_bytes.extend_from_slice(MANIFEST_MAGIC);
+        mf_bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        mf_bytes.extend_from_slice(&0u16.to_le_bytes());
+        mf_bytes.extend_from_slice(&(mf_cat.len() as u32).to_le_bytes());
+        mf_bytes.extend_from_slice(&mf_crc.to_le_bytes());
+        mf_bytes.extend_from_slice(&mf_cat);
+        std::fs::write(tmp2.path.join(&mf_name), &mf_bytes).unwrap();
+
+        let mut ptr_payload = [0u8; EXTERNAL_POINTER_LEN];
+        ptr_payload[0..8].copy_from_slice(&mf_seq.to_le_bytes());
+        ptr_payload[8..16].copy_from_slice(&(mf_bytes.len() as u64).to_le_bytes());
+        ptr_payload[16..20].copy_from_slice(&mf_crc.to_le_bytes());
+
+        let meta_path2 = tmp2.path.join(BOOT_META_FILE_NAME);
+        let mut raw2 = std::fs::read(&meta_path2).unwrap();
+        raw2[6..8].copy_from_slice(&FLAG_EXTERNAL_MANIFEST.to_le_bytes());
+        raw2[8..16].copy_from_slice(&99u64.to_le_bytes());
+        raw2[48..52].copy_from_slice(&(EXTERNAL_POINTER_LEN as u32).to_le_bytes());
+        raw2[52..56].copy_from_slice(&crc32c(&ptr_payload).to_le_bytes());
+        let h_crc2 = crc32c(&raw2[0..60]);
+        raw2[60..64].copy_from_slice(&h_crc2.to_le_bytes());
+        raw2[64..64 + EXTERNAL_POINTER_LEN].copy_from_slice(&ptr_payload);
+        let t_crc2 = crc32c(&raw2[0..4092]);
+        raw2[4092..4096].copy_from_slice(&t_crc2.to_le_bytes());
+        std::fs::write(&meta_path2, &raw2).unwrap();
+
+        let err2 = match BootMetaManager::open_or_recover(Arc::clone(&fs2)) {
+            Ok(_) => panic!("CRC-valid duplicate seq_id external manifest must abort open"),
+            Err(e) => e,
+        };
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+        assert!(tmp2.path.join(&mf_name).exists());
+        assert!(tmp2.path.join(&newer_idx2).exists());
     }
 }
