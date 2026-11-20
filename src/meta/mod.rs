@@ -458,6 +458,18 @@ impl BootMetaState {
     }
 }
 
+/// Classifies why a `boot_meta.db` slot could not be loaded.
+enum SlotLoadError {
+    /// Torn write, uninitialized slot, magic/CRC mismatch, or missing/truncated/corrupt external
+    /// manifest: safe to demote and fall back to the opposite valid slot.
+    Corrupt(io::Error),
+    /// CRC-verified slot or external manifest carrying an unsupported format version, unknown flag
+    /// bits, or non-zero reserved header bytes: must abort open without falling back.
+    Incompatible(io::Error),
+    /// Potentially transient I/O error: must abort open so nothing is swept.
+    Io(io::Error),
+}
+
 /// Identifies which of the two 4 KB slots in `boot_meta.db` is being addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotIndex {
@@ -572,10 +584,11 @@ impl<F: PlatformFs> BootMetaManager<F> {
             return Ok(mgr);
         }
 
-        // Only genuine validation failures may demote a slot; any other I/O failure while
-        // reading it aborts the open so no older generation is silently selected and swept.
-        let parsed_a = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_a_raw))?;
-        let parsed_b = Self::fail_on_transient_io(Self::parse_and_load_slot(&fs, slot_b_raw))?;
+        // Only torn/corrupt slots or missing external manifests may demote a slot; CRC-valid
+        // incompatible formats/flags/reserved bytes and transient I/O errors abort the open so no
+        // older generation is silently selected and swept.
+        let parsed_a = Self::classify_slot_result(Self::parse_and_load_slot(&fs, slot_a_raw))?;
+        let parsed_b = Self::classify_slot_result(Self::parse_and_load_slot(&fs, slot_b_raw))?;
 
         let (winning_slot, winning_state, standby_manifest_id) = match (parsed_a, parsed_b) {
             (Ok(state_a), Ok(state_b)) => {
@@ -846,50 +859,37 @@ impl<F: PlatformFs> BootMetaManager<F> {
         Ok(())
     }
 
-    /// Separates "slot content is invalid" from "reading the slot failed".
-    ///
-    /// Errors of kind `InvalidData` (CRC/magic/format violations), `UnexpectedEof` (truncated
-    /// manifest) and `NotFound` (the external manifest is genuinely absent: normal for the older
-    /// slot whose manifest was garbage-collected, and unrecoverable for the newer one) mean the
-    /// slot cannot be trusted and are returned as `Ok(Err(_))` so the caller may fall back to the
-    /// other slot. Every other kind (`PermissionDenied`, sharing violations, network errors, ...)
-    /// may be transient, so it is propagated as the outer `Err` and fails the open: nothing is
-    /// swept or overwritten and the caller can retry later.
-    fn fail_on_transient_io(
-        res: io::Result<BootMetaState>,
+    /// Separates "torn/corrupt slot that may fall back to the opposite slot" from both
+    /// "CRC-verified incompatible format" and "potentially transient I/O error".
+    fn classify_slot_result(
+        res: Result<BootMetaState, SlotLoadError>,
     ) -> io::Result<io::Result<BootMetaState>> {
         match res {
             Ok(state) => Ok(Ok(state)),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::InvalidData
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::UnexpectedEof
-                ) =>
-            {
-                Ok(Err(e))
-            }
-            Err(e) => Err(e),
+            Err(SlotLoadError::Corrupt(e)) => Ok(Err(e)),
+            Err(SlotLoadError::Incompatible(e) | SlotLoadError::Io(e)) => Err(e),
         }
     }
 
-    fn parse_and_load_slot(fs: &Arc<F>, slot_buf: &[u8; SLOT_SIZE]) -> io::Result<BootMetaState> {
+    fn parse_and_load_slot(
+        fs: &Arc<F>,
+        slot_buf: &[u8; SLOT_SIZE],
+    ) -> Result<BootMetaState, SlotLoadError> {
         if &slot_buf[0..4] != BOOT_META_MAGIC {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid magic in boot_meta slot",
-            ));
+            )));
         }
 
         let expected_header_crc =
             u32::from_le_bytes([slot_buf[60], slot_buf[61], slot_buf[62], slot_buf[63]]);
         let actual_header_crc = crc32c(&slot_buf[0..60]);
         if actual_header_crc != expected_header_crc {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "header CRC32C mismatch in boot_meta slot",
-            ));
+            )));
         }
 
         let expected_trailer_crc = u32::from_le_bytes([
@@ -900,26 +900,36 @@ impl<F: PlatformFs> BootMetaManager<F> {
         ]);
         let actual_trailer_crc = crc32c(&slot_buf[0..4092]);
         if actual_trailer_crc != expected_trailer_crc {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "trailer CRC32C mismatch in boot_meta slot (sub-sector torn write)",
-            ));
+            )));
         }
 
+        // Both slot CRCs matched: an unsupported version, unknown flag bit, or non-zero reserved
+        // field here is an intentional newer/foreign format, never a torn write.
         let version = u16::from_le_bytes([slot_buf[4], slot_buf[5]]);
         if version != FORMAT_VERSION {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported boot_meta format version: {version}"),
-            ));
+            )));
         }
 
         let flags = u16::from_le_bytes([slot_buf[6], slot_buf[7]]);
         if (flags & !FLAG_EXTERNAL_MANIFEST) != 0 {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown boot_meta flags: {flags:#x}"),
-            ));
+            )));
+        }
+
+        let reserved = u32::from_le_bytes(slot_buf[56..60].try_into().unwrap());
+        if reserved != 0 {
+            return Err(SlotLoadError::Incompatible(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-zero reserved bytes in boot_meta header: {reserved:#x}"),
+            )));
         }
 
         let generation = u64::from_le_bytes(slot_buf[8..16].try_into().unwrap());
@@ -931,18 +941,18 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let expected_payload_crc = u32::from_le_bytes(slot_buf[52..56].try_into().unwrap());
 
         if generation == 0 || payload_len > MAX_INLINE_PAYLOAD_LEN {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid generation or payload_len in boot_meta slot",
-            ));
+            )));
         }
 
         let slot_payload = &slot_buf[64..64 + payload_len];
         if crc32c(slot_payload) != expected_payload_crc {
-            return Err(io::Error::new(
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload CRC32C mismatch in boot_meta slot",
-            ));
+            )));
         }
 
         let mut state = BootMetaState {
@@ -956,77 +966,103 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         if (flags & FLAG_EXTERNAL_MANIFEST) == 0 {
             state.active_manifest_seq_id = None;
-            state.decode_catalog_payload(slot_payload)?;
+            state
+                .decode_catalog_payload(slot_payload)
+                .map_err(SlotLoadError::Corrupt)?;
         } else {
             if slot_payload.len() != EXTERNAL_POINTER_LEN {
-                return Err(io::Error::new(
+                return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid external manifest pointer length in boot_meta slot",
-                ));
+                )));
             }
             let mf_seq_id = u64::from_le_bytes(slot_payload[0..8].try_into().unwrap());
             let mf_file_len = u64::from_le_bytes(slot_payload[8..16].try_into().unwrap());
             let mf_expected_crc = u32::from_le_bytes(slot_payload[16..20].try_into().unwrap());
 
+            let map_mf_io = |e: io::Error| match e.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof => SlotLoadError::Corrupt(e),
+                _ => SlotLoadError::Io(e),
+            };
+
             let mf_name = format_manifest_file_name(mf_seq_id);
-            let mf_file = fs.open_file(&mf_name, false, false, OpenHint::ImmutableSequential)?;
-            if mf_file.file_len()? != mf_file_len
+            let mf_file = fs
+                .open_file(&mf_name, false, false, OpenHint::ImmutableSequential)
+                .map_err(map_mf_io)?;
+            if mf_file.file_len().map_err(map_mf_io)? != mf_file_len
                 || mf_file_len < MANIFEST_HEADER_LEN as u64
                 || mf_file_len > MAX_EXTERNAL_MANIFEST_BYTES
             {
-                return Err(io::Error::new(
+                return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "external manifest file length mismatch or exceeds budget",
-                ));
+                )));
             }
             let mf_len_usize = usize::try_from(mf_file_len).map_err(|_| {
-                io::Error::new(
+                SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "external manifest length overflow",
-                )
+                ))
             })?;
             let mut mf_buf = Vec::new();
             mf_buf.try_reserve_exact(mf_len_usize).map_err(|_| {
-                io::Error::new(
+                SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "external manifest allocation overflow",
-                )
+                ))
             })?;
             mf_buf.resize(mf_len_usize, 0u8);
-            mf_file.read_exact_at(&mut mf_buf, 0)?;
+            mf_file.read_exact_at(&mut mf_buf, 0).map_err(map_mf_io)?;
 
             if &mf_buf[0..4] != MANIFEST_MAGIC {
-                return Err(io::Error::new(
+                return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid magic in external manifest file",
-                ));
+                )));
             }
             let mf_ver = u16::from_le_bytes([mf_buf[4], mf_buf[5]]);
+            let mf_reserved = u16::from_le_bytes([mf_buf[6], mf_buf[7]]);
             let mf_payload_len =
                 u32::from_le_bytes([mf_buf[8], mf_buf[9], mf_buf[10], mf_buf[11]]) as usize;
             let mf_header_crc_field =
                 u32::from_le_bytes([mf_buf[12], mf_buf[13], mf_buf[14], mf_buf[15]]);
 
-            if mf_ver != FORMAT_VERSION
-                || MANIFEST_HEADER_LEN.checked_add(mf_payload_len) != Some(mf_buf.len())
+            if MANIFEST_HEADER_LEN.checked_add(mf_payload_len) != Some(mf_buf.len())
                 || mf_header_crc_field != mf_expected_crc
             {
-                return Err(io::Error::new(
+                return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "external manifest header mismatch",
-                ));
+                )));
             }
 
             let catalog_slice = &mf_buf[MANIFEST_HEADER_LEN..];
             if crc32c(catalog_slice) != mf_expected_crc {
-                return Err(io::Error::new(
+                return Err(SlotLoadError::Corrupt(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "external manifest payload CRC32C mismatch",
-                ));
+                )));
+            }
+
+            if mf_ver != FORMAT_VERSION {
+                return Err(SlotLoadError::Incompatible(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported external manifest format version: {mf_ver}"),
+                )));
+            }
+            if mf_reserved != 0 {
+                return Err(SlotLoadError::Incompatible(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "non-zero reserved bytes in external manifest header: {mf_reserved:#x}"
+                    ),
+                )));
             }
 
             state.active_manifest_seq_id = Some(mf_seq_id);
-            state.decode_catalog_payload(catalog_slice)?;
+            state
+                .decode_catalog_payload(catalog_slice)
+                .map_err(SlotLoadError::Corrupt)?;
         }
 
         Ok(state)
@@ -1736,6 +1772,149 @@ mod tests {
             assert!(
                 err.to_string().contains("unknown boot_meta flags"),
                 "{bit:#x}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_incompatible_slot_aborts_open_without_falling_back_to_older_slot() {
+        for case in ["version", "flags", "reserved"] {
+            let tmp = TempTestDir::new("single_incompat_slot");
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            let idx1 = format_idx_file_name(1);
+            let idx2 = format_idx_file_name(2);
+            {
+                let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+                // Gen 2 in Slot B references idx_1.
+                mgr.commit_update(|s| {
+                    let id = s.allocate_seq_id();
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id: id,
+                        file_len: 4096,
+                        level: 0,
+                        record_count: 1,
+                    });
+                })
+                .unwrap();
+                let _ = fs
+                    .open_file(&idx1, true, true, OpenHint::ImmutableRandom)
+                    .unwrap();
+                assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
+
+                // Gen 3 in Slot A references idx_1 and idx_2.
+                mgr.commit_update(|s| {
+                    let id = s.allocate_seq_id();
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id: id,
+                        file_len: 4096,
+                        level: 0,
+                        record_count: 1,
+                    });
+                })
+                .unwrap();
+                let _ = fs
+                    .open_file(&idx2, true, true, OpenHint::ImmutableRandom)
+                    .unwrap();
+                assert_eq!(mgr.active_slot(), SlotIndex::SlotA);
+            }
+
+            // Modify ONLY Slot A (leaving Slot B intact valid v1) with recomputed slot CRCs.
+            let path = tmp.path.join(BOOT_META_FILE_NAME);
+            let mut bytes = std::fs::read(&path).unwrap();
+            match case {
+                "version" => {
+                    bytes[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+                }
+                "flags" => {
+                    let flags = u16::from_le_bytes([bytes[6], bytes[7]]) | 0x0004;
+                    bytes[6..8].copy_from_slice(&flags.to_le_bytes());
+                }
+                "reserved" => {
+                    bytes[56..60].copy_from_slice(&1u32.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            let header_crc = crc32c(&bytes[0..60]);
+            bytes[60..64].copy_from_slice(&header_crc.to_le_bytes());
+            let trailer_crc = crc32c(&bytes[0..4092]);
+            bytes[4092..4096].copy_from_slice(&trailer_crc.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+
+            let err = BootMetaManager::open_or_recover(Arc::clone(&fs))
+                .err()
+                .expect("CRC-valid incompatible Slot A must abort open");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}: {err}");
+            assert!(
+                fs.list_files().unwrap().contains(&idx2),
+                "{case}: newer-generation segment {idx2} was swept on fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn single_incompatible_external_manifest_aborts_open_without_fallback() {
+        for case in ["version", "reserved"] {
+            let tmp = TempTestDir::new("single_incompat_mf");
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            let extra_idx_seq;
+            let mf_seq;
+            {
+                let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+                // Gen 2 in Slot B is inline (empty catalog).
+                mgr.commit_update(|s| {
+                    s.checkpoint_lsn = 10;
+                })
+                .unwrap();
+                assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
+
+                // Gen 3 in Slot A overflows into an external manifest referencing new idx files.
+                mgr.commit_update(|s| {
+                    for i in 0..200 {
+                        let seq_id = s.allocate_seq_id();
+                        let fname = format_idx_file_name(seq_id);
+                        let _ = fs
+                            .open_file(&fname, true, true, OpenHint::ImmutableRandom)
+                            .unwrap();
+                        s.idx_segments.push(IdxSegmentMeta {
+                            seq_id,
+                            file_len: 4096 * (i + 1),
+                            level: 1,
+                            record_count: 100,
+                        });
+                    }
+                })
+                .unwrap();
+                assert_eq!(mgr.active_slot(), SlotIndex::SlotA);
+                extra_idx_seq = mgr.state().idx_segments[0].seq_id;
+                mf_seq = mgr
+                    .state()
+                    .active_manifest_seq_id
+                    .expect("gen 3 must use external manifest");
+            }
+
+            let mf_name = format_manifest_file_name(mf_seq);
+            let mf_path = tmp.path.join(&mf_name);
+            let mut mf_bytes = std::fs::read(&mf_path).unwrap();
+            match case {
+                "version" => {
+                    mf_bytes[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+                }
+                "reserved" => {
+                    mf_bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&mf_path, &mf_bytes).unwrap();
+
+            let err = BootMetaManager::open_or_recover(Arc::clone(&fs))
+                .err()
+                .expect("CRC-valid incompatible external manifest must abort open");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}: {err}");
+            let files = fs.list_files().unwrap();
+            assert!(files.contains(&mf_name), "{case}: manifest was deleted");
+            assert!(
+                files.contains(&format_idx_file_name(extra_idx_seq)),
+                "{case}: newer-generation idx file was swept on fallback"
             );
         }
     }
