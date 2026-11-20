@@ -186,6 +186,10 @@ pub enum LruReadTrackingMode {
     CoalescedLazyPromotion,
     /// Baseline comparison mode (for benchmarking): Immediately logs and indexes a new
     /// `[TableID | 'l' | NewTick | PK]` mutation on every `get_row()` hit.
+    ///
+    /// Because persisting promotions requires mutable engine state, reads on capped tables
+    /// (including SQL snapshot reads outside active transactions while the engine is healthy)
+    /// take the exclusive engine lock and serialize concurrent readers on those tables.
     EagerWriteOnRead,
 }
 

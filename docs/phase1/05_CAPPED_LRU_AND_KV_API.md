@@ -123,7 +123,7 @@ Measuring 50,000 hot cache-hit reads on the oldest 100 keys of a 500-key Capped 
 | **`CoalescedLazyPromotion` (`aydb` Default)** | **`4,620,944 ops/s` (`19.7×` faster)** | **`0.22 µs`** | **`100` (`500×` fewer)** | **`100`** |
 
 * **Architectural Takeaway:**
-  * Updating the LRU timestamp on disk on every `get_row()` (`EagerWriteOnRead`) emits `50,000` WAL batches and `150,000` MemTable records for a pure read workload, throttling read throughput to `234.0 K ops/s` (`4.27 µs`).
+  * Updating the LRU timestamp on disk on every `get_row()` (`EagerWriteOnRead`) emits `50,000` WAL batches and `150,000` MemTable records for a pure read workload, throttling read throughput to `234.0 K ops/s` (`4.27 µs`). Because each hit writes WAL/MemTable records, capped-table reads under `EagerWriteOnRead` (including SQL snapshot reads outside active transactions via `with_snapshot_read` while the engine is healthy) also acquire the exclusive engine lock, serializing concurrent readers on those tables.
   * `CoalescedLazyPromotion` records read hits in the bounded in-memory `AccessTracker` (`0.22 µs` per read, **`19.7×` faster**, zero disk I/O during reads). When 100 new insertions subsequently push the table over `MAX_BYTES`, the eviction scanner lazily promotes the 100 accessed keys once (`100` WAL batches total — a **`500×` reduction** in index write amplification) while evicting the 100 truly cold keys!
 
 ### 5.2 Benchmark 2: Steady-State `MAX_BYTES` Eviction & $O(1)$ Copy-less Blob Segment Deletion
