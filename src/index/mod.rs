@@ -768,15 +768,41 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         let meta_offset = self.write_offset;
         let mut meta_buf = Vec::with_capacity(256);
         bloom.encode(&mut meta_buf);
-        meta_buf.extend_from_slice(&(self.fence_pointers.len() as u32).to_le_bytes());
+        let fp_count_u32 = u32::try_from(self.fence_pointers.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx fence pointer count exceeds u32::MAX",
+            )
+        })?;
+        meta_buf.extend_from_slice(&fp_count_u32.to_le_bytes());
         for fp in &self.fence_pointers {
-            meta_buf.extend_from_slice(&(fp.first_key.len() as u16).to_le_bytes());
+            let klen_u16 = u16::try_from(fp.first_key.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "idx fence pointer key exceeds u16::MAX",
+                )
+            })?;
+            meta_buf.extend_from_slice(&klen_u16.to_le_bytes());
             meta_buf.extend_from_slice(&fp.block_idx.to_le_bytes());
             meta_buf.extend_from_slice(&fp.first_key);
         }
-        meta_buf.extend_from_slice(&(self.last_key.len() as u16).to_le_bytes());
+        let last_klen_u16 = u16::try_from(self.last_key.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "idx last_key exceeds u16::MAX")
+        })?;
+        meta_buf.extend_from_slice(&last_klen_u16.to_le_bytes());
         meta_buf.extend_from_slice(&self.last_key);
-        let meta_len = meta_buf.len() as u32;
+        if meta_buf.len() > MAX_INDEX_META_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment metadata exceeds MAX_INDEX_META_BYTES",
+            ));
+        }
+        let meta_len = u32::try_from(meta_buf.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment metadata exceeds u32::MAX",
+            )
+        })?;
         let meta_crc = crc32c(&meta_buf);
 
         // Encode 48-byte Footer
@@ -1989,5 +2015,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn idx_builder_finish_rejects_metadata_exceeding_max_index_meta_bytes() {
+        let tmp = TempTestDir::new("idx_meta_cap");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let bits_per_key = (MAX_INDEX_META_BYTES + 1024) * 8;
+        let mut builder = IdxSegmentBuilder::create(&fs, 1, 0, bits_per_key).unwrap();
+        builder.add_raw_entry(b"k1", 1, 1, b"v1").unwrap();
+        let err = builder
+            .finish()
+            .err()
+            .expect("oversized idx metadata must be rejected before writing footer");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

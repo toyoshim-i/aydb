@@ -1008,7 +1008,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             meta_mgr,
             sync_wal,
             buf_wal,
-            next_lsn: rec.max_recovered_lsn + 1,
+            next_lsn: rec
+                .max_recovered_lsn
+                .checked_add(1)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL LSN overflow"))?,
             memtable,
             idx_segments,
             std_blobs,

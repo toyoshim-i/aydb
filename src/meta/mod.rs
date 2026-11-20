@@ -4,7 +4,7 @@
 //! See `docs/phase1/02_BOOT_META_AND_GC.md` for the detailed binary specification and
 //! crash-recovery state machine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::sync::Arc;
 
@@ -63,13 +63,32 @@ pub fn format_manifest_file_name(seq_id: u64) -> String {
     format!("manifest_{seq_id:016x}.db")
 }
 
-/// Returns `true` if `file_name` is an immutable segment or manifest managed by `BootMetaState`.
+fn is_hex_n(s: &str, expected_len: usize) -> bool {
+    s.len() == expected_len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Returns `true` if `file_name` is a canonical immutable segment or manifest managed by
+/// `BootMetaState`.
 fn is_managed_segment_or_manifest(file_name: &str) -> bool {
-    file_name.ends_with(".db")
-        && (file_name.starts_with("idx_")
-            || file_name.starts_with("blob_std_")
-            || file_name.starts_with("blob_lru_")
-            || file_name.starts_with("manifest_"))
+    if crate::pal::path::validate_flat_file_name(file_name).is_err() {
+        return false;
+    }
+    let Some(stem) = file_name.strip_suffix(".db") else {
+        return false;
+    };
+    if let Some(hex) = stem
+        .strip_prefix("idx_")
+        .or_else(|| stem.strip_prefix("blob_std_"))
+        .or_else(|| stem.strip_prefix("manifest_"))
+    {
+        return is_hex_n(hex, 16);
+    }
+    if let Some(rest) = stem.strip_prefix("blob_lru_") {
+        return rest
+            .split_once('_')
+            .is_some_and(|(tbl, seq)| is_hex_n(tbl, 4) && is_hex_n(seq, 16));
+    }
+    false
 }
 
 /// Extracts the SeqID encoded in a managed segment or manifest file name
@@ -200,9 +219,11 @@ impl BootMetaState {
         id
     }
 
-    /// Queues a filename for deferred deletion if not already queued.
+    /// Queues a managed segment or manifest filename for deferred deletion if not already queued.
     pub fn queue_pending_delete(&mut self, file_name: String) {
-        if !self.pending_delete_files.contains(&file_name) {
+        if is_managed_segment_or_manifest(&file_name)
+            && !self.pending_delete_files.contains(&file_name)
+        {
             self.pending_delete_files.push(file_name);
         }
     }
@@ -228,9 +249,19 @@ impl BootMetaState {
     /// Serializes the variable-length catalog lists into a deterministic byte vector.
     pub(crate) fn encode_catalog_payload(&self) -> io::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(256);
+        let checked_count = |len: usize, what: &str| {
+            u32::try_from(len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{what} count exceeds u32::MAX"),
+                )
+            })
+        };
 
         // 1. Index segments (24B each)
-        buf.extend_from_slice(&(self.idx_segments.len() as u32).to_le_bytes());
+        buf.extend_from_slice(
+            &checked_count(self.idx_segments.len(), "idx_segments")?.to_le_bytes(),
+        );
         for seg in &self.idx_segments {
             buf.extend_from_slice(&seg.seq_id.to_le_bytes());
             buf.extend_from_slice(&seg.file_len.to_le_bytes());
@@ -240,7 +271,9 @@ impl BootMetaState {
         }
 
         // 2. Standard blob segments (24B each)
-        buf.extend_from_slice(&(self.std_blob_segments.len() as u32).to_le_bytes());
+        buf.extend_from_slice(
+            &checked_count(self.std_blob_segments.len(), "std_blob_segments")?.to_le_bytes(),
+        );
         for seg in &self.std_blob_segments {
             buf.extend_from_slice(&seg.seq_id.to_le_bytes());
             buf.extend_from_slice(&seg.file_len.to_le_bytes());
@@ -248,7 +281,9 @@ impl BootMetaState {
         }
 
         // 3. LRU blob segments (32B each)
-        buf.extend_from_slice(&(self.lru_blob_segments.len() as u32).to_le_bytes());
+        buf.extend_from_slice(
+            &checked_count(self.lru_blob_segments.len(), "lru_blob_segments")?.to_le_bytes(),
+        );
         for seg in &self.lru_blob_segments {
             buf.extend_from_slice(&seg.seq_id.to_le_bytes());
             buf.extend_from_slice(&seg.file_len.to_le_bytes());
@@ -258,7 +293,9 @@ impl BootMetaState {
         }
 
         // 4. Table quotas (24B each)
-        buf.extend_from_slice(&(self.table_quotas.len() as u32).to_le_bytes());
+        buf.extend_from_slice(
+            &checked_count(self.table_quotas.len(), "table_quotas")?.to_le_bytes(),
+        );
         for q in &self.table_quotas {
             buf.extend_from_slice(&q.table_id.to_le_bytes());
             buf.push(q.eviction_policy as u8);
@@ -268,8 +305,16 @@ impl BootMetaState {
         }
 
         // 5. Pending delete filenames
-        buf.extend_from_slice(&(self.pending_delete_files.len() as u32).to_le_bytes());
+        buf.extend_from_slice(
+            &checked_count(self.pending_delete_files.len(), "pending_delete_files")?.to_le_bytes(),
+        );
         for name in &self.pending_delete_files {
+            if !is_managed_segment_or_manifest(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid managed filename in pending_delete_files: {name}"),
+                ));
+            }
             let bytes = name.as_bytes();
             let len_u16 = u16::try_from(bytes.len()).map_err(|_| {
                 io::Error::new(
@@ -303,12 +348,25 @@ impl BootMetaState {
                 "idx_segments allocation overflow",
             )
         })?;
+        let mut seen_idx = HashSet::new();
+        seen_idx.try_reserve(num_idx).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idx_segments seen-set allocation overflow",
+            )
+        })?;
         for _ in 0..num_idx {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
             let level = r.read_u16_le()?;
             let _reserved = r.read_u16_le()?;
             let record_count = r.read_u32_le()?;
+            if !seen_idx.insert(seq_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate seq_id in idx_segments",
+                ));
+            }
             idx_segments.push(IdxSegmentMeta {
                 seq_id,
                 file_len,
@@ -337,10 +395,23 @@ impl BootMetaState {
                     "std_blob_segments allocation overflow",
                 )
             })?;
+        let mut seen_std = HashSet::new();
+        seen_std.try_reserve(num_std_blob).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "std_blob_segments seen-set allocation overflow",
+            )
+        })?;
         for _ in 0..num_std_blob {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
             let dead_bytes = r.read_u64_le()?;
+            if !seen_std.insert(seq_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate seq_id in std_blob_segments",
+                ));
+            }
             std_blob_segments.push(StdBlobSegmentMeta {
                 seq_id,
                 file_len,
@@ -368,12 +439,25 @@ impl BootMetaState {
                     "lru_blob_segments allocation overflow",
                 )
             })?;
+        let mut seen_lru = HashSet::new();
+        seen_lru.try_reserve(num_lru_blob).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lru_blob_segments seen-set allocation overflow",
+            )
+        })?;
         for _ in 0..num_lru_blob {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
             let dead_bytes = r.read_u64_le()?;
             let table_id = r.read_u16_le()?;
             let _reserved = r.read_bytes(6)?;
+            if !seen_lru.insert((table_id, seq_id)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate (table_id, seq_id) in lru_blob_segments",
+                ));
+            }
             lru_blob_segments.push(LruBlobSegmentMeta {
                 seq_id,
                 file_len,
@@ -397,6 +481,13 @@ impl BootMetaState {
                 "table_quotas allocation overflow",
             )
         })?;
+        let mut seen_quotas = HashSet::new();
+        seen_quotas.try_reserve(num_quotas).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table_quotas seen-set allocation overflow",
+            )
+        })?;
         for _ in 0..num_quotas {
             let table_id = r.read_u16_le()?;
             let policy_byte = r.read_u8()?;
@@ -404,6 +495,12 @@ impl BootMetaState {
             let _reserved = r.read_bytes(5)?;
             let max_bytes = r.read_u64_le()?;
             let current_logical_bytes = r.read_u64_le()?;
+            if !seen_quotas.insert(table_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate table_id in table_quotas",
+                ));
+            }
             table_quotas.push(TableQuotaMeta {
                 table_id,
                 eviction_policy,
@@ -438,6 +535,12 @@ impl BootMetaState {
                     "invalid UTF-8 in pending_delete_files",
                 )
             })?;
+            if !is_managed_segment_or_manifest(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-managed filename in pending_delete_files",
+                ));
+            }
             pending_delete_files.push(name.to_owned());
         }
 
@@ -700,8 +803,12 @@ impl<F: PlatformFs> BootMetaManager<F> {
             .filter_map(|f| parse_managed_seq_id(f))
             .max();
         match max_seen {
+            Some(u64::MAX) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed segment SeqID overflow",
+            )),
             Some(m) if m >= self.state.next_seq_id => {
-                self.commit_update(|st| st.next_seq_id = m.saturating_add(1))
+                self.commit_update(|st| st.next_seq_id = m + 1)
             }
             _ => Ok(()),
         }
@@ -767,20 +874,20 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let prev_manifest_id = next_state.active_manifest_seq_id;
 
         mutate(&mut next_state);
-        next_state.generation = self
-            .state
-            .generation
-            .checked_add(1)
-            .expect("64-bit generation overflow");
+        next_state.generation = self.state.generation.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "64-bit generation overflow")
+        })?;
 
         let target_slot = self.active_slot.opposite();
         let mut slot_write_attempted = false;
+        let mut orphan_manifest = None;
         if let Err(error) = Self::write_state_to_slot_internal(
             &self.fs,
             &self.file,
             target_slot,
             &mut next_state,
             &mut slot_write_attempted,
+            &mut orphan_manifest,
         ) {
             if slot_write_attempted {
                 // A failed write or flush may already have made the new slot authoritative.
@@ -793,6 +900,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 // reference a manifest with more bytes than it describes. A crash instead of an
                 // error is covered by `reserve_seq_ids_above_existing_files` at the next open.
                 self.state.next_seq_id = self.state.next_seq_id.max(next_state.next_seq_id);
+                if let Some(mf_name) = orphan_manifest {
+                    self.state.queue_pending_delete(mf_name);
+                }
             }
             return Err(error);
         }
@@ -824,8 +934,16 @@ impl<F: PlatformFs> BootMetaManager<F> {
         if self.is_poisoned() || self.needs_initial_sync {
             return;
         }
+        let referenced = self.state.referenced_file_names();
+        let standby_mf = self.standby_manifest_id.map(format_manifest_file_name);
         let mut remaining = Vec::new();
         for file_name in self.state.pending_delete_files.drain(..) {
+            if !is_managed_segment_or_manifest(&file_name)
+                || referenced.contains(&file_name)
+                || standby_mf.as_deref() == Some(file_name.as_str())
+            {
+                continue;
+            }
             if self.fs.remove_file(&file_name).is_err() {
                 remaining.push(file_name);
             }
@@ -834,7 +952,15 @@ impl<F: PlatformFs> BootMetaManager<F> {
     }
 
     fn write_current_state_to_slot(&mut self, slot: SlotIndex) -> io::Result<()> {
-        Self::write_state_to_slot_internal(&self.fs, &self.file, slot, &mut self.state, &mut false)
+        let mut orphan_manifest = None;
+        Self::write_state_to_slot_internal(
+            &self.fs,
+            &self.file,
+            slot,
+            &mut self.state,
+            &mut false,
+            &mut orphan_manifest,
+        )
     }
 
     fn write_state_to_slot_internal(
@@ -843,6 +969,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         slot: SlotIndex,
         state: &mut BootMetaState,
         slot_write_attempted: &mut bool,
+        orphan_manifest: &mut Option<String>,
     ) -> io::Result<()> {
         let catalog_bytes = state.encode_catalog_payload()?;
 
@@ -850,24 +977,59 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state.active_manifest_seq_id = None;
             (0u16, catalog_bytes)
         } else {
+            let mf_total_len = (MANIFEST_HEADER_LEN as u64)
+                .checked_add(catalog_bytes.len() as u64)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "external manifest length overflow",
+                    )
+                })?;
+            let catalog_len_u32 = u32::try_from(catalog_bytes.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "external manifest exceeds MAX_EXTERNAL_MANIFEST_BYTES",
+                )
+            })?;
+            if mf_total_len > MAX_EXTERNAL_MANIFEST_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "external manifest exceeds MAX_EXTERNAL_MANIFEST_BYTES",
+                ));
+            }
+            if state.next_seq_id == u64::MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "64-bit SeqID overflow",
+                ));
+            }
             // Overflow to an immutable external manifest file FIRST before updating boot_meta.db!
             let mf_seq_id = state.allocate_seq_id();
             let mf_name = format_manifest_file_name(mf_seq_id);
             let mf_payload_crc = crc32c(&catalog_bytes);
-            let mf_total_len = (MANIFEST_HEADER_LEN + catalog_bytes.len()) as u64;
 
             let mut mf_buf = Vec::with_capacity(mf_total_len as usize);
             mf_buf.extend_from_slice(MANIFEST_MAGIC);
             mf_buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
             mf_buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
-            mf_buf.extend_from_slice(&(catalog_bytes.len() as u32).to_le_bytes());
+            mf_buf.extend_from_slice(&catalog_len_u32.to_le_bytes());
             mf_buf.extend_from_slice(&mf_payload_crc.to_le_bytes());
             mf_buf.extend_from_slice(&catalog_bytes);
 
-            let mf_file = fs.open_file(&mf_name, true, true, OpenHint::ImmutableSequential)?;
-            mf_file.write_all_at(&mf_buf, 0)?;
-            mf_file.sync_durable()?;
-            drop(mf_file);
+            let write_res = fs
+                .open_file(&mf_name, true, true, OpenHint::ImmutableSequential)
+                .and_then(|mf_file| {
+                    mf_file.write_all_at(&mf_buf, 0)?;
+                    mf_file.sync_durable()?;
+                    drop(mf_file);
+                    Ok(())
+                });
+            if let Err(e) = write_res {
+                if fs.remove_file(&mf_name).is_err() {
+                    *orphan_manifest = Some(mf_name);
+                }
+                return Err(e);
+            }
 
             state.active_manifest_seq_id = Some(mf_seq_id);
 
@@ -990,10 +1152,20 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let payload_len = u32::from_le_bytes(slot_buf[48..52].try_into().unwrap()) as usize;
         let expected_payload_crc = u32::from_le_bytes(slot_buf[52..56].try_into().unwrap());
 
-        if generation == 0 || payload_len > MAX_INLINE_PAYLOAD_LEN {
+        if generation == 0
+            || generation == u64::MAX
+            || next_seq_id == 0
+            || next_seq_id == u64::MAX
+            || checkpoint_lsn == u64::MAX
+            || sync_wal_epoch == 0
+            || sync_wal_epoch == u64::MAX
+            || buf_wal_epoch == 0
+            || buf_wal_epoch == u64::MAX
+            || payload_len > MAX_INLINE_PAYLOAD_LEN
+        {
             return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid generation or payload_len in boot_meta slot",
+                "invalid generation, bounds, or payload_len in boot_meta slot",
             )));
         }
 
@@ -1113,6 +1285,18 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state
                 .decode_catalog_payload(catalog_slice)
                 .map_err(SlotLoadError::Corrupt)?;
+        }
+
+        let referenced = state.referenced_file_names();
+        if state
+            .pending_delete_files
+            .iter()
+            .any(|fname| referenced.contains(fname))
+        {
+            return Err(SlotLoadError::Corrupt(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pending_delete_files references an active segment or manifest",
+            )));
         }
 
         Ok(state)
@@ -2105,5 +2289,304 @@ mod tests {
                 "boot_meta.db must not be created when missing-meta guard fails on WAL I/O"
             );
         }
+    }
+
+    fn craft_raw_catalog_with_pending_delete(name: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // idx_segments
+        buf.extend_from_slice(&0u32.to_le_bytes()); // std_blob_segments
+        buf.extend_from_slice(&0u32.to_le_bytes()); // lru_blob_segments
+        buf.extend_from_slice(&0u32.to_le_bytes()); // table_quotas
+        buf.extend_from_slice(&1u32.to_le_bytes()); // pending_delete_files = 1
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn decode_rejects_unmanaged_and_referenced_pending_deletes() {
+        for bad_name in [
+            "boot_meta.db",
+            "wal_sync.db",
+            "wal_buf.db",
+            "db.lock",
+            "../escape.db",
+            "idx_bad.db",
+            "IDX_0000000000000001.db",
+            "",
+        ] {
+            let mut state = BootMetaState::default();
+            state.queue_pending_delete(bad_name.to_string());
+            assert!(
+                state.pending_delete_files.is_empty(),
+                "queue_pending_delete must ignore {bad_name:?}"
+            );
+            let raw = craft_raw_catalog_with_pending_delete(bad_name);
+            let err = state
+                .decode_catalog_payload(&raw)
+                .expect_err("decode must reject non-managed pending_delete filename");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad_name:?}");
+        }
+
+        // Duplicate segment / quota IDs must also be rejected cleanly.
+        let mut dup_idx_payload = Vec::new();
+        dup_idx_payload.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            dup_idx_payload.extend_from_slice(&1u64.to_le_bytes());
+            dup_idx_payload.extend_from_slice(&4096u64.to_le_bytes());
+            dup_idx_payload.extend_from_slice(&0u16.to_le_bytes());
+            dup_idx_payload.extend_from_slice(&0u16.to_le_bytes());
+            dup_idx_payload.extend_from_slice(&1u32.to_le_bytes());
+        }
+        dup_idx_payload.extend_from_slice(&[0u8; 16]);
+        let mut st = BootMetaState::default();
+        assert_eq!(
+            st.decode_catalog_payload(&dup_idx_payload)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Active referenced segment listed in pending_delete_files must demote the slot, and
+        // runtime `try_process_pending_deletes` must refuse to unlink non-managed/referenced files.
+        let tmp = TempTestDir::new("pending_delete_guard");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let active_idx = format_idx_file_name(1);
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+        mgr.commit_update(|s| {
+            s.idx_segments.push(IdxSegmentMeta {
+                seq_id: 1,
+                file_len: 4096,
+                level: 0,
+                record_count: 1,
+            });
+        })
+        .unwrap();
+        let _active_f = fs
+            .open_file(&active_idx, true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        drop(_active_f);
+        // Inject an unmanaged file + the live segment directly into in-memory state and run GC.
+        std::fs::write(tmp.path.join("user_keep.txt"), b"keep").unwrap();
+        mgr.state.pending_delete_files.push("boot_meta.db".into());
+        mgr.state.pending_delete_files.push("user_keep.txt".into());
+        mgr.state.pending_delete_files.push(active_idx.clone());
+        mgr.try_process_pending_deletes();
+        assert!(mgr.state().pending_delete_files.is_empty());
+        assert!(tmp.path.join("boot_meta.db").exists());
+        assert!(tmp.path.join("user_keep.txt").exists());
+        assert!(tmp.path.join(&active_idx).exists());
+
+        // Now craft Slot A (Gen 99) claiming both `idx_segments=[1]` and `pending_delete=[idx_1]`
+        // on disk; reopen must demote Slot A and fall back cleanly to Gen 2 in Slot B.
+        drop(mgr);
+        let mut state = BootMetaState {
+            idx_segments: vec![IdxSegmentMeta {
+                seq_id: 1,
+                file_len: 4096,
+                level: 0,
+                record_count: 1,
+            }],
+            pending_delete_files: vec![active_idx.clone()],
+            ..BootMetaState::default()
+        };
+        let payload = state.encode_catalog_payload().unwrap();
+        state.pending_delete_files.clear();
+        let meta_path = tmp.path.join(BOOT_META_FILE_NAME);
+        let mut raw_slots = std::fs::read(&meta_path).unwrap();
+        // Target Slot A (Gen 1) -> bump to Gen 99 with conflicting active + pending delete.
+        raw_slots[8..16].copy_from_slice(&99u64.to_le_bytes());
+        raw_slots[48..52].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        raw_slots[52..56].copy_from_slice(&crc32c(&payload).to_le_bytes());
+        let h_crc = crc32c(&raw_slots[0..60]);
+        raw_slots[60..64].copy_from_slice(&h_crc.to_le_bytes());
+        raw_slots[64..64 + payload.len()].copy_from_slice(&payload);
+        let t_crc = crc32c(&raw_slots[0..4092]);
+        raw_slots[4092..4096].copy_from_slice(&t_crc.to_le_bytes());
+        std::fs::write(&meta_path, &raw_slots).unwrap();
+
+        let recovered = BootMetaManager::open_or_recover(fs).unwrap();
+        assert_eq!(recovered.active_slot(), SlotIndex::SlotB);
+        assert_eq!(recovered.state().generation, 2);
+        assert!(tmp.path.join(&active_idx).exists());
+    }
+
+    #[test]
+    fn corrupt_slot_with_u64_max_or_zero_epoch_is_rejected_without_panic() {
+        let cases: [(usize, u64); 8] = [
+            (8, 0),
+            (8, u64::MAX),
+            (16, 0),
+            (16, u64::MAX),
+            (24, u64::MAX),
+            (32, 0),
+            (32, u64::MAX),
+            (40, u64::MAX),
+        ];
+        for (offset, val) in cases {
+            let tmp = TempTestDir::new("u64_max_slot");
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            {
+                let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+                mgr.commit_update(|s| s.checkpoint_lsn = 42).unwrap();
+                assert_eq!(mgr.active_slot(), SlotIndex::SlotB);
+            }
+            let meta_path = tmp.path.join(BOOT_META_FILE_NAME);
+            let mut raw = std::fs::read(&meta_path).unwrap();
+            // Rewrite Slot A (generation=99) with the extreme header value and valid CRCs.
+            raw[8..16].copy_from_slice(&99u64.to_le_bytes());
+            raw[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
+            let h_crc = crc32c(&raw[0..60]);
+            raw[60..64].copy_from_slice(&h_crc.to_le_bytes());
+            let t_crc = crc32c(&raw[0..4092]);
+            raw[4092..4096].copy_from_slice(&t_crc.to_le_bytes());
+            std::fs::write(&meta_path, &raw).unwrap();
+
+            let reopened = BootMetaManager::open_or_recover(fs).unwrap();
+            assert_eq!(
+                reopened.active_slot(),
+                SlotIndex::SlotB,
+                "offset={offset} val={val:#x}"
+            );
+            assert_eq!(reopened.state().generation, 2);
+            assert_eq!(reopened.state().checkpoint_lsn, 42);
+        }
+
+        // An orphan file at SeqID u64::MAX must fail cleanly instead of panicking on next allocate.
+        let tmp = TempTestDir::new("seq_u64_max");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+        std::fs::write(tmp.path.join(format_idx_file_name(u64::MAX)), b"alien").unwrap();
+        let err = mgr.reserve_seq_ids_above_existing_files().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_rejects_oversized_manifest_and_cleans_up_failed_manifest_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Part 1: catalog exceeding MAX_EXTERNAL_MANIFEST_BYTES (16 MB) fails before allocation or poisoning.
+        let tmp = TempTestDir::new("oversized_manifest");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+        let err = mgr
+            .commit_update(|s| {
+                for seq in 1..=700_000u64 {
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id: seq,
+                        file_len: 4096,
+                        level: 0,
+                        record_count: 1,
+                    });
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!mgr.is_poisoned());
+        assert_eq!(mgr.state().next_seq_id, 1);
+        assert!(
+            !fs.list_files()
+                .unwrap()
+                .iter()
+                .any(|f| f.starts_with("manifest_"))
+        );
+        mgr.commit_update(|s| s.checkpoint_lsn = 55).unwrap();
+        assert_eq!(mgr.state().checkpoint_lsn, 55);
+
+        // Part 2: failure writing/syncing an external manifest cleans up the file while consuming SeqID.
+        struct FailManifestSyncFs {
+            inner: OsFs,
+            fail_sync: Arc<AtomicBool>,
+        }
+        struct FailManifestSyncFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            is_manifest: bool,
+            fail_sync: Arc<AtomicBool>,
+        }
+        impl PlatformFile for FailManifestSyncFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                if self.is_manifest && self.fail_sync.swap(false, Ordering::SeqCst) {
+                    return Err(io::Error::other("simulated manifest sync failure"));
+                }
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+        impl PlatformFs for FailManifestSyncFs {
+            type File = FailManifestSyncFile;
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(FailManifestSyncFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    is_manifest: rel_name.starts_with("manifest_"),
+                    fail_sync: Arc::clone(&self.fail_sync),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &std::path::Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp2 = TempTestDir::new("manifest_cleanup");
+        let fail_sync = Arc::new(AtomicBool::new(true));
+        let fs2 = Arc::new(FailManifestSyncFs {
+            inner: OsFs::open(&tmp2.path, true).unwrap(),
+            fail_sync: Arc::clone(&fail_sync),
+        });
+        let mut mgr2 = BootMetaManager::open_or_recover(Arc::clone(&fs2)).unwrap();
+        let err = mgr2
+            .commit_update(|s| {
+                for i in 1..=200u64 {
+                    s.idx_segments.push(IdxSegmentMeta {
+                        seq_id: i,
+                        file_len: 4096,
+                        level: 0,
+                        record_count: 1,
+                    });
+                }
+                s.next_seq_id = 201;
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated manifest sync failure"));
+        assert!(!mgr2.is_poisoned());
+        // Failed SeqID 201 stays consumed so retry gets 202, and orphan `manifest_*` is gone!
+        assert_eq!(mgr2.state().next_seq_id, 202);
+        assert!(
+            !fs2.list_files()
+                .unwrap()
+                .iter()
+                .any(|f| f.starts_with("manifest_"))
+        );
     }
 }
