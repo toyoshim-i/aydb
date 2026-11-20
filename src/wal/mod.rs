@@ -447,7 +447,13 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             }
         };
 
-        let file = fs.open_file(file_name, true, true, hint)?;
+        let file = match fs.open_file(file_name, false, true, hint) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs.open_file(file_name, true, true, hint)?
+            }
+            Err(e) => return Err(e),
+        };
 
         let total_sectors = (target_size / WAL_SECTOR_SIZE as u64) as usize;
         Ok(Self {

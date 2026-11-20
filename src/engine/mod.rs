@@ -705,13 +705,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             salvaged = found.txs;
         }
 
-        // Under `Fail` nothing may have been written yet: the seq-id reservation below is a
-        // catalog commit (which also unlinks pending deletes), so it comes after this check.
+        // Under `Fail` nothing may have been written yet: `ensure_durable()` and the seq-id
+        // reservation below may preallocate/sync `boot_meta.db` or commit metadata, so they come
+        // after this check.
         if let (WalDamagePolicy::Fail, Some(damage)) =
             (config.wal_damage_policy, &rec.report.damage)
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, damage.clone()));
         }
+        meta_mgr.ensure_durable()?;
         // A log file shorter than configured (a fresh one, or one cut short by a third party) is
         // lengthened only now, so that a refused open leaves it as it was.
         sync_wal.allocate_to_target()?;

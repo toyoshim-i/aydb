@@ -4307,6 +4307,44 @@ fn fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty() {
     assert!(after == before, "a file other than the missing log changed");
 }
 
+/// Regression test for [W2]: when `Fail` refuses a damaged WAL, `boot_meta.db` must remain
+/// untouched in both cache and device images — neither syncing an unsynced winning slot nor
+/// extending a short `boot_meta.db`.
+#[test]
+fn fail_policy_leaves_unsynced_and_short_boot_meta_untouched() {
+    // 1. Unsynced winning slot (cache differs from durable device image) stays unsynced.
+    {
+        let (fs, _keys, s2) = sync_sector_damage_fs();
+        {
+            let mut st = fs.st();
+            let id = st.dir["boot_meta.db"];
+            let ino = &mut st.inodes[id];
+            // Copy winning Slot B (epoch 2) into Slot A in cache only, bumping generation with
+            // valid CRCs so Slot A wins over Slot B without reaching `durable`.
+            let mut slot_a = ino.cache[4096..8192].to_vec();
+            slot_a[8..16].copy_from_slice(&99u64.to_le_bytes());
+            let hcrc = crate::util::crc32c::crc32c(&slot_a[0..60]);
+            slot_a[60..64].copy_from_slice(&hcrc.to_le_bytes());
+            let tcrc = crate::util::crc32c::crc32c(&slot_a[0..4092]);
+            slot_a[4092..4096].copy_from_slice(&tcrc.to_le_bytes());
+            ino.cache[0..4096].copy_from_slice(&slot_a);
+            assert_ne!(ino.cache, ino.durable);
+        }
+        assert_fail_open_is_untouched(&fs, WalDamageReason::CorruptSector, s2);
+    }
+
+    // 2. Short (4096-byte) `boot_meta.db` is neither preallocated nor synced on `Fail` refusal.
+    {
+        let (fs, _keys, s2) = sync_sector_damage_fs();
+        damage_synced(&fs, "boot_meta.db", |img| {
+            img.copy_within(4096..8192, 0);
+            img.truncate(4096);
+        });
+        assert_eq!(dir_state(&fs)["boot_meta.db"].0.len(), 4096);
+        assert_fail_open_is_untouched(&fs, WalDamageReason::CorruptSector, s2);
+    }
+}
+
 /// A write outside a transaction must see the row that a pending group commit wrote: it reads
 /// the old row's `'t'` record to maintain the secondary entries, and a stale read leaves the
 /// entries of the group-committed version behind as orphans.

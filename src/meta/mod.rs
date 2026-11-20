@@ -504,6 +504,8 @@ pub struct BootMetaManager<F: PlatformFs> {
     state: BootMetaState,
     standby_manifest_id: Option<u64>,
     uncertain_write: Option<String>,
+    needs_preallocate: bool,
+    needs_initial_sync: bool,
 }
 
 impl<F: PlatformFs> BootMetaManager<F> {
@@ -516,20 +518,88 @@ impl<F: PlatformFs> BootMetaManager<F> {
         Ok(mgr)
     }
 
-    /// Opens `boot_meta.db` and runs the 4-state crash-recovery truth table across Slot A and
-    /// Slot B **without** sweeping orphan segment files yet.
-    ///
-    /// Used by `StorageEngine::open` so uncataloged `blob_std_*` / `blob_lru_*` segments created
-    /// during the active WAL epoch (or in a torn opposite slot) can be discovered and validated
-    /// during Two-Stream WAL recovery before `sweep_orphans()` deletes truly unreferenced files.
-    pub fn open_or_recover_deferred_sweep(fs: Arc<F>) -> io::Result<Self> {
-        let file = fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
+    fn ensure_no_existing_db_files(fs: &Arc<F>) -> io::Result<()> {
+        for fname in fs.list_files()? {
+            if fname == crate::pal::DB_LOCK_FILE_NAME {
+                continue;
+            }
+            if is_managed_segment_or_manifest(&fname) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
+                    ),
+                ));
+            }
+            if fname == crate::wal::WAL_SYNC_FILE_NAME || fname == crate::wal::WAL_BUF_FILE_NAME {
+                let wf = match fs.open_file(&fname, false, false, OpenHint::ImmutableRandom) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                if wf.file_len()? > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn init_fresh_boot_meta(fs: Arc<F>, file: Arc<F::File>) -> io::Result<Self> {
         if file.file_len()? < BOOT_META_FILE_SIZE {
             file.preallocate(BOOT_META_FILE_SIZE, PreallocStrategy::PhysicalZeroFill)?;
         }
+        // Case 3: Newly created database (or crash prior to first metadata commit).
+        let mut mgr = Self {
+            fs,
+            file,
+            // Set active_slot to SlotB so the initial write below lands in SlotA (offset 0).
+            active_slot: SlotIndex::SlotB,
+            state: BootMetaState::default(),
+            standby_manifest_id: None,
+            uncertain_write: None,
+            needs_preallocate: false,
+            needs_initial_sync: false,
+        };
+        mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
+        mgr.active_slot = SlotIndex::SlotA;
+        Ok(mgr)
+    }
 
+    /// Opens `boot_meta.db` and runs the 4-state crash-recovery truth table across Slot A and
+    /// Slot B **without** sweeping orphan segment files yet.
+    ///
+    /// For an existing non-zero `boot_meta.db`, preallocation (if short) and the initial
+    /// `sync_durable` are deferred until [`Self::ensure_durable`], [`Self::commit_update`], or
+    /// [`Self::sweep_orphans`] so `StorageEngine::open` under `WalDamagePolicy::Fail` can inspect
+    /// the WAL and refuse damaged databases without altering `boot_meta.db` or directory state.
+    pub fn open_or_recover_deferred_sweep(fs: Arc<F>) -> io::Result<Self> {
+        let file = match fs.open_file(BOOT_META_FILE_NAME, false, true, OpenHint::MutableSyncLog) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Guard against a missing `boot_meta.db` destroying an existing database before
+                // creating the file or calling `sync_dir`.
+                Self::ensure_no_existing_db_files(&fs)?;
+                let created =
+                    fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
+                return Self::init_fresh_boot_meta(fs, created);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let file_len = file.file_len()?;
         let mut raw = [0u8; SLOT_SIZE * 2];
-        file.read_exact_at(&mut raw, 0)?;
+        let to_read = usize::try_from(file_len)
+            .unwrap_or(SLOT_SIZE * 2)
+            .min(SLOT_SIZE * 2);
+        if to_read > 0 {
+            file.read_exact_at(&mut raw[..to_read], 0)?;
+        }
 
         let slot_a_raw: &[u8; SLOT_SIZE] = raw[..SLOT_SIZE].try_into().unwrap();
         let slot_b_raw: &[u8; SLOT_SIZE] = raw[SLOT_SIZE..].try_into().unwrap();
@@ -538,50 +608,15 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let b_all_zero = slot_b_raw.iter().all(|&b| b == 0);
 
         if a_all_zero && b_all_zero {
-            // Guard against a missing or zeroed `boot_meta.db` destroying an existing database:
-            // if any managed segment/manifest file or non-empty WAL file already exists, refuse
-            // to initialize a blank state or run the orphan sweep.
-            for fname in fs.list_files()? {
-                if fname == crate::pal::DB_LOCK_FILE_NAME {
-                    continue;
-                }
-                if is_managed_segment_or_manifest(&fname) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
-                        ),
-                    ));
-                }
-                if fname == crate::wal::WAL_SYNC_FILE_NAME || fname == crate::wal::WAL_BUF_FILE_NAME
-                {
-                    if let Ok(wf) = fs.open_file(&fname, false, false, OpenHint::ImmutableRandom) {
-                        if wf.file_len().unwrap_or(0) > 0 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "boot_meta.db is missing or zeroed while existing database files are present ({fname})"
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Case 3: Newly created database (or crash prior to first metadata commit).
-            let initial_state = BootMetaState::default();
-            let mut mgr = Self {
-                fs,
-                file,
-                // Set active_slot to SlotB so the initial write below lands in SlotA (offset 0).
-                active_slot: SlotIndex::SlotB,
-                state: initial_state,
-                standby_manifest_id: None,
-                uncertain_write: None,
-            };
-            mgr.write_current_state_to_slot(SlotIndex::SlotA)?;
-            mgr.active_slot = SlotIndex::SlotA;
-            return Ok(mgr);
+            // Guard against a zeroed `boot_meta.db` destroying an existing database before
+            // preallocating or writing Slot A.
+            Self::ensure_no_existing_db_files(&fs)?;
+            // Drop the existing handle (Windows exclusive lock) and reopen with create=true so
+            // Unix `sync_dir` covers a directory entry created before an interrupted first open.
+            drop(file);
+            let created =
+                fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
+            return Self::init_fresh_boot_meta(fs, created);
         }
 
         // Only torn/corrupt slots or missing external manifests may demote a slot; CRC-valid
@@ -620,13 +655,6 @@ impl<F: PlatformFs> BootMetaManager<F> {
             }
         };
 
-        // After a process crash the winning slot may exist only in the OS cache, while the
-        // opposite slot is the only one known to be durable. The first commit overwrites that
-        // slot, so make the winner durable first; otherwise a power loss during that commit can
-        // tear both slots. One sync per open (a failure fails the open, nothing is swept or
-        // overwritten). It also covers the orphan sweep, which acts on the winner's state.
-        file.sync_durable()?;
-
         Ok(Self {
             fs,
             file,
@@ -634,7 +662,29 @@ impl<F: PlatformFs> BootMetaManager<F> {
             state: winning_state,
             standby_manifest_id,
             uncertain_write: None,
+            needs_preallocate: file_len < BOOT_META_FILE_SIZE,
+            needs_initial_sync: true,
         })
+    }
+
+    /// Ensures any deferred preallocation (if `boot_meta.db` was shorter than 8 KB) and initial
+    /// `sync_durable` of the recovered winning slot are complete on disk.
+    ///
+    /// After a process crash the winning slot may exist only in the OS cache while the opposite
+    /// slot is the only one known to be durable; making the winner durable before the first
+    /// overwrite or orphan sweep prevents a power cut from tearing both slots.
+    pub(crate) fn ensure_durable(&mut self) -> io::Result<()> {
+        self.check_healthy()?;
+        if self.needs_preallocate {
+            self.file
+                .preallocate(BOOT_META_FILE_SIZE, PreallocStrategy::PhysicalZeroFill)?;
+            self.needs_preallocate = false;
+        }
+        if self.needs_initial_sync {
+            self.file.sync_durable()?;
+            self.needs_initial_sync = false;
+        }
+        Ok(())
     }
 
     /// Durably advances `next_seq_id` past the SeqID of every managed segment or manifest file on
@@ -660,7 +710,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// Sweeps any unreferenced `idx_*`, `blob_std_*`, `blob_lru_*`, or `manifest_*` files on disk
     /// and processes `pending_delete_files`.
     pub fn sweep_orphans(&mut self) -> io::Result<()> {
-        self.check_healthy()?;
+        self.ensure_durable()?;
         let standby_mf = self.standby_manifest_id;
         self.sweep_orphans_and_pending_deletes(standby_mf)
     }
@@ -712,7 +762,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     where
         M: FnOnce(&mut BootMetaState),
     {
-        self.check_healthy()?;
+        self.ensure_durable()?;
         let mut next_state = self.state.clone();
         let prev_manifest_id = next_state.active_manifest_seq_id;
 
@@ -771,7 +821,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// Any file that fails deletion (e.g., due to `ERROR_SHARING_VIOLATION` from antivirus
     /// scanning or an open handle) remains in `pending_delete_files` for future retry.
     pub fn try_process_pending_deletes(&mut self) {
-        if self.is_poisoned() {
+        if self.is_poisoned() || self.needs_initial_sync {
             return;
         }
         let mut remaining = Vec::new();
@@ -1625,6 +1675,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum BootMetaEvent {
         Write(u64),
+        Preallocate(u64),
         Sync,
     }
 
@@ -1664,6 +1715,7 @@ mod tests {
             self.inner.file_len()
         }
         fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.record(BootMetaEvent::Preallocate(target_len));
             self.inner.preallocate(target_len, strategy)
         }
         fn sync_barrier(&self) -> io::Result<()> {
@@ -1915,6 +1967,142 @@ mod tests {
             assert!(
                 files.contains(&format_idx_file_name(extra_idx_seq)),
                 "{case}: newer-generation idx file was swept on fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn open_deferred_sweep_defers_preallocate_and_sync_until_mutation() {
+        let tmp = TempTestDir::new("defer_boot_meta");
+        let path = tmp.path.join(BOOT_META_FILE_NAME);
+        {
+            let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+            let _mgr = BootMetaManager::open_or_recover(fs).unwrap();
+        }
+        // Truncate after Slot A (keeping valid Slot A in the first 4 KB).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(SLOT_SIZE as u64)
+            .unwrap();
+
+        let log: EventLog = Arc::default();
+        let fs = Arc::new(LoggingFs {
+            inner: OsFs::open(&tmp.path, true).expect("reopen OsFs"),
+            log: Arc::clone(&log),
+        });
+        let mut mgr = BootMetaManager::open_or_recover_deferred_sweep(fs).unwrap();
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "deferred open must neither preallocate nor sync boot_meta.db: {:?}",
+            *log.lock().unwrap()
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), SLOT_SIZE as u64);
+
+        mgr.commit_update(|s| s.checkpoint_lsn = 7).unwrap();
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                BootMetaEvent::Preallocate(BOOT_META_FILE_SIZE),
+                BootMetaEvent::Sync,
+                BootMetaEvent::Write(SLOT_SIZE as u64),
+                BootMetaEvent::Sync,
+            ]
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), BOOT_META_FILE_SIZE);
+    }
+
+    #[test]
+    fn missing_boot_meta_propagates_wal_io_error_without_creating_boot_meta() {
+        struct InjectWalIoErrorFs {
+            inner: OsFs,
+            fail_open: bool,
+            fail_len: bool,
+        }
+        struct InjectWalLenFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            fail_len: bool,
+        }
+        impl PlatformFile for InjectWalLenFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                if self.fail_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected wal_sync file_len failure",
+                    ));
+                }
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+        impl PlatformFs for InjectWalIoErrorFs {
+            type File = InjectWalLenFile;
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                if self.fail_open && rel_name == crate::wal::WAL_SYNC_FILE_NAME {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected wal_sync open failure",
+                    ));
+                }
+                Ok(Arc::new(InjectWalLenFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    fail_len: self.fail_len && rel_name == crate::wal::WAL_SYNC_FILE_NAME,
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &std::path::Path {
+                self.inner.root_path()
+            }
+        }
+
+        for (fail_open, fail_len) in [(true, false), (false, true)] {
+            let tmp = TempTestDir::new("missing_boot_meta_wal_err");
+            std::fs::write(tmp.path.join(crate::wal::WAL_SYNC_FILE_NAME), b"wal").unwrap();
+            let fs = Arc::new(InjectWalIoErrorFs {
+                inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
+                fail_open,
+                fail_len,
+            });
+            let err = BootMetaManager::open_or_recover(fs)
+                .err()
+                .expect("WAL I/O error must propagate instead of creating blank boot_meta");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                !tmp.path.join(BOOT_META_FILE_NAME).exists(),
+                "boot_meta.db must not be created when missing-meta guard fails on WAL I/O"
             );
         }
     }
