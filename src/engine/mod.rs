@@ -2905,12 +2905,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // owner view may need its writer buffer flushed first (exclusive caller retries).
         self.ensure_flushed_cx(cx, ptr)?;
 
-        let cache_key = BlobCacheKey {
-            kind: ptr.kind as u8,
-            table_id: ptr.table_id,
-            seg_id: ptr.seg_id,
-            offset: ptr.offset,
-        };
+        let cache_key = BlobCacheKey::from_ptr(ptr, row_key);
         let start = slab.len();
         if self.blob_cache.get_append_into(&cache_key, slab) {
             let end = slab.len();
@@ -2972,17 +2967,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !self.is_blob_eligible_for_cache(ptr) {
                 continue;
             }
-            let cache_key = BlobCacheKey {
-                kind: ptr.kind as u8,
-                table_id: ptr.table_id,
-                seg_id: ptr.seg_id,
-                offset: ptr.offset,
-            };
-            if self.blob_cache.contains(&cache_key) {
-                continue;
-            }
             if let Some(ref reader) = lazy.reader {
                 let row_key = encode_primary_row_key(table_id, pk);
+                let cache_key = BlobCacheKey::from_ptr(ptr, &row_key);
+                if self.blob_cache.contains(&cache_key) {
+                    continue;
+                }
                 to_fetch.push(PrefetchItem {
                     cache_key,
                     row_key,
@@ -3362,12 +3352,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
-        let cache_key = BlobCacheKey {
-            kind: ptr.kind as u8,
-            table_id: ptr.table_id,
-            seg_id: ptr.seg_id,
-            offset: ptr.offset,
-        };
+        let cache_key = BlobCacheKey::from_ptr(ptr, expected_key);
         if self.blob_cache.get_append_into(&cache_key, &mut out) {
             return Ok(Some(out));
         }
@@ -3403,12 +3388,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         expected_key: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
-        let cache_key = BlobCacheKey {
-            kind: ptr.kind as u8,
-            table_id: ptr.table_id,
-            seg_id: ptr.seg_id,
-            offset: ptr.offset,
-        };
+        let cache_key = BlobCacheKey::from_ptr(ptr, expected_key);
 
         let orig_len = out.len();
         if self.blob_cache.get_append_into(&cache_key, out) {

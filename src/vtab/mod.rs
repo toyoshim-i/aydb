@@ -298,13 +298,9 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
             }
             let slice = unsafe { core::slice::from_raw_parts(text_ptr, bytes) };
             let s = core::str::from_utf8(slice).ok()?;
-            let trimmed = s.trim();
-            if let Ok(i) = trimmed.parse::<i64>() {
-                Some(i)
-            } else if let Ok(f) = trimmed.parse::<f64>() {
-                f64_to_lossless_i64(f)
-            } else {
-                None
+            match parse_sqlite_numeric_str(s) {
+                Some(Ok(i)) => Some(i),
+                _ => None,
             }
         }
         _ => None,

@@ -336,18 +336,29 @@ impl MemTable {
         lower: Bound<&'a [u8]>,
         upper: Bound<&'a [u8]>,
     ) -> MemTableRange<'a> {
-        let first = match lower {
-            Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
-            Bound::Unbounded => 0,
+        let empty = match (lower, upper) {
+            (Bound::Included(lo), Bound::Included(hi)) => lo > hi,
+            (Bound::Included(lo), Bound::Excluded(hi))
+            | (Bound::Excluded(lo), Bound::Included(hi))
+            | (Bound::Excluded(lo), Bound::Excluded(hi)) => lo >= hi,
+            _ => false,
         };
-        let last = match upper {
-            Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
-            Bound::Unbounded => self.chunks.len() - 1,
-        };
-        let chunks = if first <= last {
-            &self.chunks[first..=last]
-        } else {
+        let chunks = if empty {
             &[]
+        } else {
+            let first = match lower {
+                Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
+                Bound::Unbounded => 0,
+            };
+            let last = match upper {
+                Bound::Included(k) | Bound::Excluded(k) => chunk_index(&self.chunks, k),
+                Bound::Unbounded => self.chunks.len() - 1,
+            };
+            if first <= last {
+                &self.chunks[first..=last]
+            } else {
+                &[]
+            }
         };
         MemTableRange {
             chunks,
@@ -950,5 +961,45 @@ mod tests {
             rev.advance().unwrap();
         }
         assert_eq!(count_rev, 0);
+    }
+
+    #[test]
+    fn iter_range_with_inverted_or_empty_excluded_bounds_returns_empty_without_panicking() {
+        for total in [10u32, 300] {
+            // Small cap triggers chunking on 300 entries so both single-chunk and multi-chunk paths run.
+            let mut mt = MemTable::new(1024);
+            for i in 0..total {
+                mt.put_inline(
+                    format!("k_{i:04}").into_bytes(),
+                    b"payload_bytes".to_vec(),
+                    (i + 1) as u64,
+                );
+            }
+            assert_eq!(
+                mt.iter_range(Bound::Included(b"k_0009"), Bound::Included(b"k_0001"))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                mt.iter_range(Bound::Excluded(b"k_0005"), Bound::Excluded(b"k_0005"))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                mt.iter_range(Bound::Excluded(b"k_0005"), Bound::Included(b"k_0005"))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                mt.iter_range(Bound::Included(b"k_0005"), Bound::Excluded(b"k_0005"))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                mt.iter_range(Bound::Excluded(b"k_0200"), Bound::Excluded(b"k_0010"))
+                    .count(),
+                0
+            );
+        }
     }
 }

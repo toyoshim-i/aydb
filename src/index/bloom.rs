@@ -19,6 +19,17 @@ pub struct BloomFilter {
     num_probes: u8,
 }
 
+const MAX_BLOOM_BITS: u64 = (u32::MAX - 7) as u64;
+
+fn compute_bloom_sizing(num_keys: usize, bits_per_key: usize) -> (usize, u32) {
+    let raw_bits = (num_keys as u64)
+        .saturating_mul(bits_per_key as u64)
+        .clamp(64, MAX_BLOOM_BITS);
+    let num_bytes = raw_bits.div_ceil(8) as usize;
+    let num_bits = (num_bytes as u64 * 8) as u32;
+    (num_bytes, num_bits)
+}
+
 impl BloomFilter {
     /// Creates an empty filter disabled (`bits_per_key == 0`) or sized for `num_keys`.
     pub fn new(num_keys: usize, bits_per_key: usize) -> Self {
@@ -32,9 +43,7 @@ impl BloomFilter {
 
         // Optimal number of probes k = ln(2) * bits_per_key (~0.69 * bits_per_key)
         let k = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
-        let raw_bits = (num_keys.saturating_mul(bits_per_key)).max(64);
-        let num_bytes = raw_bits.div_ceil(8);
-        let num_bits = (num_bytes * 8) as u32;
+        let (num_bytes, num_bits) = compute_bloom_sizing(num_keys, bits_per_key);
 
         Self {
             bits: vec![0u8; num_bytes],
@@ -177,5 +186,25 @@ impl BloomFilter {
             num_bits,
             num_probes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_sizing_clamps_without_u32_truncation() {
+        let (bytes_max, bits_max) = compute_bloom_sizing(usize::MAX, 10);
+        assert!(bits_max > 0);
+        assert_eq!(bits_max as usize, bytes_max * 8);
+
+        let (bytes_512m, bits_512m) = compute_bloom_sizing(1 << 26, 8);
+        assert!(bits_512m > 0);
+        assert_eq!(bits_512m as usize, bytes_512m * 8);
+
+        let (bytes_exact_wrap, bits_exact_wrap) = compute_bloom_sizing(1 << 29, 8);
+        assert!(bits_exact_wrap > 0);
+        assert_eq!(bits_exact_wrap as usize, bytes_exact_wrap * 8);
     }
 }

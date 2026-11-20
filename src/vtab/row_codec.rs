@@ -125,19 +125,62 @@ pub fn f64_to_exact_i64(f: f64) -> Option<i64> {
     }
 }
 
-/// Attempts to parse a string slice as a well-formed SQLite numeric literal (`i64` or finite `f64`).
+fn is_sqlite_ascii_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+fn is_sqlite_decimal_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if i < b.len() && matches!(b[i], b'+' | b'-') {
+        i += 1;
+    }
+    let mut digits = 0usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        digits += 1;
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            digits += 1;
+            i += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let mut exp_digits = 0usize;
+        while i < b.len() && b[i].is_ascii_digit() {
+            exp_digits += 1;
+            i += 1;
+        }
+        if exp_digits == 0 {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
+/// Attempts to parse a string slice as a well-formed SQLite numeric literal (`i64` or `f64`).
 /// Returns `Some(Ok(i64))` if it is an exact 64-bit integer, `Some(Err(f64))` if it is a valid
-/// floating-point number that cannot be represented as `i64`, or `None` if it is not numeric.
+/// numeric floating-point value (including overflowing values such as `1e500` -> `+Inf`) that
+/// cannot be represented as `i64`, or `None` if it is not numeric.
 pub fn parse_sqlite_numeric_str(s: &str) -> Option<Result<i64, f64>> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+    let trimmed = s.trim_matches(is_sqlite_ascii_ws);
+    if trimmed.is_empty() || !is_sqlite_decimal_literal(trimmed) {
         return None;
     }
     if let Ok(i) = trimmed.parse::<i64>() {
         return Some(Ok(i));
     }
     if let Ok(f) = trimmed.parse::<f64>() {
-        if f.is_finite() {
+        if !f.is_nan() {
             if let Some(i) = f64_to_exact_i64(f) {
                 return Some(Ok(i));
             }
@@ -1299,6 +1342,17 @@ mod tests {
         assert_eq!(parse_sqlite_numeric_str(" 42 "), Some(Ok(42)));
         assert_eq!(parse_sqlite_numeric_str(" 42.0 "), Some(Ok(42)));
         assert_eq!(parse_sqlite_numeric_str(" -1.5 "), Some(Err(-1.5)));
+        assert_eq!(parse_sqlite_numeric_str(" 42\t\n\x0b\x0c\r "), Some(Ok(42)));
+        assert_eq!(parse_sqlite_numeric_str("\x0b42\x0b"), Some(Ok(42)));
+        assert_eq!(parse_sqlite_numeric_str("\u{00a0}42"), None);
+        assert_eq!(parse_sqlite_numeric_str("\u{2003}42"), None);
+        assert_eq!(parse_sqlite_numeric_str("1e500"), Some(Err(f64::INFINITY)));
+        assert_eq!(
+            parse_sqlite_numeric_str("-1e500"),
+            Some(Err(f64::NEG_INFINITY))
+        );
+        assert_eq!(parse_sqlite_numeric_str("inf"), None);
+        assert_eq!(parse_sqlite_numeric_str("NaN"), None);
         assert_eq!(parse_sqlite_numeric_str("abc"), None);
     }
 

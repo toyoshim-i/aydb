@@ -223,6 +223,7 @@ impl VerifiedBlockCache {
                 if slot.occupied && slot.seq_id == seq_id {
                     slot.occupied = false;
                     slot.ref_bit = false;
+                    slot.data = None;
                     to_remove.push((seq_id, slot.block_idx));
                 }
             }
@@ -254,6 +255,24 @@ pub struct BlobCacheKey {
     pub table_id: u16,
     pub seg_id: u64,
     pub offset: u32,
+    pub len: u32,
+    pub crc32c: u32,
+    pub key_hash: u64,
+}
+
+impl BlobCacheKey {
+    #[inline]
+    pub fn from_ptr(ptr: &crate::wal::BlobPtr, expected_key: &[u8]) -> Self {
+        Self {
+            kind: ptr.kind as u8,
+            table_id: ptr.table_id,
+            seg_id: ptr.seg_id,
+            offset: ptr.offset,
+            len: ptr.len,
+            crc32c: ptr.crc32c,
+            key_hash: crate::index::BloomFilter::hash64(expected_key),
+        }
+    }
 }
 
 struct BlobCacheEntry {
@@ -324,6 +343,8 @@ impl VerifiedBlobCache {
     fn shard_index(&self, key: &BlobCacheKey) -> usize {
         let mut h = (key.seg_id ^ 0x517c_c1b7_2722_0a95).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         h ^= (key.offset as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+        h ^= ((key.len as u64) << 32 | (key.crc32c as u64)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= key.key_hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         h ^= ((key.table_id as u64) << 16 | (key.kind as u64)).wrapping_mul(0x27bb_2ee6_87b0_b0fd);
         ((h ^ (h >> 32)) as usize) & (NUM_SHARDS - 1)
     }
@@ -458,7 +479,7 @@ impl VerifiedBlobCache {
             let mut keys_to_remove = Vec::new();
             for entry_opt in &mut shard.entries {
                 if let Some(e) = entry_opt {
-                    if e.key.table_id == table_id {
+                    if e.key.kind == crate::wal::BlobKind::Lru as u8 && e.key.table_id == table_id {
                         freed_bytes = freed_bytes.saturating_add(e.size);
                         keys_to_remove.push(e.key);
                         *entry_opt = None;
@@ -563,10 +584,13 @@ mod tests {
         assert!(cache.is_enabled());
 
         let key1 = BlobCacheKey {
-            kind: 1,
+            kind: crate::wal::BlobKind::Lru as u8,
             table_id: 10,
             seg_id: 100,
             offset: 4096,
+            len: 32,
+            crc32c: 0x1111_2222,
+            key_hash: 0xAAAA_BBBB,
         };
         let payload1 = b"hello blob cache";
         cache.insert(key1, payload1);
@@ -577,16 +601,19 @@ mod tests {
         assert_eq!(cache.hits(), 1);
 
         let key_absent = BlobCacheKey {
-            kind: 1,
+            kind: crate::wal::BlobKind::Lru as u8,
             table_id: 10,
             seg_id: 100,
             offset: 9999,
+            len: 32,
+            crc32c: 0x1111_2222,
+            key_hash: 0xAAAA_BBBB,
         };
         assert!(!cache.get_append_into(&key_absent, &mut out));
         assert_eq!(cache.misses(), 1);
 
         // Invalidate segment 100
-        cache.invalidate_blob_segment(1, 10, 100);
+        cache.invalidate_blob_segment(crate::wal::BlobKind::Lru as u8, 10, 100);
         out.clear();
         assert!(!cache.get_append_into(&key1, &mut out));
     }
@@ -595,15 +622,59 @@ mod tests {
     fn blob_cache_rejects_payload_larger_than_16kb() {
         let cache = VerifiedBlobCache::new(64 * 1024);
         let key = BlobCacheKey {
-            kind: 1,
+            kind: crate::wal::BlobKind::Lru as u8,
             table_id: 1,
             seg_id: 1,
             offset: 0,
+            len: (17 * 1024) as u32,
+            crc32c: 0x5555_6666,
+            key_hash: 0xCCCC_DDDD,
         };
         let big_payload = vec![0xAAu8; 17 * 1024];
         cache.insert(key, &big_payload);
 
         let mut out = Vec::new();
         assert!(!cache.get_append_into(&key, &mut out));
+    }
+
+    #[test]
+    fn block_cache_invalidate_releases_arc_and_blob_cache_key_distinguishes_crc_len_key() {
+        let block_cache = VerifiedBlockCache::new(1024 * 1024);
+        let block = [0x3Cu8; IDX_BLOCK_SIZE];
+        block_cache.insert(7, 0, &block);
+        let held = block_cache.get_arc(7, 0).unwrap();
+        // `held` + cache slot hold two strong references.
+        assert_eq!(Arc::strong_count(&held), 2);
+        block_cache.invalidate_segment(7);
+        assert_eq!(Arc::strong_count(&held), 1);
+
+        let blob_cache = VerifiedBlobCache::new(64 * 1024);
+        let base_ptr = crate::wal::BlobPtr {
+            kind: crate::wal::BlobKind::Standard,
+            table_id: 0,
+            seg_id: 5,
+            offset: 128,
+            len: 64,
+            crc32c: 0x1234_5678,
+        };
+        let std_key = BlobCacheKey::from_ptr(&base_ptr, b"row_a");
+        blob_cache.insert(std_key, b"payload_a");
+
+        // Standard blobs (`table_id == 0`) must not be wiped by `invalidate_table_blobs(0)`.
+        blob_cache.invalidate_table_blobs(0);
+        let mut out = Vec::new();
+        assert!(blob_cache.get_append_into(&std_key, &mut out));
+        assert_eq!(out, b"payload_a");
+
+        // Same `(kind, table_id, seg_id, offset)` with different len / crc32c / key must miss.
+        let mut diff_len = base_ptr;
+        diff_len.len = 65;
+        assert!(!blob_cache.contains(&BlobCacheKey::from_ptr(&diff_len, b"row_a")));
+
+        let mut diff_crc = base_ptr;
+        diff_crc.crc32c ^= 1;
+        assert!(!blob_cache.contains(&BlobCacheKey::from_ptr(&diff_crc, b"row_a")));
+
+        assert!(!blob_cache.contains(&BlobCacheKey::from_ptr(&base_ptr, b"row_b")));
     }
 }

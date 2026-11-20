@@ -6843,3 +6843,95 @@ fn crash_recovery_persists_reconciled_capped_bytes_across_second_crash() {
         assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()));
     }
 }
+
+#[test]
+fn register_capped_table_reconcile_failure_does_not_leave_stale_zero_state() {
+    use crate::lru::RowMetaRecord;
+    use crate::wal::{BlobKind, WalRecord};
+
+    let fs = Arc::new(PowerLossFs::new());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    // Seed table 9 with an existing row and an un-ticked (`recorded_tick = 0`) RowMetaRecord
+    // stored in the buffered standard blob writer so initial reconciliation must flush & read it.
+    engine
+        .put_row(9, b"pk1", b"val1", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let meta_key = crate::lru::encode_row_meta_key(9, b"pk1");
+    let big_meta = RowMetaRecord::encode_slice(0, 7, &[(1, vec![b'x'; 4096])]);
+    let meta_ptr = engine
+        .append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &big_meta)
+        .unwrap();
+    engine
+        .commit_wal_and_memtable(
+            vec![WalRecord::PutBlobPtr {
+                key: meta_key,
+                blob_ptr: meta_ptr,
+            }],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+
+    // Fail blob I/O during initial `register_capped_table` reconciliation.
+    fs.set_blob_write_failure(true);
+    let err = engine.register_capped_table(9, 10_000).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+    assert!(
+        engine.capped_table_state(9).is_none(),
+        "failed register_capped_table must roll back empty capped_tables entry"
+    );
+
+    // Clear the transient I/O failure and retry; reconciliation must run and count `pk1`.
+    fs.set_blob_write_failure(false);
+    engine.register_capped_table(9, 10_000).unwrap();
+    let ct = engine.capped_table_state(9).unwrap();
+    assert_eq!(ct.current_logical_bytes, 7);
+}
+
+#[test]
+fn install_compaction_discards_output_file_when_blob_sync_fails() {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.auto_compact_segment_threshold = 0;
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    engine
+        .put_row(1, b"k1", &[0xAAu8; 200], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    engine
+        .put_row(1, b"k2", &[0xBBu8; 200], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+
+    // Leave unsynced bytes in `active_std_writer` with an empty MemTable via a rolled-back write.
+    engine.begin_transaction();
+    engine
+        .put_row(
+            1,
+            b"rolled_back",
+            &[0xCCu8; 200],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    engine.rollback_transaction().unwrap();
+
+    let job = engine.prepare_compaction_at(0).unwrap().unwrap();
+    let out_name = crate::meta::format_idx_file_name(job.output_seq_id());
+    let out = job.run().unwrap();
+    assert!(fs.list_files().unwrap().contains(&out_name));
+
+    fs.arm_blob_sync_failure();
+    let err = engine.install_compaction(out).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert!(
+        !fs.list_files().unwrap().contains(&out_name),
+        "failed install_compaction must unlink {out_name} instead of leaking it"
+    );
+}

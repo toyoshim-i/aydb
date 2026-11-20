@@ -85,17 +85,22 @@ impl AccessTracker {
     /// Allocates the next monotonically increasing `AccessTick`.
     #[inline]
     pub fn next_tick(&self) -> u64 {
-        self.next_tick.fetch_add(1, Ordering::Relaxed)
+        self.next_tick
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(1))
+            })
+            .unwrap()
     }
 
     /// Advances the internal tick counter so it is strictly greater than `observed_tick`
     /// (used during WAL/segment recovery at startup).
     pub fn observe_tick(&self, observed_tick: u64) {
+        let target = observed_tick.saturating_add(1);
         let mut cur = self.next_tick.load(Ordering::Relaxed);
-        while observed_tick >= cur {
+        while target > cur {
             match self.next_tick.compare_exchange_weak(
                 cur,
-                observed_tick + 1,
+                target,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -281,5 +286,14 @@ mod tests {
         }
         assert!(tracker.len() <= 64);
         assert!(tracker.peek_hot_tick(3, b"k_0079").is_some());
+    }
+
+    #[test]
+    fn access_tracker_observe_u64_max_does_not_overflow_or_spin() {
+        let tracker = AccessTracker::new(1, 64);
+        tracker.observe_tick(u64::MAX);
+        tracker.observe_tick(u64::MAX);
+        assert_eq!(tracker.next_tick(), u64::MAX);
+        assert_eq!(tracker.next_tick(), u64::MAX);
     }
 }

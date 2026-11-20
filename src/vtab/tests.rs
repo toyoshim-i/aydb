@@ -3040,3 +3040,67 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
         assert_eq!(info.orderByConsumed, 0);
     }
 }
+
+#[test]
+fn sqlite_numeric_string_affinity_matches_native() {
+    let tmp = TempTestDir::new("numeric_affinity_diff");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    for (idx, col_type) in ["INTEGER", "NUMERIC", "REAL"].iter().enumerate() {
+        let a_tbl = format!("ay_{idx}");
+        let n_tbl = format!("nat_{idx}");
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {a_tbl} USING aydb(columns='id INTEGER PRIMARY KEY, v {col_type}');
+             CREATE TABLE {n_tbl}(id INTEGER PRIMARY KEY, v {col_type});"
+        ))
+        .unwrap();
+
+        let cases = [
+            "42",
+            " 42\t\n\x0c\r ",
+            "\x0b42",
+            "\u{00a0}42",
+            "\u{2003}42",
+            "42.0",
+            "1e500",
+            "-1e500",
+            "Inf",
+            "NaN",
+            "abc",
+        ];
+        for (row_id, text_val) in cases.iter().enumerate() {
+            let params = [
+                SqlValue::Integer((row_id + 1) as i64),
+                SqlValue::Text((*text_val).to_string()),
+            ];
+            let mut s_a = conn
+                .prepare(&format!("INSERT INTO {a_tbl} VALUES (?1, ?2)"))
+                .unwrap();
+            s_a.execute(&params).unwrap();
+            let mut s_n = conn
+                .prepare(&format!("INSERT INTO {n_tbl} VALUES (?1, ?2)"))
+                .unwrap();
+            s_n.execute(&params).unwrap();
+        }
+
+        let got_a = conn
+            .query_all(
+                &format!("SELECT id, typeof(v), v FROM {a_tbl} ORDER BY id"),
+                &[],
+            )
+            .unwrap();
+        let got_n = conn
+            .query_all(
+                &format!("SELECT id, typeof(v), v FROM {n_tbl} ORDER BY id"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(got_a, got_n, "col_type={col_type}");
+    }
+}

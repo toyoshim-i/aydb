@@ -961,30 +961,29 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         let fp_count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
         slice = &slice[4..];
 
-        // Validate `fp_count` against the number of 4 KB data blocks (`<= 1` fence pointer per block)
+        // Validate `fp_count` against the number of 4 KB data blocks (`1` fence pointer per block)
         // and the remaining bytes in `slice` (`>= 6` bytes per fence pointer) BEFORE allocating.
-        let max_possible_blocks = (meta_offset / (IDX_BLOCK_SIZE as u64)) as usize;
         let min_fp_bytes = fp_count.checked_mul(6).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "fence pointer count byte size overflow",
             )
         })?;
-        if fp_count > max_possible_blocks || min_fp_bytes > slice.len() {
+        if fp_count != num_blocks as usize || min_fp_bytes > slice.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted or out-of-bounds fence pointer count in idx segment",
             ));
         }
 
-        let mut fence_pointers = Vec::new();
+        let mut fence_pointers: Vec<FencePointer> = Vec::new();
         fence_pointers.try_reserve_exact(fp_count).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "failed to reserve fence pointers",
             )
         })?;
-        for _ in 0..fp_count {
+        for expected_block_idx in 0..fp_count {
             if slice.len() < 6 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -993,10 +992,10 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             }
             let klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
             let block_idx = u32::from_le_bytes([slice[2], slice[3], slice[4], slice[5]]);
-            if block_idx >= num_blocks {
+            if block_idx != expected_block_idx as u32 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "fence pointer block_idx out of bounds",
+                    "non-sequential fence pointer block_idx in idx segment",
                 ));
             }
             slice = &slice[6..];
@@ -1008,6 +1007,14 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             }
             let first_key = slice[..klen].to_vec().into_boxed_slice();
             slice = &slice[klen..];
+            if let Some(prev) = fence_pointers.last() {
+                if first_key.as_ref() <= prev.first_key.as_ref() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsorted fence pointers in idx segment",
+                    ));
+                }
+            }
             fence_pointers.push(FencePointer {
                 first_key,
                 block_idx,
@@ -1018,37 +1025,48 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             .first()
             .map(|fp| fp.first_key.to_vec())
             .unwrap_or_default();
-        let max_key = if slice.len() >= 2 {
-            let max_klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
-            slice = &slice[2..];
-            if slice.len() < max_klen {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated max_key in idx segment metadata",
-                ));
-            }
-            slice[..max_klen].to_vec()
-        } else if num_blocks > 0 && !fence_pointers.is_empty() {
-            let last_block_idx = num_blocks - 1;
-            let mut block_buf = [0u8; IDX_BLOCK_SIZE];
-            file.read_exact_at(
-                &mut block_buf,
-                (last_block_idx as u64) * (IDX_BLOCK_SIZE as u64),
-            )?;
-            if let Ok(reader) = IdxBlockReader::open_verified(&block_buf) {
-                if reader.num_entries() > 0 {
-                    reader
-                        .key_at(reader.num_entries() - 1)
-                        .map(|k| k.to_vec())
-                        .unwrap_or_else(|_| fence_pointers.last().unwrap().first_key.to_vec())
-                } else {
-                    min_key.clone()
+        let max_key = if slice.is_empty() {
+            if num_blocks > 0 {
+                let last_block_idx = num_blocks - 1;
+                let mut block_buf = [0u8; IDX_BLOCK_SIZE];
+                file.read_exact_at(
+                    &mut block_buf,
+                    (last_block_idx as u64) * (IDX_BLOCK_SIZE as u64),
+                )?;
+                let reader = IdxBlockReader::open_verified(&block_buf)?;
+                if reader.num_entries() == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty last block in legacy idx segment",
+                    ));
                 }
+                reader.key_at(reader.num_entries() - 1)?.to_vec()
             } else {
                 Vec::new()
             }
+        } else if slice.len() == 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated max_key in idx segment metadata",
+            ));
         } else {
-            Vec::new()
+            let max_klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
+            slice = &slice[2..];
+            if slice.len() != max_klen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated or trailing bytes in idx segment max_key",
+                ));
+            }
+            if let Some(last_fp) = fence_pointers.last() {
+                if slice < last_fp.first_key.as_ref() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "idx segment max_key precedes last fence pointer",
+                    ));
+                }
+            }
+            slice.to_vec()
         };
 
         Ok(Self {
@@ -2029,5 +2047,137 @@ mod tests {
             .err()
             .expect("oversized idx metadata must be rejected before writing footer");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn idx_open_rejects_mismatched_or_unsorted_fence_pointers_and_corrupt_legacy_tail() {
+        let tmp = TempTestDir::new("idx_fence_validate");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let mut mt = MemTable::new(DEFAULT_MEMTABLE_CAPACITY_BYTES);
+        let payload = vec![0x42u8; 256];
+        for i in 0..80u32 {
+            mt.put_inline(
+                format!("k_{i:04}").into_bytes(),
+                payload.clone(),
+                (i + 1) as u64,
+            );
+        }
+        let seg = mt.flush_to_segment(&fs, 1, 10).unwrap();
+        assert!(seg.num_blocks() >= 3);
+        let expected_max_key = seg.max_key().to_vec();
+        drop(seg);
+
+        let fname = format_idx_file_name(1);
+        let orig_bytes = std::fs::read(tmp.path.join(&fname)).unwrap();
+        let footer_start = orig_bytes.len() - IDX_FOOTER_SIZE;
+        let footer: [u8; IDX_FOOTER_SIZE] = orig_bytes[footer_start..].try_into().unwrap();
+        let meta_offset = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
+        let num_blocks = u32::from_le_bytes(footer[16..20].try_into().unwrap());
+        let orig_meta = &orig_bytes[meta_offset..footer_start];
+
+        // Parse original Bloom + fence pointers to build targeted crafted trailers.
+        let mut s = orig_meta;
+        let bloom = BloomFilter::decode(&mut s).unwrap();
+        let mut bloom_bytes = Vec::new();
+        bloom.encode(&mut bloom_bytes);
+        let fp_count = u32::from_le_bytes(s[0..4].try_into().unwrap()) as usize;
+        assert_eq!(fp_count, num_blocks as usize);
+        s = &s[4..];
+        let mut fps = Vec::with_capacity(fp_count);
+        for _ in 0..fp_count {
+            let klen = u16::from_le_bytes([s[0], s[1]]) as usize;
+            let bidx = u32::from_le_bytes([s[2], s[3], s[4], s[5]]);
+            let fk = s[6..6 + klen].to_vec();
+            s = &s[6 + klen..];
+            fps.push((fk, bidx));
+        }
+
+        let write_crafted = |data: &[u8], new_meta: &[u8], corrupt_last_block: bool| {
+            let mut raw = data.to_vec();
+            if corrupt_last_block {
+                let last_block_start = ((num_blocks - 1) as usize) * IDX_BLOCK_SIZE;
+                raw[last_block_start] ^= 0xFF;
+            }
+            raw.truncate(meta_offset);
+            raw.extend_from_slice(new_meta);
+            let mut crafted_footer = footer;
+            crafted_footer[32..36].copy_from_slice(&(new_meta.len() as u32).to_le_bytes());
+            crafted_footer[36..40].copy_from_slice(&crc32c(new_meta).to_le_bytes());
+            let fcrc = crc32c(&crafted_footer[0..44]);
+            crafted_footer[44..48].copy_from_slice(&fcrc.to_le_bytes());
+            raw.extend_from_slice(&crafted_footer);
+            std::fs::write(tmp.path.join(&fname), &raw).unwrap();
+        };
+
+        let encode_fps = |entries: &[(Vec<u8>, u32)], max_tail: Option<&[u8]>| -> Vec<u8> {
+            let mut m = bloom_bytes.clone();
+            m.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for (fk, bidx) in entries {
+                m.extend_from_slice(&(fk.len() as u16).to_le_bytes());
+                m.extend_from_slice(&bidx.to_le_bytes());
+                m.extend_from_slice(fk);
+            }
+            if let Some(tail) = max_tail {
+                m.extend_from_slice(tail);
+            }
+            m
+        };
+
+        // 1. Mismatched `fp_count < num_blocks` must fail with InvalidData.
+        let short_meta = encode_fps(&fps[..1], Some(&[2, 0, b'z', b'z']));
+        write_crafted(&orig_bytes, &short_meta, false);
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 2. Unsorted fence pointer keys must fail with InvalidData.
+        let mut swapped = fps.clone();
+        let (k0, k1) = (swapped[0].0.clone(), swapped[1].0.clone());
+        swapped[0].0 = k1;
+        swapped[1].0 = k0;
+        let mut normal_tail = Vec::new();
+        normal_tail.extend_from_slice(&(expected_max_key.len() as u16).to_le_bytes());
+        normal_tail.extend_from_slice(&expected_max_key);
+        write_crafted(
+            &orig_bytes,
+            &encode_fps(&swapped, Some(&normal_tail)),
+            false,
+        );
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 3. Trailing garbage bytes after `max_key` must fail with InvalidData.
+        let mut garbage_tail = normal_tail.clone();
+        garbage_tail.push(0xAA);
+        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&garbage_tail)), false);
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 4. Single truncated length byte in `max_key` tail must fail with InvalidData.
+        write_crafted(&orig_bytes, &encode_fps(&fps, Some(&[1u8])), false);
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 5. Legacy format omitting trailing `max_key` cleanly falls back when last block is
+        //    intact, and rejects corruption when the last block fails verification.
+        let legacy_meta = encode_fps(&fps, None);
+        write_crafted(&orig_bytes, &legacy_meta, false);
+        let legacy_seg = IdxSegmentReader::open(&fs, 1).expect("intact legacy tail opens");
+        assert_eq!(legacy_seg.max_key(), expected_max_key.as_slice());
+        drop(legacy_seg);
+
+        write_crafted(&orig_bytes, &legacy_meta, true);
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

@@ -23,6 +23,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn register_capped_table(&mut self, table_id: u16, max_bytes: u64) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
+        let prev_has_row_meta = self.table_has_row_meta.get(&table_id).copied();
         self.table_has_row_meta.insert(table_id, true);
         let was_present = self.capped_tables.contains_key(&table_id);
         let entry = self
@@ -31,7 +32,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .or_insert_with(|| CappedTableState::new(table_id, max_bytes));
         entry.max_bytes = max_bytes;
         if !was_present {
-            self.reconcile_single_capped_table(table_id)?;
+            if let Err(e) = self.reconcile_single_capped_table(table_id) {
+                self.capped_tables.remove(&table_id);
+                match prev_has_row_meta {
+                    Some(v) => {
+                        self.table_has_row_meta.insert(table_id, v);
+                    }
+                    None => {
+                        self.table_has_row_meta.remove(&table_id);
+                    }
+                }
+                return Err(e);
+            }
         }
         if self.tx_depth == 0 {
             let bytes_before = self
@@ -275,9 +287,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             if !progress {
-                if last_scanned_tick >= cursor_tick {
+                if let Some(next_cursor) = last_scanned_tick
+                    .checked_add(1)
+                    .filter(|_| last_scanned_tick >= cursor_tick)
+                {
                     if let Some(ct) = self.capped_tables.get_mut(&table_id) {
-                        ct.eviction_cursor_tick = last_scanned_tick + 1;
+                        ct.eviction_cursor_tick = next_cursor;
                     }
                 } else {
                     break;
