@@ -50,7 +50,10 @@
 
 use super::*;
 use crate::util::crc32c::crc32c;
-use crate::wal::{SingleStreamRecovery, recover_single_wal_stream};
+use crate::wal::{
+    SingleStreamRecovery, WalScanMode, recover_single_wal_stream,
+    recover_single_wal_stream_with_mode,
+};
 
 /// What a seed exercises beyond the plain power-cut workload.
 #[derive(Clone, Copy, Default, Debug)]
@@ -184,9 +187,14 @@ fn live_sectors(img: &[u8], epoch: u64) -> Vec<usize> {
         .collect()
 }
 
-fn scan_img(name: &str, img: Vec<u8>, epoch: u64) -> io::Result<SingleStreamRecovery> {
+fn scan_img(
+    name: &str,
+    img: Vec<u8>,
+    epoch: u64,
+    mode: WalScanMode,
+) -> io::Result<SingleStreamRecovery> {
     let fs = scratch_fs(vec![(name.to_string(), img)]);
-    recover_single_wal_stream(&*raw_file(&fs, name), epoch)
+    recover_single_wal_stream_with_mode(&*raw_file(&fs, name), epoch, mode)
 }
 
 fn found(r: SingleStreamRecovery) -> Vec<WalBatch> {
@@ -203,15 +211,23 @@ fn lsns_of(b: &[WalBatch]) -> Vec<u64> {
 
 /// What the logs say recovery has to report (module documentation).
 pub(super) struct Expect {
-    /// Some lost LSN is at or below the watermark of a visible batch: damage must be reported.
-    pub required: bool,
+    /// Some lost LSN is at or below the watermark of a batch visible under full scan (`Fail` /
+    /// salvage): full-scan recovery must report damage.
+    pub required_full: bool,
+    /// Some lost LSN is at or below the watermark of a batch visible under fast `StopAtEndOfLog`
+    /// (`Truncate`) scan: fast recovery must report damage.
+    pub required_fast: bool,
+    /// Fast and full scans discovered the exact same LSNs (so `Truncate` and `Fail` agree field
+    /// for field on `WalDamage`).
+    pub fast_matches_full: bool,
     /// At least one logged batch above the checkpoint is no longer visible.
     pub any_lost: bool,
     /// A lost batch lay at or below the watermark of the logs before the damage.
     pub lost_acked: bool,
-    /// Not required, but a batch hidden behind a zeroed or stale sector would have proved it.
+    /// Fast `StopAtEndOfLog` would have missed damage that `FullScan` uncovered behind a zeroed
+    /// or stale sector.
     pub hidden: bool,
-    /// The batches the scan sees in the damaged logs, by LSN.
+    /// The batches `FullScan` sees in the damaged logs, by LSN.
     pub visible: Vec<WalBatch>,
     /// The batches of the logs before the crash, as `(lsn, prev_lsn, durable_lsn)`, and the
     /// checkpoint.
@@ -286,7 +302,8 @@ impl Harness<'_> {
             return Ok(None);
         };
         let now = self.all_files();
-        let (mut before, mut visible, mut alt) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut before, mut visible_fast, mut visible_full) = (Vec::new(), Vec::new(), Vec::new());
+        let mut fast_matches_full = true;
         let io = |what: &str, e: io::Error| self.fail(format!("oracle: {what}: {e}"));
         for (name, epoch) in [
             (WAL_FILES[0], m.sync_wal_epoch),
@@ -299,60 +316,77 @@ impl Harness<'_> {
                 return Ok(None);
             };
             before.extend(found(
-                scan_img(name, lg.clone(), epoch).map_err(|e| io("scan", e))?,
+                scan_img(name, lg.clone(), epoch, WalScanMode::StopAtEndOfLog)
+                    .map_err(|e| io("scan", e))?,
             ));
-            // The scan must stop where the oracle says the log ends: what lies at or past that
+            // Fast scan must stop where the oracle says the log ends: what lies at or past that
             // sector must not change what it returns.
             let end = scan_end(cur, epoch);
-            let full = scan_img(name, cur.clone(), epoch).map_err(|e| io("scan", e))?;
-            let head =
-                scan_img(name, cur[..end * SECT].to_vec(), epoch).map_err(|e| io("scan", e))?;
-            if lsns_of(&full.batches) != lsns_of(&head.batches)
-                || lsns_of(&full.past_stop) != lsns_of(&head.past_stop)
+            let fast = scan_img(name, cur.clone(), epoch, WalScanMode::StopAtEndOfLog)
+                .map_err(|e| io("scan", e))?;
+            let head = recover_single_wal_stream(
+                &*raw_file(
+                    &scratch_fs(vec![(name.to_string(), cur[..end * SECT].to_vec())]),
+                    name,
+                ),
+                epoch,
+            )
+            .map_err(|e| io("scan", e))?;
+            if lsns_of(&fast.batches) != lsns_of(&head.batches)
+                || lsns_of(&fast.past_stop) != lsns_of(&head.past_stop)
             {
                 return Err(self.fail(format!(
-                    "{name}: the scan read past the end of the log (sector {end}): \
+                    "{name}: fast scan read past the end of the log (sector {end}): \
                      {:?}/{:?} against {:?}/{:?} without the rest",
-                    lsns_of(&full.batches),
-                    lsns_of(&full.past_stop),
+                    lsns_of(&fast.batches),
+                    lsns_of(&fast.past_stop),
                     lsns_of(&head.batches),
                     lsns_of(&head.past_stop),
                 )));
             }
-            visible.extend(found(full));
-            // What a scan that did not stop at the ordinary end would see: end markers are
-            // replaced by garbage. Only used to tell "hidden" from "unprovable" in the counters.
-            let mut open = cur.clone();
-            for i in end..open.len() / SECT {
-                if classify(&open[i * SECT..(i + 1) * SECT], epoch) == Sec::End {
-                    open[i * SECT..(i + 1) * SECT].fill(0xFF);
-                }
+            let full = scan_img(name, cur.clone(), epoch, WalScanMode::FullScan)
+                .map_err(|e| io("scan", e))?;
+            if lsns_of(&fast.batches) != lsns_of(&full.batches)
+                || lsns_of(&fast.past_stop) != lsns_of(&full.past_stop)
+                || fast.corrupt_sectors != full.corrupt_sectors
+                || fast.unsupported_format != full.unsupported_format
+            {
+                fast_matches_full = false;
             }
-            alt.extend(found(
-                scan_img(name, open, epoch).map_err(|e| io("scan", e))?,
-            ));
+            visible_fast.extend(found(fast));
+            visible_full.extend(found(full));
         }
-        visible.sort_by_key(|b| b.lsn);
-        let seen: BTreeSet<u64> = visible.iter().map(|b| b.lsn).collect();
-        let lost: Vec<u64> = before
+        visible_fast.sort_by_key(|b| b.lsn);
+        visible_full.sort_by_key(|b| b.lsn);
+        let seen_fast: BTreeSet<u64> = visible_fast.iter().map(|b| b.lsn).collect();
+        let seen_full: BTreeSet<u64> = visible_full.iter().map(|b| b.lsn).collect();
+        let lost_fast: Vec<u64> = before
             .iter()
             .map(|b| b.lsn)
-            .filter(|&l| l > m.checkpoint_lsn && !seen.contains(&l))
+            .filter(|&l| l > m.checkpoint_lsn && !seen_fast.contains(&l))
+            .collect();
+        let lost_full: Vec<u64> = before
+            .iter()
+            .map(|b| b.lsn)
+            .filter(|&l| l > m.checkpoint_lsn && !seen_full.contains(&l))
             .collect();
         let floor = |b: &[WalBatch]| b.iter().map(|b| b.durable_lsn).max().unwrap_or(0);
-        let (floor_vis, floor_alt) = (floor(&visible), floor(&alt));
+        let (floor_fast, floor_full) = (floor(&visible_fast), floor(&visible_full));
         let floor_before = before
             .iter()
             .filter(|b| b.lsn > m.checkpoint_lsn)
             .map(|b| b.durable_lsn)
             .max()
             .unwrap_or(0);
-        let required = lost.iter().any(|&l| l <= floor_vis);
+        let required_fast = lost_fast.iter().any(|&l| l <= floor_fast);
+        let required_full = lost_full.iter().any(|&l| l <= floor_full);
         Ok(Some(Expect {
-            required,
-            any_lost: !lost.is_empty(),
-            lost_acked: lost.iter().any(|&l| l <= floor_before),
-            hidden: !required && lost.iter().any(|&l| l <= floor_alt),
+            required_full,
+            required_fast,
+            fast_matches_full,
+            any_lost: !lost_fast.is_empty(),
+            lost_acked: lost_full.iter().any(|&l| l <= floor_before),
+            hidden: !required_fast && required_full,
             logged: {
                 let mut v: Vec<_> = before
                     .iter()
@@ -362,7 +396,7 @@ impl Harness<'_> {
                 v
             },
             checkpoint: m.checkpoint_lsn,
-            visible,
+            visible: visible_full,
         }))
     }
 
@@ -471,9 +505,9 @@ impl Harness<'_> {
     }
 
     /// Opens two copies of the damaged directory, one under `Fail` and one with salvage, and
-    /// checks the report, the refusal and the salvage list against the expectation. Returns the
-    /// damage the copies agree on.
-    fn recovery_on_copies(&self, x: &Expect) -> Result<Option<WalDamage>, String> {
+    /// checks the report, the refusal and the salvage list against the expectation. Returns what
+    /// the real `Truncate` open is expected to report.
+    fn recovery_on_copies(&self, x: &Expect) -> Result<ExpectDamage, String> {
         let files = self.all_files();
         let cov = &self.cov.media;
 
@@ -484,7 +518,7 @@ impl Harness<'_> {
             )?;
         let report = eng.last_wal_recovery().clone();
         let damage = report.damage.clone();
-        if damage.is_some() != x.required {
+        if damage.is_some() != x.required_full {
             return Err(self.fail(format!(
                 "recovery {} damage, but the logs {} it: a lost batch is {} the watermark of a \
                  visible batch\n  report: {report:?}\n  checkpoint {}, visible (lsn, prev, \
@@ -494,8 +528,16 @@ impl Harness<'_> {
                 } else {
                     "does not report"
                 },
-                if x.required { "prove" } else { "do not prove" },
-                if x.required { "at or below" } else { "above" },
+                if x.required_full {
+                    "prove"
+                } else {
+                    "do not prove"
+                },
+                if x.required_full {
+                    "at or below"
+                } else {
+                    "above"
+                },
                 x.checkpoint,
                 x.visible
                     .iter()
@@ -507,13 +549,12 @@ impl Harness<'_> {
         if x.lost_acked {
             Coverage::bump(&cov.lost_acked);
         }
+        if x.hidden {
+            Coverage::bump(&cov.hidden);
+        }
         if x.any_lost && damage.is_none() {
             Coverage::bump(&cov.lost_unreported);
-            Coverage::bump(if x.hidden {
-                &cov.hidden
-            } else {
-                &cov.unprovable
-            });
+            Coverage::bump(&cov.unprovable);
         }
 
         // `Fail`: refuses exactly when damage is reported, and then touches nothing.
@@ -524,7 +565,7 @@ impl Harness<'_> {
             Ok(e) => {
                 if damage.is_some() {
                     return Err(self.fail(format!(
-                        "Fail opened a WAL whose damage Truncate reports: {damage:?}"
+                        "Fail opened a WAL whose damage full scan reports: {damage:?}"
                     )));
                 }
                 if e.last_wal_recovery().damage.is_some() {
@@ -535,7 +576,7 @@ impl Harness<'_> {
                 let inner = err.get_ref().and_then(|i| i.downcast_ref::<WalDamage>());
                 if err.kind() != io::ErrorKind::InvalidData || inner != damage.as_ref() {
                     return Err(self.fail(format!(
-                        "Fail refused with {err} ({:?}); Truncate reports {damage:?}",
+                        "Fail refused with {err} ({:?}); salvage full scan reports {damage:?}",
                         err.kind()
                     )));
                 }
@@ -555,7 +596,11 @@ impl Harness<'_> {
             }
         }
         self.check_salvage(&eng, &txs, &report, x)?;
-        Ok(damage)
+        Ok(if x.fast_matches_full {
+            ExpectDamage::Exact(damage)
+        } else {
+            ExpectDamage::FastPresence(x.required_fast)
+        })
     }
 
     /// Salvage oracle: every returned transaction is a whole transaction that the workload

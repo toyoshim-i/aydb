@@ -14,7 +14,7 @@ use crate::util::crc32c::crc32c;
 mod recovery;
 pub use self::recovery::{
     DiscardedTx, StreamCounts, TwoStreamRecoveryResult, WalDamage, WalDamageReason,
-    WalRecoveryReport, recover_two_streams,
+    WalRecoveryReport, recover_two_streams, recover_two_streams_with_mode,
 };
 
 /// Fixed filename for the synchronous write-through WAL stream.
@@ -1004,25 +1004,31 @@ fn scan_sector(
     SectorScan::Usable
 }
 
+/// Controls how recovery treats an ordinary end-of-log sector (all zeros or an intact older-epoch
+/// sector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalScanMode {
+    /// Stop reading at the first end-of-log sector (fast clean opens under `Truncate`).
+    StopAtEndOfLog,
+    /// End the valid prefix at an end-of-log sector, but continue scanning the remainder of the
+    /// file into `past_stop` so later intact current-epoch batches are discovered (used by
+    /// `WalDamagePolicy::Fail` and `open_with_salvage`).
+    FullScan,
+}
+
 /// Scans a single WAL file from Sector 0 and extracts the [`WalBatch`] items of `expected_epoch`.
 ///
 /// The valid prefix ends at the first sector that is not a usable current-epoch sector: an
 /// older epoch, a newer one, a torn-write CRC, an unparsable body or an unsupported format
-/// version. The scan does not always stop reading there. Past an unusable sector it goes on and
-/// collects the intact batches of later current-epoch sectors in `past_stop`, because
-/// write-back reordering can persist a later sector while losing an earlier one. After a stop it
-/// also forgets any half-read batch, since the rest of it lies in the sector that was lost.
-///
-/// The one exception is the ordinary end of the log: a sector that is all zeros (never written)
-/// or an older-epoch sector with a valid CRC32C (left over from before the last epoch rotation).
-/// It ends the scan for good, wherever it comes, and the rest of the file is not read. After a
-/// clean shutdown and an epoch rotation that is sector 0, so a clean open reads one window
-/// instead of the whole file. The price: a sector that was lost and still holds intact older
-/// content, or zeros, ends the scan like the end of the log, so that loss goes unreported. The
-/// replay is still a correct prefix.
-pub fn recover_single_wal_stream<F: PlatformFile>(
+/// version. Past an unusable sector the scan collects later intact current-epoch batches in
+/// `past_stop`. Under [`WalScanMode::StopAtEndOfLog`], an all-zero or intact older-epoch sector
+/// ends the scan immediately so clean opens read at most one window per stream; under
+/// [`WalScanMode::FullScan`], such sectors end the valid prefix (and any in-flight fragmented
+/// batch) while scanning continues to the end of the file.
+pub fn recover_single_wal_stream_with_mode<F: PlatformFile>(
     file: &F,
     expected_epoch: u64,
+    scan_mode: WalScanMode,
 ) -> io::Result<SingleStreamRecovery> {
     let file_len = file.file_len()?;
     let total_sectors = (file_len / WAL_SECTOR_SIZE as u64) as usize;
@@ -1058,7 +1064,10 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
                     }
                     continue;
                 }
-                SectorScan::EndOfLog => break 'scan,
+                SectorScan::EndOfLog => match scan_mode {
+                    WalScanMode::StopAtEndOfLog => break 'scan,
+                    WalScanMode::FullScan => {}
+                },
                 SectorScan::OtherEpoch => {}
                 SectorScan::Corrupt => rec.corrupt_sectors += 1,
                 SectorScan::OtherVersion(version) => {
@@ -1077,6 +1086,14 @@ pub fn recover_single_wal_stream<F: PlatformFile>(
 
     // Any incomplete `First`/`Middle` chain without a `Last` fragment is automatically discarded.
     Ok(rec)
+}
+
+/// Scans a single WAL file from Sector 0 in [`WalScanMode::StopAtEndOfLog`] mode.
+pub fn recover_single_wal_stream<F: PlatformFile>(
+    file: &F,
+    expected_epoch: u64,
+) -> io::Result<SingleStreamRecovery> {
+    recover_single_wal_stream_with_mode(file, expected_epoch, WalScanMode::StopAtEndOfLog)
 }
 
 #[cfg(test)]

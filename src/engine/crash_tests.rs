@@ -26,6 +26,12 @@ use std::sync::atomic::AtomicU64;
 mod media;
 use media::{Mode, OpRec, Ticket, Touched};
 
+#[derive(Clone)]
+pub(super) enum ExpectDamage {
+    Exact(Option<WalDamage>),
+    FastPresence(bool),
+}
+
 // =============================================================================================
 // Deterministic random numbers
 // =============================================================================================
@@ -1042,8 +1048,8 @@ struct Harness<'a> {
     /// Batches were lost to the damage, so the next recovery may show an older state than the
     /// acknowledged one.
     relaxed: bool,
-    /// What the copies of the damaged directory reported; the real open must report the same.
-    expect_damage: Option<Option<WalDamage>>,
+    /// What the copies of the damaged directory reported; the real open must match.
+    expect_damage: Option<ExpectDamage>,
     /// The LSNs and rows of the workload's operations in this epoch, for the salvage oracle.
     oplog: Vec<OpRec>,
     /// Group commits appended and not yet seen durable.
@@ -1715,11 +1721,22 @@ impl<'a> Harness<'a> {
             // The first open of a damaged directory reports what the copies reported (unless a
             // recovery that was cut short may already have consumed the evidence).
             if let Some(want) = self.expect_damage.take() {
-                if report.damage != want {
-                    return Err(self.fail(format!(
-                        "recovery ({what}) of the damaged logs reports {:?}, the copies {want:?}",
-                        report.damage
-                    )));
+                match want {
+                    ExpectDamage::Exact(expected) if report.damage != expected => {
+                        return Err(self.fail(format!(
+                            "recovery ({what}) of the damaged logs reports {:?}, the copies \
+                             {expected:?}",
+                            report.damage
+                        )));
+                    }
+                    ExpectDamage::FastPresence(present) if report.damage.is_some() != present => {
+                        return Err(self.fail(format!(
+                            "recovery ({what}) of the damaged logs reports {:?}, fast scan expects \
+                             damage={present}",
+                            report.damage
+                        )));
+                    }
+                    _ => {}
                 }
             }
             self.damage_pending = false;
@@ -3602,6 +3619,58 @@ fn fail_policy_refuses_unverifiable_blob_and_leaves_files_untouched() {
     let mut e = StorageEngine::open(Arc::clone(&fs), repro_config()).unwrap();
     assert_recovered_prefix(&mut e, &keys, 1);
     assert!(e.last_wal_recovery().damage.is_some());
+}
+
+/// Regression test for [W1]: on a single-stream (`SyncTransactional`-only) WAL, zeroing a
+/// middle sector or replacing it with an intact older-epoch sector must still be detected by
+/// `WalDamagePolicy::Fail` and salvaged by `open_with_salvage`.
+#[test]
+fn fail_and_salvage_detect_single_stream_zeroed_and_stale_sync_sectors() {
+    for kind in ["zeroed", "stale_epoch"] {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+        let mut e = StorageEngine::open(Arc::clone(&fs), salvage_config()).unwrap();
+        let t1 = e
+            .register_or_resolve_vtab_with_durability("orders", None, SYNC)
+            .unwrap();
+        e.flush_memtable().unwrap();
+
+        e.put_row(t1, b"k1", b"v1", &[], SYNC).unwrap();
+        let lsn2 = e.next_lsn();
+        e.put_row(t1, b"k2", b"v2", &[], SYNC).unwrap();
+        e.put_row(t1, b"k3", b"v3", &[], SYNC).unwrap();
+        fs.cut_now();
+        drop(e);
+        fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+        damage_synced(&fs, "wal_sync.db", |img| match kind {
+            "zeroed" => img[4096..8192].fill(0),
+            "stale_epoch" => {
+                let sec = &mut img[4096..8192];
+                let epoch = u64::from_le_bytes(sec[4..12].try_into().unwrap());
+                assert!(epoch >= 2);
+                sec[4..12].copy_from_slice(&(epoch - 1).to_le_bytes());
+                let crc = crate::util::crc32c::crc32c(&sec[4..]);
+                sec[0..4].copy_from_slice(&crc.to_le_bytes());
+            }
+            _ => unreachable!(),
+        });
+
+        assert_fail_open_is_untouched(&fs, WalDamageReason::MissingPredecessor, lsn2);
+
+        let (mut e, salvaged) = open_salvage(&fs);
+        let d = e
+            .last_wal_recovery()
+            .damage
+            .clone()
+            .expect("open_with_salvage must report MissingPredecessor");
+        assert_eq!(d.reason, WalDamageReason::MissingPredecessor, "{kind}");
+        assert_eq!(d.first_lost_lsn, lsn2, "{kind}");
+        assert_eq!(e.get_row(t1, b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(e.get_row(t1, b"k2").unwrap(), None);
+        assert_eq!(e.get_row(t1, b"k3").unwrap(), None);
+        assert_eq!(salvaged.len(), 1, "{kind}");
+        assert_eq!(salvaged[0].ops, vec![put_op("orders", b"k3", b"v3")]);
+    }
 }
 
 /// `Truncate` is the default: a default configuration opens a damaged WAL, replays exactly the

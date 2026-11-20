@@ -898,3 +898,47 @@ fn a_lost_batch_at_the_watermark_is_damage_although_the_chain_names_a_later_cut(
         .expect("batch 2 was acknowledged and is lost");
     assert_eq!(d.first_lost_lsn, 2);
 }
+
+#[test]
+fn full_scan_reads_past_zeroed_and_older_epoch_sectors() {
+    for kind in ["zeroed", "older_epoch"] {
+        let l = sync_log_of_three(&format!("wal_full_{kind}"));
+        match kind {
+            "zeroed" => Logs::zero(&l.sync, 1),
+            "older_epoch" => set_epoch(&l.sync, 1, 0, true),
+            _ => unreachable!(),
+        }
+
+        let rec = recover_single_wal_stream_with_mode(&**l.sync.file(), 1, WalScanMode::FullScan)
+            .unwrap();
+        assert_eq!(
+            rec.batches.iter().map(|b| b.lsn).collect::<Vec<_>>(),
+            [1],
+            "{kind}"
+        );
+        assert_eq!(past_lsns(&rec), vec![3], "{kind}");
+        assert_eq!(rec.corrupt_sectors, 0, "{kind}");
+        assert_eq!(rec.next_sector_idx, 1, "{kind}");
+
+        let r = recover_two_streams_with_mode(
+            &**l.sync.file(),
+            1,
+            &**l.buf.file(),
+            1,
+            0,
+            WalScanMode::FullScan,
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(lsns(&r), vec![1], "{kind}");
+        let d = r.report.damage.expect("full scan must prove lost batch 2");
+        assert_eq!(d.reason, WalDamageReason::MissingPredecessor, "{kind}");
+        assert_eq!(d.first_lost_lsn, 2, "{kind}");
+        assert_eq!(d.last_lsn_seen, 3, "{kind}");
+        assert_eq!(
+            r.discarded_txs.iter().map(|t| t.lsn).collect::<Vec<_>>(),
+            vec![3],
+            "{kind}"
+        );
+    }
+}

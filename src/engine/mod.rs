@@ -65,8 +65,8 @@ use crate::meta::{
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
 use crate::wal::{
     BlobKind, BlobPtr, DEFAULT_BUF_WAL_SIZE, DEFAULT_SYNC_WAL_SIZE, WAL_BUF_FILE_NAME,
-    WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalStreamMode, WalStreamWriter,
-    recover_two_streams,
+    WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalScanMode, WalStreamMode,
+    WalStreamWriter, recover_two_streams_with_mode,
 };
 pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport};
 
@@ -663,12 +663,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             config.buf_wal_mode,
         )?;
 
-        let mut rec = recover_two_streams(
+        let scan_mode = if with_salvage || config.wal_damage_policy == WalDamagePolicy::Fail {
+            WalScanMode::FullScan
+        } else {
+            WalScanMode::StopAtEndOfLog
+        };
+        let mut rec = recover_two_streams_with_mode(
             &**sync_wal.file(),
             state_snapshot.sync_wal_epoch,
             &**buf_wal.file(),
             state_snapshot.buf_wal_epoch,
             state_snapshot.checkpoint_lsn,
+            scan_mode,
             |ptr| match ptr.kind {
                 BlobKind::Standard => match std_blobs.get(&ptr.seg_id) {
                     Some(b) => b.reader.validate_blob_ptr(ptr),

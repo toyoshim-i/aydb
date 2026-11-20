@@ -14,7 +14,10 @@
 
 use std::io;
 
-use super::{BlobPtr, SingleStreamRecovery, WalBatch, WalRecord, recover_single_wal_stream};
+use super::{
+    BlobPtr, SingleStreamRecovery, WalBatch, WalRecord, WalScanMode,
+    recover_single_wal_stream_with_mode,
+};
 use crate::pal::PlatformFile;
 
 /// A count for each of the two log streams.
@@ -453,8 +456,34 @@ where
     F: PlatformFile,
     V: FnMut(&BlobPtr) -> io::Result<bool>,
 {
-    let sync_rec = recover_single_wal_stream(sync_file, sync_epoch)?;
-    let buf_rec = recover_single_wal_stream(buf_file, buf_epoch)?;
+    recover_two_streams_with_mode(
+        sync_file,
+        sync_epoch,
+        buf_file,
+        buf_epoch,
+        checkpoint_lsn,
+        WalScanMode::StopAtEndOfLog,
+        validate_blob,
+    )
+}
+
+/// [`recover_two_streams`] with explicit control over whether end-of-log sectors end the stream
+/// scan early ([`WalScanMode::StopAtEndOfLog`]) or are read past ([`WalScanMode::FullScan`]).
+pub fn recover_two_streams_with_mode<F, V>(
+    sync_file: &F,
+    sync_epoch: u64,
+    buf_file: &F,
+    buf_epoch: u64,
+    checkpoint_lsn: u64,
+    scan_mode: WalScanMode,
+    validate_blob: V,
+) -> io::Result<TwoStreamRecoveryResult>
+where
+    F: PlatformFile,
+    V: FnMut(&BlobPtr) -> io::Result<bool>,
+{
+    let sync_rec = recover_single_wal_stream_with_mode(sync_file, sync_epoch, scan_mode)?;
+    let buf_rec = recover_single_wal_stream_with_mode(buf_file, buf_epoch, scan_mode)?;
     recover_ordered(sync_rec, buf_rec, checkpoint_lsn, validate_blob)
 }
 
