@@ -61,6 +61,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         && old.max_bytes == new.max_bytes
                 });
             if evicted || !same_registrations {
+                // Ensure buffered deletions from the eviction (or earlier buffered writes) are
+                // durable in `wal_buf.db` before persisting `table_quotas`, so a power cut cannot
+                // drop the WAL while leaving a stale `current_logical_bytes` that `replayed_wal ==
+                // false` would trust on reopen.
+                if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                    self.make_buf_wal_durable(true)?;
+                }
                 self.meta_mgr.commit_update(|st| {
                     st.table_quotas = quota_metas;
                 })?;
@@ -256,6 +263,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn reconcile_single_capped_table(&mut self, tid: u16) -> io::Result<()> {
+        self.reconcile_single_capped_table_inner(tid, true)
+            .map(|_| ())
+    }
+
+    fn reconcile_single_capped_table_inner(
+        &mut self,
+        tid: u16,
+        apply_repairs: bool,
+    ) -> io::Result<bool> {
         const RECONCILE_BATCH_SIZE: usize = 512;
         let meta_prefix = encode_namespace_prefix(tid, NS_ROW_META);
         let user_prefix = encode_namespace_prefix(tid, NS_PRIMARY_ROW);
@@ -263,6 +279,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut r_seek_key = user_prefix.to_vec();
         let mut r_lower_inc = true;
         let mut total_bytes = 0u64;
+        let mut needs_repair = false;
 
         loop {
             let row_entries = self.scan_merged_prefix_range(
@@ -335,36 +352,39 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if let Some((meta, old_m_ptr)) = meta_map.get(pk) {
                     total_bytes = total_bytes.saturating_add(meta.logical_size as u64);
                     if meta.recorded_tick == 0 {
-                        let tick = self.access_tracker.next_tick();
-                        missing_records.push(WalRecord::PutInline {
-                            key: encode_lru_queue_key(tid, tick, pk),
-                            value: Vec::new(),
-                        });
-                        let meta_key = encode_row_meta_key(tid, pk);
-                        let meta_bytes = RowMetaRecord::encode_slice(
-                            tick,
-                            meta.logical_size,
-                            &meta.secondary_keys,
-                        );
-                        if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                            let ptr = self.append_to_blob_segment(
-                                BlobKind::Standard,
-                                0,
-                                &meta_key,
-                                &meta_bytes,
-                            )?;
-                            missing_records.push(WalRecord::PutBlobPtr {
-                                key: meta_key,
-                                blob_ptr: ptr,
-                            });
-                        } else {
+                        needs_repair = true;
+                        if apply_repairs {
+                            let tick = self.access_tracker.next_tick();
                             missing_records.push(WalRecord::PutInline {
-                                key: meta_key,
-                                value: meta_bytes,
+                                key: encode_lru_queue_key(tid, tick, pk),
+                                value: Vec::new(),
                             });
-                        }
-                        if let Some(m_ptr) = *old_m_ptr {
-                            dead_meta_ptrs.push(m_ptr);
+                            let meta_key = encode_row_meta_key(tid, pk);
+                            let meta_bytes = RowMetaRecord::encode_slice(
+                                tick,
+                                meta.logical_size,
+                                &meta.secondary_keys,
+                            );
+                            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
+                                let ptr = self.append_to_blob_segment(
+                                    BlobKind::Standard,
+                                    0,
+                                    &meta_key,
+                                    &meta_bytes,
+                                )?;
+                                missing_records.push(WalRecord::PutBlobPtr {
+                                    key: meta_key,
+                                    blob_ptr: ptr,
+                                });
+                            } else {
+                                missing_records.push(WalRecord::PutInline {
+                                    key: meta_key,
+                                    value: meta_bytes,
+                                });
+                            }
+                            if let Some(m_ptr) = *old_m_ptr {
+                                dead_meta_ptrs.push(m_ptr);
+                            }
                         }
                     }
                 } else {
@@ -380,23 +400,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         // deletion (which cleans 'i'/'l' entries by scanning), under `Error` it
                         // stays until the user deletes it. Never fail reconciliation/open.
                         total_bytes = total_bytes.saturating_add(logical_size as u64);
-                        let _ = self.note_corrupt_blob(mkey, mptr);
+                        needs_repair = true;
+                        if apply_repairs {
+                            let _ = self.note_corrupt_blob(mkey, mptr);
+                        }
                         continue;
                     }
                     total_bytes = total_bytes.saturating_add(logical_size as u64);
-                    let tick = self.access_tracker.next_tick();
-                    missing_records.push(WalRecord::PutInline {
-                        key: encode_lru_queue_key(tid, tick, pk),
-                        value: Vec::new(),
-                    });
-                    missing_records.push(WalRecord::PutInline {
-                        key: encode_row_meta_key(tid, pk),
-                        value: RowMetaRecord::encode_slice(tick, logical_size, &[]),
-                    });
+                    needs_repair = true;
+                    if apply_repairs {
+                        let tick = self.access_tracker.next_tick();
+                        missing_records.push(WalRecord::PutInline {
+                            key: encode_lru_queue_key(tid, tick, pk),
+                            value: Vec::new(),
+                        });
+                        missing_records.push(WalRecord::PutInline {
+                            key: encode_row_meta_key(tid, pk),
+                            value: RowMetaRecord::encode_slice(tick, logical_size, &[]),
+                        });
+                    }
                 }
             }
 
-            if !missing_records.is_empty() {
+            if apply_repairs && !missing_records.is_empty() {
                 self.commit_wal_and_memtable(missing_records, WriteDurability::BufferedFast)?;
                 for m_ptr in dead_meta_ptrs {
                     self.record_dead_blob_bytes(&m_ptr);
@@ -407,7 +433,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(ct) = self.capped_tables.get_mut(&tid) {
             ct.current_logical_bytes = total_bytes;
         }
-        Ok(())
+        Ok(needs_repair)
+    }
+
+    /// Recomputes `current_logical_bytes` and advances `access_tracker` for every capped table
+    /// without mutating the WAL or MemTable, returning whether any metadata repairs are needed.
+    pub(super) fn reconcile_capped_tables_readonly(&mut self) -> io::Result<bool> {
+        let table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
+        let mut any_needs_repair = false;
+        for tid in table_ids {
+            if self.reconcile_single_capped_table_inner(tid, false)? {
+                any_needs_repair = true;
+            }
+        }
+        Ok(any_needs_repair)
     }
 
     /// Rebuilds the byte totals and access ticks of every capped table after recovery.
@@ -454,7 +493,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn build_quota_metas(&self) -> Vec<TableQuotaMeta> {
-        self.capped_tables
+        Self::quota_metas_from_map(&self.capped_tables)
+    }
+
+    /// Quotas safe to persist on a MemTable flush: during a `RingFull` rotation inside an
+    /// uncommitted transaction commit (`tx_start_meta.active == true`), only the pre-transaction
+    /// settled quotas match the flushed MemTable.
+    pub(super) fn settled_quota_metas(&self) -> Vec<TableQuotaMeta> {
+        if self.tx_start_meta.active {
+            Self::quota_metas_from_map(&self.tx_start_meta.capped_tables)
+        } else {
+            Self::quota_metas_from_map(&self.capped_tables)
+        }
+    }
+
+    fn quota_metas_from_map(capped_tables: &HashMap<u16, CappedTableState>) -> Vec<TableQuotaMeta> {
+        capped_tables
             .values()
             .map(|ct| TableQuotaMeta {
                 table_id: ct.table_id,

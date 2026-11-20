@@ -281,7 +281,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 table_id: b.table_id,
             })
             .collect();
-        let quota_metas = self.build_quota_metas();
+        // During a `RingFull` flush inside an uncommitted transaction, only pre-transaction quotas
+        // reflect the flushed `MemTable`.
+        let quota_metas = self.settled_quota_metas();
         // The commit rotates the WAL epochs, so no batch can reference these segments any more.
         let lingering = self.unlink_after_wal_rotation.clone();
 

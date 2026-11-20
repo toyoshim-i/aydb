@@ -772,9 +772,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
         let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
         if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
+            // Sync any buffered WAL entries before committing `table_quotas`, matching
+            // `register_capped_table`, so a power cut cannot leave unverified byte totals.
+            let sync_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                self.make_buf_wal_durable(true)
+            } else {
+                Ok(())
+            };
             let quota_metas = self.build_quota_metas();
-            if let Err(e) = self.meta_mgr.commit_update(|st| {
-                st.table_quotas = quota_metas;
+            if let Err(e) = sync_res.and_then(|()| {
+                self.meta_mgr.commit_update(|st| {
+                    st.table_quotas = quota_metas;
+                })
             }) {
                 self.record_maintenance_failure(&e);
             }

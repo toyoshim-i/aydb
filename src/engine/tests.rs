@@ -6690,3 +6690,42 @@ fn secondary_lookup_sees_the_owners_uncommitted_entries_and_tombstones() {
         assert_eq!(look(&engine, b"x"), vec![b"a".to_vec()]);
     }
 }
+
+#[test]
+fn crash_recovery_persists_reconciled_capped_bytes_across_second_crash() {
+    let tmp = TempTestDir::new("capped_double_crash");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 4096;
+    let wal = WriteDurability::BufferedFast;
+    let payload = vec![0x42u8; 1000];
+
+    let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    engine.register_capped_table(1, 100_000).unwrap();
+    engine.put_row(1, b"k1", &payload, &[], wal).unwrap();
+    engine.checkpoint().unwrap();
+    let flushed_bytes = engine.capped_table_state(1).unwrap().current_logical_bytes;
+    engine.put_row(1, b"k2", &payload, &[], wal).unwrap();
+    engine.put_row(1, b"k3", &payload, &[], wal).unwrap();
+    let expected = engine.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(expected > flushed_bytes);
+    drop(engine); // Crash #1: k2 and k3 exist only in the WAL
+
+    // Recovery #1 replays WAL, reconciles `current_logical_bytes`, and persists it during open.
+    let engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        expected
+    );
+    drop(engine); // Crash #2 immediately after recovery without calling `checkpoint()`
+
+    // Recovery #2 sees an empty WAL (`replayed_wal == false`) and reads persisted `table_quotas`.
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        expected
+    );
+    for k in [b"k1", b"k2", b"k3"] {
+        assert_eq!(engine.get_row(1, k).unwrap(), Some(payload.clone()));
+    }
+}

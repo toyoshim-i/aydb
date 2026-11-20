@@ -944,6 +944,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
 
+        // Reconcile capped byte totals in read-only mode before rotating WAL epochs so a non-empty
+        // `flush_memtable()` commits the updated `table_quotas` atomically with the checkpoint.
+        let needs_capped_repair = if replayed_wal && !engine.capped_tables.is_empty() {
+            engine.reconcile_capped_tables_readonly()?
+        } else {
+            false
+        };
+
         // Always rotate both WAL epochs after recovery, even when nothing was recovered.
         // Recovery halts at the first torn/old sector, but later sectors of the SAME epoch may
         // already be on disk (write-back reordering before a crash). If we kept the epoch, new
@@ -956,10 +964,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             engine.flush_memtable()?;
         } else {
             engine.rotate_wal_epochs_only()?;
+            if replayed_wal && !engine.capped_tables.is_empty() {
+                let mut quota_metas = engine.build_quota_metas();
+                quota_metas.sort_by_key(|q| q.table_id);
+                let mut stored = engine.meta_mgr.state().table_quotas.clone();
+                stored.sort_by_key(|q| q.table_id);
+                if stored != quota_metas {
+                    engine.meta_mgr.commit_update(|st| {
+                        st.table_quotas = quota_metas;
+                    })?;
+                }
+            }
         }
 
         // Reconciliation records land in the fresh epoch and are replayed by the next recovery.
-        engine.reconcile_capped_tables_after_recovery(replayed_wal)?;
+        if replayed_wal {
+            if needs_capped_repair {
+                engine.reconcile_capped_tables_after_recovery(true)?;
+            }
+        } else {
+            engine.reconcile_capped_tables_after_recovery(false)?;
+        }
 
         // Now that WAL recovery and the post-recovery checkpoint are complete, sweep any truly
         // orphaned segment/manifest files and process pending deletes!

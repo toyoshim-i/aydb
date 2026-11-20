@@ -4339,3 +4339,124 @@ fn checkpoint_and_flush_do_not_evict_row_replaced_by_pending_group_commit() {
         );
     }
 }
+
+/// `register_capped_table` committing `table_quotas` to `boot_meta.db` while `wal_buf.db` holds
+/// buffered writes/evictions must sync `wal_buf.db` first; otherwise a power cut drops `wal_buf.db`
+/// (`replayed_wal == false`), leaving phantom `current_logical_bytes` that bricks future inserts.
+#[test]
+fn buffered_writes_and_register_capped_table_survive_power_cut_without_phantom_quota() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut cfg = repro_config();
+    cfg.inline_threshold_bytes = 4096;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(1, 2500).unwrap();
+    e.checkpoint().unwrap();
+
+    // Fill table 1 with buffered writes right below quota, then trigger a `boot_meta.db` quota
+    // commit via registering table 2 (before `wal_buf.db` was synced).
+    let payload = vec![0x42u8; 400];
+    for i in 0..5u8 {
+        e.put_row(1, &[b'k', i], &payload, &[], BUF).unwrap();
+    }
+    let buffered_bytes = e.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(buffered_bytes > 1500 && buffered_bytes <= 2500);
+    e.register_capped_table(2, 4096).unwrap();
+
+    // Cut I/O and lose all unsynced OS page cache on power loss.
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let live_rows_before_evict = e.scan_keys_range(1, None, None, 100).unwrap().len();
+    assert_eq!(live_rows_before_evict, 5);
+    assert_eq!(
+        e.capped_table_state(1).unwrap().current_logical_bytes,
+        buffered_bytes
+    );
+
+    // Now lower table 1's quota to force BufferedFast eviction + `table_quotas` commit, then crash.
+    e.register_capped_table(1, 1200).unwrap();
+    let kept_rows = e.scan_keys_range(1, None, None, 100).unwrap().len();
+    let kept_bytes = e.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(kept_rows > 0 && kept_rows < 5);
+    assert!(kept_bytes <= 1200);
+
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(
+        e.scan_keys_range(1, None, None, 100).unwrap().len(),
+        kept_rows
+    );
+    assert_eq!(
+        e.capped_table_state(1).unwrap().current_logical_bytes,
+        kept_bytes
+    );
+    // Inserting a new row must succeed normally rather than being immediately wiped out.
+    e.put_row(1, b"fresh", &[0x55u8; 200], &[], SYNC).unwrap();
+    assert_eq!(e.get_row(1, b"fresh").unwrap(), Some(vec![0x55u8; 200]));
+}
+
+/// If an uncommitted transaction triggers a `RingFull` `flush_memtable_no_auto_compact()` during
+/// commit and then fails before its own WAL batch is durable, `boot_meta.db` must persist only the
+/// pre-transaction settled `table_quotas`, not the uncommitted transaction's bytes or tables.
+#[test]
+fn tx_ring_full_flush_persists_settled_quotas_not_uncommitted_tx() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 7));
+    let mut cfg = repro_config();
+    cfg.sync_wal_size_bytes = 6 * 4096;
+    cfg.buf_wal_size_bytes = 6 * 4096;
+    cfg.memtable_capacity_bytes = 16 * 1024 * 1024;
+    cfg.inline_threshold_bytes = 4096;
+
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(1, 100_000).unwrap();
+    e.set_table_inline_threshold(1, 4096);
+    // Consume most of `sync_wal` with small committed rows while keeping MemTable un-flushed.
+    for i in 0..4u8 {
+        e.put_row(1, &[b'c', i], &[0x11u8; 3000], &[], SYNC)
+            .unwrap();
+    }
+    let settled_bytes = e.capped_table_state(1).unwrap().current_logical_bytes;
+    assert!(settled_bytes >= 12_000);
+    assert_eq!(e.meta_mgr.state().idx_segments.len(), 0);
+    assert_eq!(e.sync_wal.current_sector_idx(), 4);
+
+    // Inside a transaction, register table 2 and add enough rows to overflow `sync_wal` on commit
+    // (`RingFull`) without tripping `prepare_commit_transaction`'s `exceeds_wal` pre-grow.
+    e.begin_transaction();
+    e.register_capped_table(2, 50_000).unwrap();
+    for i in 0..4u8 {
+        e.put_row(1, &[b'u', i], &[0x22u8; 3000], &[], SYNC)
+            .unwrap();
+    }
+    assert!(e.capped_table_state(1).unwrap().current_logical_bytes > settled_bytes);
+
+    let meta_gen_before = e.meta_mgr.state().generation;
+    let wal_sync_nth = fs.op_stats().1[FileKind::WalSync as usize];
+    // Fail the retry `WalSync` write immediately after `RingFull` flushes `idx` + `boot_meta.db`.
+    fs.arm(None, Some((FileKind::WalSync, wal_sync_nth)));
+    assert!(e.commit_transaction().is_err());
+    assert!(
+        e.meta_mgr.state().generation > meta_gen_before,
+        "RingFull must have committed boot_meta.db"
+    );
+    let quotas = &e.meta_mgr.state().table_quotas;
+    assert_eq!(quotas.len(), 1, "uncommitted table 2 leaked into quotas");
+    assert_eq!(quotas[0].table_id, 1);
+    assert_eq!(quotas[0].current_logical_bytes, settled_bytes);
+
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+    let e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(
+        e.capped_table_state(1).unwrap().current_logical_bytes,
+        settled_bytes
+    );
+    assert!(e.capped_table_state(2).is_none());
+}
