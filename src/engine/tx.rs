@@ -162,7 +162,7 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
-    pub(super) vtabs_created_len: usize,
+    pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
     pub(super) quotas_modified_in_tx: bool,
 }
 
@@ -1008,7 +1008,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_vtab_ids: self.active_vtab_ids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
-            vtabs_created_len: self.vtabs_created_in_tx.len(),
+            vtabs_created_in_tx: self.vtabs_created_in_tx.clone(),
             quotas_modified_in_tx: self.quotas_modified_in_tx,
         }
     }
@@ -1031,7 +1031,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.active_vtab_ids = snap.active_vtab_ids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
-        self.vtabs_created_in_tx.truncate(snap.vtabs_created_len);
+        self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();
         self.quotas_modified_in_tx = snap.quotas_modified_in_tx;
     }
 

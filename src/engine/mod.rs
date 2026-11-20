@@ -1310,15 +1310,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    /// Whether the active transaction created virtual table `(table_id, table_name)` in `db_name`.
-    pub(crate) fn is_created_in_tx(&self, table_id: u16, table_name: &str, db_name: &str) -> bool {
-        let norm = table_name.trim().to_ascii_lowercase();
-        let norm_db = db_name.trim().to_ascii_lowercase();
-        self.vtabs_created_in_tx
-            .iter()
-            .any(|(id, name, db)| *id == table_id && *name == norm && *db == norm_db)
-    }
-
     /// Drops a table that the active transaction created and that SQLite no longer has, but only
     /// if the catalog still maps `table_name` to `table_id`. A savepoint rollback the engine was
     /// told about has already removed the table, and its id (or name) may belong to another
@@ -1364,6 +1355,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         stale.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
+    /// Removes any tables created in the active transaction for which `is_stale(db, name)` holds,
+    /// returning them so `vtab_sync_tx` can drop creations undone by SQLite savepoint rollbacks
+    /// (including tables that were subsequently renamed).
+    pub(crate) fn take_stale_vtabs_created_in_tx(
+        &mut self,
+        mut is_stale: impl FnMut(&str, &str) -> bool,
+    ) -> Vec<(u16, String)> {
+        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
+            .into_iter()
+            .partition(|(_, name, db)| is_stale(db, name));
+        self.vtabs_created_in_tx = kept;
+        stale.into_iter().map(|(id, name, _)| (id, name)).collect()
+    }
+
+    /// Returns the live normalized table name registered for `table_id`, if any.
+    pub(crate) fn active_vtab_name(&self, table_id: u16) -> Option<String> {
+        self.active_vtab_ids.get(&table_id).map(|s| s.to_string())
+    }
+
     /// The mutation epoch (see the field): equal values mean no row changed in between.
     pub(crate) fn mutation_epoch(&self) -> u64 {
         self.mutation_epoch
@@ -1398,9 +1408,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.drain_group_for_autocommit()?;
         let old_norm = old_name.trim().to_ascii_lowercase();
         let new_norm = new_name.trim().to_ascii_lowercase();
-        if old_norm == new_norm {
-            return Ok(());
-        }
         let catalog_key = |name: &str| {
             let mut key = Vec::with_capacity(3 + name.len());
             key.extend_from_slice(&[0u8, 0u8, b'c']);
@@ -1414,15 +1421,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 "virtual table name exceeds maximum catalog key length",
             ));
         }
+        let mut catalog_old_name: Option<String> = None;
         for entry in self.scan_merged_prefix(&[0u8, 0u8, b'c'])? {
             let IndexValue::Inline(val) = entry.value else {
                 continue;
             };
-            if val.len() == 2 && entry.key[3..] == *new_norm.as_bytes() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("a virtual table named '{new_norm}' already exists"),
-                ));
+            if val.len() == 2 && entry.key.len() > 3 {
+                let id = u16::from_be_bytes([val[0], val[1]]);
+                let entry_name = String::from_utf8_lossy(&entry.key[3..]).into_owned();
+                if entry_name == new_norm && id != table_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("a virtual table named '{new_norm}' already exists"),
+                    ));
+                }
+                if id == table_id && (catalog_old_name.is_none() || entry_name == old_norm) {
+                    catalog_old_name = Some(entry_name);
+                }
             }
         }
         if let Some(live) = self.active_vtab_ids.iter().find_map(|(id, name)| {
@@ -1433,12 +1448,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 format!("a virtual table named '{new_norm}' is live as table_id {live}"),
             ));
         }
+        let effective_old = catalog_old_name.as_deref().unwrap_or(&old_norm);
+        if effective_old == new_norm {
+            self.active_vtab_ids
+                .insert(table_id, Arc::from(new_norm.as_str()));
+            for (id, name, _) in &mut self.vtabs_created_in_tx {
+                if *id == table_id {
+                    *name = new_norm.clone();
+                }
+            }
+            return Ok(());
+        }
         let mut records = Vec::with_capacity(2);
-        let old_key = catalog_key(&old_norm);
-        if !matches!(
-            self.check_existing_row(&old_key)?,
-            ExistingRowStatus::NotFound
-        ) {
+        let old_key = catalog_key(effective_old);
+        if catalog_old_name.is_some()
+            || !matches!(
+                self.check_existing_row(&old_key)?,
+                ExistingRowStatus::NotFound
+            )
+        {
             records.push(WalRecord::Delete { key: old_key });
         }
         records.push(WalRecord::PutInline {
@@ -1448,6 +1476,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.commit_wal_and_memtable(records, durability)?;
         self.active_vtab_ids
             .insert(table_id, Arc::from(new_norm.as_str()));
+        for (id, name, _) in &mut self.vtabs_created_in_tx {
+            if *id == table_id {
+                *name = new_norm.clone();
+            }
+        }
         Ok(())
     }
 
@@ -1484,6 +1517,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        let mut catalog_keys_for_id = std::collections::HashSet::new();
+        for entry in self.scan_merged_prefix(&[0u8, 0u8, b'c'])? {
+            if let IndexValue::Inline(val) = entry.value {
+                if val.len() == 2 && u16::from_be_bytes([val[0], val[1]]) == table_id {
+                    catalog_keys_for_id.insert(entry.key.clone());
+                    records.push(WalRecord::Delete { key: entry.key });
+                }
+            }
+        }
+
         // Without an enclosing transaction the deletes run in an internal one: its chunked
         // TxBegin/TxCommit framing and WAL growth let a table larger than the WAL be dropped
         // atomically. The internal transaction is exempt from `max_transaction_bytes`. It begins
@@ -1492,6 +1535,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if internal_tx {
             self.begin_transaction();
         }
+        self.vtabs_created_in_tx
+            .retain(|(id, _, _)| *id != table_id);
         let removed_name = self
             .active_vtab_ids
             .remove(&table_id)
@@ -1503,14 +1548,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());
             cat_key.extend_from_slice(&[0u8, 0u8, b'c']);
             cat_key.extend_from_slice(norm_name.as_bytes());
-            match self.check_existing_row(&cat_key) {
-                Ok(ExistingRowStatus::NotFound) => {}
-                Ok(_) => records.push(WalRecord::Delete { key: cat_key }),
-                Err(e) => {
-                    if internal_tx {
-                        let _ = self.rollback_transaction();
+            if !catalog_keys_for_id.contains(&cat_key) {
+                match self.check_existing_row(&cat_key) {
+                    Ok(ExistingRowStatus::NotFound) => {}
+                    Ok(_) => records.push(WalRecord::Delete { key: cat_key }),
+                    Err(e) => {
+                        if internal_tx {
+                            let _ = self.rollback_transaction();
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
         }

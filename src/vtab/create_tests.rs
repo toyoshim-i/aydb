@@ -457,3 +457,65 @@ fn attached_db_create_with_same_name_does_not_drop_main_table() {
     let conn = fixture.open();
     assert_eq!(ints(&conn, "SELECT v FROM main.t"), [42]);
 }
+
+#[test]
+fn a_create_and_rename_inside_a_rolled_back_savepoint_is_undone_on_commit() {
+    for with_other_table in [false, true] {
+        let mut fixture = Fixture::new("create_rename_sp_rollback");
+        let conn = fixture.open();
+        if with_other_table {
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+                 BEGIN;
+                 INSERT INTO u VALUES (1, 100);",
+            )
+            .unwrap();
+        } else {
+            conn.execute_batch("BEGIN;").unwrap();
+        }
+        conn.execute_batch(
+            "SAVEPOINT s;
+             CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+             INSERT INTO t VALUES (1, 'a', 10);
+             ALTER TABLE t RENAME TO t2;
+             ROLLBACK TO s;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(conn);
+        fixture.restart();
+        let conn = fixture.open();
+        conn.execute_batch(T).unwrap();
+        assert!(ints(&conn, "SELECT v FROM t").is_empty());
+        conn.execute_batch("INSERT INTO t VALUES (1, 'a', 20)")
+            .unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM t"), [20]);
+        conn.execute_batch("DROP TABLE t").unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t2 USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+        )
+        .unwrap();
+        assert!(ints(&conn, "SELECT v FROM t2").is_empty());
+    }
+}
+
+#[test]
+fn a_create_before_savepoint_and_rename_inside_rolled_back_savepoint_keeps_original_name() {
+    let mut fixture = Fixture::new("create_then_rename_sp_rollback");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "BEGIN;
+         CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+         INSERT INTO t VALUES (1, 'a', 10);
+         SAVEPOINT s;
+         ALTER TABLE t RENAME TO t2;
+         ROLLBACK TO s;
+         COMMIT;",
+    )
+    .unwrap();
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [10]);
+    assert!(conn.query_all("SELECT * FROM t2", &[]).is_err());
+}

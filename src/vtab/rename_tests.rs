@@ -314,3 +314,101 @@ fn a_table_with_a_stored_check_can_be_renamed() {
     assert!(conn.execute_batch("INSERT INTO t2 VALUES (2, 5)").is_err());
     conn.execute_batch("DROP TABLE t2").unwrap();
 }
+
+#[test]
+fn a_rolled_back_rename_can_be_renamed_again_and_dropped_cleanly() {
+    // Part 1: ROLLBACK followed by repeating the same RENAME TO name on the same connection.
+    let mut fixture = Fixture::new("rename_repeat_after_rollback");
+    let conn = fixture.open();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch("BEGIN; INSERT INTO t VALUES (5, 'e', 50); ALTER TABLE t RENAME TO t2")
+        .unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+    conn.execute_batch("ALTER TABLE t RENAME TO t2").unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t2"), [10]);
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t2"), [10]);
+    conn.execute_batch(TABLE).unwrap();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+
+    // Part 2: SAVEPOINT + ROLLBACK TO followed by renaming to a third name and committing.
+    let mut fixture = Fixture::new("rename_savepoint_rollback_to");
+    let conn = fixture.open();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t VALUES (2, 'b', 20);
+         SAVEPOINT sp;
+         ALTER TABLE t RENAME TO t2;
+         ROLLBACK TO sp;
+         ALTER TABLE t RENAME TO t3;
+         COMMIT;",
+    )
+    .unwrap();
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t3 ORDER BY k"), [10, 20]);
+    conn.execute_batch(TABLE).unwrap();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+    conn.execute_batch("DROP TABLE t").unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t2 USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+    )
+    .unwrap();
+    assert!(ints(&conn, "SELECT v FROM t2").is_empty());
+    conn.execute_batch("DROP TABLE t2").unwrap();
+    conn.execute_batch("DROP TABLE t3").unwrap();
+}
+
+#[test]
+fn a_rename_rolled_back_via_another_table_leaves_no_orphan_catalog_entry() {
+    // Subcase 1: another table owns/rolls back the transaction so `t` never gets `xRollback`.
+    let mut fixture = Fixture::new("rename_other_table_rollback");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO u VALUES (1, 100); ALTER TABLE t RENAME TO t2; ROLLBACK;",
+    )
+    .unwrap();
+    conn.execute_batch("ALTER TABLE t RENAME TO t3").unwrap();
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t3 ORDER BY k"), [10]);
+    conn.execute_batch(TABLE).unwrap();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+
+    // Subcase 2: DROP TABLE after a rollback triggered via another table cleans up the catalog.
+    let fixture = Fixture::new("rename_other_table_drop");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO u VALUES (1, 100); ALTER TABLE t RENAME TO t2; ROLLBACK;",
+    )
+    .unwrap();
+    conn.execute_batch("DROP TABLE t").unwrap();
+    conn.execute_batch(TABLE).unwrap();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 99)")
+        .unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [99]);
+}

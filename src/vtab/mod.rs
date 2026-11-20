@@ -370,6 +370,9 @@ pub(super) struct AydbVTab {
     db_name: String,
     /// Normalised at use. Changes when the table is renamed.
     table_name: std::sync::Mutex<String>,
+    /// Name before an uncommitted rename inside the current transaction, used to clean up live
+    /// registration if the rename is rolled back without SQLite invoking `xRollback` on this vtab.
+    pre_tx_name: std::sync::Mutex<Option<String>>,
     durability: WriteDurability,
     /// The UNIQUE columns with the collation and affinity that shape their index keys.
     unique_def: unique_key::UniqueDef,
@@ -906,6 +909,7 @@ unsafe fn vtab_create_or_connect(
             table_id,
             db_name: ddl.db_name,
             table_name: std::sync::Mutex::new(ddl.table_name),
+            pre_tx_name: std::sync::Mutex::new(None),
             durability: ddl.durability,
             unique_def: unique_key::UniqueDef::from_columns(
                 &ddl.col_unique,
@@ -941,7 +945,16 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
                 if let Ok(mut eng) = vtab.engine.write() {
-                    eng.unregister_vtab(vtab.table_id, &vtab.name());
+                    let name = vtab.name();
+                    if eng.is_vtab_active(vtab.table_id, &name) {
+                        eng.unregister_vtab(vtab.table_id, &name);
+                    } else if !eng.in_active_transaction() {
+                        if let Ok(prev) = vtab.pre_tx_name.lock() {
+                            if let Some(prev_name) = prev.as_deref() {
+                                eng.unregister_vtab(vtab.table_id, prev_name);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -952,6 +965,10 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
 
 /// `ALTER TABLE ... RENAME TO`: moves the catalog entry to the new name. Without this SQLite
 /// only rewrites the stored definition, and the table (looked up by name) could no longer be found.
+///
+/// Note on SQLite's `xRename` lifecycle: SQLite invokes `xRename` before rewriting `sqlite_schema`
+/// and does not call `xBegin`/`xCommit`/`xRollback` for an autocommit rename, so an autocommit
+/// `xRename` commits immediately while transactional renames join the active engine transaction.
 unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c_char) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         if p_vtab.is_null() || z_new.is_null() {
@@ -979,8 +996,18 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
             (*p_vtab).zErrMsg = sqlite_error_message(RENAME_NEEDS_WRITE);
             return SQLITE_ERROR;
         }
-        if let Err(e) = eng.rename_vtab(vtab.table_id, &vtab.name(), &new_name, vtab.durability) {
+        let old_effective = eng
+            .active_vtab_name(vtab.table_id)
+            .unwrap_or_else(|| vtab.name());
+        if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
             return io_err_to_sqlite_rc(&e);
+        }
+        if eng.in_active_transaction() {
+            if let Ok(mut prev) = vtab.pre_tx_name.lock() {
+                prev.get_or_insert(old_effective);
+            }
+        } else if let Ok(mut prev) = vtab.pre_tx_name.lock() {
+            *prev = None;
         }
         if let Ok(mut name) = vtab.table_name.lock() {
             *name = new_name;
@@ -2614,17 +2641,16 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
         }
-        // A table this transaction created whose creation a `ROLLBACK TO` has since undone in
-        // SQLite's schema (nothing tells the table) must not be committed.
-        let name = vtab.name();
-        if eng.is_created_in_tx(vtab.table_id, &name, &vtab.db_name)
-            && !schema_has_table(vtab.db, &vtab.db_name, &name)
-        {
-            let _ = eng.take_vtabs_created_in_tx(Some(vtab.table_id), &name, |prev_db, _| {
-                prev_db.eq_ignore_ascii_case(&vtab.db_name)
+        // Tables this transaction created (even if later renamed) whose creation a `ROLLBACK TO`
+        // has since undone in SQLite's schema must not be committed.
+        if eng.conn_has_open_transaction(vtab.db as usize) {
+            let stale = eng.take_stale_vtabs_created_in_tx(|prev_db, prev_name| {
+                !schema_has_table(vtab.db, prev_db, prev_name)
             });
-            if let Err(e) = eng.drop_stale_created_vtab(vtab.table_id, &name) {
-                return io_err_to_sqlite_rc(&e);
+            for (id, stale_name) in stale {
+                if let Err(e) = eng.drop_stale_created_vtab(id, &stale_name) {
+                    return io_err_to_sqlite_rc(&e);
+                }
             }
         }
         if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
@@ -2672,6 +2698,9 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         if let Err(e) = committed {
             return io_err_to_sqlite_rc(&e);
         }
+        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
+            *prev = None;
+        }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -2686,6 +2715,14 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         };
         if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
+        }
+        if let Some(actual) = eng.active_vtab_name(vtab.table_id) {
+            if let Ok(mut name) = vtab.table_name.lock() {
+                *name = actual;
+            }
+        }
+        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
+            *prev = None;
         }
         SQLITE_OK
     }))
@@ -2731,6 +2768,11 @@ unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoin
         };
         if let Err(e) = eng.rollback_to_savepoint_for_conn(vtab.db as usize, i_savepoint) {
             return io_err_to_sqlite_rc(&e);
+        }
+        if let Some(actual) = eng.active_vtab_name(vtab.table_id) {
+            if let Ok(mut name) = vtab.table_name.lock() {
+                *name = actual;
+            }
         }
         SQLITE_OK
     }))
