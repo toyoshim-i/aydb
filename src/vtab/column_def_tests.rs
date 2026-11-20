@@ -228,3 +228,18 @@ fn columns_option_keeps_quotes_of_the_first_and_last_identifier() {
         "SELECT k, v FROM {t}",
     );
 }
+
+#[test]
+fn adjacent_constraint_clauses_match_native_table() {
+    check(
+        "\"k\"INTEGER PRIMARY KEY, v VARCHAR(10)UNIQUE, w VARCHAR(10)NOT NULL",
+        "",
+        &[
+            "INSERT INTO {t} VALUES(1, '01', 'a')",
+            "INSERT INTO {t} VALUES(2, '01', 'b')",
+            "INSERT INTO {t} VALUES(3, '02', NULL)",
+            "INSERT INTO {t} VALUES(4, '03', 'c')",
+        ],
+        "SELECT k, v, typeof(v), w FROM {t} ORDER BY k",
+    );
+}

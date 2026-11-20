@@ -100,8 +100,29 @@ fn is_table_constraint(tokens: &[&str]) -> bool {
     }
 }
 
-/// Split a column definition without splitting quoted values or parenthesized expressions.
-fn column_tokens(input: &str) -> Vec<&str> {
+/// Advances past a quoted literal or identifier starting at `bytes[i]` (`'...'`, `"..."`,
+/// `` `...` ``, or `[...]`), returning an error if unclosed.
+fn scan_quoted(bytes: &[u8], mut i: usize, quote: u8) -> Result<usize, c_int> {
+    let close = if quote == b'[' { b']' } else { quote };
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == close {
+            i += 1;
+            if close != b']' && bytes.get(i) == Some(&close) {
+                i += 1;
+            } else {
+                return Ok(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Err(SQLITE_ERROR)
+}
+
+/// Splits a column definition at SQL token boundaries (`(...)` groups, quotes, `+`/`-`, and
+/// whitespace) while keeping SQLite `x'...'` blob literals and scientific notation intact.
+fn column_tokens(input: &str) -> Result<Vec<&str>, c_int> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -109,43 +130,69 @@ fn column_tokens(input: &str) -> Vec<&str> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        if i >= bytes.len() {
+            break;
+        }
         let start = i;
-        let mut depth = 0usize;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\'' | b'"' | b'`' | b'[' => {
-                    let end = if bytes[i] == b'[' { b']' } else { bytes[i] };
-                    i += 1;
-                    while i < bytes.len() {
-                        if bytes[i] == end {
-                            i += 1;
-                            if end != b']' && bytes.get(i) == Some(&end) {
-                                i += 1;
-                            } else {
-                                break;
-                            }
-                        } else {
+        match bytes[i] {
+            q @ (b'\'' | b'"' | b'`' | b'[') => {
+                i = scan_quoted(bytes, i, q)?;
+            }
+            b'(' => {
+                let mut depth = 1usize;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        q @ (b'\'' | b'"' | b'`' | b'[') => {
+                            i = scan_quoted(bytes, i, q)?;
+                        }
+                        b'(' => {
+                            depth += 1;
                             i += 1;
                         }
+                        b')' => {
+                            depth -= 1;
+                            i += 1;
+                        }
+                        _ => i += 1,
                     }
                 }
-                b'(' => {
-                    depth += 1;
+                if depth != 0 {
+                    return Err(SQLITE_ERROR);
+                }
+            }
+            b')' => return Err(SQLITE_ERROR),
+            b'+' | b'-' => {
+                i += 1;
+            }
+            _ => {
+                let starts_numeric = bytes[start].is_ascii_digit() || bytes[start] == b'.';
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b.is_ascii_whitespace()
+                        || matches!(b, b'\'' | b'"' | b'`' | b'[' | b'(' | b')')
+                    {
+                        break;
+                    }
+                    if matches!(b, b'+' | b'-')
+                        && !(starts_numeric && i > start && matches!(bytes[i - 1], b'e' | b'E'))
+                    {
+                        break;
+                    }
                     i += 1;
                 }
-                b')' => {
-                    depth = depth.saturating_sub(1);
-                    i += 1;
+                // SQLite hex blob literal `x'...'` / `X'...'` stays a single token.
+                if i - start == 1
+                    && matches!(bytes[start], b'x' | b'X')
+                    && bytes.get(i) == Some(&b'\'')
+                {
+                    i = scan_quoted(bytes, i, b'\'')?;
                 }
-                b if b.is_ascii_whitespace() && depth == 0 => break,
-                _ => i += 1,
             }
         }
-        if start < i {
-            tokens.push(&input[start..i]);
-        }
+        tokens.push(&input[start..i]);
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Removes one pair of matching `'...'` or `"..."` wrapping from an option value and undoes the
@@ -214,17 +261,16 @@ fn has_comment_outside_quotes(input: &str) -> bool {
     false
 }
 
-/// The word a column-definition token starts with, uppercased: the leading run of word
-/// characters. `CHECK(a>0)` gives `CHECK`; a quoted token gives `None`.
+/// Uppercased identifier keyword if `token` is a bare ASCII identifier word (`[A-Za-z0-9_]+`).
 fn token_keyword(token: &str) -> Option<String> {
-    let word: String = token
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    if word.is_empty() {
-        None
+    if !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        Some(token.to_ascii_uppercase())
     } else {
-        Some(word.to_ascii_uppercase())
+        None
     }
 }
 
@@ -232,6 +278,7 @@ fn token_keyword(token: &str) -> Option<String> {
 /// refused, and a table that has one refuses INSERT and UPDATE.
 pub(super) const CHECK_UNSUPPORTED: &str = "CHECK constraints are not supported by aydb tables";
 pub(super) const DEFAULT_UNSUPPORTED: &str = "DEFAULT values are not supported by aydb tables";
+pub(super) const AUTOINCREMENT_UNSUPPORTED: &str = "AUTOINCREMENT is not supported by aydb tables";
 
 /// Words that start a column constraint and therefore end the type name.
 const CONSTRAINT_KEYWORDS: [&str; 11] = [
@@ -272,26 +319,22 @@ struct ColumnDef {
     declared: String,
 }
 
-/// Consumes the parenthesised group that follows keyword token `tokens[i]`, either attached to
-/// it (`CHECK(a>0)`) or as the next token (`CHECK (a>0)`). Returns the index after the group.
+/// Consumes the parenthesised group token that follows keyword token `tokens[i]`. Returns the
+/// index after the group.
 fn skip_paren_group(tokens: &[&str], i: usize) -> Option<usize> {
-    let word_len = tokens[i]
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .count();
-    if tokens[i][word_len..].starts_with('(') {
-        Some(i + 1)
-    } else if tokens.get(i + 1).is_some_and(|t| t.starts_with('(')) {
-        Some(i + 2)
-    } else {
-        None
-    }
+    tokens
+        .get(i + 1)
+        .is_some_and(|t| t.starts_with('('))
+        .then_some(i + 2)
 }
 
 /// Parses one column definition (`column-def` of the SQLite grammar) from its tokens: the
 /// column name, the type name (identifiers up to the first constraint keyword, with an optional
 /// parenthesised size), then column constraints. The affinity comes from the type name only.
 fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
+    if tokens[0].starts_with('(') {
+        return Err(SQLITE_ERROR);
+    }
     let mut def = ColumnDef {
         name: unquote_identifier(tokens[0]),
         affinity: ColumnAffinity::Blob,
@@ -319,9 +362,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         if quoted {
             type_words.push(unquote_identifier(tok).to_ascii_uppercase());
         } else if !tok.starts_with('(') {
-            // `VARCHAR(10)`: the size takes no part in the affinity.
-            let word = tok.split('(').next().unwrap_or(tok);
-            type_words.push(word.to_ascii_uppercase());
+            type_words.push(tok.to_ascii_uppercase());
         }
         i += 1;
     }
@@ -336,6 +377,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
             return Err(SQLITE_ERROR);
         };
         let start = i;
+        let mut has_autoincrement = false;
         match keyword.as_str() {
             "CONSTRAINT" => {
                 if i + 1 >= tokens.len() {
@@ -346,7 +388,7 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                 continue;
             }
             "PRIMARY" => {
-                if !is_word(tokens.get(i + 1), "KEY") {
+                if def.primary_key || !is_word(tokens.get(i + 1), "KEY") {
                     return Err(SQLITE_ERROR);
                 }
                 def.primary_key = true;
@@ -359,6 +401,11 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                     i += 1;
                 }
                 if is_word(tokens.get(i), "AUTOINCREMENT") {
+                    if !def.rowid_alias {
+                        return Err(SQLITE_ERROR);
+                    }
+                    def.unsupported.get_or_insert(AUTOINCREMENT_UNSUPPORTED);
+                    has_autoincrement = true;
                     i += 1;
                 }
             }
@@ -385,22 +432,14 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
             // one is read-only for inserts and updates (see `unsupported`).
             "DEFAULT" => {
                 def.unsupported.get_or_insert(DEFAULT_UNSUPPORTED);
-                let word_len = tokens[i]
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .count();
-                if tokens[i].len() > word_len {
-                    i += 1;
-                } else {
-                    i += 1;
-                    if matches!(tokens.get(i), Some(&"+") | Some(&"-")) {
-                        i += 1;
-                    }
-                    if i >= tokens.len() {
-                        return Err(SQLITE_ERROR);
-                    }
+                i += 1;
+                if matches!(tokens.get(i), Some(&"+") | Some(&"-")) {
                     i += 1;
                 }
+                if i >= tokens.len() {
+                    return Err(SQLITE_ERROR);
+                }
+                i += 1;
             }
             "COLLATE" => {
                 let Some(name) = tokens.get(i + 1) else {
@@ -415,10 +454,10 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
             "REFERENCES" => {
                 // SQLite does not enforce foreign keys on virtual tables; skip the clause.
                 i += 1;
-                if i >= tokens.len() {
+                if i >= tokens.len() || tokens[i].starts_with('(') {
                     return Err(SQLITE_ERROR);
                 }
-                i += 1; // parent table, possibly with its column list attached
+                i += 1; // parent table name
                 if tokens.get(i).is_some_and(|t| t.starts_with('(')) {
                     i += 1;
                 }
@@ -432,10 +471,24 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         let name = pending_name.take();
         if !leaves_index {
             declared.extend_from_slice(name.unwrap_or(&[]));
-            declared.extend_from_slice(&tokens[start..i]);
+            if keyword == "PRIMARY" && has_autoincrement {
+                declared.extend_from_slice(&tokens[start..i - 1]);
+            } else {
+                declared.extend_from_slice(&tokens[start..i]);
+            }
         }
     }
-    def.declared = declared.join(" ");
+    if pending_name.is_some() {
+        return Err(SQLITE_ERROR);
+    }
+    let mut out = String::new();
+    for tok in declared {
+        if !out.is_empty() && !tok.starts_with('(') {
+            out.push(' ');
+        }
+        out.push_str(tok);
+    }
+    def.declared = out;
     Ok(def)
 }
 
@@ -568,6 +621,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let mut col_unique = Vec::new();
         let mut pk_col_idx = 0usize;
         let mut pk_rowid_alias = false;
+        let mut has_primary_key = false;
         let mut unsupported: Option<&'static str> = None;
         let mut declared_columns: Vec<String> = Vec::new();
         for col_def in split_top_level_commas(&columns_spec) {
@@ -577,7 +631,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             if has_comment_outside_quotes(trimmed) {
                 return Err(SQLITE_ERROR);
             }
-            let raw_tokens = column_tokens(trimmed);
+            let raw_tokens = column_tokens(trimmed)?;
             if raw_tokens.windows(2).any(|pair| {
                 pair[0].eq_ignore_ascii_case("ON") && pair[1].eq_ignore_ascii_case("CONFLICT")
             }) {
@@ -591,6 +645,10 @@ pub(super) unsafe fn parse_vtab_ddl(
             }
             let def = parse_column_def(&raw_tokens)?;
             if def.primary_key {
+                if has_primary_key {
+                    return Err(SQLITE_ERROR);
+                }
+                has_primary_key = true;
                 pk_col_idx = col_names.len();
                 pk_rowid_alias = def.rowid_alias;
             }
@@ -604,7 +662,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             col_not_null.push(def.not_null);
             col_unique.push(def.unique);
         }
-        if col_names.is_empty() {
+        if col_names.is_empty() || col_names.len() >= 0x8000 {
             return Err(SQLITE_ERROR);
         }
         let pk_affinity = col_affinities
@@ -623,6 +681,9 @@ pub(super) unsafe fn parse_vtab_ddl(
             if idx_col.trim().is_empty() {
                 continue;
             }
+            if next_idx_id >= 0x8000 {
+                return Err(SQLITE_ERROR);
+            }
             let target = unquote_identifier(idx_col.trim());
             let Some(pos) = col_names
                 .iter()
@@ -630,6 +691,9 @@ pub(super) unsafe fn parse_vtab_ddl(
             else {
                 return Err(SQLITE_ERROR);
             };
+            if secondary_indexes.iter().any(|&(p, _)| p == pos) {
+                return Err(SQLITE_ERROR);
+            }
             secondary_indexes.push((pos, next_idx_id));
             next_idx_id += 1;
         }
@@ -774,7 +838,8 @@ mod tests {
     }
 
     fn cols(spec: &str) -> ParsedVtabDdl {
-        parse(&[&format!("columns='{spec}'")]).unwrap_or_else(|_| panic!("rejected [{spec}]"))
+        parse(&[&format!("columns='{}'", spec.replace('\'', "''"))])
+            .unwrap_or_else(|_| panic!("rejected [{spec}]"))
     }
 
     #[test]
@@ -988,5 +1053,126 @@ mod tests {
         assert_eq!(d.col_not_null, vec![false, true, false]);
         assert_eq!(d.col_names.len(), 3);
         assert_eq!(cols("k TEXT PRIMARY KEY, v INT").unsupported, None);
+    }
+
+    #[test]
+    fn adjacent_parens_and_quotes_split_into_separate_tokens() {
+        let d = cols("k TEXT PRIMARY KEY, v VARCHAR(10)UNIQUE");
+        assert_eq!(d.col_affinities[1], ColumnAffinity::Text);
+        assert_eq!(d.col_unique, vec![false, true]);
+        assert_eq!(d.declared_columns, "k TEXT, v VARCHAR(10)");
+
+        let d = cols("k TEXT PRIMARY KEY, v VARCHAR(10)NOT NULL");
+        assert_eq!(d.col_not_null, vec![false, true]);
+        assert_eq!(d.declared_columns, "k TEXT, v VARCHAR(10) NOT NULL");
+
+        let d = cols("k TEXT PRIMARY KEY, v VARCHAR(10)CHECK(v<>'')");
+        assert_eq!(d.unsupported, Some(CHECK_UNSUPPORTED));
+        assert_eq!(d.col_affinities[1], ColumnAffinity::Text);
+
+        let d = cols("k TEXT PRIMARY KEY, v INT DEFAULT(0)UNIQUE");
+        assert_eq!(d.unsupported, Some(DEFAULT_UNSUPPORTED));
+        assert_eq!(d.col_unique, vec![false, true]);
+
+        let d = cols("k TEXT PRIMARY KEY, v TEXT DEFAULT'abc'UNIQUE");
+        assert_eq!(d.unsupported, Some(DEFAULT_UNSUPPORTED));
+        assert_eq!(d.col_unique, vec![false, true]);
+
+        let d = cols("k TEXT PRIMARY KEY, v INT DEFAULT-1 UNIQUE");
+        assert_eq!(d.unsupported, Some(DEFAULT_UNSUPPORTED));
+        assert_eq!(d.col_unique, vec![false, true]);
+
+        let d = cols("k TEXT PRIMARY KEY, v REAL DEFAULT 1e-5 UNIQUE");
+        assert_eq!(d.unsupported, Some(DEFAULT_UNSUPPORTED));
+        assert_eq!(d.col_unique, vec![false, true]);
+
+        let d = cols("k TEXT PRIMARY KEY, v BLOB DEFAULT x'0102'UNIQUE");
+        assert_eq!(d.unsupported, Some(DEFAULT_UNSUPPORTED));
+        assert_eq!(d.col_unique, vec![false, true]);
+
+        let d = cols("k TEXT PRIMARY KEY, v TEXT CHECK(v <> ')')NOT NULL");
+        assert_eq!(d.unsupported, Some(CHECK_UNSUPPORTED));
+        assert_eq!(d.col_not_null, vec![false, true]);
+
+        let d = cols("\"k\"INTEGER PRIMARY KEY, v TEXT CONSTRAINT\"u\"UNIQUE");
+        assert_eq!(d.col_names, vec!["k", "v"]);
+        assert!(d.pk_rowid_alias);
+        assert_eq!(d.col_unique, vec![false, true]);
+        assert_eq!(d.declared_columns, "\"k\" INTEGER PRIMARY KEY, v TEXT");
+
+        let d = cols("k TEXT PRIMARY KEY, v TEXT REFERENCES p(id)ON DELETE CASCADE");
+        assert_eq!(
+            d.declared_columns,
+            "k TEXT, v TEXT REFERENCES p(id) ON DELETE CASCADE"
+        );
+
+        for malformed in [
+            "k TEXT PRIMARY KEY, CONSTRAINT \"c\"UNIQUE(k)",
+            "k TEXT PRIMARY KEY, v VARCHAR(10",
+            "k TEXT PRIMARY KEY, v INT ) UNIQUE",
+            "\"k TEXT PRIMARY KEY",
+            "k TEXT PRIMARY KEY, v INT CONSTRAINT c",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{malformed}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_primary_keys_are_rejected() {
+        for spec in [
+            "a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY",
+            "a TEXT PRIMARY KEY, b TEXT PRIMARY KEY",
+            "a TEXT PRIMARY KEY PRIMARY KEY, b INT",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{spec}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn autoincrement_is_flagged_or_rejected() {
+        let d = cols("k INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT");
+        assert!(d.pk_rowid_alias);
+        assert_eq!(d.unsupported, Some(AUTOINCREMENT_UNSUPPORTED));
+        assert_eq!(d.declared_columns, "k INTEGER PRIMARY KEY, v TEXT");
+
+        for invalid in [
+            "k TEXT PRIMARY KEY AUTOINCREMENT, v TEXT",
+            "k INT PRIMARY KEY AUTOINCREMENT, v TEXT",
+            "k INTEGER PRIMARY KEY DESC AUTOINCREMENT, v TEXT",
+            "k INTEGER(4) PRIMARY KEY AUTOINCREMENT, v TEXT",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{invalid}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexes_reject_duplicates_and_high_bit_overflow() {
+        let cols_opt = "columns='id INTEGER PRIMARY KEY, name TEXT, tag TEXT'";
+        for dup in ["indexes='name, NAME'", "indexes='name, \"name\"'"] {
+            assert_eq!(parse(&[cols_opt, dup]).err(), Some(SQLITE_ERROR), "{dup}");
+        }
+
+        // 0x8000 columns (32768) exceeds the non-UNIQUE column limit so `unique_index_id` high
+        // bit (`0x8000`) and secondary index IDs (`1..0x8000`) remain disjoint.
+        let mut many_cols = String::from("c0 INTEGER PRIMARY KEY");
+        for i in 1..0x8000usize {
+            many_cols.push_str(&format!(", c{i} INT"));
+        }
+        assert_eq!(
+            parse(&[&format!("columns='{many_cols}'")]).err(),
+            Some(SQLITE_ERROR)
+        );
     }
 }

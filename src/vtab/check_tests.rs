@@ -29,8 +29,9 @@ fn create_rejects_check_constraints_with_a_message() {
     {
         let err = conn
             .execute_batch(&format!(
-                "CREATE VIRTUAL TABLE c{i} USING aydb(table_id={}, columns='{columns}')",
-                i + 1
+                "CREATE VIRTUAL TABLE c{i} USING aydb(table_id={}, columns='{}')",
+                i + 1,
+                columns.replace('\'', "''")
             ))
             .unwrap_err()
             .to_string();
@@ -319,4 +320,42 @@ fn a_stored_table_with_default_columns_can_be_deleted_from_renamed_and_dropped()
         conn.execute_batch("DROP TABLE t2").unwrap();
         assert!(conn.query_all("SELECT k FROM t2", &[]).is_err());
     }
+}
+
+#[test]
+fn create_rejects_autoincrement_with_a_message() {
+    let fixture = legacy_check_table("autoincrement_reject");
+    let conn = fixture.open();
+    let err = conn
+        .execute_batch(
+            "CREATE VIRTUAL TABLE c USING aydb(table_id=9, columns='k INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT')",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("AUTOINCREMENT is not supported"), "{err}");
+
+    let legacy = legacy_check_table("autoincrement_legacy");
+    {
+        let setup = legacy.open();
+        setup
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master
+                    SET sql = replace(
+                        replace(sql, 'x INT CHECK(x > 0) UNIQUE', 'x INT UNIQUE'),
+                        'k INTEGER PRIMARY KEY',
+                        'k INTEGER PRIMARY KEY AUTOINCREMENT'
+                    )
+                  WHERE name = 't';",
+            )
+            .unwrap();
+    }
+    let conn = legacy.open();
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES (3, 30)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("AUTOINCREMENT is not supported"), "{err}");
+    assert_eq!(rows(&conn), original_rows());
+    conn.execute_batch("DROP TABLE t").unwrap();
 }
