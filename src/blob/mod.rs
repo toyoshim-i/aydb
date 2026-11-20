@@ -150,7 +150,12 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         }
 
         let rec_start = self.write_buf.len();
-        self.write_buf.reserve(total_len);
+        self.write_buf.try_reserve(total_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to allocate blob staging buffer",
+            )
+        })?;
         self.write_buf.extend_from_slice(BLOB_RECORD_MAGIC);
         self.write_buf.extend_from_slice(&0u32.to_le_bytes()); // placeholder for CRC32C at +4..+8
         self.write_buf
@@ -163,10 +168,13 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         let payload_crc = crc32c(&self.write_buf[rec_start + 8..rec_start + total_len]);
         self.write_buf[rec_start + 4..rec_start + 8].copy_from_slice(&payload_crc.to_le_bytes());
 
-        self.write_offset += total_len as u64;
         if self.write_buf.len() >= BLOB_WRITE_BUFFER_CAPACITY {
-            self.flush_buffer()?;
+            if let Err(e) = self.flush_buffer() {
+                self.write_buf.truncate(rec_start);
+                return Err(e);
+            }
         }
+        self.write_offset += total_len as u64;
 
         Ok(BlobPtr {
             kind: self.kind,
@@ -331,11 +339,36 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             return Ok(false);
         }
 
+        let file_len = self.file.file_len()?;
+        let Some(end_offset) = (ptr.offset as u64).checked_add(ptr.len as u64) else {
+            return Ok(false);
+        };
+        if end_offset > file_len {
+            return Ok(false);
+        }
+
         let orig_len = out.len();
-        out.resize(orig_len + len, 0);
+        let new_len = orig_len.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "blob read buffer length overflow",
+            )
+        })?;
+        let reserve_res = if orig_len == 0 {
+            out.try_reserve_exact(len)
+        } else {
+            out.try_reserve(len)
+        };
+        reserve_res.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to allocate buffer for blob record",
+            )
+        })?;
+        out.resize(new_len, 0);
         match self
             .file
-            .read_exact_at(&mut out[orig_len..orig_len + len], ptr.offset as u64)
+            .read_exact_at(&mut out[orig_len..new_len], ptr.offset as u64)
         {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -349,7 +382,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             }
         }
 
-        let buf = &out[orig_len..orig_len + len];
+        let buf = &out[orig_len..new_len];
         let Some(val_slice) = Self::verify_blob_record(buf, ptr.crc32c, expected_key) else {
             out.truncate(orig_len);
             return Ok(false);
@@ -505,5 +538,171 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(slab.len(), prev_len);
+    }
+
+    #[test]
+    fn append_blob_into_rejects_corrupt_huge_len_without_allocating() {
+        let dir = TempTestDir::new("blob_huge_len");
+        let fs = OsFs::open(&dir.path, true).unwrap();
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let valid = writer.append_blob(b"k1", b"small-payload").unwrap();
+        writer.sync_durable().unwrap();
+        drop(writer);
+
+        let reader = BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(b"prefix:");
+        let initial_cap = out.capacity();
+
+        let corrupt_huge_len = BlobPtr {
+            kind: BlobKind::Standard,
+            table_id: 0,
+            seg_id: 1,
+            offset: 0,
+            len: u32::MAX,
+            crc32c: valid.crc32c,
+        };
+        assert!(
+            !reader
+                .append_blob_into(&corrupt_huge_len, Some(b"k1"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, b"prefix:");
+        assert_eq!(out.capacity(), initial_cap);
+
+        let corrupt_offset_overflow = BlobPtr {
+            kind: BlobKind::Standard,
+            table_id: 0,
+            seg_id: 1,
+            offset: u32::MAX,
+            len: 64,
+            crc32c: valid.crc32c,
+        };
+        assert!(
+            !reader
+                .append_blob_into(&corrupt_offset_overflow, Some(b"k1"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out, b"prefix:");
+        assert_eq!(out.capacity(), initial_cap);
+    }
+
+    #[test]
+    fn append_blob_flush_failure_preserves_write_offset_and_prior_buffered_records() {
+        use crate::pal::{OsFile, PreallocStrategy};
+        use std::path::Path;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FaultBlobFile {
+            inner: Arc<OsFile>,
+            fail_large_write: Arc<AtomicBool>,
+        }
+
+        impl PlatformFile for FaultBlobFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                if buf.len() >= BLOB_WRITE_BUFFER_CAPACITY
+                    && self.fail_large_write.swap(false, Ordering::SeqCst)
+                {
+                    return Err(io::Error::other("simulated blob flush write failure"));
+                }
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        struct FaultBlobFs {
+            inner: OsFs,
+            fail_large_write: Arc<AtomicBool>,
+        }
+
+        impl PlatformFs for FaultBlobFs {
+            type File = FaultBlobFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(FaultBlobFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    fail_large_write: Arc::clone(&self.fail_large_write),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let dir = TempTestDir::new("blob_flush_fail");
+        let fail_flag = Arc::new(AtomicBool::new(true));
+        let fs = FaultBlobFs {
+            inner: OsFs::open(&dir.path, true).unwrap(),
+            fail_large_write: Arc::clone(&fail_flag),
+        };
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let val1 = vec![0x11u8; 4096];
+        let ptr1 = writer.append_blob(b"k1", &val1).unwrap();
+        assert_eq!(writer.current_len(), ptr1.len as u64);
+        assert_eq!(writer.flushed_offset(), 0);
+
+        let big_val_len = BLOB_WRITE_BUFFER_CAPACITY
+            - ptr1.len as usize
+            - BLOB_RECORD_HEADER_LEN
+            - b"k_big".len();
+        let val_big = vec![0x22u8; big_val_len];
+        let err = writer.append_blob(b"k_big", &val_big).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("simulated blob flush write failure")
+        );
+        assert_eq!(writer.current_len(), ptr1.len as u64);
+        assert_eq!(writer.flushed_offset(), 0);
+
+        let val2 = vec![0x33u8; 2048];
+        let ptr2 = writer.append_blob(b"k2", &val2).unwrap();
+        assert_eq!(writer.current_len(), (ptr1.len + ptr2.len) as u64);
+        writer.sync_durable().unwrap();
+        assert_eq!(writer.flushed_offset(), writer.current_len());
+        drop(writer);
+
+        let reader = BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        assert_eq!(
+            reader.read_blob(&ptr1, Some(b"k1")).unwrap().as_deref(),
+            Some(val1.as_slice())
+        );
+        assert_eq!(
+            reader.read_blob(&ptr2, Some(b"k2")).unwrap().as_deref(),
+            Some(val2.as_slice())
+        );
     }
 }
