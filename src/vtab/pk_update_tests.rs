@@ -483,8 +483,8 @@ fn int_pk_multi_row_update_or_replace_preserves_replaced_row_like_native() {
             .unwrap()
     );
 
-    // 3. Legacy INT PRIMARY KEY row without persistent NS_ROWID_BY_PK/NS_PK_BY_ROWID entries
-    //    remains readable and preserves rowid=k across in-place and key-changing updates.
+    // 3. Per pre-release format policy, an unmapped INT PRIMARY KEY row without persistent
+    //    NS_ROWID_BY_PK/NS_PK_BY_ROWID entries is rejected as corrupt rather than migrated.
     aydb.execute_batch(
         "CREATE VIRTUAL TABLE legacy USING aydb(table_id=9, columns='k INT PRIMARY KEY, v TEXT')",
     )
@@ -500,35 +500,9 @@ fn int_pk_multi_row_update_or_replace_preserves_replaced_row_like_native() {
             WriteDurability::BufferedFast,
         )
         .unwrap();
-    assert_eq!(
-        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
-            .unwrap(),
-        vec![vec![
-            SqlValue::Integer(1),
-            SqlValue::Integer(1),
-            SqlValue::Text("old".into()),
-        ]]
-    );
-    aydb.execute_batch("UPDATE legacy SET v = 'mid' WHERE k = 1")
-        .unwrap();
-    assert_eq!(
-        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
-            .unwrap(),
-        vec![vec![
-            SqlValue::Integer(1),
-            SqlValue::Integer(1),
-            SqlValue::Text("mid".into()),
-        ]]
-    );
-    aydb.execute_batch("UPDATE legacy SET k = 7 WHERE k = 1")
-        .unwrap();
-    assert_eq!(
-        aydb.query_all("SELECT rowid, k, v FROM legacy", &[])
-            .unwrap(),
-        vec![vec![
-            SqlValue::Integer(1),
-            SqlValue::Integer(7),
-            SqlValue::Text("mid".into()),
-        ]]
-    );
+    let err = aydb
+        .query_all("SELECT rowid, k, v FROM legacy", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("database disk image is malformed"), "{err}");
 }

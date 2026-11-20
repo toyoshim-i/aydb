@@ -7,16 +7,14 @@ use crate::engine::{StorageEngine, WriteDurability};
 use crate::pal::PlatformFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::AydbVTab;
-use crate::vtab::row_codec::{
-    ColumnAffinity, decode_i64_tagged_key, extract_column_key_bytes_with_collation,
-};
+use crate::vtab::row_codec::{decode_i64_tagged_key, extract_column_key_bytes_with_collation};
 
 pub(super) fn assign_synthetic_rowid<FS: PlatformFs>(
     engine: &mut StorageEngine<FS>,
     table_id: u16,
     pk: &[u8],
     durability: WriteDurability,
-    integer_primary_keys: bool,
+    pk_rowid_alias: bool,
 ) -> io::Result<i64> {
     engine.assign_rowid(
         table_id,
@@ -24,19 +22,8 @@ pub(super) fn assign_synthetic_rowid<FS: PlatformFs>(
         hash_pk_to_rowid(pk),
         durability,
         |engine, rowid| {
-            if !integer_primary_keys {
-                return Ok(false);
-            }
-            let int_pk = super::encode_i64_tagged_key(rowid);
-            if int_pk.as_slice() == pk {
-                return Ok(false);
-            }
-            // Protect unmapped implicit/legacy integer PK rows without blocking rowids whose
-            // integer-keyed row already lives under an explicit persistent mapping.
-            Ok(engine.row_exists(table_id, &int_pk)?
-                && engine
-                    .rowid_for_pk_view(crate::engine::ReadView::Owner, table_id, &int_pk)?
-                    .is_none())
+            Ok(pk_rowid_alias
+                && engine.row_exists(table_id, &super::encode_i64_tagged_key(rowid))?)
         },
     )
 }
@@ -57,8 +44,7 @@ pub fn hash_pk_to_rowid(encoded_pk: &[u8]) -> i64 {
 /// For `INTEGER PRIMARY KEY` rowid aliases (`vtab.pk_rowid_alias` and `type_tag == 1`), reads
 /// the 8-byte `i64` directly in $O(1)$ with zero allocation.
 /// For all other primary keys (including non-alias `INT PRIMARY KEY` and `TEXT`/`BLOB`/`REAL`),
-/// reads the persistent synthetic `rowid` from the engine (falling back to key decoding for
-/// legacy unmapped `INT PRIMARY KEY` rows).
+/// reads the persistent synthetic `rowid` from the engine.
 #[inline]
 pub(super) fn extract_rowid_from_row(
     row_bytes: &[u8],
@@ -98,18 +84,12 @@ pub(super) fn extract_rowid_from_pk_bytes(
         vtab.table_id,
         snapshot,
         |eng| {
-            if let Some(id) = eng.rowid_for_pk(vtab.table_id, pk_bytes)? {
-                return Ok(id);
-            }
-            if !vtab.pk_rowid_alias && vtab.pk_affinity == ColumnAffinity::Integer {
-                if let Some(id) = decode_i64_tagged_key(pk_bytes) {
-                    return Ok(id);
-                }
-            }
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "row has no persistent SQLite rowid",
-            ))
+            eng.rowid_for_pk(vtab.table_id, pk_bytes)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "row has no persistent SQLite rowid",
+                )
+            })
         },
     )
     .unwrap_or_else(|| Err(io::Error::other("engine lock poisoned")))
