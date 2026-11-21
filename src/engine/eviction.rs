@@ -327,6 +327,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 r_lower_inc,
                 None,
                 RECONCILE_BATCH_SIZE,
+                false,
             )?;
             if row_entries.is_empty() {
                 break;
@@ -347,6 +348,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 true,
                 Some((&meta_hi, true)),
                 usize::MAX,
+                false,
             )?;
             let mut meta_map: HashMap<Vec<u8>, (RowMetaRecord, Option<BlobPtr>)> =
                 HashMap::with_capacity(meta_entries.len());
@@ -526,6 +528,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true,
             None,
             1,
+            false,
             |key, _lsn, _value| {
                 newest_tick = decode_lru_queue_key(table_id, key).map(|(tick, _)| tick);
                 Ok(true)

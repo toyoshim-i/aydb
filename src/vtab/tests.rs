@@ -3591,3 +3591,77 @@ fn cross_affinity_numeric_comparisons_on_text_and_blob_columns_match_native_sqli
         assert_eq!(got_ay, got_nat, "streaming mismatch on `{tmpl}`");
     }
 }
+
+#[test]
+fn sql_chunked_full_scan_bypasses_block_cache_and_secondary_lookup_caches() {
+    let tmp = TempTestDir::new("vtab_scan_cache_policy");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.block_cache_bytes = 64 * 1024;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(
+            table_id = 1,
+            columns = 'k TEXT PRIMARY KEY, tag TEXT',
+            indexes = 'tag'
+        );",
+    )
+    .unwrap();
+
+    let mut batch = String::from("BEGIN;");
+    for i in 0..600u32 {
+        batch.push_str(&format!("INSERT INTO t VALUES ('k_{i:04}', 'tag_{i:04}');"));
+    }
+    batch.push_str("COMMIT;");
+    conn.execute_batch(&batch).unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
+
+    let (hits0, _misses0) = {
+        let eng = engine.read().unwrap();
+        (eng.block_cache().hits(), eng.block_cache().misses())
+    };
+
+    for _ in 0..2 {
+        let cnt = conn.query_all("SELECT COUNT(*) FROM t", &[]).unwrap();
+        assert_eq!(cnt, vec![vec![SqlValue::Integer(600)]]);
+    }
+
+    let (hits1, misses1) = {
+        let eng = engine.read().unwrap();
+        (eng.block_cache().hits(), eng.block_cache().misses())
+    };
+    assert_eq!(
+        hits1, hits0,
+        "Chunked SQL full-table scan must bypass VerifiedBlockCache insertion"
+    );
+
+    let first = conn
+        .query_all("SELECT k FROM t WHERE tag = 'tag_0001'", &[])
+        .unwrap();
+    assert_eq!(first, vec![vec![SqlValue::Text("k_0001".into())]]);
+    let (hits2, misses2) = {
+        let eng = engine.read().unwrap();
+        (eng.block_cache().hits(), eng.block_cache().misses())
+    };
+    assert!(
+        misses2 > misses1,
+        "First secondary-index equality lookup must consult VerifiedBlockCache"
+    );
+
+    let second = conn
+        .query_all("SELECT k FROM t WHERE tag = 'tag_0001'", &[])
+        .unwrap();
+    assert_eq!(second, first);
+    let (hits3, misses3) = {
+        let eng = engine.read().unwrap();
+        (eng.block_cache().hits(), eng.block_cache().misses())
+    };
+    assert!(
+        hits3 > hits2,
+        "Second secondary-index equality lookup must hit VerifiedBlockCache"
+    );
+    assert_eq!(misses3, misses2);
+}

@@ -4018,6 +4018,82 @@ fn full_scan_bypasses_block_cache_insertion() {
 }
 
 #[test]
+fn chunked_full_scan_bypasses_block_cache_while_secondary_lookup_populates_it() {
+    let tmp = TempTestDir::new("chunked_scan_cache_policy");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.block_cache_bytes = 64 * 1024;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    for i in 0..600u32 {
+        let k = format!("s_{i:04}").into_bytes();
+        let tag = format!("tag_{i:04}").into_bytes();
+        engine
+            .put_row(
+                1,
+                &k,
+                b"val_payload_padding",
+                &[(1, tag)],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    let seg_id = engine.idx_segments[0].seq_id();
+
+    let mut block_buf = [0u8; 4096];
+    assert!(!engine.block_cache().get_into(seg_id, 0, &mut block_buf));
+
+    // Stream the entire table in 256-row chunks (mirroring vtab_filter / vtab_next).
+    let mut total_pks = 0usize;
+    let mut lower_pk: Option<Vec<u8>> = None;
+    let (mut pks, mut slab, mut spans) = (Vec::new(), Vec::new(), Vec::new());
+    loop {
+        pks.clear();
+        slab.clear();
+        spans.clear();
+        engine
+            .scan_range_into_slab(
+                1,
+                lower_pk.as_deref().map(|pk| (pk, false)),
+                None,
+                false,
+                256,
+                true,
+                &mut pks,
+                &mut slab,
+                &mut spans,
+                None,
+            )
+            .unwrap();
+        total_pks += pks.len();
+        if pks.len() < 256 {
+            break;
+        }
+        lower_pk = pks.last().cloned();
+    }
+    assert_eq!(total_pks, 600);
+    assert!(
+        !engine.block_cache().get_into(seg_id, 0, &mut block_buf),
+        "Chunked full-table scan must bypass block cache population"
+    );
+
+    // Exact secondary index lookup must populate the block cache and serve hits on repeat calls.
+    let first = engine.lookup_by_secondary_index(1, 1, b"tag_0001").unwrap();
+    assert_eq!(first, vec![b"s_0001".to_vec()]);
+    let hits_after_1 = engine.block_cache().hits();
+    let misses_after_1 = engine.block_cache().misses();
+
+    let second = engine.lookup_by_secondary_index(1, 1, b"tag_0001").unwrap();
+    assert_eq!(second, vec![b"s_0001".to_vec()]);
+    assert!(
+        engine.block_cache().hits() > hits_after_1,
+        "Repeat secondary index lookup must hit VerifiedBlockCache"
+    );
+    assert_eq!(engine.block_cache().misses(), misses_after_1);
+}
+
+#[test]
 fn rollback_without_active_transaction_is_a_noop() {
     let tmp = TempTestDir::new("rollback_noop");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());

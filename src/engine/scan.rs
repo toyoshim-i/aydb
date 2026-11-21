@@ -149,6 +149,25 @@ impl<'a> PreparedPrefixRange<'a> {
     }
 }
 
+#[inline]
+pub(super) fn should_populate_range_cache(
+    lower: Option<(&[u8], bool)>,
+    upper: Option<(&[u8], bool)>,
+    limit: usize,
+) -> bool {
+    lower.is_some() && upper.is_some() && limit <= 256
+}
+
+#[inline]
+pub(super) fn should_populate_secondary_cache(
+    prefix: &[u8],
+    upper_sec_key: Option<(&[u8], bool)>,
+    limit: usize,
+) -> bool {
+    let is_exact_eq = prefix.len() > 5;
+    is_exact_eq || (upper_sec_key.is_some() && limit <= 256)
+}
+
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Scans all live rows `(pk, value)` in `table_id` in ascending memcomparable primary-key order.
     pub fn scan_table(&mut self, table_id: u16) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -178,14 +197,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut pks = Vec::new();
         let mut slab = Vec::new();
         let mut spans = Vec::new();
+        let lower_b = lower.map(|b| (b, true));
+        let upper_b = upper.map(|b| (b, true));
+        let populate_cache = should_populate_range_cache(lower_b, upper_b, limit);
         self.scan_range_into_slab_cx(
             cx,
             table_id,
-            lower.map(|b| (b, true)),
-            upper.map(|b| (b, true)),
+            lower_b,
+            upper_b,
             false,
             limit,
             true,
+            populate_cache,
             &mut pks,
             &mut slab,
             &mut spans,
@@ -215,6 +238,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         spans_out: &mut Vec<(usize, usize)>,
         mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<()> {
+        let populate_cache = should_populate_range_cache(lower, upper, limit);
         self.owner_read(|eng, cx| {
             eng.scan_range_into_slab_cx(
                 cx,
@@ -224,6 +248,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 reverse,
                 limit,
                 keys_only,
+                populate_cache,
                 pks_out,
                 slab_out,
                 spans_out,
@@ -242,6 +267,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         reverse: bool,
         limit: usize,
         keys_only: bool,
+        populate_cache: bool,
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
@@ -426,6 +452,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 lo_inc,
                 upper_key_slice,
                 limit,
+                populate_cache,
                 &mut emit_entry,
             )?;
         } else {
@@ -436,6 +463,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 lo_inc,
                 upper_key_slice,
                 limit,
+                populate_cache,
                 &mut emit_entry,
             )?;
         }
@@ -577,12 +605,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok((rows, next));
         }
 
+        let populate_cache = lower_bound.is_some() && upper_bound.is_some() && limit <= 256;
         let merged = self.scan_merged_prefix_range(
             &prefix,
             &seek_key,
             lo_inc,
             upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
             limit,
+            populate_cache,
         )?;
         let mut rows = Vec::with_capacity(merged.len());
         let mut next = None;
@@ -635,6 +665,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true,
             None,
             usize::MAX,
+            true,
             |key, _lsn, _val| {
                 if key.starts_with(&prefix) {
                     pks.push(key[prefix.len()..].to_vec());
@@ -666,6 +697,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         spans_out: &mut Vec<(usize, usize)>,
         mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<Option<Vec<u8>>> {
+        let populate_cache = should_populate_secondary_cache(prefix, upper_sec_key, limit);
         self.owner_read(|eng, cx| {
             eng.scan_secondary_index_into_slab_cx(
                 cx,
@@ -676,6 +708,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 upper_sec_key,
                 limit,
                 keys_only,
+                populate_cache,
                 pks_out,
                 slab_out,
                 spans_out,
@@ -695,6 +728,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         upper_sec_key: Option<(&[u8], bool)>,
         limit: usize,
         keys_only: bool,
+        populate_cache: bool,
         pks_out: &mut Vec<Vec<u8>>,
         slab_out: &mut Vec<u8>,
         spans_out: &mut Vec<(usize, usize)>,
@@ -752,6 +786,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     cur_inc,
                     upper_sec_key,
                     limit,
+                    populate_cache,
                     |k, _lsn, _val| {
                         if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
                             pks_out.push(pk.to_vec());
@@ -813,6 +848,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     cur_inc,
                     upper_sec_key,
                     batch_need,
+                    populate_cache,
                     |k, _lsn, _val| {
                         if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
                             batch_pks.push(pk.to_vec());
@@ -875,6 +911,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true,
             None,
             usize::MAX,
+            false,
             |key, lsn, val| {
                 let value = match val {
                     MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
@@ -897,7 +934,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         seek_key: &[u8],
         limit: usize,
     ) -> io::Result<Vec<IndexEntry>> {
-        self.scan_merged_prefix_range(prefix, seek_key, true, None, limit)
+        self.scan_merged_prefix_range(prefix, seek_key, true, None, limit, false)
     }
 
     /// Performs a bounded-memory streaming K-way merge across `self.memtable` and all
@@ -913,6 +950,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
     ) -> io::Result<Vec<IndexEntry>> {
         let mut out = Vec::new();
         self.visit_merged_prefix_range(
@@ -921,6 +959,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lower_inclusive,
             upper_key_bound,
             limit,
+            populate_cache,
             |key, lsn, val| {
                 let value = match val {
                     MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
@@ -940,6 +979,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Streams up to `limit` live entries from the ascending K-way merge across `self.memtable`
     /// and `self.idx_segments` into `on_live` without allocating intermediate `IndexEntry`
     /// structs or per-entry `Vec<u8>` buffers.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_merged_prefix_range<F>(
         &self,
         prefix: &[u8],
@@ -947,6 +987,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
         on_live: F,
     ) -> io::Result<()>
     where
@@ -959,6 +1000,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lower_inclusive,
             upper_key_bound,
             limit,
+            populate_cache,
             on_live,
         )
     }
@@ -972,6 +1014,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
         on_live: F,
     ) -> io::Result<()>
     where
@@ -984,6 +1027,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lower_inclusive,
             upper_key_bound,
             limit,
+            populate_cache,
             on_live,
         )
     }
@@ -997,6 +1041,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
         mut on_live: F,
     ) -> io::Result<()>
     where
@@ -1019,10 +1064,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             false,
         );
         let mut mem_exhausted = false;
-
-        let is_unbounded_full_scan =
-            seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
-        let populate_cache = !is_unbounded_full_scan;
 
         let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
         let upper_for_overlap = range.upper_for_overlap();
@@ -1163,6 +1204,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
         on_live: F,
     ) -> io::Result<()>
     where
@@ -1175,6 +1217,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             lower_inclusive,
             upper_key_bound,
             limit,
+            populate_cache,
             on_live,
         )
     }
@@ -1188,6 +1231,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        populate_cache: bool,
         mut on_live: F,
     ) -> io::Result<()>
     where
@@ -1210,10 +1254,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true,
         );
         let mut mem_exhausted = false;
-
-        let is_unbounded_full_scan =
-            seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
-        let populate_cache = !is_unbounded_full_scan;
 
         let seg_upper_arg = range.seg_upper_arg();
         let upper_for_overlap = range.upper_for_overlap();

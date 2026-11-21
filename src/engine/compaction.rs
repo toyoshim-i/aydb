@@ -405,6 +405,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 lower_inclusive,
                 None,
                 RELOCATE_BATCH_SIZE,
+                false,
             )?;
             if entries.is_empty() {
                 break;

@@ -229,6 +229,37 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
         spans_out: &mut Vec<(usize, usize)>,
         lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<()> {
+        let populate_cache = super::scan::should_populate_range_cache(lower, upper, limit);
+        self.scan_range_into_slab_with_cache(
+            table_id,
+            lower,
+            upper,
+            reverse,
+            limit,
+            keys_only,
+            populate_cache,
+            pks_out,
+            slab_out,
+            spans_out,
+            lazy_blobs_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_range_into_slab_with_cache(
+        &self,
+        table_id: u16,
+        lower: Option<(&[u8], bool)>,
+        upper: Option<(&[u8], bool)>,
+        reverse: bool,
+        limit: usize,
+        keys_only: bool,
+        populate_cache: bool,
+        pks_out: &mut Vec<Vec<u8>>,
+        slab_out: &mut Vec<u8>,
+        spans_out: &mut Vec<(usize, usize)>,
+        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+    ) -> io::Result<()> {
         self.eng.scan_range_into_slab_cx(
             &self.cx,
             table_id,
@@ -237,6 +268,7 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
             reverse,
             limit,
             keys_only,
+            populate_cache,
             pks_out,
             slab_out,
             spans_out,
@@ -260,6 +292,40 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
         spans_out: &mut Vec<(usize, usize)>,
         lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
     ) -> io::Result<Option<Vec<u8>>> {
+        let populate_cache =
+            super::scan::should_populate_secondary_cache(prefix, upper_sec_key, limit);
+        self.scan_secondary_index_into_slab_with_cache(
+            table_id,
+            index_id,
+            prefix,
+            lower_sec_key,
+            upper_sec_key,
+            limit,
+            keys_only,
+            populate_cache,
+            pks_out,
+            slab_out,
+            spans_out,
+            lazy_blobs_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_secondary_index_into_slab_with_cache(
+        &self,
+        table_id: u16,
+        index_id: u16,
+        prefix: &[u8],
+        lower_sec_key: (&[u8], bool),
+        upper_sec_key: Option<(&[u8], bool)>,
+        limit: usize,
+        keys_only: bool,
+        populate_cache: bool,
+        pks_out: &mut Vec<Vec<u8>>,
+        slab_out: &mut Vec<u8>,
+        spans_out: &mut Vec<(usize, usize)>,
+        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+    ) -> io::Result<Option<Vec<u8>>> {
         self.eng.scan_secondary_index_into_slab_cx(
             &self.cx,
             table_id,
@@ -269,6 +335,7 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
             upper_sec_key,
             limit,
             keys_only,
+            populate_cache,
             pks_out,
             slab_out,
             spans_out,

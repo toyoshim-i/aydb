@@ -3835,7 +3835,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         let prefix = encode_namespace_prefix(table_id, NS_ROW_META);
         let has = !self
-            .scan_merged_prefix_range(&prefix, &prefix, true, None, 1)?
+            .scan_merged_prefix_range(&prefix, &prefix, true, None, 1, false)?
             .is_empty();
         self.table_has_row_meta.insert(table_id, has);
         Ok(has)

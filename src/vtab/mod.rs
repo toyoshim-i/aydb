@@ -483,13 +483,14 @@ fn start_pk_full_scan(
     reverse: bool,
 ) -> io::Result<()> {
     cursor.keys_only = keys_only;
-    eng.scan_range_into_slab(
+    eng.scan_range_into_slab_with_cache(
         table_id,
         None,
         None,
         reverse,
         CURSOR_STREAM_CHUNK_ROWS,
         keys_only,
+        false,
         &mut cursor.pks,
         &mut cursor.slab,
         &mut cursor.spans,
@@ -634,12 +635,13 @@ fn max_integer_rowid(
             pks.clear();
             slab.clear();
             spans.clear();
-            reader.scan_range_into_slab(
+            reader.scan_range_into_slab_with_cache(
                 table_id,
                 Some((&lower, true)),
                 Some((&upper, upper_inclusive)),
                 true,
                 limit,
+                true,
                 true,
                 &mut pks,
                 &mut slab,
@@ -1599,7 +1601,7 @@ unsafe fn execute_vtab_filter(
                     index_id,
                     &col_val,
                 );
-                let next_last_sec = match eng.scan_secondary_index_into_slab(
+                let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
                     vtab.table_id,
                     index_id,
                     &prefix,
@@ -1607,6 +1609,7 @@ unsafe fn execute_vtab_filter(
                     None,
                     CURSOR_STREAM_CHUNK_ROWS,
                     keys_only,
+                    true,
                     &mut cursor.pks,
                     &mut cursor.slab,
                     &mut cursor.spans,
@@ -1666,6 +1669,7 @@ unsafe fn execute_vtab_filter(
                     } else {
                         None
                     };
+                let has_user_lower = parsed_lower.is_some();
                 let lower_bound = parsed_lower.or_else(|| {
                     let mut min_non_null = Vec::with_capacity(6);
                     min_non_null.extend_from_slice(&crate::lru::encode_secondary_index_prefix(
@@ -1704,7 +1708,7 @@ unsafe fn execute_vtab_filter(
                     .as_ref()
                     .map(|(b, inc)| (b.as_slice(), *inc))
                     .unwrap_or((&idx_prefix, true));
-                let next_last_sec = match eng.scan_secondary_index_into_slab(
+                let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
                     vtab.table_id,
                     index_id,
                     &idx_prefix,
@@ -1712,6 +1716,7 @@ unsafe fn execute_vtab_filter(
                     upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                     CURSOR_STREAM_CHUNK_ROWS,
                     keys_only,
+                    has_user_lower && upper_bound.is_some(),
                     &mut cursor.pks,
                     &mut cursor.slab,
                     &mut cursor.spans,
@@ -1773,13 +1778,14 @@ unsafe fn execute_vtab_filter(
                 let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
                 let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
                 cursor.keys_only = keys_only;
-                if let Err(e) = eng.scan_range_into_slab(
+                if let Err(e) = eng.scan_range_into_slab_with_cache(
                     vtab.table_id,
                     lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                     upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
                     reverse,
                     CURSOR_STREAM_CHUNK_ROWS,
                     keys_only,
+                    lower_bound.is_some() && upper_bound.is_some(),
                     &mut cursor.pks,
                     &mut cursor.slab,
                     &mut cursor.spans,
@@ -1920,7 +1926,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                         cursor.spans.clear();
                         cursor.pks.clear();
                         cursor.lazy_blobs.clear();
-                        match eng.scan_secondary_index_into_slab(
+                        match eng.scan_secondary_index_into_slab_with_cache(
                             vtab.table_id,
                             sec_index_id,
                             &cursor.stream_sec_prefix,
@@ -1928,6 +1934,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                             upper_ref,
                             CURSOR_STREAM_CHUNK_ROWS,
                             keys_only,
+                            false,
                             &mut cursor.pks,
                             &mut cursor.slab,
                             &mut cursor.spans,
@@ -1987,13 +1994,14 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     cursor.spans.clear();
                     cursor.pks.clear();
                     cursor.lazy_blobs.clear();
-                    if let Err(e) = eng.scan_range_into_slab(
+                    if let Err(e) = eng.scan_range_into_slab_with_cache(
                         vtab.table_id,
                         lower_ref,
                         upper_ref,
                         reverse,
                         CURSOR_STREAM_CHUNK_ROWS,
                         keys_only,
+                        false,
                         &mut cursor.pks,
                         &mut cursor.slab,
                         &mut cursor.spans,
