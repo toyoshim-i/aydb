@@ -7521,92 +7521,109 @@ fn relocate_fragmented_std_blobs_preserves_data_generation_and_does_not_recurse(
     }
 }
 
+type SyncCountMap = Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+struct CountedFile {
+    rel_name: String,
+    inner: Arc<<OsFs as PlatformFs>::File>,
+    sync_counts: SyncCountMap,
+    barrier_counts: SyncCountMap,
+}
+
+impl PlatformFile for CountedFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.inner.write_all_at(buf, offset)
+    }
+    fn file_len(&self) -> io::Result<u64> {
+        self.inner.file_len()
+    }
+    fn preallocate(
+        &self,
+        target_len: u64,
+        strategy: crate::pal::PreallocStrategy,
+    ) -> io::Result<()> {
+        self.inner.preallocate(target_len, strategy)
+    }
+    fn sync_durable(&self) -> io::Result<()> {
+        *self
+            .sync_counts
+            .lock()
+            .unwrap()
+            .entry(self.rel_name.clone())
+            .or_insert(0) += 1;
+        self.inner.sync_durable()
+    }
+    fn sync_barrier(&self) -> io::Result<()> {
+        *self
+            .barrier_counts
+            .lock()
+            .unwrap()
+            .entry(self.rel_name.clone())
+            .or_insert(0) += 1;
+        self.inner.sync_barrier()
+    }
+    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.evict_os_cache(offset, len)
+    }
+}
+
+struct CountedFs {
+    inner: OsFs,
+    sync_counts: SyncCountMap,
+    barrier_counts: SyncCountMap,
+}
+
+impl CountedFs {
+    fn open_counted(dir: &std::path::Path) -> (Arc<Self>, SyncCountMap, SyncCountMap) {
+        let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let barrier_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let fs = Arc::new(Self {
+            inner: OsFs::open(dir, true).unwrap(),
+            sync_counts: Arc::clone(&sync_counts),
+            barrier_counts: Arc::clone(&barrier_counts),
+        });
+        (fs, sync_counts, barrier_counts)
+    }
+}
+
+impl PlatformFs for CountedFs {
+    type File = CountedFile;
+
+    fn open_file(
+        &self,
+        rel_name: &str,
+        create: bool,
+        writable: bool,
+        hint: crate::pal::OpenHint,
+    ) -> io::Result<Arc<Self::File>> {
+        Ok(Arc::new(CountedFile {
+            rel_name: rel_name.to_string(),
+            inner: self.inner.open_file(rel_name, create, writable, hint)?,
+            sync_counts: Arc::clone(&self.sync_counts),
+            barrier_counts: Arc::clone(&self.barrier_counts),
+        }))
+    }
+    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+        self.inner.remove_file(rel_name)
+    }
+    fn list_files(&self) -> io::Result<Vec<String>> {
+        self.inner.list_files()
+    }
+    fn root_path(&self) -> &std::path::Path {
+        self.inner.root_path()
+    }
+}
+
 #[test]
 fn prepare_compaction_and_wal_rotation_avoid_redundant_fsyncs() {
-    use crate::pal::OpenHint;
-    use std::path::Path;
-
-    struct CountedFile {
-        rel_name: String,
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    }
-
-    impl PlatformFile for CountedFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            *self
-                .sync_counts
-                .lock()
-                .unwrap()
-                .entry(self.rel_name.clone())
-                .or_insert(0) += 1;
-            self.inner.sync_durable()
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct CountedFs {
-        inner: OsFs,
-        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    }
-
-    impl PlatformFs for CountedFs {
-        type File = CountedFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(CountedFile {
-                rel_name: rel_name.to_string(),
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                sync_counts: Arc::clone(&self.sync_counts),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
-        }
-    }
-
     let tmp = TempTestDir::new("pm1_avoid_redundant_fsyncs");
-    let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let fs = Arc::new(CountedFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        sync_counts: Arc::clone(&sync_counts),
-    });
+    let (fs, sync_counts, _) = CountedFs::open_counted(&tmp.path);
 
     let mut cfg = EngineConfig::default();
     cfg.auto_compact_segment_threshold = 2;
@@ -7708,4 +7725,113 @@ fn prepare_compaction_and_wal_rotation_avoid_redundant_fsyncs() {
         "reclaim_fully_dead_lru_blob_segments must not fsync wal_buf.db when already synced"
     );
     assert_eq!(engine.active_lru_blob_segment_count(10), 1);
+}
+
+#[test]
+fn evict_until_within_quota_batches_window_evictions_and_promotions_into_single_wal_sync() {
+    let tmp = TempTestDir::new("ph4_batched_eviction");
+    let (fs, _, barrier_counts) = CountedFs::open_counted(&tmp.path);
+
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    cfg.max_blob_segment_bytes = 16 * 1024;
+    cfg.memtable_capacity_bytes = 4 * 1024 * 1024;
+
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine.register_capped_table(7, 20_000).unwrap();
+
+        let payload = vec![0x5Au8; 1_000];
+        for i in 0..18u32 {
+            let pk = format!("k_{i:02}");
+            let tag = format!("tag_{i:02}");
+            engine
+                .put_row(
+                    7,
+                    pk.as_bytes(),
+                    &payload,
+                    &[(1, tag.into_bytes())],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+        }
+
+        // Warm the 3 oldest keys in `AccessTracker` so eviction triggers 3 lazy promotions.
+        for i in 0..3u32 {
+            let pk = format!("k_{i:02}");
+            assert!(engine.get_row(7, pk.as_bytes()).unwrap().is_some());
+        }
+
+        barrier_counts.lock().unwrap().clear();
+
+        // Inserting one 12 KB row pushes total logical bytes (~30 KB) well above 20 KB, forcing
+        // 3 lazy promotions + 11 cascading evictions inside a single 64-entry scan window.
+        let big_payload = vec![0x7Bu8; 12_000];
+        engine
+            .put_row(
+                7,
+                b"k_big",
+                &big_payload,
+                &[(1, b"tag_big".to_vec())],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+
+        let wal_sync_barriers = barrier_counts
+            .lock()
+            .unwrap()
+            .get(crate::wal::WAL_SYNC_FILE_NAME)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            wal_sync_barriers, 2,
+            "put_row + entire batched eviction window must issue only 2 wal_sync barriers total"
+        );
+
+        let ct = engine.capped_table_state(7).unwrap();
+        assert_eq!(ct.total_lazy_promotions, 3);
+        assert_eq!(ct.total_evictions, 11);
+        assert!(!ct.is_over_quota());
+
+        for i in 0..3u32 {
+            let pk = format!("k_{i:02}");
+            let tag = format!("tag_{i:02}");
+            assert!(
+                engine.get_row(7, pk.as_bytes()).unwrap().is_some(),
+                "lazily promoted row {pk} must survive eviction"
+            );
+            let idx_hits = engine
+                .lookup_by_secondary_index(7, 1, tag.as_bytes())
+                .unwrap();
+            assert_eq!(idx_hits.len(), 1);
+            assert_eq!(idx_hits[0], pk.as_bytes());
+        }
+        for i in 3..14u32 {
+            let pk = format!("k_{i:02}");
+            let tag = format!("tag_{i:02}");
+            assert_eq!(engine.get_row(7, pk.as_bytes()).unwrap(), None);
+            assert!(
+                engine
+                    .lookup_by_secondary_index(7, 1, tag.as_bytes())
+                    .unwrap()
+                    .is_empty(),
+                "secondary index entry for evicted row {pk} must be removed"
+            );
+        }
+        for i in 14..18u32 {
+            let pk = format!("k_{i:02}");
+            assert!(engine.get_row(7, pk.as_bytes()).unwrap().is_some());
+        }
+        assert_eq!(
+            engine.get_row(7, b"k_big").unwrap().as_deref(),
+            Some(big_payload.as_slice())
+        );
+    }
+
+    // Reopen and verify WAL replay + reconciliation reproduce the exact live keys and quota state.
+    let mut reopened = StorageEngine::open(fs, cfg).unwrap();
+    let live_keys = reopened.scan_keys_range(7, None, None, 100).unwrap();
+    assert_eq!(live_keys.len(), 8);
+    let ct = reopened.capped_table_state(7).unwrap();
+    assert!(!ct.is_over_quota());
 }

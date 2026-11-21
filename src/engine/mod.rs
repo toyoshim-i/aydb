@@ -3921,7 +3921,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// secondary-index (`'i'`) and LRU-queue (`'l'`) entry of `table_id` whose trailing primary
     /// key equals `pk`, found by scanning both namespaces, plus the best-effort logical size
     /// estimate of the row (`pk.len()` + value length, derived from the row record itself).
-    fn collect_orphans_for_pk(
+    pub(super) fn collect_orphans_for_pk(
         &self,
         table_id: u16,
         pk: &[u8],
