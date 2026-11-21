@@ -11,7 +11,7 @@ use crate::lru::{
     RowMetaRecord, encode_primary_row_key, encode_row_meta_key, encode_secondary_index_key,
 };
 use crate::pal::PlatformFs;
-use crate::wal::{BlobKind, WalRecord};
+use crate::wal::WalRecord;
 
 use super::{
     BLOB_RECORD_HEADER_LEN, ExistingRowStatus, MetaLookup, ReadView, StorageEngine, WriteDurability,
@@ -188,29 +188,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // An uncapped row left without any key needs no record at all.
-        if keys.is_empty() && recorded_tick == 0 {
+        let mut new_meta_blob_ptr = None;
+        let wrote_meta = !(keys.is_empty() && recorded_tick == 0);
+        if !wrote_meta {
             records.push(WalRecord::Delete { key: meta_key });
         } else {
             let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &keys);
-            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                let ptr =
-                    self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
-                if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                    self.sync_active_std_writer()?;
-                }
-                records.push(WalRecord::PutBlobPtr {
-                    key: meta_key,
-                    blob_ptr: ptr,
-                });
-            } else {
-                records.push(WalRecord::PutInline {
-                    key: meta_key,
-                    value: meta_bytes,
-                });
+            new_meta_blob_ptr =
+                self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
+        }
+        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+            if let Some(ref p) = new_meta_blob_ptr {
+                self.record_dead_blob_bytes(p);
             }
+            return Err(e);
+        }
+        if wrote_meta {
             self.table_has_row_meta.insert(table_id, true);
         }
-        self.commit_wal_and_memtable(records, durability)?;
         if let Some(old_m_ptr) = old_meta_blob_ptr {
             self.record_dead_blob_bytes(&old_m_ptr);
         }

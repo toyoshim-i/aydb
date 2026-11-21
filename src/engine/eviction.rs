@@ -222,29 +222,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             },
                         ];
                         let mut old_m_ptr = None;
+                        let mut new_m_ptr = None;
                         if let Some((mut mrec, m_ptr)) = self.get_row_meta_with_ptr(&meta_key)? {
                             old_m_ptr = m_ptr;
                             mrec.recorded_tick = hot_tick;
                             let meta_bytes = mrec.to_bytes();
-                            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                                let ptr = self.append_to_blob_segment(
-                                    BlobKind::Standard,
-                                    0,
-                                    &meta_key,
-                                    &meta_bytes,
-                                )?;
-                                records.push(WalRecord::PutBlobPtr {
-                                    key: meta_key,
-                                    blob_ptr: ptr,
-                                });
-                            } else {
-                                records.push(WalRecord::PutInline {
-                                    key: meta_key,
-                                    value: meta_bytes,
-                                });
-                            }
+                            new_m_ptr = self.append_std_meta_record(
+                                meta_key,
+                                meta_bytes,
+                                durability,
+                                &mut records,
+                            )?;
                         }
-                        self.commit_wal_and_memtable(records, durability)?;
+                        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+                            if let Some(ref p) = new_m_ptr {
+                                self.record_dead_blob_bytes(p);
+                            }
+                            return Err(e);
+                        }
                         if let Some(m_ptr) = old_m_ptr {
                             self.record_dead_blob_bytes(&m_ptr);
                         }
@@ -387,6 +382,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             let mut missing_records = Vec::new();
+            let mut new_meta_ptrs = Vec::new();
             let mut dead_meta_ptrs = Vec::new();
 
             for entry in row_entries {
@@ -409,22 +405,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 meta.logical_size,
                                 &meta.secondary_keys,
                             );
-                            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                                let ptr = self.append_to_blob_segment(
-                                    BlobKind::Standard,
-                                    0,
-                                    &meta_key,
-                                    &meta_bytes,
-                                )?;
-                                missing_records.push(WalRecord::PutBlobPtr {
-                                    key: meta_key,
-                                    blob_ptr: ptr,
-                                });
-                            } else {
-                                missing_records.push(WalRecord::PutInline {
-                                    key: meta_key,
-                                    value: meta_bytes,
-                                });
+                            match self.append_std_meta_record(
+                                meta_key,
+                                meta_bytes,
+                                WriteDurability::BufferedFast,
+                                &mut missing_records,
+                            ) {
+                                Ok(Some(ptr)) => new_meta_ptrs.push(ptr),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    for p in &new_meta_ptrs {
+                                        self.record_dead_blob_bytes(p);
+                                    }
+                                    return Err(e);
+                                }
                             }
                             if let Some(m_ptr) = *old_m_ptr {
                                 dead_meta_ptrs.push(m_ptr);
@@ -467,7 +461,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             if apply_repairs && !missing_records.is_empty() {
-                self.commit_wal_and_memtable(missing_records, WriteDurability::BufferedFast)?;
+                if let Err(e) =
+                    self.commit_wal_and_memtable(missing_records, WriteDurability::BufferedFast)
+                {
+                    for p in &new_meta_ptrs {
+                        self.record_dead_blob_bytes(p);
+                    }
+                    return Err(e);
+                }
                 for m_ptr in dead_meta_ptrs {
                     self.record_dead_blob_bytes(&m_ptr);
                 }

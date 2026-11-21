@@ -4771,3 +4771,44 @@ fn tx_ring_full_flush_persists_settled_quotas_not_uncommitted_tx() {
     );
     assert!(e.capped_table_state(2).is_none());
 }
+
+/// Lazy LRU promotion inside `evict_until_within_quota` can spill an oversized `'t'`
+/// (`RowMetaRecord`) into `blob_std`; under autocommit `SyncTransactional`, `blob_std` must be
+/// synced before the WAL append (`Write-Blob-Before-WAL`).
+#[test]
+fn lazy_lru_promotion_with_out_of_line_meta_syncs_blob_std_before_sync_wal() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 17));
+    let mut cfg = repro_config();
+    cfg.inline_threshold_bytes = 4096;
+    cfg.wal_damage_policy = WalDamagePolicy::Fail;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(1, 2200).unwrap();
+
+    let sec = vec![
+        (1, vec![b'a'; 1500]),
+        (2, vec![b'b'; 1500]),
+        (3, vec![b'c'; 1500]),
+    ];
+    e.put_row(1, b"k1", &[0x11u8; 100], &sec, SYNC).unwrap();
+    e.checkpoint().unwrap();
+
+    e.put_row(1, b"k2", &[0x22u8; 1900], &[], SYNC).unwrap();
+    // Record a RAM hit so evicting past `k1` triggers lazy LRU promotion of `k1`'s >4 KB meta.
+    assert_eq!(e.get_row(1, b"k1").unwrap(), Some(vec![0x11u8; 100]));
+
+    e.put_row(1, b"k3", &[0x33u8; 1500], &[], SYNC).unwrap();
+    assert_eq!(e.capped_table_state(1).unwrap().total_lazy_promotions, 1);
+
+    fs.cut_now();
+    drop(e);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+    let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert!(reopened.last_wal_recovery().damage.is_none());
+    assert_eq!(reopened.get_row(1, b"k1").unwrap(), Some(vec![0x11u8; 100]));
+    assert_eq!(reopened.get_row(1, b"k2").unwrap(), None);
+    assert_eq!(
+        reopened.get_row(1, b"k3").unwrap(),
+        Some(vec![0x33u8; 1500])
+    );
+}

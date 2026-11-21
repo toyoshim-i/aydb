@@ -2038,14 +2038,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if need_meta {
             let meta_bytes =
                 RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys);
-            if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-                let ptr = match self.append_to_blob_segment(
-                    BlobKind::Standard,
-                    0,
-                    &meta_key,
-                    &meta_bytes,
-                ) {
-                    Ok(p) => p,
+            new_meta_blob_ptr =
+                match self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records) {
+                    Ok(ptr_opt) => ptr_opt,
                     Err(e) => {
                         if let Some(ref p) = new_row_blob_ptr {
                             self.record_dead_blob_bytes(p);
@@ -2053,28 +2048,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         return Err(e);
                     }
                 };
-                new_meta_blob_ptr = Some(ptr);
-                if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                    if let Err(e) = self.sync_active_std_writer() {
-                        if let Some(ref p) = new_row_blob_ptr {
-                            self.record_dead_blob_bytes(p);
-                        }
-                        if let Some(ref p) = new_meta_blob_ptr {
-                            self.record_dead_blob_bytes(p);
-                        }
-                        return Err(e);
-                    }
-                }
-                records.push(WalRecord::PutBlobPtr {
-                    key: meta_key,
-                    blob_ptr: ptr,
-                });
-            } else {
-                records.push(WalRecord::PutInline {
-                    key: meta_key,
-                    value: meta_bytes,
-                });
-            }
         } else if had_old_meta {
             records.push(WalRecord::Delete { key: meta_key });
         }
@@ -2224,27 +2197,51 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged);
+        let new_meta_blob_ptr =
+            self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
+        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+            if let Some(ref p) = new_meta_blob_ptr {
+                self.record_dead_blob_bytes(p);
+            }
+            return Err(e);
+        }
+        self.table_has_row_meta.insert(table_id, true);
+        if let Some(old_m_ptr) = old_meta_blob_ptr {
+            self.record_dead_blob_bytes(&old_m_ptr);
+        }
+        Ok(true)
+    }
+
+    /// Encodes `meta_key` -> `meta_bytes` into `records`, spilling oversized metadata to
+    /// `blob_std` and syncing `active_std_writer` before autocommit `SyncTransactional` WAL
+    /// appends (`Write-Blob-Before-WAL`).
+    pub(super) fn append_std_meta_record(
+        &mut self,
+        meta_key: Vec<u8>,
+        meta_bytes: Vec<u8>,
+        durability: WriteDurability,
+        records: &mut Vec<WalRecord>,
+    ) -> io::Result<Option<BlobPtr>> {
         if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
             if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
-                self.sync_active_std_writer()?;
+                if let Err(e) = self.sync_active_std_writer() {
+                    self.record_dead_blob_bytes(&ptr);
+                    return Err(e);
+                }
             }
             records.push(WalRecord::PutBlobPtr {
                 key: meta_key,
                 blob_ptr: ptr,
             });
+            Ok(Some(ptr))
         } else {
             records.push(WalRecord::PutInline {
                 key: meta_key,
                 value: meta_bytes,
             });
+            Ok(None)
         }
-        self.table_has_row_meta.insert(table_id, true);
-        self.commit_wal_and_memtable(records, durability)?;
-        if let Some(old_m_ptr) = old_meta_blob_ptr {
-            self.record_dead_blob_bytes(&old_m_ptr);
-        }
-        Ok(true)
     }
 
     /// Point lookup of a row (`pk`) in `table_id` (owner view: sees this engine's own
