@@ -7220,6 +7220,18 @@ fn reopen_skips_blob_fsync_when_replayed_pointers_are_within_cataloged_len() {
             ref other => panic!("expected Blob pointer for k2, got {other:?}"),
         };
         assert_ne!(seg1, seg2);
+        // Simulate a crash after recovery cataloged `seg1`'s already-synced length in `boot_meta`
+        // (while `seg2` still has cataloged `file_len == 0`) with both WAL records still subject
+        // to replay on reopen.
+        let seg1_len = engine.std_blobs[&seg1].file_len;
+        engine
+            .meta_mgr
+            .commit_update(|st| {
+                if let Some(m) = st.std_blob_segments.iter_mut().find(|m| m.seq_id == seg1) {
+                    m.file_len = seg1_len;
+                }
+            })
+            .unwrap();
         (seg1, seg2)
     };
 

@@ -438,6 +438,64 @@ fn open_uncataloged_blob<FS: PlatformFs>(
     }
 }
 
+fn record_post_catalog_span<K: Ord>(
+    spans: &mut BTreeMap<K, Vec<(u64, u64)>>,
+    key: K,
+    offset: u64,
+    end: u64,
+    cataloged_len: u64,
+    file_len: u64,
+) {
+    let start = offset.max(cataloged_len);
+    let clamped_end = end.min(file_len);
+    if clamped_end > start {
+        spans.entry(key).or_default().push((start, clamped_end));
+    }
+}
+
+fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
+    if spans.is_empty() {
+        return 0;
+    }
+    spans.sort_unstable();
+    let mut total = 0u64;
+    let mut cur_start = spans[0].0;
+    let mut cur_end = spans[0].1;
+    for &(s, e) in &spans[1..] {
+        if s <= cur_end {
+            cur_end = cur_end.max(e);
+        } else {
+            total += cur_end - cur_start;
+            cur_start = s;
+            cur_end = e;
+        }
+    }
+    total + (cur_end - cur_start)
+}
+
+fn account_post_catalog_gap<K: Ord + std::hash::Hash + Copy>(
+    key: K,
+    file_len: u64,
+    dead_bytes: &mut u64,
+    cataloged_len: &HashMap<K, u64>,
+    spans: &mut BTreeMap<K, Vec<(u64, u64)>>,
+    base_dead: &BTreeMap<K, u64>,
+) -> u64 {
+    let cat_len = cataloged_len.get(&key).copied().unwrap_or(0);
+    let post_catalog_total = file_len.saturating_sub(cat_len);
+    let covered = spans
+        .get_mut(&key)
+        .map(|v| merged_span_bytes(v))
+        .unwrap_or(0);
+    let unaccounted = post_catalog_total.saturating_sub(covered);
+    let mut persisted = base_dead.get(&key).copied().unwrap_or(0);
+    if unaccounted > 0 {
+        *dead_bytes = dead_bytes.saturating_add(unaccounted).min(file_len);
+        persisted = persisted.saturating_add(unaccounted).min(file_len);
+    }
+    persisted
+}
+
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Opens or recovers a `StorageEngine` rooted at `fs`.
     pub fn open(fs: Arc<FS>, config: EngineConfig) -> io::Result<Self> {
@@ -491,7 +549,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 2. Open active `blob_std_<SeqID>.db` segments
         let mut std_blobs = BTreeMap::new();
-        let mut std_valid_end = BTreeMap::new();
+        let mut std_post_catalog_spans: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
         let mut cataloged_std_len: HashMap<u64, u64> =
             HashMap::with_capacity(state_snapshot.std_blob_segments.len());
         let mut dirty_std_blobs: HashSet<u64> = HashSet::new();
@@ -508,7 +566,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // reached the device) must not make the missing bytes count as garbage a second
             // time: recovery has to give the same result however often it runs.
             cataloged_std_len.insert(bmeta.seq_id, bmeta.file_len);
-            std_valid_end.insert(bmeta.seq_id, bmeta.file_len);
             std_blobs.insert(
                 bmeta.seq_id,
                 TrackedStdBlob {
@@ -521,7 +578,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 3. Open active `blob_lru_<TblID>_<SeqID>.db` segments
         let mut lru_blobs = BTreeMap::new();
-        let mut lru_valid_end = BTreeMap::new();
+        let mut lru_post_catalog_spans: BTreeMap<(u16, u64), Vec<(u64, u64)>> = BTreeMap::new();
         let mut cataloged_lru_len: HashMap<(u16, u64), u64> =
             HashMap::with_capacity(state_snapshot.lru_blob_segments.len());
         let mut dirty_lru_blobs: HashSet<(u16, u64)> = HashSet::new();
@@ -535,7 +592,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let file_len = physical_len.max(lmeta.file_len);
             // See the `blob_std` loop above.
             cataloged_lru_len.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
-            lru_valid_end.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
             lru_blobs.insert(
                 (lmeta.table_id, lmeta.seq_id),
                 TrackedLruBlob {
@@ -568,7 +624,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                             let flen = file.file_len()?;
                             dirty_std_blobs.insert(seq_id);
-                            std_valid_end.insert(seq_id, 0);
                             std_blobs.insert(
                                 seq_id,
                                 TrackedStdBlob {
@@ -593,7 +648,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                                 let flen = file.file_len()?;
                                 dirty_lru_blobs.insert((tbl_id, seq_id));
-                                lru_valid_end.insert((tbl_id, seq_id), 0);
                                 lru_blobs.insert(
                                     (tbl_id, seq_id),
                                     TrackedLruBlob {
@@ -626,10 +680,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // references blobs in that segment (e.g. if `boot_meta.db` fell back to an older slot).
         let needs_idx_blob_scan = std_blobs.iter().any(|(&seq, b)| {
             cataloged_std_seqs.contains(&seq)
-                && b.file_len > std_valid_end.get(&seq).copied().unwrap_or(0)
+                && b.file_len > cataloged_std_len.get(&seq).copied().unwrap_or(0)
         }) || lru_blobs.iter().any(|(&k, b)| {
             cataloged_lru_keys.contains(&k)
-                && b.file_len > lru_valid_end.get(&k).copied().unwrap_or(0)
+                && b.file_len > cataloged_lru_len.get(&k).copied().unwrap_or(0)
         });
         if needs_idx_blob_scan {
             for seg in &idx_segments {
@@ -638,20 +692,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if let IndexValue::Blob(ptr) = entry.value {
                         let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
                         match ptr.kind {
-                            BlobKind::Standard if cataloged_std_seqs.contains(&ptr.seg_id) => {
-                                if let Some(ve) = std_valid_end.get_mut(&ptr.seg_id) {
-                                    *ve = (*ve).max(end);
+                            BlobKind::Standard => {
+                                if let (Some(&cataloged_len), Some(b)) = (
+                                    cataloged_std_len.get(&ptr.seg_id),
+                                    std_blobs.get(&ptr.seg_id),
+                                ) {
+                                    record_post_catalog_span(
+                                        &mut std_post_catalog_spans,
+                                        ptr.seg_id,
+                                        ptr.offset as u64,
+                                        end,
+                                        cataloged_len,
+                                        b.file_len,
+                                    );
                                 }
                             }
-                            BlobKind::Lru
-                                if cataloged_lru_keys.contains(&(ptr.table_id, ptr.seg_id)) =>
-                            {
-                                if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id))
+                            BlobKind::Lru => {
+                                let key = (ptr.table_id, ptr.seg_id);
+                                if let (Some(&cataloged_len), Some(b)) =
+                                    (cataloged_lru_len.get(&key), lru_blobs.get(&key))
                                 {
-                                    *ve = (*ve).max(end);
+                                    record_post_catalog_span(
+                                        &mut lru_post_catalog_spans,
+                                        key,
+                                        ptr.offset as u64,
+                                        end,
+                                        cataloged_len,
+                                        b.file_len,
+                                    );
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -762,20 +832,37 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             if end > cataloged_len {
                                 dirty_std_blobs.insert(ptr.seg_id);
                             }
-                            if let Some(ve) = std_valid_end.get_mut(&ptr.seg_id) {
-                                *ve = (*ve).max(end);
+                            if let (Some(&cat_len), Some(b)) = (
+                                cataloged_std_len.get(&ptr.seg_id),
+                                std_blobs.get(&ptr.seg_id),
+                            ) {
+                                record_post_catalog_span(
+                                    &mut std_post_catalog_spans,
+                                    ptr.seg_id,
+                                    ptr.offset as u64,
+                                    end,
+                                    cat_len,
+                                    b.file_len,
+                                );
                             }
                         }
                         BlobKind::Lru => {
-                            let cataloged_len = cataloged_lru_len
-                                .get(&(ptr.table_id, ptr.seg_id))
-                                .copied()
-                                .unwrap_or(0);
+                            let key = (ptr.table_id, ptr.seg_id);
+                            let cataloged_len = cataloged_lru_len.get(&key).copied().unwrap_or(0);
                             if end > cataloged_len {
-                                dirty_lru_blobs.insert((ptr.table_id, ptr.seg_id));
+                                dirty_lru_blobs.insert(key);
                             }
-                            if let Some(ve) = lru_valid_end.get_mut(&(ptr.table_id, ptr.seg_id)) {
-                                *ve = (*ve).max(end);
+                            if let (Some(&cat_len), Some(b)) =
+                                (cataloged_lru_len.get(&key), lru_blobs.get(&key))
+                            {
+                                record_post_catalog_span(
+                                    &mut lru_post_catalog_spans,
+                                    key,
+                                    ptr.offset as u64,
+                                    end,
+                                    cat_len,
+                                    b.file_len,
+                                );
                             }
                         }
                     }
@@ -937,13 +1024,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 std_persist_dead.insert(seq_id, persisted);
                 return true;
             }
-            let valid_end = std_valid_end.get(&seq_id).copied().unwrap_or(0);
-            let mut persisted = std_base_dead.get(&seq_id).copied().unwrap_or(0);
-            if b.file_len > valid_end {
-                let tail_garbage = b.file_len - valid_end;
-                b.dead_bytes = b.dead_bytes.saturating_add(tail_garbage).min(b.file_len);
-                persisted = persisted.saturating_add(tail_garbage).min(b.file_len);
-            }
+            let persisted = account_post_catalog_gap(
+                seq_id,
+                b.file_len,
+                &mut b.dead_bytes,
+                &cataloged_std_len,
+                &mut std_post_catalog_spans,
+                &std_base_dead,
+            );
             std_persist_dead.insert(seq_id, persisted);
             true
         });
@@ -964,13 +1052,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 lru_persist_dead.insert((tid, seq_id), persisted);
                 return true;
             }
-            let valid_end = lru_valid_end.get(&(tid, seq_id)).copied().unwrap_or(0);
-            let mut persisted = lru_base_dead.get(&(tid, seq_id)).copied().unwrap_or(0);
-            if b.file_len > valid_end {
-                let tail_garbage = b.file_len - valid_end;
-                b.dead_bytes = b.dead_bytes.saturating_add(tail_garbage).min(b.file_len);
-                persisted = persisted.saturating_add(tail_garbage).min(b.file_len);
-            }
+            let persisted = account_post_catalog_gap(
+                (tid, seq_id),
+                b.file_len,
+                &mut b.dead_bytes,
+                &cataloged_lru_len,
+                &mut lru_post_catalog_spans,
+                &lru_base_dead,
+            );
             lru_persist_dead.insert((tid, seq_id), persisted);
             true
         });

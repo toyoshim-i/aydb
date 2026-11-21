@@ -361,3 +361,123 @@ fn failed_idx_flush_with_failed_cleanup_does_not_reuse_the_name() {
         );
     }
 }
+
+#[test]
+fn reopen_accounts_interior_aborted_blob_gap_and_reclaims_segment() {
+    let tmp = TempTestDir::new("blob_interior_aborted_gap");
+    let mut config = EngineConfig::default();
+    config.inline_threshold_bytes = 64;
+    config.max_blob_segment_bytes = 600;
+    let sync = WriteDurability::SyncTransactional;
+    let fast = WriteDurability::BufferedFast;
+
+    let seg1;
+    let seg2;
+    {
+        let mut engine = open_plain(&tmp.path, &config);
+        engine
+            .put_row(1, b"live0", &[0x11u8; 120], &[], sync)
+            .unwrap();
+        seg1 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        engine.flush_memtable().unwrap();
+
+        // Append inside an aborted transaction, leaving unreferenced bytes immediately above the
+        // cataloged length, then commit a subsequent blob into the same segment before rolling over.
+        engine.begin_transaction();
+        engine
+            .put_row(1, b"aborted", &[0x22u8; 150], &[], fast)
+            .unwrap();
+        assert_eq!(engine.active_std_writer.as_ref().unwrap().seq_id(), seg1);
+        engine.rollback_transaction().unwrap();
+
+        engine
+            .put_row(1, b"live1", &[0x33u8; 150], &[], fast)
+            .unwrap();
+        assert_eq!(engine.active_std_writer.as_ref().unwrap().seq_id(), seg1);
+
+        // Rolling to seg2 seals seg1 with [live0 (cataloged) | aborted gap | live1 (WAL)].
+        engine
+            .put_row(1, b"live2", &[0x44u8; 300], &[], fast)
+            .unwrap();
+        seg2 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        assert_ne!(seg1, seg2);
+        engine.flush_active_blob_buffers().unwrap();
+    }
+
+    let seg1_path = tmp.path.join(format_std_blob_file_name(seg1));
+    assert!(seg1_path.exists());
+
+    let mut reopened = open_plain(&tmp.path, &config);
+    assert_eq!(reopened.get_row(1, b"aborted").unwrap(), None);
+    assert_eq!(
+        reopened.get_row(1, b"live0").unwrap(),
+        Some(vec![0x11u8; 120])
+    );
+    assert_eq!(
+        reopened.get_row(1, b"live1").unwrap(),
+        Some(vec![0x33u8; 150])
+    );
+    assert_eq!(
+        reopened.get_row(1, b"live2").unwrap(),
+        Some(vec![0x44u8; 300])
+    );
+    assert!(
+        reopened.std_blobs[&seg1].dead_bytes >= 150,
+        "interior aborted gap must be accounted on recovery: dead_bytes={} file_len={}",
+        reopened.std_blobs[&seg1].dead_bytes,
+        reopened.std_blobs[&seg1].file_len
+    );
+
+    reopened.delete_row(1, b"live0", sync).unwrap();
+    reopened.delete_row(1, b"live1", sync).unwrap();
+    reopened.flush_memtable().unwrap();
+    reopened.checkpoint().unwrap();
+
+    assert!(
+        !seg1_path.exists(),
+        "segment with interior aborted gap was never reclaimed after deleting live rows"
+    );
+    assert_eq!(
+        reopened.get_row(1, b"live2").unwrap(),
+        Some(vec![0x44u8; 300])
+    );
+}
+
+#[test]
+fn blob_rollover_during_uncommitted_tx_does_not_leak_segment_after_rollback_and_crash() {
+    let tmp = TempTestDir::new("blob_uncommitted_rollover");
+    let mut config = EngineConfig::default();
+    config.inline_threshold_bytes = 64;
+    config.max_blob_segment_bytes = 300;
+    let fast = WriteDurability::BufferedFast;
+
+    let seg1;
+    let seg2;
+    {
+        let mut engine = open_plain(&tmp.path, &config);
+        engine.begin_transaction();
+        engine.put_row(1, b"t1", &[0xAAu8; 200], &[], fast).unwrap();
+        seg1 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        engine.put_row(1, b"t2", &[0xBBu8; 200], &[], fast).unwrap();
+        seg2 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        assert_ne!(seg1, seg2);
+        engine.rollback_transaction().unwrap();
+        // Drop without checkpoint to simulate crash after rollback.
+    }
+
+    let seg1_path = tmp.path.join(format_std_blob_file_name(seg1));
+    let reopened = open_plain(&tmp.path, &config);
+    assert!(
+        !seg1_path.exists(),
+        "uncommitted rolled-over blob segment leaked on disk across rollback + crash"
+    );
+    assert!(
+        !reopened
+            .meta_mgr
+            .state()
+            .std_blob_segments
+            .iter()
+            .any(|m| m.seq_id == seg1),
+        "reclaimed uncommitted segment must not remain in boot_meta catalog"
+    );
+}
