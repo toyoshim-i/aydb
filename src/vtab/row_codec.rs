@@ -1094,15 +1094,24 @@ pub fn extract_column_key_bytes_with_collation(
     collation: ColCollation,
 ) -> io::Result<Vec<u8>> {
     if row_bytes.len() < 4 {
-        return Ok(vec![KEY_TAG_NULL]);
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "row_bytes shorter than 4-byte header",
+        ));
     }
     let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
     if col_idx >= col_count {
         return Ok(vec![KEY_TAG_NULL]);
     }
     let dir_pos = 4 + col_idx * 5;
-    if dir_pos + 5 > row_bytes.len() {
-        return Ok(vec![KEY_TAG_NULL]);
+    if dir_pos
+        .checked_add(5)
+        .is_none_or(|end| end > row_bytes.len())
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "truncated column directory in row_bytes",
+        ));
     }
     let type_tag = row_bytes[dir_pos];
     let offset =
@@ -1111,49 +1120,68 @@ pub fn extract_column_key_bytes_with_collation(
     match type_tag {
         0 => Ok(vec![KEY_TAG_NULL]),
         1 => {
-            if offset + 8 > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
-            let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+            let Some(end) = offset.checked_add(8).filter(|&end| end <= row_bytes.len()) else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Integer column",
+                ));
+            };
+            let v = i64::from_le_bytes(row_bytes[offset..end].try_into().unwrap());
             Ok(encode_i64_tagged_key(v).to_vec())
         }
         2 => {
-            if offset + 8 > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
-            let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
+            let Some(end) = offset.checked_add(8).filter(|&end| end <= row_bytes.len()) else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "truncated Float column",
+                ));
+            };
+            let v = f64::from_le_bytes(row_bytes[offset..end].try_into().unwrap());
             Ok(encode_f64_unified_key(v))
         }
-        3 => {
-            if offset + 4 > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
+        3 | 4 => {
+            let is_text = type_tag == 3;
+            let Some(payload_start) = offset.checked_add(4).filter(|&s| s <= row_bytes.len())
+            else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    if is_text {
+                        "truncated Text length"
+                    } else {
+                        "truncated Blob length"
+                    },
+                ));
+            };
             let len =
-                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-            if offset + 4 + len > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
-            let slice = &row_bytes[offset + 4..offset + 4 + len];
+                u32::from_le_bytes(row_bytes[offset..payload_start].try_into().unwrap()) as usize;
+            let Some(payload_end) = payload_start
+                .checked_add(len)
+                .filter(|&end| end <= row_bytes.len())
+            else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    if is_text {
+                        "truncated Text payload"
+                    } else {
+                        "truncated Blob payload"
+                    },
+                ));
+            };
+            let slice = &row_bytes[payload_start..payload_end];
             let mut out = Vec::with_capacity(1 + len);
-            out.push(KEY_TAG_TEXT);
-            collation.push_normalized_text(slice, &mut out);
+            if is_text {
+                out.push(KEY_TAG_TEXT);
+                collation.push_normalized_text(slice, &mut out);
+            } else {
+                out.push(KEY_TAG_BLOB);
+                out.extend_from_slice(slice);
+            }
             Ok(out)
         }
-        4 => {
-            if offset + 4 > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
-            let len =
-                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-            if offset + 4 + len > row_bytes.len() {
-                return Ok(vec![KEY_TAG_NULL]);
-            }
-            let mut out = Vec::with_capacity(1 + len);
-            out.push(KEY_TAG_BLOB);
-            out.extend_from_slice(&row_bytes[offset + 4..offset + 4 + len]);
-            Ok(out)
-        }
-        _ => Ok(vec![KEY_TAG_NULL]),
+        other => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unknown column type tag {other}"),
+        )),
     }
 }
 
@@ -1555,5 +1583,91 @@ mod tests {
             sqlite3_finalize(stmt);
             sqlite3_close(db);
         }
+    }
+
+    #[test]
+    fn extract_column_key_bytes_fails_closed_on_corrupt_rows() {
+        // Short headers must fail with InvalidData.
+        for short in [&[][..], &[1, 0, 0][..]] {
+            let err = extract_column_key_bytes(short, 0).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+        }
+
+        // Valid NULL and out-of-range column index on a well-formed header remain Ok(KEY_TAG_NULL).
+        let valid_row = encode_row(&[SqlValue::Null, SqlValue::Integer(42)]);
+        assert_eq!(
+            extract_column_key_bytes(&valid_row, 0).unwrap(),
+            vec![KEY_TAG_NULL]
+        );
+        assert_eq!(
+            extract_column_key_bytes(&valid_row, 2).unwrap(),
+            vec![KEY_TAG_NULL]
+        );
+
+        // Truncated column directory.
+        let mut trunc_dir = vec![2, 0, 0, 0];
+        trunc_dir.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert_eq!(
+            extract_column_key_bytes(&trunc_dir, 1).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+
+        // Helper for building a single-column row header with arbitrary (type_tag, offset, tail).
+        let make_row = |type_tag: u8, offset: u32, tail: &[u8]| {
+            let mut buf = vec![1, 0, 0, 0, type_tag];
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(tail);
+            buf
+        };
+
+        // Truncated Integer and Float payloads (and offset overflow bounds).
+        for (tag, tail) in [(1u8, &[1u8, 2, 3][..]), (2u8, &[1u8, 2, 3, 4, 5, 6, 7][..])] {
+            let row = make_row(tag, 9, tail);
+            assert_eq!(
+                extract_column_key_bytes(&row, 0).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+            let overflow = make_row(tag, u32::MAX - 2, &[]);
+            assert_eq!(
+                extract_column_key_bytes(&overflow, 0).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
+
+        // Truncated Text / Blob length prefixes, truncated payloads, and overflowing u32::MAX len.
+        for tag in [3u8, 4u8] {
+            let trunc_len = make_row(tag, 9, &[1, 0]);
+            assert_eq!(
+                extract_column_key_bytes(&trunc_len, 0).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+
+            let mut trunc_payload = 5u32.to_le_bytes().to_vec();
+            trunc_payload.extend_from_slice(b"abc");
+            let row_trunc_payload = make_row(tag, 9, &trunc_payload);
+            assert_eq!(
+                extract_column_key_bytes(&row_trunc_payload, 0)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidData
+            );
+
+            let row_huge_len = make_row(tag, 9, &u32::MAX.to_le_bytes());
+            assert_eq!(
+                extract_column_key_bytes(&row_huge_len, 0)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidData
+            );
+        }
+
+        // Unknown type tag must fail with InvalidData instead of impersonating NULL.
+        let unknown_tag = make_row(99, 9, &[]);
+        assert_eq!(
+            extract_column_key_bytes(&unknown_tag, 0)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 }
