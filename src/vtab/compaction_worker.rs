@@ -230,5 +230,11 @@ fn worker_loop(engine: Arc<RwLock<StorageEngine<OsFs>>>, signal: Arc<Signal>) {
                 Ok(false) | Err(_) => break,
             }
         }
+
+        if !is_shutdown(&signal) {
+            if let Ok(mut eng) = engine.write() {
+                let _ = eng.background_relocate_fragmented_std_blobs(0.5);
+            }
+        }
     }
 }

@@ -131,6 +131,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some(hook) = &self.compaction_hook {
                 hook();
             }
+        } else if self.tx_depth == 0
+            && self.config.background_compaction
+            && !self.relocating_std_blobs
+            && self.has_fragmented_std_blobs(0.5)
+        {
+            if let Some(hook) = &self.compaction_hook {
+                hook();
+            }
         }
         Ok(())
     }
@@ -232,7 +240,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
-            return self.release_unlinkable_blob_files();
+            self.release_unlinkable_blob_files()?;
+            if !self.meta_mgr.state().pending_delete_files.is_empty() {
+                self.meta_mgr.try_process_pending_deletes();
+            }
+            return Ok(());
         }
 
         // Ensure all active blob segments are durably flushed before checkpointing `boot_meta.db`
@@ -363,6 +375,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    fn fragmented_std_seqs<'a>(
+        &'a self,
+        dead_ratio_threshold: f64,
+    ) -> impl Iterator<Item = u64> + 'a {
+        let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
+        self.std_blobs.iter().filter_map(move |(&seq, b)| {
+            (Some(seq) != active_std_seq
+                && b.file_len > 0
+                && b.dead_bytes < b.file_len
+                && (b.dead_bytes as f64) / (b.file_len as f64) >= dead_ratio_threshold)
+                .then_some(seq)
+        })
+    }
+
+    /// Returns `true` when at least one sealed `blob_std` segment has `dead_bytes / file_len >=
+    /// dead_ratio_threshold` and can be relocated to reclaim dead space.
+    pub fn has_fragmented_std_blobs(&self, dead_ratio_threshold: f64) -> bool {
+        !self.is_poisoned()
+            && self
+                .fragmented_std_seqs(dead_ratio_threshold)
+                .next()
+                .is_some()
+    }
+
     /// Relocates live blobs out of fragmented sealed `blob_std_<SeqID>.db` segments whose
     /// `dead_bytes / file_len >= dead_ratio_threshold`, appending them to the active `blob_std`
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
@@ -372,22 +408,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         dead_ratio_threshold: f64,
     ) -> io::Result<usize> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
+        if self.tx_depth > 0 || self.relocating_std_blobs {
             return Ok(0);
         }
+        self.relocating_std_blobs = true;
+        let res = self.relocate_fragmented_std_blobs_inner(dead_ratio_threshold);
+        self.relocating_std_blobs = false;
+        res
+    }
+
+    fn relocate_fragmented_std_blobs_inner(
+        &mut self,
+        dead_ratio_threshold: f64,
+    ) -> io::Result<usize> {
         self.drain_pending_durable()?;
-        let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
-        let fragmented_seqs: HashSet<u64> = self
-            .std_blobs
-            .iter()
-            .filter(|&(&seq, b)| {
-                Some(seq) != active_std_seq
-                    && b.file_len > 0
-                    && b.dead_bytes < b.file_len
-                    && (b.dead_bytes as f64) / (b.file_len as f64) >= dead_ratio_threshold
-            })
-            .map(|(&seq, _)| seq)
-            .collect();
+        let fragmented_seqs: HashSet<u64> =
+            self.fragmented_std_seqs(dead_ratio_threshold).collect();
 
         if fragmented_seqs.is_empty() {
             return Ok(0);
@@ -440,10 +476,41 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
             if !batch_wal_records.is_empty() {
-                self.commit_wal_and_memtable(batch_wal_records, WriteDurability::BufferedFast)?;
+                self.commit_wal_and_memtable_core(
+                    batch_wal_records,
+                    WriteDurability::BufferedFast,
+                    false,
+                    false,
+                )?;
                 for old_ptr in batch_dead_ptrs {
                     self.record_dead_blob_bytes(&old_ptr);
                 }
+                if self.memtable.should_flush() {
+                    if let Err(e) = self.flush_memtable_no_auto_compact() {
+                        self.record_maintenance_failure(&e);
+                    }
+                }
+            }
+        }
+        Ok(relocated)
+    }
+
+    /// Background-worker pass that relocates fragmented sealed `blob_std` segments and flushes or
+    /// reclaims them so dead disk space is freed even under background compaction mode.
+    pub(crate) fn background_relocate_fragmented_std_blobs(
+        &mut self,
+        dead_ratio_threshold: f64,
+    ) -> io::Result<usize> {
+        self.check_not_poisoned()?;
+        if self.tx_depth > 0 || !self.has_fragmented_std_blobs(dead_ratio_threshold) {
+            return Ok(0);
+        }
+        let relocated = self.relocate_fragmented_std_blobs(dead_ratio_threshold)?;
+        if relocated > 0 {
+            if !self.memtable.is_empty() {
+                self.flush_memtable_no_auto_compact()?;
+            } else {
+                self.reclaim_fully_dead_blob_segments()?;
             }
         }
         Ok(relocated)
@@ -769,6 +836,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         drop(removed);
         drop(inputs);
         self.meta_mgr.try_process_pending_deletes();
+        if self.config.background_compaction
+            && !self.relocating_std_blobs
+            && self.has_fragmented_std_blobs(0.5)
+        {
+            if let Some(hook) = &self.compaction_hook {
+                hook();
+            }
+        }
         Ok(true)
     }
 

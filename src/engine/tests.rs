@@ -7444,3 +7444,79 @@ fn drop_table_clears_access_tracker_on_commit_but_not_on_rollback() {
     assert!(engine.access_tracker.peek_hot_tick(1, b"k1").is_none());
     assert!(engine.access_tracker.is_empty());
 }
+
+#[test]
+fn relocate_fragmented_std_blobs_preserves_data_generation_and_does_not_recurse() {
+    let tmp = TempTestDir::new("reloc_gen_no_recurse");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 1024;
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4096;
+    cfg.auto_compact_segment_threshold = 8;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    let payload = vec![0x7Eu8; 96];
+    for i in 0..40u32 {
+        let pk = format!("rk_{i:04}").into_bytes();
+        engine
+            .put_row(1, &pk, &payload, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.compact().unwrap();
+
+    let mut initial_std_files: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_std_"))
+        .collect();
+    initial_std_files.sort();
+    assert_eq!(
+        initial_std_files.len(),
+        2,
+        "expected 2 blob_std files: {initial_std_files:?}"
+    );
+    let fragmented_file = initial_std_files[0].clone();
+
+    // Fragment sealed segment 1 (>= 50% dead) while keeping enough live blobs to force a
+    // mid-relocation MemTable flush under `memtable_capacity_bytes = 1024`.
+    for i in 0..20u32 {
+        let pk = format!("rk_{i:04}").into_bytes();
+        engine
+            .delete_row(1, &pk, WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    assert!(engine.has_fragmented_std_blobs(0.5));
+
+    let snap = engine.capture_read_snapshot();
+    let relocated = engine.relocate_fragmented_std_blobs(0.5).unwrap();
+    assert!(
+        relocated >= 10,
+        "expected >= 10 relocated blobs, got {relocated}"
+    );
+    assert!(
+        engine.snapshot_is_current(&snap),
+        "physical blob relocation must not invalidate user-data ReadSnapshot"
+    );
+    drop(snap);
+
+    engine.flush_memtable().unwrap();
+    assert!(!engine.has_fragmented_std_blobs(0.5));
+    let std_files: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_std_"))
+        .collect();
+    assert!(
+        !std_files.contains(&fragmented_file),
+        "expected fragmented {fragmented_file} reclaimed, remaining: {std_files:?}"
+    );
+
+    for i in 20..40u32 {
+        let pk = format!("rk_{i:04}").into_bytes();
+        assert_eq!(engine.get_row(1, &pk).unwrap(), Some(payload.clone()));
+    }
+}

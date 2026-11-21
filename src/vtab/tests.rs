@@ -2593,6 +2593,92 @@ fn compaction_worker_is_shared_per_engine_and_refcounted() {
     assert_eq!(Arc::strong_count(&engine), 1);
 }
 
+#[test]
+fn background_worker_relocates_and_reclaims_fragmented_std_blobs() {
+    use crate::pal::PlatformFs;
+    let tmp = TempTestDir::new("vtab_bg_relocate");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 128;
+    cfg.max_blob_segment_bytes = 2048;
+    cfg.auto_compact_segment_threshold = 64;
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(Arc::clone(&fs), cfg).unwrap(),
+    ));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_reloc USING aydb(
+            table_id = 1,
+            durability = 'buffered',
+            columns = 'id INTEGER PRIMARY KEY, body BLOB'
+        );",
+    )
+    .unwrap();
+
+    let mut ins = conn.prepare("INSERT INTO t_reloc VALUES (?1, ?2)").unwrap();
+    for i in 0..10i64 {
+        ins.execute(&[
+            SqlValue::Integer(i),
+            SqlValue::Blob(vec![(i as u8).wrapping_add(1); 512]),
+        ])
+        .unwrap();
+    }
+    drop(ins);
+
+    let mut initial_std_files: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_std_"))
+        .collect();
+    initial_std_files.sort();
+    assert!(
+        initial_std_files.len() >= 2,
+        "expected >= 2 blob_std segments, got {initial_std_files:?}"
+    );
+    let fragmented_file = initial_std_files[0].clone();
+
+    // Delete 2 of the ~3 blobs in the oldest sealed segment (> 50% dead, with id=2 still alive),
+    // then flush so the background worker wakes for `has_fragmented_std_blobs(0.5)`.
+    conn.execute_batch("DELETE FROM t_reloc WHERE id < 2;")
+        .unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let fragmented = engine.read().unwrap().has_fragmented_std_blobs(0.5);
+        let std_files: Vec<String> = fs
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.starts_with("blob_std_"))
+            .collect();
+        if !fragmented && !std_files.contains(&fragmented_file) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background worker did not relocate fragmented blobs (fragmented={fragmented}, files={std_files:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    for i in 2..10i64 {
+        let row = conn
+            .query_all(
+                "SELECT body FROM t_reloc WHERE id = ?1",
+                &[SqlValue::Integer(i)],
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            vec![vec![SqlValue::Blob(vec![(i as u8).wrapping_add(1); 512])]]
+        );
+    }
+}
+
 /// Runs `f` on a helper thread and fails the test if it does not finish in `secs` (deadlock guard).
 fn run_with_timeout(secs: u64, f: impl FnOnce() + Send + 'static) {
     let (tx, rx) = std::sync::mpsc::channel();

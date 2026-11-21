@@ -352,6 +352,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Set when a full-WAL rotation flushed the MemTable without auto compaction; consumed by
     /// `run_due_auto_compaction` at the next point where no batch holds an unappended LSN.
     pub(super) auto_compaction_due: bool,
+    /// Re-entrancy guard preventing `relocate_fragmented_std_blobs` from triggering another
+    /// relocation pass if its internal MemTable flush invokes auto-compaction.
+    pub(super) relocating_std_blobs: bool,
     /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
     /// compaction pending in background mode.
     pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1143,6 +1146,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             deferred_flush_on_commit: false,
             deferred_compact_on_commit: false,
             auto_compaction_due: false,
+            relocating_std_blobs: false,
             compaction_hook: None,
             tx_prepared: false,
             tx_preparing: false,
@@ -3596,6 +3600,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
         count_as_data_write: bool,
     ) -> io::Result<u64> {
+        self.commit_wal_and_memtable_core(records, durability, count_as_data_write, true)
+    }
+
+    pub(super) fn commit_wal_and_memtable_core(
+        &mut self,
+        records: Vec<WalRecord>,
+        durability: WriteDurability,
+        count_as_data_write: bool,
+        allow_auto_flush: bool,
+    ) -> io::Result<u64> {
         if count_as_data_write || self.tx_depth > 0 {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         }
@@ -3660,14 +3674,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if count_as_data_write && has_records {
             self.data_generation += 1;
         }
-        // The batch is committed; a failed flush is retried because `should_flush` stays true.
-        if self.memtable.should_flush() {
-            if let Err(e) = self.flush_memtable() {
-                self.record_maintenance_failure(&e);
+        if allow_auto_flush {
+            // The batch is committed; a failed flush is retried because `should_flush` stays true.
+            if self.memtable.should_flush() {
+                if let Err(e) = self.flush_memtable() {
+                    self.record_maintenance_failure(&e);
+                }
             }
+            // Safe point: the batch is appended and `next_lsn` has advanced.
+            self.run_due_auto_compaction();
         }
-        // Safe point: the batch is appended and `next_lsn` has advanced.
-        self.run_due_auto_compaction();
         Ok(lsn)
     }
 
