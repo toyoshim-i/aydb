@@ -115,9 +115,24 @@ impl ColCollation {
     }
 }
 
-/// Checks if a finite `f64` is an exact integer within `[i64::MIN, i64::MAX]`.
+/// Checks if a finite `f64` is an exact integer within SQLite's strict open coercion interval
+/// `(-2^63, 2^63)` (`-9223372036854775808.0 < f < 9223372036854775808.0`).
+///
+/// SQLite's `INTEGER`/`NUMERIC` affinity storage coercion and rowid conversion exclude `-2^63`
+/// (`-9223372036854775808.0`), keeping it as `REAL`.
 #[inline]
 pub fn f64_to_exact_i64(f: f64) -> Option<i64> {
+    if f.is_finite() && f.fract() == 0.0 && f > F64_I64_MIN && f < F64_I64_UPPER_EXCL {
+        Some(f as i64)
+    } else {
+        None
+    }
+}
+
+/// Checks if a finite `f64` represents an exact integer within `[-2^63, 2^63)` for canonical
+/// numeric index equivalence (where `-9223372036854775808.0 == -9223372036854775808`).
+#[inline]
+fn f64_to_canonical_i64(f: f64) -> Option<i64> {
     if f.is_finite() && f.fract() == 0.0 && (F64_I64_MIN..F64_I64_UPPER_EXCL).contains(&f) {
         Some(f as i64)
     } else {
@@ -277,7 +292,7 @@ pub fn encode_f64_unified_key(v: f64) -> Vec<u8> {
 /// identical bytes (`[0x10, encode_i64_memcomparable(q)]` when `r == 0.0`).
 #[inline]
 pub fn encode_canonical_numeric_key_from_f64(v: f64) -> Vec<u8> {
-    if let Some(i) = f64_to_exact_i64(v) {
+    if let Some(i) = f64_to_canonical_i64(v) {
         encode_i64_tagged_key(i).to_vec()
     } else {
         encode_f64_unified_key(v)
@@ -798,14 +813,6 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
             SQLITE_INTEGER => {
                 let v = sqlite3_value_int64(vptr);
                 match affinity {
-                    ColumnAffinity::Real => {
-                        if canonical_numeric {
-                            if let Some(i_val) = f64_to_exact_i64(v as f64) {
-                                return encode_i64_tagged_key(i_val).to_vec();
-                            }
-                        }
-                        encode_f64_unified_key(v as f64)
-                    }
                     ColumnAffinity::Text => {
                         let s = v.to_string();
                         let mut out = Vec::with_capacity(1 + s.len());
@@ -813,6 +820,7 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                         collation.push_normalized_text(s.as_bytes(), &mut out);
                         out
                     }
+                    // Compare exact 64-bit integers mathematically even against REAL columns.
                     _ => encode_i64_tagged_key(v).to_vec(),
                 }
             }
@@ -820,7 +828,9 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                 let f = sqlite3_value_double(vptr);
                 match affinity {
                     ColumnAffinity::Integer | ColumnAffinity::Numeric => {
-                        if let Some(i_val) = f64_to_exact_i64(f) {
+                        if canonical_numeric {
+                            encode_canonical_numeric_key_from_f64(f)
+                        } else if let Some(i_val) = f64_to_exact_i64(f) {
                             encode_i64_tagged_key(i_val).to_vec()
                         } else {
                             encode_f64_unified_key(f)
@@ -853,32 +863,10 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
             SQLITE_TEXT => {
                 let slice = sqlite_value_text_bytes(vptr);
                 match affinity {
-                    ColumnAffinity::Integer | ColumnAffinity::Numeric => {
+                    ColumnAffinity::Integer | ColumnAffinity::Numeric | ColumnAffinity::Real => {
                         if let Ok(s) = core::str::from_utf8(slice) {
                             match parse_sqlite_numeric_str(s) {
                                 Some(Ok(i_val)) => return encode_i64_tagged_key(i_val).to_vec(),
-                                Some(Err(f_val)) => {
-                                    return if canonical_numeric {
-                                        encode_canonical_numeric_key_from_f64(f_val)
-                                    } else {
-                                        encode_f64_unified_key(f_val)
-                                    };
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    ColumnAffinity::Real => {
-                        if let Ok(s) = core::str::from_utf8(slice) {
-                            match parse_sqlite_numeric_str(s) {
-                                Some(Ok(i_val)) => {
-                                    let f_val = i_val as f64;
-                                    return if canonical_numeric {
-                                        encode_canonical_numeric_key_from_f64(f_val)
-                                    } else {
-                                        encode_f64_unified_key(f_val)
-                                    };
-                                }
                                 Some(Err(f_val)) => {
                                     return if canonical_numeric {
                                         encode_canonical_numeric_key_from_f64(f_val)
@@ -1315,6 +1303,27 @@ mod tests {
         assert_eq!(parse_sqlite_numeric_str("inf"), None);
         assert_eq!(parse_sqlite_numeric_str("NaN"), None);
         assert_eq!(parse_sqlite_numeric_str("abc"), None);
+
+        // SQLite strict open coercion interval (-2^63, 2^63): -2^63.0 stays REAL on storage
+        // coercion while -2^63+1024 coerces to Integer and canonical keys remain equivalent.
+        assert_eq!(f64_to_exact_i64(-9_223_372_036_854_775_808.0), None);
+        assert_eq!(
+            f64_to_exact_i64(-9_223_372_036_854_774_784.0),
+            Some(-9_223_372_036_854_774_784)
+        );
+        assert_eq!(f64_to_exact_i64(9_223_372_036_854_775_808.0), None);
+        assert_eq!(
+            parse_sqlite_numeric_str("-9223372036854775808.0"),
+            Some(Err(-9_223_372_036_854_775_808.0))
+        );
+        assert_eq!(
+            parse_sqlite_numeric_str("-9223372036854775808"),
+            Some(Ok(i64::MIN))
+        );
+        assert_eq!(
+            encode_canonical_numeric_key_from_f64(-9_223_372_036_854_775_808.0),
+            encode_i64_tagged_key(i64::MIN).to_vec()
+        );
     }
 
     #[test]

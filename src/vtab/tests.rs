@@ -3104,3 +3104,158 @@ fn sqlite_numeric_string_affinity_matches_native() {
         assert_eq!(got_a, got_n, "col_type={col_type}");
     }
 }
+
+#[test]
+fn real_primary_key_and_secondary_index_compare_64bit_integers_without_rounding() {
+    let tmp = TempTestDir::new("real_pk_i64_compare");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_real USING aydb(
+            columns='k REAL PRIMARY KEY, r REAL, v TEXT',
+            indexes='r'
+         );
+         CREATE TABLE nat_real(k REAL PRIMARY KEY, r REAL, v TEXT);
+         CREATE INDEX nat_real_r ON nat_real(r);",
+    )
+    .unwrap();
+
+    for (val, label) in [
+        (9_007_199_254_740_992.0_f64, "two53"),
+        (9_007_199_254_740_994.0_f64, "two53_plus_2"),
+        (-9_007_199_254_740_992.0_f64, "neg_two53"),
+        (9_223_372_036_854_775_808.0_f64, "two63"),
+    ] {
+        for tbl in ["ay_real", "nat_real"] {
+            let mut stmt = conn
+                .prepare(&format!("INSERT INTO {tbl} VALUES (?1, ?2, ?3)"))
+                .unwrap();
+            stmt.execute(&[
+                SqlValue::Float(val),
+                SqlValue::Float(val),
+                SqlValue::Text(label.to_string()),
+            ])
+            .unwrap();
+        }
+    }
+
+    let queries = [
+        "SELECT v FROM {tbl} WHERE k < 9007199254740993 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k <= 9007199254740993 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k = 9007199254740993 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k > 9007199254740993 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k >= 9007199254740993 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k = 9007199254740992 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k < '9007199254740993' ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k = '9007199254740993' ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k < 9223372036854775807 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k = 9223372036854775807 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k > 9223372036854775807 ORDER BY k",
+        "SELECT v FROM {tbl} WHERE r < 9007199254740993 ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r = 9007199254740993 ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r > 9007199254740993 ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r = 9007199254740992 ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r < '9007199254740993' ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r < 9223372036854775807 ORDER BY r",
+        "SELECT v FROM {tbl} WHERE r > 9223372036854775807 ORDER BY r",
+    ];
+    for tmpl in queries {
+        let ay_sql = tmpl.replace("{tbl}", "ay_real");
+        let nat_sql = tmpl.replace("{tbl}", "nat_real");
+        let got_a = conn.query_all(&ay_sql, &[]).unwrap();
+        let got_n = conn.query_all(&nat_sql, &[]).unwrap();
+        assert_eq!(got_a, got_n, "query mismatch for `{tmpl}`");
+    }
+}
+
+#[test]
+fn i64_min_float_stays_real_on_coercion_and_matches_integer_in_lookups_and_unique() {
+    let tmp = TempTestDir::new("i64_min_float_coercion");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_t USING aydb(
+            columns='k INT PRIMARY KEY, u INT UNIQUE, s INT',
+            indexes='s'
+         );
+         CREATE TABLE nat_t(k INT PRIMARY KEY, u INT UNIQUE, s INT);
+         CREATE INDEX nat_t_s ON nat_t(s);",
+    )
+    .unwrap();
+
+    let min_f64 = -9_223_372_036_854_775_808.0_f64;
+    let adj_f64 = -9_223_372_036_854_774_784.0_f64;
+    for tbl in ["ay_t", "nat_t"] {
+        let mut s = conn
+            .prepare(&format!("INSERT INTO {tbl} VALUES (?1, ?2, ?3)"))
+            .unwrap();
+        s.execute(&[
+            SqlValue::Float(min_f64),
+            SqlValue::Float(min_f64),
+            SqlValue::Float(min_f64),
+        ])
+        .unwrap();
+        s.execute(&[
+            SqlValue::Float(adj_f64),
+            SqlValue::Float(adj_f64),
+            SqlValue::Float(adj_f64),
+        ])
+        .unwrap();
+    }
+
+    assert_eq!(
+        conn.query_all(
+            "SELECT typeof(k), typeof(u), typeof(s) FROM ay_t ORDER BY k",
+            &[]
+        )
+        .unwrap(),
+        conn.query_all(
+            "SELECT typeof(k), typeof(u), typeof(s) FROM nat_t ORDER BY k",
+            &[]
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        conn.query_all("SELECT k, s FROM ay_t WHERE k = -9223372036854775808", &[])
+            .unwrap(),
+        conn.query_all("SELECT k, s FROM nat_t WHERE k = -9223372036854775808", &[])
+            .unwrap()
+    );
+    assert_eq!(
+        conn.query_all("SELECT k, s FROM ay_t WHERE s = -9223372036854775808", &[])
+            .unwrap(),
+        conn.query_all("SELECT k, s FROM nat_t WHERE s = -9223372036854775808", &[])
+            .unwrap()
+    );
+
+    // Inserting i64::MIN conflicts with -9223372036854775808.0 on both PK and UNIQUE, and
+    // passing -9223372036854775808.0 as an explicit rowid fails with datatype mismatch.
+    for tbl in ["ay_t", "nat_t"] {
+        let mut dup_pk = conn
+            .prepare(&format!("INSERT INTO {tbl} VALUES (?1, 1, 1)"))
+            .unwrap();
+        assert!(dup_pk.execute(&[SqlValue::Integer(i64::MIN)]).is_err());
+        let mut dup_u = conn
+            .prepare(&format!("INSERT INTO {tbl} VALUES (1, ?1, 1)"))
+            .unwrap();
+        assert!(dup_u.execute(&[SqlValue::Integer(i64::MIN)]).is_err());
+        let mut bad_rowid = conn
+            .prepare(&format!(
+                "INSERT INTO {tbl}(rowid, k, u, s) VALUES (?1, 2, 2, 2)"
+            ))
+            .unwrap();
+        assert!(bad_rowid.execute(&[SqlValue::Float(min_f64)]).is_err());
+    }
+}

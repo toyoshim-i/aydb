@@ -140,12 +140,23 @@ fn build_numeric_alt_key(pk: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+#[inline]
+fn needs_numeric_alt_probe(pk: &[u8], affinity: ColumnAffinity) -> bool {
+    if !matches!(affinity, ColumnAffinity::Integer | ColumnAffinity::Numeric) {
+        return true;
+    }
+    // Under SQLite's strict open coercion interval (-2^63, 2^63), `-9223372036854775808.0` stays
+    // REAL (17-byte key) in INTEGER/NUMERIC columns while comparing equal to `i64::MIN` (9-byte
+    // key). Check the leading 9-byte integer prefix directly via `decode_i64_tagged_key`.
+    pk.len() >= 9 && decode_i64_tagged_key(&pk[..9]) == Some(i64::MIN)
+}
+
 /// Checks if `pk` or its exact-integer numeric dual (`build_numeric_alt_key(pk)`) exists in
 /// `table_id`, returning the existing key bytes if found.
 ///
 /// When `pk_affinity` is `ColumnAffinity::Integer` or `ColumnAffinity::Numeric`, all exact-integer
-/// floats (`10.0`) are coerced to 9-byte `Integer(q)` before storage, so a 17-byte `Float(q.0)`
-/// key can never exist in the table and the second probe is skipped.
+/// floats in `(-2^63, 2^63)` are coerced to 9-byte `Integer(q)` before storage, so only
+/// `i64::MIN` / `-9223372036854775808.0` can have an uncoerced numeric dual in the table.
 #[inline]
 fn find_existing_pk_or_numeric_alt(
     eng: &mut StorageEngine<OsFs>,
@@ -156,10 +167,7 @@ fn find_existing_pk_or_numeric_alt(
     if eng.row_exists(table_id, pk)? {
         return Ok(Some(pk.to_vec()));
     }
-    if !matches!(
-        pk_affinity,
-        ColumnAffinity::Integer | ColumnAffinity::Numeric
-    ) {
+    if needs_numeric_alt_probe(pk, pk_affinity) {
         if let Some(alt) = build_numeric_alt_key(pk) {
             if eng.row_exists(table_id, &alt)? {
                 return Ok(Some(alt));
@@ -270,25 +278,13 @@ unsafe fn constraint_matches_col_collation(
     parsed == Some(col_collation)
 }
 
-const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
-const I64_MAX_PLUS_1_F64: f64 = 9_223_372_036_854_775_808.0;
-
-#[inline]
-fn f64_to_lossless_i64(f: f64) -> Option<i64> {
-    if f.is_finite() && f.fract() == 0.0 && (I64_MIN_F64..I64_MAX_PLUS_1_F64).contains(&f) {
-        Some(f as i64)
-    } else {
-        None
-    }
-}
-
 unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
     if val.is_null() {
         return None;
     }
     match unsafe { sqlite3_value_type(val) } {
         SQLITE_INTEGER => Some(unsafe { sqlite3_value_int64(val) }),
-        SQLITE_FLOAT => f64_to_lossless_i64(unsafe { sqlite3_value_double(val) }),
+        SQLITE_FLOAT => f64_to_exact_i64(unsafe { sqlite3_value_double(val) }),
         SQLITE_TEXT => {
             let slice = unsafe { sqlite_value_text_bytes(val) };
             if slice.is_empty() {
@@ -1465,10 +1461,7 @@ unsafe extern "system" fn vtab_filter(
                             if found {
                                 cursor.pks.push(pk_bytes);
                                 cursor.lazy_blobs.push(None);
-                            } else if !matches!(
-                                vtab.pk_affinity,
-                                ColumnAffinity::Integer | ColumnAffinity::Numeric
-                            ) {
+                            } else if needs_numeric_alt_probe(&pk_bytes, vtab.pk_affinity) {
                                 if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
                                     match point_fetch(
                                         eng,
