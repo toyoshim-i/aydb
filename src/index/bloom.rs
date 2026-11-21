@@ -1,15 +1,93 @@
-//! Kirsch-Mitzenmacher Double-Hashing Bloom Filter built on hardware-accelerated CRC32C.
+//! Kirsch-Mitzenmacher Double-Hashing Bloom Filter built on a single-pass non-linear 64-bit hash.
 //!
 //! Keeps a compact bitset in heap memory (~10 bits per key = 1.25 bytes per key, ~0.9%
 //! false-positive rate) so point lookups (`get`) can skip immutable `idx_<SeqID>.db` segments
 //! without issuing a single `pread` system call.
+//!
+//! Uses a single-pass wyhash-style 64-bit mixer (`hash64`) and splits its upper and lower 32-bit
+//! halves into `(h1, h2)` so double-hashing probes have independent entropy across equal-length
+//! keys (avoiding GF(2)-affine correlation between dual-seed CRC32C hashes).
 
 use std::io;
 
-use crate::util::crc32c::crc32c_append;
+const SECRET0: u64 = 0xa076_1d64_78bd_642f;
+const SECRET1: u64 = 0xe703_7ed1_a0b4_28db;
+const SECRET2: u64 = 0x8ebc_6af0_9c88_c6e3;
+const SECRET3: u64 = 0x5899_65cc_7537_4cc3;
 
-const SEED_H1: u32 = 0x1357_9BDF;
-const SEED_H2: u32 = 0x2468_ACE0;
+#[inline]
+fn wymix(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+#[inline]
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+
+#[inline]
+fn read_u32_le(bytes: &[u8]) -> u64 {
+    u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64
+}
+
+#[inline]
+fn read_small(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    ((bytes[0] as u64) << 16) | ((bytes[len >> 1] as u64) << 8) | (bytes[len - 1] as u64)
+}
+
+#[inline]
+fn wyhash64(key: &[u8]) -> u64 {
+    let len = key.len();
+    let mut seed = SECRET0 ^ wymix(SECRET0, SECRET1);
+    let (a, b) = if len <= 16 {
+        if len >= 4 {
+            let off = (len >> 3) << 2;
+            let a = (read_u32_le(&key[..4]) << 32) | read_u32_le(&key[off..]);
+            let b = (read_u32_le(&key[len - 4..]) << 32) | read_u32_le(&key[len - 4 - off..]);
+            (a, b)
+        } else if len > 0 {
+            (read_small(key), 0)
+        } else {
+            (0, 0)
+        }
+    } else {
+        let mut rem = key;
+        if rem.len() > 48 {
+            let mut see1 = seed;
+            let mut see2 = seed;
+            while rem.len() > 48 {
+                seed = wymix(
+                    read_u64_le(&rem[0..8]) ^ SECRET1,
+                    read_u64_le(&rem[8..16]) ^ seed,
+                );
+                see1 = wymix(
+                    read_u64_le(&rem[16..24]) ^ SECRET2,
+                    read_u64_le(&rem[24..32]) ^ see1,
+                );
+                see2 = wymix(
+                    read_u64_le(&rem[32..40]) ^ SECRET3,
+                    read_u64_le(&rem[40..48]) ^ see2,
+                );
+                rem = &rem[48..];
+            }
+            seed ^= see1 ^ see2;
+        }
+        while rem.len() > 16 {
+            seed = wymix(
+                read_u64_le(&rem[0..8]) ^ SECRET1,
+                read_u64_le(&rem[8..16]) ^ seed,
+            );
+            rem = &rem[16..];
+        }
+        (
+            read_u64_le(&key[len - 16..len - 8]),
+            read_u64_le(&key[len - 8..len]),
+        )
+    };
+    wymix(SECRET1 ^ (len as u64), wymix(a ^ SECRET1, b ^ seed))
+}
 
 /// Compact in-memory Bloom filter for an `idx_<SeqID>.db` segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,36 +130,42 @@ impl BloomFilter {
         }
     }
 
+    #[inline]
+    fn unpack_hash_pair(hash: u64) -> (u32, u32) {
+        ((hash >> 32) as u32, (hash as u32) | 1)
+    }
+
+    #[inline]
+    fn insert_pair(&mut self, h1: u32, h2: u32) {
+        let mut h = h1;
+        for _ in 0..self.num_probes {
+            let bit_idx = (h % self.num_bits) as usize;
+            self.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
+            h = h.wrapping_add(h2);
+        }
+    }
+
     /// Computes the `(h1, h2)` double-hashing probe pair for `key`.
     #[inline]
     pub fn hash_pair(key: &[u8]) -> (u32, u32) {
-        let h1 = crc32c_append(SEED_H1, key);
-        let h2 = crc32c_append(SEED_H2, key).rotate_left(17) | 1;
-        (h1, h2)
+        Self::unpack_hash_pair(Self::hash64(key))
     }
 
-    /// Computes a packed 64-bit hash `((h1 as u64) << 32) | (h2 as u64)` for `key`.
+    /// Computes a full-entropy 64-bit hash for `key` in a single pass.
     #[inline]
     pub fn hash64(key: &[u8]) -> u64 {
-        let (h1, h2) = Self::hash_pair(key);
-        ((h1 as u64) << 32) | (h2 as u64)
+        wyhash64(key)
     }
 
-    /// Builds a [`BloomFilter`] from packed 64-bit hashes without retaining raw keys.
+    /// Builds a [`BloomFilter`] from 64-bit hashes without retaining raw keys.
     pub fn from_hashes64(hashes: &[u64], bits_per_key: usize) -> Self {
         if bits_per_key == 0 || hashes.is_empty() {
             return Self::new(0, 0);
         }
         let mut filter = Self::new(hashes.len(), bits_per_key);
         for &packed in hashes {
-            let h1 = (packed >> 32) as u32;
-            let h2 = packed as u32;
-            let mut h = h1;
-            for _ in 0..filter.num_probes {
-                let bit_idx = (h % filter.num_bits) as usize;
-                filter.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
-                h = h.wrapping_add(h2);
-            }
+            let (h1, h2) = Self::unpack_hash_pair(packed);
+            filter.insert_pair(h1, h2);
         }
         filter
     }
@@ -93,13 +177,7 @@ impl BloomFilter {
             return;
         }
         let (h1, h2) = Self::hash_pair(key);
-
-        let mut h = h1;
-        for _ in 0..self.num_probes {
-            let bit_idx = (h % self.num_bits) as usize;
-            self.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
-            h = h.wrapping_add(h2);
-        }
+        self.insert_pair(h1, h2);
     }
 
     /// Returns `true` if `key` may be present in the segment, or `false` if `key` is
@@ -206,5 +284,85 @@ mod tests {
         let (bytes_exact_wrap, bits_exact_wrap) = compute_bloom_sizing(1 << 29, 8);
         assert!(bits_exact_wrap > 0);
         assert_eq!(bits_exact_wrap as usize, bytes_exact_wrap * 8);
+    }
+
+    #[test]
+    fn hash_pair_components_are_nonlinear_and_independent_across_equal_length_keys() {
+        use std::collections::HashSet;
+
+        let mut xors = HashSet::new();
+        let mut seen_even = false;
+        let mut seen_odd = false;
+        for i in 0..256u32 {
+            let key = format!("key_equal_{i:06}");
+            assert_eq!(key.len(), 16);
+            let h64 = BloomFilter::hash64(key.as_bytes());
+            seen_even |= (h64 & 1) == 0;
+            seen_odd |= (h64 & 1) == 1;
+            let (h1, h2) = BloomFilter::hash_pair(key.as_bytes());
+            assert_eq!(h2 & 1, 1);
+            xors.insert(h1 ^ h2);
+        }
+        assert!(seen_even && seen_odd, "hash64 should use full 64-bit LSB");
+        assert!(
+            xors.len() >= 200,
+            "h1 ^ h2 across equal-length keys must not collapse to a constant (got {} distinct)",
+            xors.len()
+        );
+
+        let mut length_hashes = HashSet::new();
+        for len in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 17, 48, 49, 100] {
+            let base = vec![0xA5u8; len];
+            let h_base = BloomFilter::hash64(&base);
+            assert!(length_hashes.insert(h_base));
+            if len > 0 {
+                let mut flipped = base.clone();
+                flipped[len / 2] ^= 1;
+                let h_flip = BloomFilter::hash64(&flipped);
+                assert_ne!(h_base, h_flip);
+                assert_ne!(h_base >> 32, h_flip >> 32);
+                assert_ne!(h_base as u32, h_flip as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn bloom_from_hashes64_matches_insert_and_has_low_false_positive_rate() {
+        let mut keys = Vec::with_capacity(2000);
+        for i in 0..2000usize {
+            let len = i % 100;
+            let mut key = vec![(i & 0xFF) as u8; len];
+            if len >= 4 {
+                key[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            } else {
+                key.extend_from_slice(&(i as u32).to_le_bytes());
+            }
+            keys.push(key);
+        }
+
+        let mut f_insert = BloomFilter::new(keys.len(), 10);
+        let mut hashes = Vec::with_capacity(keys.len());
+        for key in &keys {
+            f_insert.insert(key);
+            hashes.push(BloomFilter::hash64(key));
+        }
+        let f_hashed = BloomFilter::from_hashes64(&hashes, 10);
+        assert_eq!(f_insert, f_hashed);
+
+        for key in &keys {
+            assert!(f_insert.may_contain(key), "false negative for {key:?}");
+        }
+
+        let mut false_positives = 0usize;
+        for j in 0..10_000u32 {
+            let probe = format!("absent_probe_{j:06}");
+            if f_hashed.may_contain(probe.as_bytes()) {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives < 250,
+            "unexpectedly high false positive rate: {false_positives}/10000"
+        );
     }
 }
