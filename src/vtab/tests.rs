@@ -3386,3 +3386,47 @@ fn collate_nocase_embedded_nul_matches_native_sqlite() {
         assert_eq!(got_a, got_n, "mismatch on `{tmpl}`");
     }
 }
+
+#[test]
+fn text_primary_key_preserves_invalid_utf8_bytes_on_projection_and_lookup() {
+    let tmp = TempTestDir::new("non_utf8_text_pk");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    for (idx, coll) in ["BINARY", "NOCASE", "RTRIM"].iter().enumerate() {
+        let ay = format!("ay_{idx}");
+        let nat = format!("nat_{idx}");
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {ay} USING aydb(columns='k TEXT PRIMARY KEY COLLATE {coll}, v INT');
+             CREATE TABLE {nat}(k TEXT PRIMARY KEY COLLATE {coll}, v INT);
+             INSERT INTO {ay} VALUES (CAST(x'80' AS TEXT), 1), (CAST(x'FF0080' AS TEXT), 2);
+             INSERT INTO {nat} VALUES (CAST(x'80' AS TEXT), 1), (CAST(x'FF0080' AS TEXT), 2);"
+        ))
+        .unwrap();
+
+        for tmpl in [
+            "SELECT hex(k) FROM {tbl} ORDER BY k",
+            "SELECT typeof(k), hex(k), v FROM {tbl} ORDER BY v",
+            "SELECT hex(k), v FROM {tbl} WHERE k = CAST(x'80' AS TEXT)",
+            "SELECT hex(k), v FROM {tbl} WHERE k = CAST(x'FF0080' AS TEXT)",
+            "SELECT hex(k), v FROM {tbl} WHERE k >= CAST(x'80' AS TEXT) ORDER BY k",
+        ] {
+            let got_a = conn.query_all(&tmpl.replace("{tbl}", &ay), &[]).unwrap();
+            let got_n = conn.query_all(&tmpl.replace("{tbl}", &nat), &[]).unwrap();
+            assert_eq!(got_a, got_n, "coll={coll}, query=`{tmpl}`");
+        }
+        assert_eq!(
+            conn.query_all(
+                &format!("SELECT hex(k) FROM {ay} WHERE k = CAST(x'80' AS TEXT)"),
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("80".to_string())]]
+        );
+    }
+}

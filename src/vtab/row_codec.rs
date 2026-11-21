@@ -902,6 +902,86 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
     }
 }
 
+/// Passes a raw slice to `sqlite3_result_text` or `sqlite3_result_blob`, reporting `TOOBIG` and
+/// returning `false` when `payload.len() > i32::MAX as usize`.
+#[inline]
+unsafe fn result_bytes(ctx: *mut sqlite3_context, payload: &[u8], is_text: bool) -> bool {
+    if payload.len() > i32::MAX as usize {
+        unsafe { sqlite3_result_error_toobig(ctx) };
+        return false;
+    }
+    unsafe {
+        if is_text {
+            sqlite3_result_text(
+                ctx,
+                payload.as_ptr() as *const _,
+                payload.len() as i32,
+                sqlite_transient(),
+            );
+        } else {
+            sqlite3_result_blob(
+                ctx,
+                payload.as_ptr() as *const _,
+                payload.len() as i32,
+                sqlite_transient(),
+            );
+        }
+    }
+    true
+}
+
+/// Projects a type-tagged primary key slice directly into `ctx` (`sqlite3_result_*`) with
+/// zero heap allocation and exact byte preservation (including invalid UTF-8 `TEXT` keys).
+///
+/// Returns `false` if `key` is malformed or has an unknown tag.
+///
+/// # Safety
+/// `ctx` must be a valid non-null `*mut sqlite3_context`.
+#[inline]
+pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> bool {
+    let Some((&tag, payload)) = key.split_first() else {
+        return false;
+    };
+    unsafe {
+        match tag {
+            KEY_TAG_NULL if payload.is_empty() => {
+                sqlite3_result_null(ctx);
+                true
+            }
+            KEY_TAG_INTEGER if payload.len() == 8 => {
+                let arr: [u8; 8] = payload.try_into().unwrap();
+                sqlite3_result_int64(ctx, decode_i64_memcomparable(arr));
+                true
+            }
+            KEY_TAG_INTEGER if payload.len() == 16 => {
+                let q_arr: [u8; 8] = payload[0..8].try_into().unwrap();
+                let r_arr: [u8; 8] = payload[8..16].try_into().unwrap();
+                let f = if u64::from_be_bytes(r_arr) == 0 {
+                    decode_i64_memcomparable(q_arr) as f64
+                } else {
+                    decode_f64_memcomparable(r_arr)
+                };
+                sqlite3_result_double(ctx, f);
+                true
+            }
+            KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 if payload.len() == 8 => {
+                let arr: [u8; 8] = payload.try_into().unwrap();
+                sqlite3_result_double(ctx, decode_f64_memcomparable(arr));
+                true
+            }
+            KEY_TAG_TEXT => {
+                let _ = result_bytes(ctx, payload, true);
+                true
+            }
+            KEY_TAG_BLOB => {
+                let _ = result_bytes(ctx, payload, false);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Projects column `col_idx` from `row_bytes` directly into `ctx` (`sqlite3_result_*`) with
 /// **zero Rust heap allocations** (`0` `String` / `Vec` allocations)!
 ///
@@ -953,43 +1033,41 @@ pub unsafe fn project_column_zero_copy(
                 let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
                 sqlite3_result_double(ctx, v);
             }
-            3 => {
+            3 | 4 => {
+                let is_text = type_tag == 3;
                 if offset + 4 > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text len"));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        if is_text {
+                            "truncated Text len"
+                        } else {
+                            "truncated Blob len"
+                        },
+                    ));
                 }
                 let len =
                     u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
                 if offset + 4 + len > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Text"));
-                }
-                if len > i32::MAX as usize {
-                    sqlite3_result_error_toobig(ctx);
                     return Err(io::Error::new(
-                        ErrorKind::InvalidInput,
-                        "Text column exceeds i32::MAX bytes",
+                        ErrorKind::InvalidData,
+                        if is_text {
+                            "truncated Text"
+                        } else {
+                            "truncated Blob"
+                        },
                     ));
                 }
-                let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
-                sqlite3_result_text(ctx, ptr as *const _, len as i32, sqlite_transient());
-            }
-            4 => {
-                if offset + 4 > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob len"));
-                }
-                let len =
-                    u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                if offset + 4 + len > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Blob"));
-                }
-                if len > i32::MAX as usize {
-                    sqlite3_result_error_toobig(ctx);
+                let payload = &row_bytes[offset + 4..offset + 4 + len];
+                if !result_bytes(ctx, payload, is_text) {
                     return Err(io::Error::new(
                         ErrorKind::InvalidInput,
-                        "Blob column exceeds i32::MAX bytes",
+                        if is_text {
+                            "Text column exceeds i32::MAX bytes"
+                        } else {
+                            "Blob column exceeds i32::MAX bytes"
+                        },
                     ));
                 }
-                let ptr = row_bytes[offset + 4..offset + 4 + len].as_ptr();
-                sqlite3_result_blob(ctx, ptr as *const _, len as i32, sqlite_transient());
             }
             other => {
                 return Err(io::Error::new(

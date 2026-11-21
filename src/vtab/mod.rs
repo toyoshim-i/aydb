@@ -92,8 +92,8 @@ pub use crate::vtab::row_codec::{
     encode_canonical_numeric_key_from_f64, encode_f64_memcomparable, encode_f64_unified_key,
     encode_i64_tagged_key, encode_row, encode_sqlite_values_direct, extract_column_key_bytes,
     extract_column_key_bytes_with_collation, f64_to_exact_i64, format_sqlite_float_text,
-    parse_sqlite_numeric_str, project_column_zero_copy, sqlite_value_to_key_bytes,
-    sqlite_value_to_key_bytes_with_schema,
+    parse_sqlite_numeric_str, project_column_zero_copy, project_key_zero_copy,
+    sqlite_value_to_key_bytes, sqlite_value_to_key_bytes_with_schema,
 };
 pub use crate::vtab::rowid_map::hash_pk_to_rowid;
 use crate::vtab::rowid_map::{extract_rowid_from_pk_bytes, extract_rowid_from_row};
@@ -1936,8 +1936,7 @@ unsafe extern "system" fn vtab_column(
                 return SQLITE_OK;
             }
             if i_col as usize == vtab.pk_col_idx {
-                if let Some(val) = SqlValue::from_key_bytes(pk_bytes) {
-                    val.set_sqlite_result(p_ctx);
+                if project_key_zero_copy(pk_bytes, p_ctx) {
                     return SQLITE_OK;
                 }
             }
@@ -1966,8 +1965,7 @@ unsafe extern "system" fn vtab_column(
         // Fast path 2: Primary Key column projection with Binary collation directly from cursor.pks
         if i_col as usize == vtab.pk_col_idx && vtab.pk_collation == ColCollation::Binary {
             if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-                if let Some(val) = SqlValue::from_key_bytes(pk_bytes) {
-                    val.set_sqlite_result(p_ctx);
+                if project_key_zero_copy(pk_bytes, p_ctx) {
                     return SQLITE_OK;
                 }
             }
