@@ -33,6 +33,9 @@ pub const IDX_BLOCK_SIZE: usize = 4096;
 /// Manager Virtual Address Control Block size) used by [`IdxSegmentBuilder`].
 const IDX_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
 
+/// Sequential read-ahead chunk size (`64 * 4 KB = 256 KB`) for compaction merge cursors.
+const COMPACTION_READAHEAD_BLOCKS: u32 = 64;
+
 /// Size of the fixed trailer at the end of every 4 KB index data block (`4088..4096`).
 const IDX_BLOCK_TRAILER_SIZE: usize = 8;
 
@@ -1334,9 +1337,18 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 
     /// Creates a bounded-memory streaming cursor over all entries in this segment, reading
-    /// one 4 KB data block at a time on demand (bypasses cache insertion for bulk compaction).
+    /// one 4 KB data block at a time on demand (bypasses cache insertion).
     pub fn cursor_all(&self) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_all(self, false)
+        IdxSegmentCursor::new_all(self, false, CursorBlockStorage::new())
+    }
+
+    /// Creates a streaming cursor over all entries in this segment using batched sequential
+    /// read-ahead chunks of up to `max_blocks` 4 KB blocks per `read_exact_at` syscall.
+    pub(crate) fn cursor_all_batched(
+        &self,
+        max_blocks: u32,
+    ) -> io::Result<IdxSegmentCursor<'_, F>> {
+        IdxSegmentCursor::new_all(self, false, CursorBlockStorage::new_batched(max_blocks))
     }
 
     /// Creates a bounded-memory streaming cursor over all entries in this segment with explicit cache policy.
@@ -1344,7 +1356,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         &self,
         populate_cache: bool,
     ) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_all(self, populate_cache)
+        IdxSegmentCursor::new_all(self, populate_cache, CursorBlockStorage::new())
     }
 
     /// Creates a bounded-memory streaming cursor starting at `(lower_key, lower_inclusive)`,
@@ -1386,11 +1398,129 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 }
 
+struct ReadAheadBuffer {
+    buf: Vec<u8>,
+    start_block: u32,
+    block_count: u32,
+    max_blocks: u32,
+}
+
+enum ActiveBlock {
+    None,
+    Cached(Arc<[u8; IDX_BLOCK_SIZE]>),
+    Scratch,
+    ReadAhead(usize),
+}
+
+struct CursorBlockStorage {
+    active: ActiveBlock,
+    scratch: Option<Box<[u8; IDX_BLOCK_SIZE]>>,
+    read_ahead: Option<ReadAheadBuffer>,
+}
+
+impl CursorBlockStorage {
+    fn new() -> Self {
+        Self {
+            active: ActiveBlock::None,
+            scratch: None,
+            read_ahead: None,
+        }
+    }
+
+    fn new_batched(max_blocks: u32) -> Self {
+        let max_blocks = max_blocks.max(1);
+        Self {
+            active: ActiveBlock::None,
+            scratch: None,
+            read_ahead: Some(ReadAheadBuffer {
+                buf: Vec::with_capacity((max_blocks as usize) * IDX_BLOCK_SIZE),
+                start_block: 0,
+                block_count: 0,
+                max_blocks,
+            }),
+        }
+    }
+
+    #[inline]
+    fn block_bytes(&self) -> &[u8; IDX_BLOCK_SIZE] {
+        match &self.active {
+            ActiveBlock::Cached(arc) => arc.as_ref(),
+            ActiveBlock::Scratch => self
+                .scratch
+                .as_deref()
+                .expect("Scratch active without allocated buffer"),
+            ActiveBlock::ReadAhead(off) => {
+                let ra = self
+                    .read_ahead
+                    .as_ref()
+                    .expect("ReadAhead active without buffer");
+                ra.buf[*off..*off + IDX_BLOCK_SIZE]
+                    .try_into()
+                    .expect("ReadAhead slice matches IDX_BLOCK_SIZE")
+            }
+            ActiveBlock::None => panic!("CursorBlockStorage::block_bytes called when empty"),
+        }
+    }
+
+    fn load<F: PlatformFile>(
+        &mut self,
+        seg: &IdxSegmentReader<F>,
+        block_idx: u32,
+        populate_cache: bool,
+    ) -> io::Result<IdxBlockReader<'_>> {
+        let preverified = if let Some(ra) = &mut self.read_ahead {
+            if block_idx < ra.start_block || block_idx >= ra.start_block + ra.block_count {
+                let count = seg
+                    .num_blocks
+                    .saturating_sub(block_idx)
+                    .min(ra.max_blocks)
+                    .max(1);
+                let bytes = (count as usize) * IDX_BLOCK_SIZE;
+                ra.buf.resize(bytes, 0);
+                seg.file
+                    .read_exact_at(&mut ra.buf, (block_idx as u64) * (IDX_BLOCK_SIZE as u64))?;
+                ra.start_block = block_idx;
+                ra.block_count = count;
+            }
+            let off = ((block_idx - ra.start_block) as usize) * IDX_BLOCK_SIZE;
+            self.active = ActiveBlock::ReadAhead(off);
+            false
+        } else if let Some(arc) = seg
+            .block_cache
+            .as_ref()
+            .and_then(|c| c.get_arc(seg.seq_id, block_idx))
+        {
+            self.active = ActiveBlock::Cached(arc);
+            true
+        } else {
+            let scratch = self
+                .scratch
+                .get_or_insert_with(|| Box::new([0u8; IDX_BLOCK_SIZE]));
+            seg.file
+                .read_exact_at(&mut **scratch, (block_idx as u64) * (IDX_BLOCK_SIZE as u64))?;
+            self.active = ActiveBlock::Scratch;
+            false
+        };
+
+        if preverified {
+            IdxBlockReader::open_preverified(self.block_bytes())
+        } else {
+            let reader = IdxBlockReader::open_verified(self.block_bytes())?;
+            if populate_cache {
+                if let Some(cache) = &seg.block_cache {
+                    cache.insert(seg.seq_id, block_idx, reader.buf);
+                }
+            }
+            Ok(reader)
+        }
+    }
+}
+
 /// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`].
 pub struct IdxSegmentRevCursor<'a, F: PlatformFile> {
     seg: &'a IdxSegmentReader<F>,
     next_block_idx: Option<u32>,
-    block_buf: [u8; IDX_BLOCK_SIZE],
+    block: CursorBlockStorage,
     entry_idx: usize,
     num_entries_in_block: usize,
     current_span: Option<CursorEntrySpan>,
@@ -1406,7 +1536,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
         let mut cursor = Self {
             seg,
             next_block_idx: None,
-            block_buf: [0u8; IDX_BLOCK_SIZE],
+            block: CursorBlockStorage::new(),
             entry_idx: 0,
             num_entries_in_block: 0,
             current_span: None,
@@ -1435,7 +1565,7 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
         let mut b = seg.fence_pointers[pos - 1].block_idx;
 
         loop {
-            let reader = seg.read_block(b, &mut cursor.block_buf, cursor.populate_cache)?;
+            let reader = cursor.block.load(seg, b, cursor.populate_cache)?;
             cursor.num_entries_in_block = reader.num_entries();
 
             // Binary-search for the first entry strictly after `(ub_key, ub_inclusive)`
@@ -1476,19 +1606,21 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
     /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
+        let block = self.block.block_bytes();
         self.current_span
             .as_ref()
-            .map(|s| &self.block_buf[s.key_range.clone()])
+            .map(|s| &block[s.key_range.clone()])
     }
 
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf`.
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        let block = self.block.block_bytes();
         self.current_span.as_ref().map(|s| RawIdxEntry {
-            key: &self.block_buf[s.key_range.clone()],
+            key: &block[s.key_range.clone()],
             lsn: s.lsn,
             val_type: s.val_type,
-            val_bytes: &self.block_buf[s.val_range.clone()],
+            val_bytes: &block[s.val_range.clone()],
         })
     }
 
@@ -1518,15 +1650,14 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
                 return Ok(());
             };
             self.next_block_idx = b.checked_sub(1);
-            let reader = self
-                .seg
-                .read_block(b, &mut self.block_buf, self.populate_cache)?;
+            let reader = self.block.load(self.seg, b, self.populate_cache)?;
             self.num_entries_in_block = reader.num_entries();
             self.entry_idx = self.num_entries_in_block;
         }
 
         self.entry_idx -= 1;
-        let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
+        let reader =
+            IdxBlockReader::from_verified_buf(self.block.block_bytes(), self.num_entries_in_block);
         let span = reader.parse_entry_span_at(self.entry_idx)?;
         self.current_span = Some(span);
         Ok(())
@@ -1535,12 +1666,12 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
 
 /// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].
 ///
-/// Holds only a single 4 KB data block buffer (`[u8; IDX_BLOCK_SIZE]`) in stack/struct memory,
-/// enabling zero-allocation key/LSN inspection and $O(K \times 4\text{ KB})$ streaming K-way merges.
+/// Borrows cached `Arc<[u8; IDX_BLOCK_SIZE]>` blocks zero-copy on cache hit and falls back to an
+/// on-demand 4 KB scratch buffer (or a sequential read-ahead buffer during compaction) only on miss.
 pub struct IdxSegmentCursor<'a, F: PlatformFile> {
     seg: &'a IdxSegmentReader<F>,
     next_block_idx: u32,
-    block_buf: [u8; IDX_BLOCK_SIZE],
+    block: CursorBlockStorage,
     entry_idx: usize,
     num_entries_in_block: usize,
     current_span: Option<CursorEntrySpan>,
@@ -1548,11 +1679,15 @@ pub struct IdxSegmentCursor<'a, F: PlatformFile> {
 }
 
 impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
-    fn new_all(seg: &'a IdxSegmentReader<F>, populate_cache: bool) -> io::Result<Self> {
+    fn new_all(
+        seg: &'a IdxSegmentReader<F>,
+        populate_cache: bool,
+        block: CursorBlockStorage,
+    ) -> io::Result<Self> {
         let mut cursor = Self {
             seg,
             next_block_idx: 0,
-            block_buf: [0u8; IDX_BLOCK_SIZE],
+            block,
             entry_idx: 0,
             num_entries_in_block: 0,
             current_span: None,
@@ -1571,7 +1706,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         let mut cursor = Self {
             seg,
             next_block_idx: 0,
-            block_buf: [0u8; IDX_BLOCK_SIZE],
+            block: CursorBlockStorage::new(),
             entry_idx: 0,
             num_entries_in_block: 0,
             current_span: None,
@@ -1589,7 +1724,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
         while cursor.next_block_idx < seg.num_blocks {
             let b = cursor.next_block_idx;
             cursor.next_block_idx += 1;
-            let reader = seg.read_block(b, &mut cursor.block_buf, cursor.populate_cache)?;
+            let reader = cursor.block.load(seg, b, cursor.populate_cache)?;
             cursor.num_entries_in_block = reader.num_entries();
 
             // Binary-search the u16 offset directory for the first key satisfying the lower bound
@@ -1625,19 +1760,21 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
     /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
+        let block = self.block.block_bytes();
         self.current_span
             .as_ref()
-            .map(|s| &self.block_buf[s.key_range.clone()])
+            .map(|s| &block[s.key_range.clone()])
     }
 
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block_buf`.
+    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        let block = self.block.block_bytes();
         self.current_span.as_ref().map(|s| RawIdxEntry {
-            key: &self.block_buf[s.key_range.clone()],
+            key: &block[s.key_range.clone()],
             lsn: s.lsn,
             val_type: s.val_type,
-            val_bytes: &self.block_buf[s.val_range.clone()],
+            val_bytes: &block[s.val_range.clone()],
         })
     }
 
@@ -1668,14 +1805,13 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
             }
             let b = self.next_block_idx;
             self.next_block_idx += 1;
-            let reader = self
-                .seg
-                .read_block(b, &mut self.block_buf, self.populate_cache)?;
+            let reader = self.block.load(self.seg, b, self.populate_cache)?;
             self.num_entries_in_block = reader.num_entries();
             self.entry_idx = 0;
         }
 
-        let reader = IdxBlockReader::from_verified_buf(&self.block_buf, self.num_entries_in_block);
+        let reader =
+            IdxBlockReader::from_verified_buf(self.block.block_bytes(), self.num_entries_in_block);
         let span = reader.parse_entry_span_at(self.entry_idx)?;
         self.entry_idx += 1;
         self.current_span = Some(span);
@@ -1706,7 +1842,7 @@ pub fn compact_idx_segments<F: PlatformFile>(
 ) -> io::Result<CompactionResult<F>> {
     let mut cursors: Vec<IdxSegmentCursor<'_, F>> = Vec::with_capacity(inputs.len());
     for &seg in inputs {
-        cursors.push(seg.cursor_all()?);
+        cursors.push(seg.cursor_all_batched(COMPACTION_READAHEAD_BLOCKS)?);
     }
 
     let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
@@ -2147,5 +2283,151 @@ mod tests {
             IdxSegmentReader::open(&fs, 1).err().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn idx_segment_cursor_borrows_cached_block_zero_copy_and_shrinks_struct() {
+        assert!(std::mem::size_of::<IdxSegmentCursor<'_, crate::pal::OsFile>>() < 512);
+        assert!(std::mem::size_of::<IdxSegmentRevCursor<'_, crate::pal::OsFile>>() < 512);
+
+        let tmp = TempTestDir::new("cursor_zero_copy");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let cache = Arc::new(VerifiedBlockCache::new(1024 * 1024));
+
+        let mut builder = IdxSegmentBuilder::create(&fs, 1, 0, 10).unwrap();
+        let val = vec![0x55u8; 64];
+        for i in 0..200u32 {
+            let k = format!("zc_key_{i:05}").into_bytes();
+            builder.add_raw_entry(&k, i as u64 + 1, 1, &val).unwrap();
+        }
+        let mut reader = builder.finish().unwrap();
+        assert!(reader.num_blocks() >= 3);
+        reader.set_block_cache(Some(Arc::clone(&cache)));
+
+        // Warm all blocks in VerifiedBlockCache.
+        let mut warm = reader.cursor_from(b"zc_key_00000", true).unwrap();
+        while warm.next_entry().unwrap().is_some() {}
+
+        let fwd = reader.cursor_from(b"zc_key_00000", true).unwrap();
+        assert!(fwd.block.scratch.is_none());
+        assert!(matches!(fwd.block.active, ActiveBlock::Cached(_)));
+        assert_eq!(fwd.current_key(), Some(b"zc_key_00000".as_slice()));
+
+        let rev = reader.cursor_reverse_from(None).unwrap();
+        assert!(rev.block.scratch.is_none());
+        assert!(matches!(rev.block.active, ActiveBlock::Cached(_)));
+        assert_eq!(rev.current_key(), Some(b"zc_key_00199".as_slice()));
+    }
+
+    #[test]
+    fn compact_idx_segments_uses_batched_reads_instead_of_per_block_syscalls() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct CountingReadFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            is_idx: bool,
+            read_exact_calls: Arc<AtomicUsize>,
+        }
+
+        impl PlatformFile for CountingReadFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                if self.is_idx {
+                    self.read_exact_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(
+                &self,
+                target_len: u64,
+                strategy: crate::pal::PreallocStrategy,
+            ) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        struct CountingReadFs {
+            inner: OsFs,
+            read_exact_calls: Arc<AtomicUsize>,
+        }
+
+        impl PlatformFs for CountingReadFs {
+            type File = CountingReadFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(CountingReadFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    is_idx: rel_name.starts_with("idx_"),
+                    read_exact_calls: Arc::clone(&self.read_exact_calls),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("batched_compaction_reads");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fs = CountingReadFs {
+            inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
+            read_exact_calls: Arc::clone(&calls),
+        };
+
+        let val = vec![0x3Cu8; 64];
+        for (seq_id, start) in [(1u64, 0u32), (2u64, 1u32)] {
+            let mut b = IdxSegmentBuilder::create(&fs, seq_id, 0, 10).unwrap();
+            for i in (start..2400u32).step_by(2) {
+                let k = format!("batch_key_{i:05}").into_bytes();
+                b.add_raw_entry(&k, i as u64 + 1, 1, &val).unwrap();
+            }
+            let r = b.finish().unwrap();
+            assert!(r.num_blocks() >= 16);
+        }
+
+        let s1 = IdxSegmentReader::open(&fs, 1).unwrap();
+        let s2 = IdxSegmentReader::open(&fs, 2).unwrap();
+        calls.store(0, AtomicOrdering::Relaxed);
+
+        let res = compact_idx_segments(&fs, &[&s1, &s2], 3, 1, 10, true).unwrap();
+        let syscalls = calls.load(AtomicOrdering::Relaxed);
+        assert!(
+            syscalls <= 4,
+            "expected batched compaction reads (<= 4 syscalls across >= 32 blocks), got {syscalls}"
+        );
+        let merged = res.new_segment.scan_all().unwrap();
+        assert_eq!(merged.len(), 2400);
+        for (idx, entry) in merged.iter().enumerate() {
+            assert_eq!(entry.key, format!("batch_key_{idx:05}").into_bytes());
+        }
     }
 }
