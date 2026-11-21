@@ -197,6 +197,7 @@ impl core::fmt::Debug for HandlePool {
 
 struct HandlePoolInner {
     tracked: Vec<TrackedHandle>,
+    clock_hand: usize,
 }
 
 struct TrackedHandle {
@@ -210,13 +211,19 @@ impl HandlePool {
             max_descriptors,
             inner: Mutex::new(HandlePoolInner {
                 tracked: Vec::new(),
+                clock_hand: 0,
             }),
         }
     }
 
     pub fn register(&self, path: &Path, file: &Arc<UnixPlatformFile>) {
         let mut inner = self.inner.lock().unwrap();
-        self.evict_if_needed(&mut inner);
+        inner.tracked.retain(|th| th.file.strong_count() > 0);
+        if inner.tracked.is_empty() {
+            inner.clock_hand = 0;
+        } else {
+            inner.clock_hand %= inner.tracked.len();
+        }
         inner.tracked.push(TrackedHandle {
             path: path.to_path_buf(),
             file: Arc::downgrade(file),
@@ -230,8 +237,14 @@ impl HandlePool {
 
     fn evict_if_needed(&self, inner: &mut HandlePoolInner) {
         inner.tracked.retain(|th| th.file.strong_count() > 0);
+        let len = inner.tracked.len();
+        if len == 0 {
+            inner.clock_hand = 0;
+            return;
+        }
+        inner.clock_hand %= len;
 
-        let open_count = inner
+        let mut open_count = inner
             .tracked
             .iter()
             .filter_map(|th| th.file.upgrade())
@@ -241,19 +254,29 @@ impl HandlePool {
             return;
         }
 
-        // Close the oldest unpinned open handle. Unpinned means the only owner besides the local
-        // upgraded Arc is the engine or caller (strong_count <= 2), the file has not been
-        // unlinked, and it has no unsynced dirty writes (closing an unsynced Linux fd risks
-        // losing writeback errors in `errseq_t` on reopen). Re-check all guards after taking the
-        // handle's write lock to eliminate the TOCTOU window with `pin_open_before_unlink`.
-        for th in &inner.tracked {
-            let Some(arc) = th.file.upgrade() else {
+        // CLOCK sweep across at most two full passes: the first clears `referenced` for recently
+        // used handles and the second evicts unpinned, clean idle handles until
+        // `open_count < self.max_descriptors` so temporarily elevated counts drain back to the
+        // cap. Re-check all guards after taking the handle's write lock to eliminate the TOCTOU
+        // window with `pin_open_before_unlink`.
+        for _ in 0..len.saturating_mul(2) {
+            if open_count < self.max_descriptors {
+                break;
+            }
+            let idx = inner.clock_hand;
+            inner.clock_hand = (idx + 1) % len;
+
+            let Some(arc) = inner.tracked[idx].file.upgrade() else {
                 continue;
             };
-            if arc.keep_open.load(Ordering::Acquire)
+            if !arc.descriptor_open.load(Ordering::Acquire)
+                || arc.keep_open.load(Ordering::Acquire)
                 || arc.has_unsynced_writes()
                 || Arc::strong_count(&arc) > 2
             {
+                continue;
+            }
+            if arc.referenced.swap(false, Ordering::AcqRel) {
                 continue;
             }
             if let Ok(mut guard) = arc.file.try_write() {
@@ -266,7 +289,7 @@ impl HandlePool {
                 if guard.is_some() {
                     *guard = None;
                     arc.descriptor_open.store(false, Ordering::Release);
-                    return;
+                    open_count = open_count.saturating_sub(1);
                 }
             }
         }
@@ -306,6 +329,8 @@ pub struct UnixPlatformFile {
     file: RwLock<Option<File>>,
     /// Mirrors `file.is_some()` so the pool can count open descriptors without taking `file`.
     descriptor_open: AtomicBool,
+    /// CLOCK second-chance reference bit set on every descriptor access.
+    referenced: AtomicBool,
     /// Set once the file is about to be unlinked while still referenced: the descriptor must
     /// stay open because the path can no longer be reopened.
     keep_open: AtomicBool,
@@ -361,6 +386,7 @@ impl UnixPlatformFile {
             hint,
             file: RwLock::new(Some(file)),
             descriptor_open: AtomicBool::new(true),
+            referenced: AtomicBool::new(true),
             keep_open: AtomicBool::new(false),
             active_writers: AtomicUsize::new(0),
             write_seq: AtomicU64::new(0),
@@ -399,11 +425,13 @@ impl UnixPlatformFile {
         {
             let guard = self.file.read().unwrap();
             if let Some(ref file) = *guard {
+                self.referenced.store(true, Ordering::Relaxed);
                 return f(file);
             }
         }
         let mut guard = self.file.write().unwrap();
         if let Some(ref file) = *guard {
+            self.referenced.store(true, Ordering::Relaxed);
             return f(file);
         }
         if let Some(ref pool) = self.pool {
@@ -414,10 +442,10 @@ impl UnixPlatformFile {
             .write(self.writable)
             .open(&self.path)?;
         apply_open_hint(&reopened, self.hint);
-        let res = f(&reopened);
         *guard = Some(reopened);
         self.descriptor_open.store(true, Ordering::Release);
-        res
+        self.referenced.store(true, Ordering::Relaxed);
+        f(guard.as_ref().unwrap())
     }
 
     /// Whether the underlying file descriptor is currently open in memory.
@@ -510,6 +538,7 @@ impl PlatformFile for UnixPlatformFile {
 #[derive(Debug, Clone)]
 pub struct UnixPlatformFs {
     root: PathBuf,
+    dir_file: Arc<File>,
     _lock_file: Arc<File>,
     pool: Arc<HandlePool>,
 }
@@ -525,6 +554,7 @@ impl UnixPlatformFs {
         pool_cap: usize,
     ) -> io::Result<Self> {
         let normalized = normalize_db_root_path(root.as_ref(), create)?;
+        let dir_file = File::open(&normalized)?;
         let lock_path = normalized.join(DB_LOCK_FILE_NAME);
         let lock_file = OpenOptions::new()
             .read(true)
@@ -532,12 +562,20 @@ impl UnixPlatformFs {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        let rc = unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            let rc = unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
         Ok(Self {
             root: normalized,
+            dir_file: Arc::new(dir_file),
             _lock_file: Arc::new(lock_file),
             pool: Arc::new(HandlePool::new(pool_cap)),
         })
@@ -546,14 +584,13 @@ impl UnixPlatformFs {
     /// Flushes directory metadata to non-volatile storage so newly created or unlinked
     /// segment/manifest directory entries survive sudden power loss.
     pub fn sync_dir(&self) -> io::Result<()> {
-        let dir = File::open(&self.root)?;
         #[cfg(target_os = "macos")]
         {
-            macos_sync_file_durable(&dir)
+            macos_sync_file_durable(&self.dir_file)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            dir.sync_all()
+            self.dir_file.sync_all()
         }
     }
 }
@@ -858,6 +895,84 @@ mod tests {
             .open_file("idx_0003.db", true, true, OpenHint::ImmutableRandom)
             .unwrap();
         assert!(!f1.is_descriptor_open());
+    }
+
+    #[test]
+    fn handle_pool_reclaims_multiple_excess_handles_and_uses_clock_second_chance() {
+        // 1. Multiple excess dirty handles that later sync must all drain back to <= cap on the
+        // next open (rather than leaking above cap one-by-one).
+        let tmp = TempTestDir::new("handle_pool_multi_excess");
+        let fs = UnixPlatformFs::open_with_pool_cap(&tmp.path, true, 2).expect("open fs");
+
+        let f1 = fs
+            .open_file("idx_0001.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f1.write_all_at(b"a", 0).unwrap();
+        let f2 = fs
+            .open_file("idx_0002.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f2.write_all_at(b"b", 0).unwrap();
+        let f3 = fs
+            .open_file("idx_0003.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f3.write_all_at(b"c", 0).unwrap();
+        assert_eq!(open_count(&[&f1, &f2, &f3]), 3);
+
+        f1.sync_durable().unwrap();
+        f2.sync_durable().unwrap();
+        f3.sync_durable().unwrap();
+
+        let f4 = fs
+            .open_file("idx_0004.db", true, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        f4.write_all_at(b"d", 0).unwrap();
+        f4.sync_durable().unwrap();
+        assert!(
+            open_count(&[&f1, &f2, &f3, &f4]) <= 2,
+            "open count exceeded cap after clean drain: {}",
+            open_count(&[&f1, &f2, &f3, &f4])
+        );
+
+        // 2. CLOCK second-chance: touch older handle `h1` after a sweep cleared reference bits,
+        // so opening `h4` grants `h1` a second chance and evicts newer untouched `h2` instead.
+        let tmp2 = TempTestDir::new("handle_pool_clock_second_chance");
+        let fs2 = UnixPlatformFs::open_with_pool_cap(&tmp2.path, true, 3).expect("open fs2");
+        let mk_clean = |name: &str, data: &[u8]| {
+            let f = fs2
+                .open_file(name, true, true, OpenHint::ImmutableRandom)
+                .unwrap();
+            f.write_all_at(data, 0).unwrap();
+            f.sync_durable().unwrap();
+            f
+        };
+        let h0 = mk_clean("idx_0010.db", b"h0");
+        let h1 = mk_clean("idx_0011.db", b"h1");
+        let h2 = mk_clean("idx_0012.db", b"h2");
+        // Opening h3 clears reference bits on h0..h2 and evicts h0, leaving clock_hand at h1 and
+        // h1/h2 unreferenced.
+        let h3 = mk_clean("idx_0013.db", b"h3");
+        assert!(!h0.is_descriptor_open());
+        assert!(h1.is_descriptor_open());
+        assert!(h2.is_descriptor_open());
+        assert!(h3.is_descriptor_open());
+
+        // Reading h1 sets its reference bit without touching h2.
+        let mut buf = [0u8; 2];
+        h1.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"h1");
+
+        // Opening h4 must give h1 a second chance and evict h2 instead.
+        let h4 = mk_clean("idx_0014.db", b"h4");
+        assert!(
+            h1.is_descriptor_open(),
+            "referenced h1 should receive CLOCK second chance"
+        );
+        assert!(
+            !h2.is_descriptor_open(),
+            "unreferenced h2 should be evicted before recently read h1"
+        );
+        assert!(h3.is_descriptor_open());
+        assert!(h4.is_descriptor_open());
     }
 
     #[test]
