@@ -478,28 +478,45 @@ impl PlatformFile for UnixPlatformFile {
 
     fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
         let current_len = self.file_len()?;
-        if current_len < target_len {
-            let _guard = self.mark_write_start();
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(len_i64) = i64::try_from(target_len) {
-                    self.with_file(|f| {
-                        fallocate_or_fallback(
-                            || unsafe { posix_fallocate(f.as_raw_fd(), 0, len_i64) },
-                            || f.set_len(target_len),
-                        )
-                    })?;
-                } else {
+        if current_len >= target_len {
+            return Ok(());
+        }
+
+        match strategy {
+            PreallocStrategy::LogicalExtendOnly => {
+                let _guard = self.mark_write_start();
+                let extend_len = target_len - current_len;
+                #[cfg(target_os = "linux")]
+                {
+                    if let (Ok(off_i64), Ok(len_i64)) =
+                        (i64::try_from(current_len), i64::try_from(extend_len))
+                    {
+                        self.with_file(|f| {
+                            fallocate_or_fallback(
+                                || unsafe { posix_fallocate(f.as_raw_fd(), off_i64, len_i64) },
+                                || f.set_len(target_len),
+                            )
+                        })?;
+                    } else {
+                        self.with_file(|f| f.set_len(target_len))?;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
                     self.with_file(|f| f.set_len(target_len))?;
                 }
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                self.with_file(|f| f.set_len(target_len))?;
+            PreallocStrategy::PhysicalZeroFill => {
+                super::preallocate_physical_zero_fill_with_rollback(
+                    self,
+                    current_len,
+                    target_len,
+                    |len| {
+                        let _guard = self.mark_write_start();
+                        let _ = self.with_file(|f| f.set_len(len));
+                    },
+                )?;
             }
-        }
-        if strategy == PreallocStrategy::PhysicalZeroFill && current_len < target_len {
-            super::preallocate_physical_zero_fill(self, current_len, target_len)?;
         }
         Ok(())
     }

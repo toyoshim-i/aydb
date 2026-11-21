@@ -73,6 +73,7 @@ const ERROR_IO_PENDING: DWORD = 997;
 const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x02;
 
 // FILE_INFO_BY_HANDLE_CLASS discriminants
+const FILE_ALLOCATION_INFO_CLASS: i32 = 5;
 const FILE_END_OF_FILE_INFO_CLASS: i32 = 6;
 const FILE_IO_PRIORITY_HINT_INFO_CLASS: i32 = 13;
 
@@ -86,6 +87,11 @@ struct Overlapped {
     offset: u32,
     offset_high: u32,
     h_event: HANDLE,
+}
+
+#[repr(C)]
+struct FileAllocationInfo {
+    allocation_size: i64,
 }
 
 #[repr(C)]
@@ -321,6 +327,27 @@ impl WinPlatformFile {
         Ok((Self { handle }, already_existed))
     }
 
+    fn set_allocation_size(&self, target_len: u64) -> io::Result<()> {
+        let len_i64 = i64::try_from(target_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "file size exceeds i64::MAX")
+        })?;
+        let info = FileAllocationInfo {
+            allocation_size: len_i64,
+        };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                self.handle,
+                FILE_ALLOCATION_INFO_CLASS,
+                (&info as *const FileAllocationInfo).cast(),
+                core::mem::size_of::<FileAllocationInfo>() as DWORD,
+            )
+        };
+        if ok == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn set_eof(&self, target_len: u64) -> io::Result<()> {
         let len_i64 = i64::try_from(target_len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "file size exceeds i64::MAX")
@@ -513,14 +540,29 @@ impl PlatformFile for WinPlatformFile {
         if current_len >= target_len {
             return Ok(());
         }
+        let _ = i64::try_from(target_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "file size exceeds i64::MAX")
+        })?;
 
-        // 1. Set logical EndOfFile (reserves clusters on NTFS).
-        self.set_eof(target_len)?;
-
-        // 2. If PhysicalZeroFill is requested, write zeros sequentially across [current_len, target_len)
-        //    so NTFS ValidDataLength (VDL) advances all the way to `target_len`.
-        if strategy == PreallocStrategy::PhysicalZeroFill {
-            super::preallocate_physical_zero_fill(self, current_len, target_len)?;
+        match strategy {
+            PreallocStrategy::LogicalExtendOnly => {
+                // Set logical EndOfFile (reserves clusters on NTFS lazily via VDL).
+                self.set_eof(target_len)?;
+            }
+            PreallocStrategy::PhysicalZeroFill => {
+                // Best-effort contiguous cluster reservation without advancing logical EOF yet.
+                let _ = self.set_allocation_size(target_len);
+                // Write physical zeros across [current_len, target_len) so NTFS ValidDataLength
+                // reaches `target_len`. Roll back logical EOF to `current_len` on failure.
+                super::preallocate_physical_zero_fill_with_rollback(
+                    self,
+                    current_len,
+                    target_len,
+                    |len| {
+                        let _ = self.set_eof(len);
+                    },
+                )?;
+            }
         }
 
         Ok(())
@@ -752,5 +794,40 @@ mod tests {
         shared.read_exact_at(&mut b, 4096).unwrap();
         assert_eq!(&b, b"hello-world");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn set_allocation_size_preserves_eof_and_physical_zero_fill_extends_cleanly() {
+        let dir = crate::util::test_util::TempTestDir::new("win_alloc_size");
+        let fs = WinPlatformFs::open(&dir.path, true).unwrap();
+        let file = fs
+            .open_file("wal_sync.db", true, true, OpenHint::MutableSyncLog)
+            .unwrap();
+
+        // Reserving cluster allocation does not advance logical EOF.
+        file.set_allocation_size(64 * 1024).unwrap();
+        assert_eq!(file.file_len().unwrap(), 0);
+
+        // Rolling back EOF after a simulated partial write restores `current_len` on disk.
+        file.set_eof(8192).unwrap();
+        assert_eq!(file.file_len().unwrap(), 8192);
+        file.set_eof(4096).unwrap();
+        assert_eq!(file.file_len().unwrap(), 4096);
+
+        // Extending via PhysicalZeroFill reaches `target_len` with physical zero bytes.
+        file.preallocate(64 * 1024, PreallocStrategy::PhysicalZeroFill)
+            .unwrap();
+        assert_eq!(file.file_len().unwrap(), 64 * 1024);
+
+        let mut buf = vec![0xA5u8; 64 * 1024];
+        file.read_exact_at(&mut buf, 0).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+
+        // Oversized target length is rejected upfront without changing file_len.
+        let err = file
+            .preallocate(u64::MAX, PreallocStrategy::PhysicalZeroFill)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(file.file_len().unwrap(), 64 * 1024);
     }
 }

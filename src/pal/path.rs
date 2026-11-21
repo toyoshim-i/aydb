@@ -43,34 +43,57 @@ fn clean_lexical_path(path: &Path) -> PathBuf {
     out
 }
 
+#[cfg(windows)]
+fn push_collapsed_backslashes(out: &mut Vec<u16>, rest: &[u16]) {
+    let sep = b'\\' as u16;
+    for &unit in rest {
+        if unit == sep && out.last().copied() == Some(sep) {
+            continue;
+        }
+        out.push(unit);
+    }
+}
+
 /// Ensures that a Windows path uses the `\\?\` or `\\?\UNC\` extended-length prefix.
+/// Normalizes any `/` separators to `\` before constructing or preserving the prefix because
+/// Win32 extended-length paths disable automatic slash translation.
 /// On non-Windows platforms, returns the path unchanged.
 #[cfg(windows)]
 pub fn ensure_extended_length_prefix(path: PathBuf) -> PathBuf {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    for unit in &mut wide {
+        if *unit == b'/' as u16 {
+            *unit = b'\\' as u16;
+        }
+    }
+
+    let sep = b'\\' as u16;
     // Already starts with `\\?\` or `\\.\`
     if wide.len() >= 4
-        && wide[0] == b'\\' as u16
-        && wide[1] == b'\\' as u16
+        && wide[0] == sep
+        && wide[1] == sep
         && (wide[2] == b'?' as u16 || wide[2] == b'.' as u16)
-        && wide[3] == b'\\' as u16
+        && wide[3] == sep
     {
-        return path;
+        let mut out = Vec::with_capacity(wide.len());
+        out.extend_from_slice(&wide[..4]);
+        push_collapsed_backslashes(&mut out, &wide[4..]);
+        return PathBuf::from(OsString::from_wide(&out));
     }
 
     // UNC path `\\server\share\...` -> `\\?\UNC\server\share\...`
-    if wide.len() >= 2 && wide[0] == b'\\' as u16 && wide[1] == b'\\' as u16 {
+    if wide.len() >= 2 && wide[0] == sep && wide[1] == sep {
         let mut out: Vec<u16> = "\\\\?\\UNC\\".encode_utf16().collect();
-        out.extend_from_slice(&wide[2..]);
+        push_collapsed_backslashes(&mut out, &wide[2..]);
         return PathBuf::from(OsString::from_wide(&out));
     }
 
     // Standard drive-letter path `C:\...` -> `\\?\C:\...`
     let mut out: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-    out.extend_from_slice(&wide);
+    push_collapsed_backslashes(&mut out, &wide);
     PathBuf::from(OsString::from_wide(&out))
 }
 
@@ -161,5 +184,39 @@ mod tests {
             .expect("normalize_db_root_path must create paths > 260 chars");
         assert!(normalized.exists());
         let _ = std::fs::remove_dir_all(&base_prefixed);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ensure_extended_length_prefix_normalizes_mixed_slash_unc_and_drive_paths() {
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from("//server/share/aydb")),
+            PathBuf::from(r"\\?\UNC\server\share\aydb")
+        );
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from(r"\\server/share/dir//sub")),
+            PathBuf::from(r"\\?\UNC\server\share\dir\sub")
+        );
+        let cleaned = clean_lexical_path(Path::new("//server/share/a/../b"));
+        assert_eq!(
+            ensure_extended_length_prefix(cleaned),
+            PathBuf::from(r"\\?\UNC\server\share\b")
+        );
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from("//?/UNC/server/share/aydb")),
+            PathBuf::from(r"\\?\UNC\server\share\aydb")
+        );
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from(r"\\?\C:/foo//bar")),
+            PathBuf::from(r"\\?\C:\foo\bar")
+        );
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from("C:/foo/bar")),
+            PathBuf::from(r"\\?\C:\foo\bar")
+        );
+        assert_eq!(
+            ensure_extended_length_prefix(PathBuf::from(r"\\.\C:/foo")),
+            PathBuf::from(r"\\.\C:\foo")
+        );
     }
 }

@@ -148,6 +148,21 @@ pub(crate) fn preallocate_physical_zero_fill<F: PlatformFile + ?Sized>(
     file.sync_durable()
 }
 
+/// Zero-fills `[current_len, target_len)` and syncs durably, invoking `rollback(current_len)`
+/// if any write or sync fails so a subsequent retry does not see an unzeroed file at `target_len`.
+pub(crate) fn preallocate_physical_zero_fill_with_rollback<F: PlatformFile + ?Sized>(
+    file: &F,
+    current_len: u64,
+    target_len: u64,
+    rollback: impl FnOnce(u64),
+) -> io::Result<()> {
+    if let Err(err) = preallocate_physical_zero_fill(file, current_len, target_len) {
+        rollback(current_len);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Coalesces adjacent or nearby non-overlapping positional read requests into larger contiguous
 /// physical reads (`<= 64 KB` span with gaps `<= 16 KB`) to minimize kernel transitions.
 pub(crate) fn coalesced_read_many_at<F: PlatformFile + ?Sized>(
@@ -496,5 +511,106 @@ mod tests {
             ),
             "unexpected error kind: {err:?}"
         );
+    }
+
+    #[test]
+    fn preallocate_physical_zero_fill_rolls_back_eof_on_error_and_allows_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailNthWriteFile {
+            inner: Arc<OsFile>,
+            writes: AtomicUsize,
+            fail_on: AtomicUsize,
+        }
+
+        impl PlatformFile for FailNthWriteFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.fail_on.load(Ordering::Relaxed) == n {
+                    return Err(io::Error::other("injected ENOSPC"));
+                }
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                let current_len = self.file_len()?;
+                if current_len >= target_len {
+                    return Ok(());
+                }
+                if strategy == PreallocStrategy::LogicalExtendOnly {
+                    return self.inner.preallocate(target_len, strategy);
+                }
+                preallocate_physical_zero_fill_with_rollback(self, current_len, target_len, |len| {
+                    let _ = len;
+                })
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        let tmp = TempTestDir::new("prealloc_rollback");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let inner = fs
+            .open_file("wal_sync.db", true, true, OpenHint::MutableSyncLog)
+            .expect("open file");
+        inner
+            .preallocate(4096, PreallocStrategy::PhysicalZeroFill)
+            .unwrap();
+        let seed_data = [0x5Au8; 4096];
+        inner.write_all_at(&seed_data, 0).unwrap();
+        inner.sync_durable().unwrap();
+
+        let wrapped = FailNthWriteFile {
+            inner: Arc::clone(&inner),
+            writes: AtomicUsize::new(0),
+            fail_on: AtomicUsize::new(2),
+        };
+
+        // Writing [4096, 512 * 1024) spans two 256 KB write_all_at calls; the second fails.
+        let target_len = 512 * 1024u64;
+        let current_len = wrapped.file_len().unwrap();
+        assert_eq!(current_len, 4096);
+
+        let rollback_target = std::sync::Mutex::new(None);
+        let err = preallocate_physical_zero_fill_with_rollback(
+            &wrapped,
+            current_len,
+            target_len,
+            |len| {
+                *rollback_target.lock().unwrap() = Some(len);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(*rollback_target.lock().unwrap(), Some(4096));
+
+        // On real OsFile retry, preallocating to `target_len` zero-fills completely.
+        inner
+            .preallocate(target_len, PreallocStrategy::PhysicalZeroFill)
+            .unwrap();
+        assert_eq!(inner.file_len().unwrap(), target_len);
+
+        let mut head = [0u8; 4096];
+        inner.read_exact_at(&mut head, 0).unwrap();
+        assert_eq!(head, seed_data);
+
+        let mut tail = vec![0xFFu8; (target_len - 4096) as usize];
+        inner.read_exact_at(&mut tail, 4096).unwrap();
+        assert!(tail.iter().all(|&b| b == 0));
     }
 }
