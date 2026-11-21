@@ -3259,3 +3259,130 @@ fn i64_min_float_stays_real_on_coercion_and_matches_integer_in_lookups_and_uniqu
         assert!(bad_rowid.execute(&[SqlValue::Float(min_f64)]).is_err());
     }
 }
+
+#[test]
+fn collate_nocase_embedded_nul_matches_native_sqlite() {
+    let tmp = TempTestDir::new("nocase_embedded_nul");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_pk USING aydb(
+            columns='k TEXT PRIMARY KEY COLLATE NOCASE, v INT'
+         );
+         CREATE TABLE nat_pk(k TEXT PRIMARY KEY COLLATE NOCASE, v INT);
+         CREATE VIRTUAL TABLE ay_sec USING aydb(
+            columns='id INTEGER PRIMARY KEY, u TEXT UNIQUE COLLATE NOCASE, s TEXT COLLATE NOCASE',
+            indexes='s'
+         );
+         CREATE TABLE nat_sec(id INTEGER PRIMARY KEY, u TEXT UNIQUE COLLATE NOCASE, s TEXT COLLATE NOCASE);
+         CREATE INDEX nat_sec_s ON nat_sec(s COLLATE NOCASE);",
+    )
+    .unwrap();
+
+    // Exact Astra-2 reproduction: 'a'||char(0)||'b' matches 'a'||char(0)||'c' under COLLATE NOCASE
+    // and rejects inserting 'a'||char(0)||'c' as a duplicate primary / unique key.
+    for tbl in ["ay_pk", "nat_pk"] {
+        conn.execute_batch(&format!("INSERT INTO {tbl} VALUES ('a'||char(0)||'b', 1);"))
+            .unwrap();
+        assert!(
+            conn.execute_batch(&format!("INSERT INTO {tbl} VALUES ('A'||char(0)||'c', 2);"))
+                .is_err(),
+            "{tbl} must reject duplicate COLLATE NOCASE key differing only after NUL"
+        );
+    }
+
+    assert_eq!(
+        conn.query_all(
+            "SELECT hex(k), v FROM ay_pk WHERE k = ('a'||char(0)||'c')",
+            &[]
+        )
+        .unwrap(),
+        conn.query_all(
+            "SELECT hex(k), v FROM nat_pk WHERE k = ('a'||char(0)||'c')",
+            &[]
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        conn.query_all("SELECT v FROM ay_pk WHERE k = ('a'||char(0)||'c')", &[])
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Distinct lengths after NUL must stay distinct and sort in SQLite COLLATE NOCASE order.
+    for (idx, expr) in [
+        "('a'||char(0))",
+        "'a'",
+        "('a'||char(0)||'bb')",
+        "'aa'",
+        "'b'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let row_num = idx + 2;
+        for tbl in ["ay_pk", "nat_pk"] {
+            conn.execute_batch(&format!("INSERT INTO {tbl} VALUES ({expr}, {row_num});"))
+                .unwrap();
+        }
+    }
+
+    for tmpl in [
+        "SELECT hex(k), v FROM {tbl} ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k < ('a'||char(0)||'c') ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k <= ('a'||char(0)||'c') ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k > ('a'||char(0)||'b') ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k >= ('a'||char(0)||'c') ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k < 'aa' ORDER BY k",
+        "SELECT v FROM {tbl} WHERE k > 'a' ORDER BY k",
+    ] {
+        let got_a = conn
+            .query_all(&tmpl.replace("{tbl}", "ay_pk"), &[])
+            .unwrap();
+        let got_n = conn
+            .query_all(&tmpl.replace("{tbl}", "nat_pk"), &[])
+            .unwrap();
+        assert_eq!(got_a, got_n, "mismatch on `{tmpl}`");
+    }
+
+    // Also verify UNIQUE + secondary index columns with COLLATE NOCASE and embedded NUL.
+    for tbl in ["ay_sec", "nat_sec"] {
+        conn.execute_batch(&format!(
+            "INSERT INTO {tbl} VALUES (1, 'a'||char(0)||'b', 'X'||char(0)||'y');"
+        ))
+        .unwrap();
+        assert!(
+            conn.execute_batch(&format!(
+                "INSERT INTO {tbl} VALUES (2, 'A'||char(0)||'c', 'z');"
+            ))
+            .is_err(),
+            "{tbl} must reject duplicate UNIQUE COLLATE NOCASE key differing only after NUL"
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO {tbl} VALUES (2, 'a'||char(0), 'x'||char(0));
+             INSERT INTO {tbl} VALUES (3, 'a', 'x');"
+        ))
+        .unwrap();
+    }
+
+    for tmpl in [
+        "SELECT id FROM {tbl} WHERE u = ('A'||char(0)||'z')",
+        "SELECT id FROM {tbl} WHERE s = ('x'||char(0)||'q')",
+        "SELECT id FROM {tbl} WHERE s >= ('x'||char(0)||'b') ORDER BY id",
+    ] {
+        let got_a = conn
+            .query_all(&tmpl.replace("{tbl}", "ay_sec"), &[])
+            .unwrap();
+        let got_n = conn
+            .query_all(&tmpl.replace("{tbl}", "nat_sec"), &[])
+            .unwrap();
+        assert_eq!(got_a, got_n, "mismatch on `{tmpl}`");
+    }
+}

@@ -102,7 +102,13 @@ impl ColCollation {
         match self {
             Self::Binary => out.extend_from_slice(bytes),
             Self::NoCase => {
-                out.extend(bytes.iter().map(|b| b.to_ascii_lowercase()));
+                out.reserve(bytes.len());
+                if let Some(nul_pos) = bytes.iter().position(|&b| b == 0) {
+                    out.extend(bytes[..nul_pos].iter().map(|b| b.to_ascii_lowercase()));
+                    out.resize(out.len() + (bytes.len() - nul_pos), 0);
+                } else {
+                    out.extend(bytes.iter().map(|b| b.to_ascii_lowercase()));
+                }
             }
             Self::RTrim => {
                 let mut end = bytes.len();
@@ -1283,6 +1289,25 @@ mod tests {
         let mut out = Vec::new();
         ColCollation::NoCase.push_normalized_text(b"AlIcE_123!", &mut out);
         assert_eq!(out, b"alice_123!");
+
+        let mut nul_b = Vec::new();
+        let mut nul_c = Vec::new();
+        let mut nul_short = Vec::new();
+        let mut plain_a = Vec::new();
+        let mut nul_bb = Vec::new();
+        let mut plain_aa = Vec::new();
+        ColCollation::NoCase.push_normalized_text(b"a\0b", &mut nul_b);
+        ColCollation::NoCase.push_normalized_text(b"A\0c", &mut nul_c);
+        ColCollation::NoCase.push_normalized_text(b"a\0", &mut nul_short);
+        ColCollation::NoCase.push_normalized_text(b"a", &mut plain_a);
+        ColCollation::NoCase.push_normalized_text(b"a\0bb", &mut nul_bb);
+        ColCollation::NoCase.push_normalized_text(b"aa", &mut plain_aa);
+        assert_eq!(nul_b, b"a\0\0");
+        assert_eq!(nul_b, nul_c);
+        assert!(plain_a < nul_short);
+        assert!(nul_short < nul_b);
+        assert!(nul_b < nul_bb);
+        assert!(nul_bb < plain_aa);
 
         out.clear();
         ColCollation::RTrim.push_normalized_text(b"hello   ", &mut out);

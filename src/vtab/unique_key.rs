@@ -41,7 +41,7 @@ pub(crate) struct UniqueDef {
 
 impl UniqueDef {
     /// Marker format version.
-    const MARKER_VERSION: u8 = 1;
+    const MARKER_VERSION: u8 = 2;
 
     pub(crate) fn new(cols: Vec<(usize, ColCollation, ColumnAffinity)>) -> Self {
         Self { cols }
@@ -66,7 +66,7 @@ impl UniqueDef {
         self.cols.is_empty()
     }
 
-    /// `[ver = 1][n u16 BE][(col_idx u16 BE, collation u8, affinity u8) * n]`.
+    /// `[ver = 2][n u16 BE][(col_idx u16 BE, collation u8, affinity u8) * n]`.
     pub(crate) fn marker_value(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(3 + self.cols.len() * 4);
         out.push(Self::MARKER_VERSION);
@@ -532,6 +532,13 @@ mod tests {
             text("A"),
             text("a "),
             text("a  "),
+            text("a\0b"),
+            text("a\0c"),
+            text("A\0b"),
+            text("a\0"),
+            text("a\0\0"),
+            text("a\0bb"),
+            text("aa"),
             text("10"),
             text("10.0"),
             text(" 10"),
