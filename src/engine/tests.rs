@@ -4916,6 +4916,64 @@ fn failed_group_flush_poisons_the_engine_and_fails_every_waiter() {
 }
 
 #[test]
+fn poisoned_engine_refuses_pending_group_drain_and_finish_group_flush() {
+    let tmp = TempTestDir::new("poisoned_group_bypass");
+    let mut engine = open_group_engine(&tmp);
+    let ticket = commit_into_group(&mut engine, 1, b"a", b"1");
+    let GroupRole::Lead(target) = ticket.2.join_group(ticket.0).unwrap() else {
+        panic!("this commit must lead");
+    };
+
+    // Simulate an unrelated write failure poisoning the engine while the leader synced.
+    let _ = engine.poison(io::Error::other("simulated prior wal failure"));
+
+    assert!(engine.finish_group_flush(target, Ok(())).is_err());
+    assert!(engine.drain_group_for_autocommit().is_err());
+    assert!(
+        engine
+            .reconcile_unique_keys(1, b"a", &[], WriteDurability::BufferedFast)
+            .is_err()
+    );
+    assert!(
+        engine
+            .plan_assign_rowid(1, b"a", 1, |_, _| Ok(false))
+            .is_err()
+    );
+    assert!(engine.plan_set_rowid(1, b"a", 1).is_err());
+
+    assert!(!engine.pending_group.is_empty());
+    assert_eq!(row_visible_to(&engine, 9, b"a"), None);
+    assert!(ticket.2.join_group(ticket.0).is_err());
+}
+
+#[test]
+fn group_commit_leader_guard_wakes_followers_on_unwind() {
+    let tmp = TempTestDir::new("group_leader_unwind");
+    let mut engine = open_group_engine(&tmp);
+    let first = commit_into_group(&mut engine, 1, b"a", b"1");
+    let second = commit_into_group(&mut engine, 2, b"b", b"2");
+    let GroupRole::Lead(_) = first.2.join_group(first.0).unwrap() else {
+        panic!("expected leader role");
+    };
+
+    let follower_gate = Arc::clone(&second.2);
+    let follower_lsn = second.0;
+    let handle = std::thread::spawn(move || follower_gate.join_group(follower_lsn));
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = first.2.leader_guard();
+        panic!("simulated leader panic during sync_barrier");
+    }));
+    assert!(res.is_err());
+
+    let follower_res = handle.join().unwrap();
+    assert!(
+        follower_res.is_err(),
+        "abandoned leader must fail followers instead of hanging"
+    );
+}
+
+#[test]
 fn memtable_flush_includes_commits_still_waiting_for_their_group_flush() {
     let tmp = TempTestDir::new("group_flush_memtable");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());

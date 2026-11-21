@@ -2745,12 +2745,18 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 match gate.join_group(lsn)? {
                     GroupRole::Durable => break Ok(()),
                     GroupRole::Lead(target) => {
+                        let mut leader_guard = gate.leader_guard();
                         let flushed = file.sync_barrier();
                         match vtab.engine.write() {
-                            Ok(mut eng) => eng.finish_group_flush(target, flushed)?,
+                            Ok(mut eng) => {
+                                let res = eng.finish_group_flush(target, flushed);
+                                leader_guard.disarm();
+                                res?;
+                            }
                             Err(_) => {
                                 let e = io::Error::other("engine lock poisoned");
                                 gate.abandon_flush(&e);
+                                leader_guard.disarm();
                                 break Err(e);
                             }
                         }

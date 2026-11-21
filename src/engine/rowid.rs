@@ -105,6 +105,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         preferred: i64,
         reserved: impl Fn(&Self, i64) -> io::Result<bool>,
     ) -> io::Result<(i64, Vec<WalRecord>)> {
+        self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         if let Some(rowid) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             return Ok((rowid, Vec::new()));
@@ -161,6 +162,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         rowid: i64,
     ) -> io::Result<Vec<WalRecord>> {
+        self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         let mut records = Vec::new();
         if let Some(old) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {

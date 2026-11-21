@@ -132,6 +132,38 @@ impl CommitGate {
     pub(crate) fn abandon_flush(&self, error: &io::Error) {
         self.fail(error);
     }
+
+    /// Returns a RAII guard that calls [`Self::abandon_flush`] if the flush leader unwinds before
+    /// disarming it after [`StorageEngine::finish_group_flush`].
+    pub(crate) fn leader_guard(&self) -> CommitLeaderGuard<'_> {
+        CommitLeaderGuard {
+            gate: self,
+            armed: true,
+        }
+    }
+}
+
+/// Ensures a panicked or early-returning group-commit flush leader clears `leader_active` so
+/// waiting followers never hang indefinitely.
+pub(crate) struct CommitLeaderGuard<'a> {
+    gate: &'a CommitGate,
+    armed: bool,
+}
+
+impl CommitLeaderGuard<'_> {
+    #[inline]
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommitLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate
+                .abandon_flush(&io::Error::other("group-commit leader aborted"));
+        }
+    }
 }
 
 /// Outcome of [`StorageEngine::begin_commit_for_conn`].
@@ -637,6 +669,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
     /// the transaction is discarded from memory.
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
+        if let Err(e) = self.check_not_poisoned() {
+            if self.tx_depth > 0 {
+                let _ = self.rollback_transaction();
+            }
+            return Err(e);
+        }
         match flushed {
             Ok(()) => {
                 // The flush ran after the batch was written and no other append can have
@@ -662,6 +700,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         target: u64,
         flushed: io::Result<()>,
     ) -> io::Result<()> {
+        if let Err(e) = self.check_not_poisoned() {
+            self.commit_gate.fail(&e);
+            return Err(e);
+        }
         match flushed {
             Ok(()) => {
                 // Only batches up to `target` were written when the flush started.
@@ -683,6 +725,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// MemTable, or write to it directly call this first, because they rely on the MemTable
     /// holding all earlier commits.
     pub(super) fn drain_pending_durable(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         let Some(&(target, _)) = self.pending_group.back() else {
             return Ok(());
         };
