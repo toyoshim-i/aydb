@@ -7835,3 +7835,108 @@ fn evict_until_within_quota_batches_window_evictions_and_promotions_into_single_
     let ct = reopened.capped_table_state(7).unwrap();
     assert!(!ct.is_over_quota());
 }
+
+#[test]
+fn multi_chunk_sync_transaction_uses_single_wal_barrier_and_recovers_cleanly() {
+    let tmp = TempTestDir::new("ph5_multi_chunk_single_barrier");
+    let (fs, _, barrier_counts) = CountedFs::open_counted(&tmp.path);
+
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 1024 * 1024;
+    cfg.max_transaction_bytes = 16 * 1024 * 1024;
+    cfg.memtable_capacity_bytes = 16 * 1024 * 1024;
+
+    // 1. Multi-chunk transaction (~1.65 MB of inline rows -> 4 chunks) must issue only ONE `wal_sync` barrier.
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine.begin_transaction();
+        for i in 0..550u32 {
+            let pk = format!("chunk_{i:03}");
+            let val = vec![(i as u8).wrapping_add(1); 3_000];
+            engine
+                .put_row(
+                    1,
+                    pk.as_bytes(),
+                    &val,
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+        }
+        engine
+            .prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .unwrap();
+        let lsn_before_flush = engine.next_lsn;
+        barrier_counts.lock().unwrap().clear();
+        engine.commit_transaction().unwrap();
+
+        let wal_sync_barriers = barrier_counts
+            .lock()
+            .unwrap()
+            .get(crate::wal::WAL_SYNC_FILE_NAME)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            wal_sync_barriers, 1,
+            "multi-chunk SyncTransactional commit must issue only one wal_sync barrier on the final chunk"
+        );
+        assert!(
+            engine.next_lsn - lsn_before_flush >= 3,
+            "multi-chunk commit must emit multiple chunk batches (TxBegin + middle + TxCommit), got {}",
+            engine.next_lsn - lsn_before_flush
+        );
+        assert!(engine.idx_segments.is_empty());
+    }
+
+    // Reopen and verify every row from all chunks recovered cleanly from `wal_sync.db`.
+    {
+        let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        for i in 0..550u32 {
+            let pk = format!("chunk_{i:03}");
+            let expected = vec![(i as u8).wrapping_add(1); 3_000];
+            assert_eq!(
+                reopened.get_row(1, pk.as_bytes()).unwrap(),
+                Some(expected),
+                "reopen must replay multi-chunk row {pk}"
+            );
+        }
+
+        // 2. Exact 2-chunk boundary (~525 KB > 512 KB): only `TxBegin` + `TxCommit`, still 1 barrier.
+        reopened.begin_transaction();
+        for i in 0..176u32 {
+            let pk = format!("two_{i:03}");
+            let val = vec![(i as u8).wrapping_add(11); 3_000];
+            reopened
+                .put_row(
+                    1,
+                    pk.as_bytes(),
+                    &val,
+                    &[],
+                    WriteDurability::SyncTransactional,
+                )
+                .unwrap();
+        }
+        reopened
+            .prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .unwrap();
+        let lsn_before_flush = reopened.next_lsn;
+        barrier_counts.lock().unwrap().clear();
+        reopened.commit_transaction().unwrap();
+
+        let wal_sync_barriers = barrier_counts
+            .lock()
+            .unwrap()
+            .get(crate::wal::WAL_SYNC_FILE_NAME)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(wal_sync_barriers, 1);
+        assert_eq!(reopened.next_lsn - lsn_before_flush, 2);
+    }
+
+    let mut reopened2 = StorageEngine::open(fs, cfg).unwrap();
+    for i in 0..176u32 {
+        let pk = format!("two_{i:03}");
+        let expected = vec![(i as u8).wrapping_add(11); 3_000];
+        assert_eq!(reopened2.get_row(1, pk.as_bytes()).unwrap(), Some(expected));
+    }
+}
