@@ -797,7 +797,63 @@ fn a_file_left_over_from_an_older_epoch_is_read_one_window_at_most() {
     let reads = counting.reads.load(std::sync::atomic::Ordering::Relaxed);
     let bytes = counting.bytes.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reads, 1);
-    assert!(bytes <= 64 * WAL_SECTOR_SIZE, "read {bytes} bytes");
+    assert_eq!(bytes, WAL_SECTOR_SIZE, "read {bytes} bytes");
+}
+
+#[test]
+fn clean_reopen_probes_only_first_sector_and_fragmented_sector0_still_recovers() {
+    // 1. All-zero Sector 0 under StopAtEndOfLog issues only a single 4 KB read.
+    let tmp = TempTestDir::new("wal_sector0_probe");
+    let fs = OsFs::open(&tmp.path, true).unwrap();
+    {
+        let w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            1024 * 1024,
+            1,
+            WalStreamMode::BufferedImmediateOsCache,
+        )
+        .unwrap();
+        let counting = CountingFile {
+            inner: Arc::clone(w.file()),
+            reads: Default::default(),
+            bytes: Default::default(),
+        };
+        let rec = recover_single_wal_stream(&counting, 1).unwrap();
+        assert!(rec.batches.is_empty());
+        assert_eq!(counting.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            counting.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            WAL_SECTOR_SIZE
+        );
+    }
+
+    // 2. A fragmented multi-sector batch beginning in Sector 0 and ending in Sector 2 recovers
+    // cleanly across the Sector-0 stack probe to window-loop handoff.
+    let tmp_frag = TempTestDir::new("wal_sector0_frag_handoff");
+    let fs_frag = OsFs::open(&tmp_frag.path, true).unwrap();
+    let mut w = WalStreamWriter::open(
+        &fs_frag,
+        WAL_BUF_FILE_NAME,
+        1024 * 1024,
+        1,
+        WalStreamMode::BufferedImmediateOsCache,
+    )
+    .unwrap();
+    let big_batch = WalBatch {
+        lsn: 42,
+        prev_lsn: 41,
+        durable_lsn: 41,
+        records: vec![WalRecord::PutInline {
+            key: b"\x00\x01rbig".to_vec(),
+            value: vec![0xAB; 10_000],
+        }],
+    };
+    w.append_batch(&big_batch).unwrap();
+    w.seal_open_sector_for_durability().unwrap();
+    let rec = recover_single_wal_stream(&**w.file(), 1).unwrap();
+    assert_eq!(rec.batches, vec![big_batch]);
+    assert_eq!(rec.corrupt_sectors, 0);
 }
 
 /// A four-chunk transaction (begin, two middles, commit) plus plain batches around it.
@@ -901,11 +957,16 @@ fn a_lost_batch_at_the_watermark_is_damage_although_the_chain_names_a_later_cut(
 
 #[test]
 fn full_scan_reads_past_zeroed_and_older_epoch_sectors() {
-    for kind in ["zeroed", "older_epoch"] {
+    for kind in ["zeroed", "older_epoch", "corrupt_older_epoch"] {
         let l = sync_log_of_three(&format!("wal_full_{kind}"));
         match kind {
             "zeroed" => Logs::zero(&l.sync, 1),
             "older_epoch" => set_epoch(&l.sync, 1, 0, true),
+            "corrupt_older_epoch" => {
+                // Corrupt payload + CRC while leaving epoch != current: FullScan must skip CRC32C
+                // on non-current epoch sectors and still discover intact current-epoch batches.
+                set_epoch(&l.sync, 1, 0, false);
+            }
             _ => unreachable!(),
         }
 

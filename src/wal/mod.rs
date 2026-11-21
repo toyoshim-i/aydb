@@ -959,25 +959,41 @@ enum SectorScan {
 /// `partial` carries a batch whose first fragments lie in earlier sectors. With `lenient` set
 /// (after the scan has already stopped once) a continuation fragment without its start is
 /// skipped instead of being corruption: its batch began in a sector that was lost.
+///
+/// When `verify_other_epoch_crc` is `false` (used by [`WalScanMode::FullScan`], which continues
+/// scanning after any non-current sector regardless of whether it was intact or torn), mismatched-
+/// epoch and all-zero older-epoch sectors return [`SectorScan::OtherEpoch`] immediately without a
+/// 4 KB zero scan or CRC32C calculation.
 fn scan_sector(
     sector: &[u8],
     expected_epoch: u64,
     lenient: bool,
+    verify_other_epoch_crc: bool,
     partial: &mut Option<Vec<u8>>,
     out: &mut Vec<WalBatch>,
 ) -> SectorScan {
-    if sector.iter().all(|&b| b == 0) {
-        return SectorScan::EndOfLog;
-    }
     let sector_epoch = u64::from_le_bytes(sector[4..12].try_into().unwrap());
     let expected_crc = u32::from_le_bytes(sector[0..4].try_into().unwrap());
-    if sector_epoch != expected_epoch {
-        let intact = crc32c(&sector[4..WAL_SECTOR_SIZE]) == expected_crc;
-        return if sector_epoch < expected_epoch && intact {
-            SectorScan::EndOfLog
-        } else {
-            SectorScan::OtherEpoch
-        };
+    if !verify_other_epoch_crc {
+        if sector_epoch != expected_epoch {
+            return SectorScan::OtherEpoch;
+        }
+        if expected_epoch == 0 && sector.iter().all(|&b| b == 0) {
+            return SectorScan::EndOfLog;
+        }
+    } else {
+        if sector_epoch == 0 && sector.iter().all(|&b| b == 0) {
+            return SectorScan::EndOfLog;
+        }
+        if sector_epoch != expected_epoch {
+            let intact = sector_epoch < expected_epoch
+                && crc32c(&sector[4..WAL_SECTOR_SIZE]) == expected_crc;
+            return if intact {
+                SectorScan::EndOfLog
+            } else {
+                SectorScan::OtherEpoch
+            };
+        }
     }
     if crc32c(&sector[4..WAL_SECTOR_SIZE]) != expected_crc {
         return SectorScan::Corrupt;
@@ -1074,14 +1090,61 @@ pub fn recover_single_wal_stream_with_mode<F: PlatformFile>(
     let total_sectors = (file_len / WAL_SECTOR_SIZE as u64) as usize;
 
     let mut rec = SingleStreamRecovery::default();
+    if total_sectors == 0 {
+        return Ok(rec);
+    }
+
     let mut partial_batch_buf: Option<Vec<u8>> = None;
     let mut stopped = false;
-
-    // Read in 256 KB windows (64 sectors) to maximize sequential throughput during recovery.
-    const WINDOW_SECTORS: usize = 64;
-    let mut window_buf = vec![0u8; WINDOW_SECTORS * WAL_SECTOR_SIZE];
-
+    let verify_other_epoch_crc = scan_mode == WalScanMode::StopAtEndOfLog;
     let mut sec_idx = 0usize;
+
+    // On a clean reopen under `StopAtEndOfLog`, Sector 0 is typically all zeros or from an
+    // earlier epoch. Probe only that 4 KB sector on the stack first to avoid a 256 KB read and
+    // heap allocation when no recovery work exists.
+    if scan_mode == WalScanMode::StopAtEndOfLog {
+        let mut first_sector = [0u8; WAL_SECTOR_SIZE];
+        file.read_exact_at(&mut first_sector, 0)?;
+        match scan_sector(
+            &first_sector,
+            expected_epoch,
+            false,
+            verify_other_epoch_crc,
+            &mut partial_batch_buf,
+            &mut rec.batches,
+        ) {
+            SectorScan::Usable => rec.next_sector_idx = 1,
+            SectorScan::EndOfLog => return Ok(rec),
+            SectorScan::OtherEpoch => {
+                stopped = true;
+                partial_batch_buf = None;
+            }
+            SectorScan::Corrupt => {
+                rec.corrupt_sectors += 1;
+                stopped = true;
+                partial_batch_buf = None;
+            }
+            SectorScan::OtherVersion(version) => {
+                rec.unsupported_format.get_or_insert(UnsupportedWalFormat {
+                    sector_idx: 0,
+                    version,
+                });
+                stopped = true;
+                partial_batch_buf = None;
+            }
+        }
+        sec_idx = 1;
+    }
+
+    if sec_idx >= total_sectors {
+        return Ok(rec);
+    }
+
+    // Read remaining sectors in up to 256 KB windows (64 sectors) to maximize sequential throughput.
+    const WINDOW_SECTORS: usize = 64;
+    let initial_window = (total_sectors - sec_idx).min(WINDOW_SECTORS);
+    let mut window_buf = vec![0u8; initial_window * WAL_SECTOR_SIZE];
+
     'scan: while sec_idx < total_sectors {
         let count = (total_sectors - sec_idx).min(WINDOW_SECTORS);
         let byte_len = count * WAL_SECTOR_SIZE;
@@ -1097,7 +1160,14 @@ pub fn recover_single_wal_stream_with_mode<F: PlatformFile>(
             } else {
                 &mut rec.batches
             };
-            match scan_sector(sector, expected_epoch, stopped, &mut partial_batch_buf, out) {
+            match scan_sector(
+                sector,
+                expected_epoch,
+                stopped,
+                verify_other_epoch_crc,
+                &mut partial_batch_buf,
+                out,
+            ) {
                 SectorScan::Usable => {
                     if !stopped {
                         rec.next_sector_idx = sec_idx + i + 1;

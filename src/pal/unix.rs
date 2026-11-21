@@ -617,7 +617,15 @@ impl PlatformFs for UnixPlatformFs {
     ) -> io::Result<Arc<Self::File>> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(rel_name);
-        let existed = full_path.exists();
+        let existed = if create
+            && !matches!(
+                hint,
+                OpenHint::MutableSyncLog | OpenHint::MutableBufferedLog
+            ) {
+            full_path.exists()
+        } else {
+            true
+        };
         let use_pool = match hint {
             OpenHint::MutableSyncLog | OpenHint::MutableBufferedLog => false,
             OpenHint::ImmutableSequential

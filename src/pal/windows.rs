@@ -65,7 +65,12 @@ fn sharing_violation_backoff(retry: u32) -> Option<std::time::Duration> {
     (retry < SHARING_VIOLATION_RETRIES).then(|| std::time::Duration::from_millis(1u64 << retry))
 }
 const ERROR_HANDLE_EOF: DWORD = 38;
+const ERROR_ALREADY_EXISTS: DWORD = 183;
 const ERROR_IO_PENDING: DWORD = 997;
+
+/// Instructs the Windows I/O Manager not to signal the file handle object on synchronous
+/// or queued completion, avoiding extra kernel dispatcher work on every cached read/write.
+const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x02;
 
 // FILE_INFO_BY_HANDLE_CLASS discriminants
 const FILE_END_OF_FILE_INFO_CLASS: i32 = 6;
@@ -146,7 +151,7 @@ unsafe extern "system" {
         lp_name: *const u16,
     ) -> HANDLE;
 
-    fn ResetEvent(h_event: HANDLE) -> BOOL;
+    fn SetFileCompletionNotificationModes(file_handle: HANDLE, flags: u8) -> BOOL;
 
     fn CloseHandle(h_object: HANDLE) -> BOOL;
 
@@ -169,15 +174,6 @@ impl ThreadLocalEvent {
         }
         Ok(self.0)
     }
-
-    #[inline]
-    fn reset(&self) {
-        if !self.0.is_null() {
-            unsafe {
-                ResetEvent(self.0);
-            }
-        }
-    }
 }
 
 impl Drop for ThreadLocalEvent {
@@ -197,7 +193,7 @@ thread_local! {
 #[inline]
 fn with_tls_event<F, R>(f: F) -> io::Result<R>
 where
-    F: FnOnce(HANDLE, &ThreadLocalEvent) -> io::Result<R>,
+    F: FnOnce(HANDLE) -> io::Result<R>,
 {
     TLS_EVENT.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -205,7 +201,7 @@ where
         // Setting the low bit (`| 1`) instructs the Windows kernel not to queue an IOCP
         // packet if the handle is ever associated with an I/O Completion Port.
         let tagged_event = ((h_event as usize) | 1) as HANDLE;
-        f(tagged_event, &guard)
+        f(tagged_event)
     })
 }
 
@@ -227,7 +223,7 @@ impl WinPlatformFile {
         writable: bool,
         truncate: bool,
         hint: OpenHint,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, bool)> {
         let wide_path: Vec<u16> = full_path
             .as_os_str()
             .encode_wide()
@@ -297,6 +293,15 @@ impl WinPlatformFile {
             }
             return Err(io::Error::from_raw_os_error(err as i32));
         };
+        // Capture existence from `CreateFileW` immediately before any subsequent Win32 call
+        // alters `GetLastError()`, avoiding an extra `GetFileAttributesW` / `exists()` call.
+        let already_existed = !create || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+
+        // Best-effort: skip signaling the file handle dispatcher object since overlapped I/O
+        // always uses a dedicated `OVERLAPPED::hEvent`.
+        unsafe {
+            let _ = SetFileCompletionNotificationModes(handle, FILE_SKIP_SET_EVENT_ON_HANDLE);
+        }
 
         if hint == OpenHint::BackgroundBulk {
             // Best-effort I/O priority lowering so compaction does not starve foreground reads.
@@ -313,7 +318,7 @@ impl WinPlatformFile {
             }
         }
 
-        Ok(Self { handle })
+        Ok((Self { handle }, already_existed))
     }
 
     fn set_eof(&self, target_len: u64) -> io::Result<()> {
@@ -355,7 +360,7 @@ impl PlatformFile for WinPlatformFile {
         }
         let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;
 
-        with_tls_event(|h_event, tls_ev| {
+        with_tls_event(|h_event| {
             let mut overlapped = Overlapped {
                 internal: 0,
                 internal_high: 0,
@@ -400,19 +405,14 @@ impl PlatformFile for WinPlatformFile {
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
 
-            // Slow path: wait on the thread-local manual-reset event, then reset it.
+            // Slow path: wait on the thread-local manual-reset event (`ReadFile`/`WriteFile`
+            // reset `OVERLAPPED::hEvent` automatically before starting the next I/O).
             let wait_res =
                 unsafe { GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 1) };
-            let wait_err = if wait_res == FALSE {
-                unsafe { GetLastError() }
-            } else {
-                0
-            };
-            tls_ev.reset();
-
             if wait_res != FALSE {
                 return Ok(bytes_read as usize);
             }
+            let wait_err = unsafe { GetLastError() };
             if wait_err == ERROR_HANDLE_EOF {
                 return Ok(0);
             }
@@ -442,7 +442,7 @@ impl PlatformFile for WinPlatformFile {
     fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         while !buf.is_empty() {
             let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;
-            let written = with_tls_event(|h_event, tls_ev| {
+            let written = with_tls_event(|h_event| {
                 let mut overlapped = Overlapped {
                     internal: 0,
                     internal_high: 0,
@@ -480,18 +480,11 @@ impl PlatformFile for WinPlatformFile {
                 let wait_res = unsafe {
                     GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_written, 1)
                 };
-                let wait_err = if wait_res == FALSE {
-                    unsafe { GetLastError() }
-                } else {
-                    0
-                };
-                tls_ev.reset();
-
                 if wait_res != FALSE {
                     return Ok(bytes_written as usize);
                 }
 
-                Err(io::Error::from_raw_os_error(wait_err as i32))
+                Err(io::Error::last_os_error())
             })?;
 
             if written == 0 {
@@ -658,8 +651,8 @@ impl PlatformFs for WinPlatformFs {
     ) -> io::Result<Arc<Self::File>> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(OsStr::new(rel_name));
-        let existed = full_path.exists();
-        let file = WinPlatformFile::open_internal(&full_path, create, writable, false, hint)?;
+        let (file, existed) =
+            WinPlatformFile::open_internal(&full_path, create, writable, false, hint)?;
         if create
             && (!existed
                 || matches!(
@@ -721,5 +714,43 @@ mod tests {
         assert_eq!(delays.iter().sum::<u64>(), 1023);
         assert_eq!(sharing_violation_backoff(10), None);
         assert_eq!(sharing_violation_backoff(u32::MAX), None);
+    }
+
+    #[test]
+    fn open_internal_reports_existence_and_overlapped_io_works_without_manual_reset() {
+        let dir = crate::util::test_util::TempTestDir::new("win_open_overlapped");
+        let fs = WinPlatformFs::open(&dir.path, true).unwrap();
+        let path = fs.root_path().join("probe.dat");
+
+        // Fresh creation reports `already_existed == false` and preserves positional R/W.
+        let (file1, existed1) =
+            WinPlatformFile::open_internal(&path, true, true, false, OpenHint::MutableBufferedLog)
+                .unwrap();
+        assert!(!existed1);
+        file1.write_all_at(b"hello-world", 4096).unwrap();
+        file1.write_all_at(b"SECOND", 16 * 1024).unwrap();
+        let mut buf1 = [0u8; 11];
+        file1.read_exact_at(&mut buf1, 4096).unwrap();
+        assert_eq!(&buf1, b"hello-world");
+        drop(file1);
+
+        // Reopen reports `already_existed == true` and concurrent cross-thread reads succeed.
+        let (file2, existed2) =
+            WinPlatformFile::open_internal(&path, true, false, false, OpenHint::ImmutableRandom)
+                .unwrap();
+        assert!(existed2);
+        let shared = Arc::new(file2);
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut b = [0u8; 6];
+                shared.read_exact_at(&mut b, 16 * 1024).unwrap();
+                assert_eq!(&b, b"SECOND");
+            })
+        };
+        let mut b = [0u8; 11];
+        shared.read_exact_at(&mut b, 4096).unwrap();
+        assert_eq!(&b, b"hello-world");
+        worker.join().unwrap();
     }
 }
