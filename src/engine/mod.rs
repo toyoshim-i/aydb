@@ -378,7 +378,7 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Monotonic registration token counter for live virtual table instances.
     next_vtab_token: u64,
     /// Live virtual table holder tokens per `table_id` (reference-counted across connections).
-    active_vtab_holders: HashMap<u16, Vec<u64>>,
+    pub(super) active_vtab_holders: HashMap<u16, Vec<u64>>,
     /// Bumped by every change that can add or remove a row as some view sees it: each write,
     /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
     /// rows (a cache) stays valid exactly as long as the epoch does not move.
@@ -409,9 +409,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     last_maintenance_error: Mutex<Option<String>>,
     /// Explicit per-table corruption policies (absent -> derived default, see
     /// [`Self::corrupt_policy`]).
-    corrupt_policies: HashMap<u16, CorruptPolicy>,
+    pub(super) corrupt_policies: HashMap<u16, CorruptPolicy>,
     /// Explicit per-table inline threshold overrides in bytes (see [`Self::set_table_inline_threshold`]).
-    table_inline_thresholds: BTreeMap<u16, usize>,
+    pub(super) table_inline_thresholds: BTreeMap<u16, usize>,
     /// Scratch buffer for encoded WAL batches on commit, avoiding per-commit heap allocation.
     pub(super) scratch_wal_encoded: Vec<u8>,
     /// In-process verified 4 KB index block cache.
@@ -1776,12 +1776,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
-        self.corrupt_policies.remove(&table_id);
-        self.table_inline_thresholds.remove(&table_id);
-        self.blob_cache.invalidate_table_blobs(table_id);
-        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
-            q.retain(|(tid, _), _| *tid != table_id);
-        }
         let mut records = Vec::new();
         let mut dead_ptrs = Vec::new();
 
@@ -1813,6 +1807,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        let candidate_name = table_name
+            .map(|s| s.trim().to_ascii_lowercase())
+            .or_else(|| self.active_vtab_ids.get(&table_id).map(|s| s.to_string()));
+        if let Some(norm_name) = candidate_name {
+            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
+            cat_key.extend_from_slice(&[0u8, 0u8, b'c']);
+            cat_key.extend_from_slice(norm_name.as_bytes());
+            if !catalog_keys_for_id.contains(&cat_key) {
+                if let Some((_, IndexValue::Inline(val))) = self.lookup_raw_entry(&cat_key)? {
+                    if val.len() == 2 && u16::from_be_bytes([val[0], val[1]]) == table_id {
+                        records.push(WalRecord::Delete { key: cat_key });
+                    }
+                }
+            }
+        }
+
         // Without an enclosing transaction the deletes run in an internal one: its chunked
         // TxBegin/TxCommit framing and WAL growth let a table larger than the WAL be dropped
         // atomically. The internal transaction is exempt from `max_transaction_bytes`. It begins
@@ -1821,33 +1831,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if internal_tx {
             self.begin_transaction();
         }
-        self.vtabs_created_in_tx
-            .retain(|(id, _, _)| *id != table_id);
-        let removed_name = self
-            .active_vtab_ids
-            .remove(&table_id)
-            .map(|s| s.to_string());
-        let name_to_clean = table_name
-            .map(|s| s.trim().to_ascii_lowercase())
-            .or(removed_name);
-        if let Some(norm_name) = name_to_clean {
-            let mut cat_key = Vec::with_capacity(3 + norm_name.len());
-            cat_key.extend_from_slice(&[0u8, 0u8, b'c']);
-            cat_key.extend_from_slice(norm_name.as_bytes());
-            if !catalog_keys_for_id.contains(&cat_key) {
-                match self.check_existing_row(&cat_key) {
-                    Ok(ExistingRowStatus::NotFound) => {}
-                    Ok(_) => records.push(WalRecord::Delete { key: cat_key }),
-                    Err(e) => {
-                        if internal_tx {
-                            let _ = self.rollback_transaction();
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
         if !records.is_empty() {
             let was_preparing = core::mem::replace(&mut self.tx_preparing, internal_tx);
             let res = self.commit_wal_and_memtable(records, WriteDurability::BufferedFast);
@@ -1863,30 +1846,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.record_dead_blob_bytes(&ptr);
         }
 
+        self.vtabs_created_in_tx
+            .retain(|(id, _, _)| *id != table_id);
+        self.active_vtab_ids.remove(&table_id);
+        self.active_vtab_holders.remove(&table_id);
+        self.corrupt_policies.remove(&table_id);
+        self.table_inline_thresholds.remove(&table_id);
         let was_capped = self.capped_tables.remove(&table_id).is_some();
         self.table_has_row_meta.insert(table_id, false);
-        if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
-            // Left unpoisoned on purpose: every byte of this segment is dead from here on, so
-            // no committed state ever depends on it being durable.
-            let _ = old_w.sync_durable();
-            if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
-                b.file_len = old_w.current_len();
-                b.dead_bytes = b.file_len;
-            }
-        }
-        for (&(tid, _), b) in &mut self.lru_blobs {
-            if tid == table_id {
-                b.dead_bytes = b.file_len;
-            }
+        self.blob_cache.invalidate_table_blobs(table_id);
+        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
+            q.retain(|(tid, _), _| *tid != table_id);
         }
 
-        // Blob reclaim and the quota commit happen exactly once: in `commit_transaction` for the
-        // internal and any enclosing transaction alike, via `dropped_tables_in_tx`.
+        // Blob reclaim, LRU writer/segment disposal, and quota commit happen once on commit in
+        // `publish_committed_transaction` via `dropped_tables_in_tx` so rolling back an enclosing
+        // transaction leaves `active_lru_writers` and `lru_blobs` intact.
         self.dropped_tables_in_tx.push((table_id, was_capped));
         if internal_tx {
             self.commit_transaction()?;
         }
-        self.active_vtab_holders.remove(&table_id);
         Ok(())
     }
 

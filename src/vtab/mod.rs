@@ -1062,7 +1062,7 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
                     if let Err(e) = eng.check_write_allowed_for_conn(vtab_ref.db as usize) {
                         return io_err_to_sqlite_rc(&e);
                     }
-                    if let Err(e) = eng.drop_table(vtab_ref.table_id, Some(&vtab_ref.name())) {
+                    if let Err(e) = eng.drop_table(vtab_ref.table_id, None) {
                         return io_err_to_sqlite_rc(&e);
                     }
                 }

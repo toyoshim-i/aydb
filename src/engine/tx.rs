@@ -192,6 +192,9 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
     pub(super) capped_tables: HashMap<u16, CappedTableState>,
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
+    pub(super) active_vtab_holders: HashMap<u16, Vec<u64>>,
+    pub(super) corrupt_policies: HashMap<u16, super::CorruptPolicy>,
+    pub(super) table_inline_thresholds: BTreeMap<u16, usize>,
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
@@ -816,6 +819,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
         let mut dropped_any_capped = false;
         for (tid, was_capped) in dropped_tables {
+            if let Some(mut old_w) = self.active_lru_writers.remove(&tid) {
+                // Left unpoisoned on purpose: every byte of this segment is dead from here on, so
+                // no committed state ever depends on it being durable.
+                let _ = old_w.sync_durable();
+                if let Some(b) = self.lru_blobs.get_mut(&(tid, old_w.seq_id())) {
+                    b.file_len = old_w.current_len();
+                    b.dead_bytes = b.file_len;
+                }
+            }
+            for (&(t, _), b) in &mut self.lru_blobs {
+                if t == tid {
+                    b.dead_bytes = b.file_len;
+                }
+            }
             if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
                 self.record_maintenance_failure(&e);
             }
@@ -1061,6 +1078,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .collect(),
             capped_tables: self.capped_tables.clone(),
             active_vtab_ids: self.active_vtab_ids.clone(),
+            active_vtab_holders: self.active_vtab_holders.clone(),
+            corrupt_policies: self.corrupt_policies.clone(),
+            table_inline_thresholds: self.table_inline_thresholds.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
             vtabs_created_in_tx: self.vtabs_created_in_tx.clone(),
@@ -1084,8 +1104,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.capped_tables = snap.capped_tables.clone();
         self.active_vtab_ids = snap.active_vtab_ids.clone();
-        self.active_vtab_holders
-            .retain(|id, _| self.active_vtab_ids.contains_key(id));
+        self.active_vtab_holders = snap.active_vtab_holders.clone();
+        self.corrupt_policies = snap.corrupt_policies.clone();
+        self.table_inline_thresholds = snap.table_inline_thresholds.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
         self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();

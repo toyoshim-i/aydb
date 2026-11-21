@@ -191,3 +191,67 @@ fn a_drop_outside_a_transaction_still_works() {
         assert!(ints(&conn, "SELECT v FROM t").is_empty());
     }
 }
+
+#[test]
+fn cross_connection_drop_after_rename_and_recreate_does_not_delete_new_table_catalog() {
+    let mut fixture = Fixture::new("cross_conn_rename_drop");
+    let conn1 = fixture.open();
+    let conn2 = fixture.open();
+
+    conn1
+        .execute_batch("CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v INT')")
+        .unwrap();
+    conn1
+        .execute_batch("INSERT INTO t VALUES (1, 100)")
+        .unwrap();
+    let id1 = fixture
+        .engine()
+        .write()
+        .unwrap()
+        .register_or_resolve_vtab("t", None)
+        .unwrap();
+
+    // Hold a second live vtab handle under the original name `t` on conn2 before renaming.
+    assert_eq!(ints(&conn2, "SELECT v FROM t"), [100]);
+
+    conn1
+        .execute_batch(
+            "ALTER TABLE t RENAME TO t_old;
+             CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+             INSERT INTO t VALUES (2, 200);",
+        )
+        .unwrap();
+    let id2 = fixture
+        .engine()
+        .write()
+        .unwrap()
+        .register_or_resolve_vtab("t", None)
+        .unwrap();
+    assert_ne!(id1, id2);
+
+    conn1.execute_batch("DROP TABLE t_old").unwrap();
+    drop(conn2);
+    // Also exercise the direct `drop_table(id1, Some("t"))` stale-name guard against recreated `t`.
+    fixture
+        .engine()
+        .write()
+        .unwrap()
+        .drop_table(id1, Some("t"))
+        .unwrap();
+
+    assert_eq!(ints(&conn1, "SELECT v FROM t"), [200]);
+    drop(conn1);
+
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [200]);
+    assert_eq!(
+        fixture
+            .engine()
+            .write()
+            .unwrap()
+            .register_or_resolve_vtab("t", None)
+            .unwrap(),
+        id2
+    );
+}

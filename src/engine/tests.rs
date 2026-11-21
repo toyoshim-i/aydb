@@ -7263,3 +7263,74 @@ fn reopen_skips_blob_fsync_when_replayed_pointers_are_within_cataloged_len() {
         "replayed blob extending past cataloged file_len must still be fsynced at open: {counts:?}"
     );
 }
+
+#[test]
+fn drop_table_inside_rolled_back_tx_preserves_lru_writer_policies_and_holders() {
+    let tmp = TempTestDir::new("drop_table_rollback_state");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    let plan = engine.plan_vtab_registration("t", None).unwrap();
+    let (tid, token) = engine
+        .register_vtab_plan(plan, WriteDurability::BufferedFast)
+        .unwrap();
+    engine.register_capped_table(tid, 1 << 20).unwrap();
+    engine.set_table_corrupt_policy(tid, CorruptPolicy::Error);
+    engine.set_table_inline_threshold(tid, 96);
+    engine
+        .put_row(
+            tid,
+            b"k1",
+            &[0x5Au8; 200],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+
+    assert!(engine.active_lru_writers.contains_key(&tid));
+    assert_eq!(engine.corrupt_policy(tid), CorruptPolicy::Error);
+    assert_eq!(engine.effective_inline_threshold(tid), 96);
+    assert_eq!(
+        engine
+            .active_vtab_holders
+            .get(&tid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &[token]
+    );
+
+    engine.begin_transaction();
+    engine.drop_table(tid, Some("t")).unwrap();
+    engine.rollback_transaction().unwrap();
+
+    assert!(
+        engine.active_lru_writers.contains_key(&tid),
+        "active_lru_writers entry must survive rollback of drop_table"
+    );
+    assert_eq!(engine.corrupt_policy(tid), CorruptPolicy::Error);
+    assert_eq!(engine.effective_inline_threshold(tid), 96);
+    assert_eq!(
+        engine
+            .active_vtab_holders
+            .get(&tid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &[token]
+    );
+    assert_eq!(
+        engine.active_vtab_ids.get(&tid).map(|s| s.as_ref()),
+        Some("t")
+    );
+    assert!(engine.capped_tables.contains_key(&tid));
+    assert!(
+        engine
+            .lru_blobs
+            .iter()
+            .filter(|(k, _)| k.0 == tid)
+            .all(|(_, b)| b.dead_bytes < b.file_len),
+        "lru_blobs dead_bytes must not remain full segment length after rollback"
+    );
+    assert_eq!(engine.get_row(tid, b"k1").unwrap(), Some(vec![0x5Au8; 200]));
+}
