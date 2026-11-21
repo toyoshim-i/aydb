@@ -322,18 +322,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
 
         if self.idx_segments_for(cx.src).is_empty() && !reverse {
-            let lo = match lower {
-                Some((_, false)) => Bound::Excluded(seek_key),
-                _ => Bound::Included(seek_key),
-            };
-            let hi = match upper_key_slice {
-                Some((ub, true)) => Bound::Included(ub),
-                Some((ub, false)) => Bound::Excluded(ub),
-                None => Bound::Unbounded,
+            let Some(range) =
+                PreparedPrefixRange::prepare(&prefix, seek_key, lo_inc, upper_key_slice)
+            else {
+                return Ok(());
             };
             let mut last_pk_buf: Vec<u8> = Vec::new();
-            for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
-                if !k.starts_with(&prefix) {
+            for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
+                if !range.in_upper_and_prefix(k) {
                     break;
                 }
                 if keys_only {
@@ -568,18 +564,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         if self.idx_segments.is_empty() {
-            let lo = match lower_bound {
-                Some((_, false)) => Bound::Excluded(seek_key.as_slice()),
-                _ => Bound::Included(seek_key.as_slice()),
-            };
-            let hi = match &upper_full {
-                Some((ub, true)) => Bound::Included(ub.as_slice()),
-                Some((ub, false)) => Bound::Excluded(ub.as_slice()),
-                None => Bound::Unbounded,
+            let Some(range) = PreparedPrefixRange::prepare(
+                &prefix,
+                &seek_key,
+                lo_inc,
+                upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
+            ) else {
+                return Ok((Vec::new(), None));
             };
             let entries: Vec<(Vec<u8>, IndexValue)> = self
-                .mem_view(lo, hi)
-                .take_while(|(k, _, _)| k.starts_with(&prefix))
+                .mem_view(range.lo_bound(), range.hi_bound())
+                .take_while(|(k, _, _)| range.in_upper_and_prefix(k))
                 .filter(|(_, e, _)| !matches!(e.value, IndexValue::Tombstone))
                 .take(limit)
                 .map(|(k, e, _)| {
@@ -645,10 +640,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<Vec<Vec<u8>>> {
         let prefix = encode_secondary_index_exact_prefix(table_id, index_id, col_val);
         if self.idx_segments.is_empty() {
+            let Some(range) = PreparedPrefixRange::prepare(&prefix, &prefix, true, None) else {
+                return Ok(Vec::new());
+            };
             let mut pks = Vec::new();
-            for (k, entry, _) in self.mem_view(Bound::Included(prefix.as_slice()), Bound::Unbounded)
-            {
-                if !k.starts_with(&prefix) {
+            for (k, entry, _) in self.mem_view(range.lo_bound(), range.hi_bound()) {
+                if !range.in_upper_and_prefix(k) {
                     break;
                 }
                 if !matches!(entry.value, IndexValue::Tombstone) {
@@ -718,6 +715,43 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn collect_mem_secondary_pks_cx(
+        &self,
+        cx: &ReadCtx<'_, FS::File>,
+        table_id: u16,
+        index_id: u16,
+        prefix: &[u8],
+        seek_slice: &[u8],
+        lower_inclusive: bool,
+        upper_sec_key: Option<(&[u8], bool)>,
+        limit: usize,
+        pks_out: &mut Vec<Vec<u8>>,
+        last_sec_key_buf: &mut Vec<u8>,
+    ) {
+        let Some(range) =
+            PreparedPrefixRange::prepare(prefix, seek_slice, lower_inclusive, upper_sec_key)
+        else {
+            return;
+        };
+        for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
+            if !range.in_upper_and_prefix(k) {
+                break;
+            }
+            if matches!(entry.value, IndexValue::Tombstone) {
+                continue;
+            }
+            if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                pks_out.push(pk.to_vec());
+                last_sec_key_buf.clear();
+                last_sec_key_buf.extend_from_slice(k);
+                if pks_out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_secondary_index_into_slab_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
@@ -752,32 +786,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if keys_only {
             if self.idx_segments_for(cx.src).is_empty() {
-                let lo = if cur_inc {
-                    Bound::Included(seek_slice)
-                } else {
-                    Bound::Excluded(seek_slice)
-                };
-                let hi = match upper_sec_key {
-                    Some((ub, true)) => Bound::Included(ub),
-                    Some((ub, false)) => Bound::Excluded(ub),
-                    None => Bound::Unbounded,
-                };
-                for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
-                    if !k.starts_with(prefix) {
-                        break;
-                    }
-                    if matches!(entry.value, IndexValue::Tombstone) {
-                        continue;
-                    }
-                    if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
-                        pks_out.push(pk.to_vec());
-                        last_sec_key_buf.clear();
-                        last_sec_key_buf.extend_from_slice(k);
-                        if pks_out.len() >= limit {
-                            break;
-                        }
-                    }
-                }
+                self.collect_mem_secondary_pks_cx(
+                    cx,
+                    table_id,
+                    index_id,
+                    prefix,
+                    seek_slice,
+                    cur_inc,
+                    upper_sec_key,
+                    limit,
+                    pks_out,
+                    &mut last_sec_key_buf,
+                );
             } else {
                 self.visit_merged_prefix_range_src(
                     cx.src,
@@ -814,32 +834,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
 
             if self.idx_segments_for(cx.src).is_empty() {
-                let lo = if cur_inc {
-                    Bound::Included(active_seek)
-                } else {
-                    Bound::Excluded(active_seek)
-                };
-                let hi = match upper_sec_key {
-                    Some((ub, true)) => Bound::Included(ub),
-                    Some((ub, false)) => Bound::Excluded(ub),
-                    None => Bound::Unbounded,
-                };
-                for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
-                    if !k.starts_with(prefix) {
-                        break;
-                    }
-                    if matches!(entry.value, IndexValue::Tombstone) {
-                        continue;
-                    }
-                    if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
-                        batch_pks.push(pk.to_vec());
-                        last_sec_key_buf.clear();
-                        last_sec_key_buf.extend_from_slice(k);
-                        if batch_pks.len() >= batch_need {
-                            break;
-                        }
-                    }
-                }
+                self.collect_mem_secondary_pks_cx(
+                    cx,
+                    table_id,
+                    index_id,
+                    prefix,
+                    active_seek,
+                    cur_inc,
+                    upper_sec_key,
+                    batch_need,
+                    &mut batch_pks,
+                    &mut last_sec_key_buf,
+                );
             } else {
                 self.visit_merged_prefix_range_src(
                     cx.src,

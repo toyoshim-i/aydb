@@ -439,7 +439,7 @@ Under default `Truncate`, recovery reads each file in 64-sector windows and stop
 
 The design was built in eight separately committed steps (reproductions and oracle, format, engine tracking, ordered recovery, policy, salvage, harness extension, docs). No further work on it is planned. These are the behaviours that were decided rather than left open:
 
-* **A missing log file is created before the `Fail` decision.** `wal_sync.db` or `wal_buf.db` that does not exist is created empty when the streams are opened, so a refused open on such a directory still leaves a new, empty file. Every other file stays as it was, and a truncated existing file is not lengthened (7a4ff05). Pinned by `fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty`.
+* **A missing log file is not created before the `Fail` decision.** If `wal_sync.db` or `wal_buf.db` is missing, recovery inspects existing streams first and creates any missing WAL file only after passing the `WalDamagePolicy::Fail` gate, so a refused open leaves the directory untouched. Pinned by `fail_policy_with_a_missing_wal_file_refuses_without_creating_it`.
 * **The report is not exposed through SQL.** The SQLite adapter takes an engine that the application has opened, and the application reads `last_wal_recovery()` there (see the SQLite guide). There is no pragma or table-valued function for it.
 * **The salvage list is memory-only** (4.6.7), and a transaction that lost a chunk, or the good operations of a transaction dropped for an unsalvageable one, are not counted individually.
 * **A WAL in an older format** takes the same path as any file in an unknown format (4.6.5); it has no handling of its own.

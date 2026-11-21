@@ -313,8 +313,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.invalidate_snapshot_idx_segments();
         self.memtable.clear();
         self.idx_segments.push(Arc::new(new_reader));
-        self.sync_wal.reset_for_new_epoch(new_sync_epoch);
-        self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        self.sync_wal.reset_for_new_epoch(new_sync_epoch)?;
+        self.buf_wal.reset_for_new_epoch(new_buf_epoch)?;
         self.last_buf_synced_lsn = self.last_buf_append_lsn;
         // `drain_pending_durable` ran first, so no group-committed batch is lost to the rotation.
         self.wal_links.rotated();
@@ -369,8 +369,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             settled.dead_lru_keys,
             !settled.dead_blob_files.is_empty() || !lingering.is_empty(),
         );
-        self.sync_wal.reset_for_new_epoch(new_sync_epoch);
-        self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        self.sync_wal.reset_for_new_epoch(new_sync_epoch)?;
+        self.buf_wal.reset_for_new_epoch(new_buf_epoch)?;
         self.last_buf_synced_lsn = self.last_buf_append_lsn;
         // Callers drain the group commit first (or have nothing pending, as `open` does).
         self.wal_links.rotated();

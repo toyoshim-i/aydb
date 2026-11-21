@@ -14,7 +14,8 @@ use crate::util::crc32c::crc32c;
 mod recovery;
 pub use self::recovery::{
     DiscardedTx, StreamCounts, TwoStreamRecoveryResult, WalDamage, WalDamageReason,
-    WalRecoveryReport, recover_two_streams, recover_two_streams_with_mode,
+    WalRecoveryReport, recover_two_streams, recover_two_streams_optional_with_mode,
+    recover_two_streams_with_mode,
 };
 
 /// Fixed filename for the synchronous write-through WAL stream.
@@ -428,38 +429,30 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         Ok(writer)
     }
 
-    /// Opens the stream like [`Self::open`] but leaves a file that is shorter than `target_size`
-    /// as it is, so that recovery can read it and a refused open changes nothing. The caller must
-    /// call [`Self::allocate_to_target`] before the first append.
-    pub fn open_unallocated(
-        fs: &impl PlatformFs<File = F>,
-        file_name: &str,
-        target_size: u64,
-        active_epoch: u64,
+    fn validate_wal_target_size(target_size: u64) -> io::Result<usize> {
+        if target_size < WAL_SECTOR_SIZE as u64
+            || !target_size.is_multiple_of(WAL_SECTOR_SIZE as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL size must be a positive multiple of 4096 bytes",
+            ));
+        }
+        usize::try_from(target_size / WAL_SECTOR_SIZE as u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL sector count exceeds usize::MAX",
+            )
+        })
+    }
+
+    fn init_with_file(
+        file: Arc<F>,
         mode: WalStreamMode,
-    ) -> io::Result<Self> {
-        assert!(
-            target_size >= WAL_SECTOR_SIZE as u64
-                && target_size.is_multiple_of(WAL_SECTOR_SIZE as u64),
-            "WAL size must be a positive multiple of 4096 bytes"
-        );
-        let hint = match mode {
-            WalStreamMode::SyncSectorIsolated => OpenHint::MutableSyncLog,
-            WalStreamMode::BufferedImmediateOsCache | WalStreamMode::BufferedUserSpaceCoalesced => {
-                OpenHint::MutableBufferedLog
-            }
-        };
-
-        let file = match fs.open_file(file_name, false, true, hint) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs.open_file(file_name, true, true, hint)?
-            }
-            Err(e) => return Err(e),
-        };
-
-        let total_sectors = (target_size / WAL_SECTOR_SIZE as u64) as usize;
-        Ok(Self {
+        total_sectors: usize,
+        active_epoch: u64,
+    ) -> Self {
+        Self {
             file,
             mode,
             total_sectors,
@@ -473,7 +466,67 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             scratch_encode_buf: Vec::with_capacity(512),
             multi_sector_buf: Vec::new(),
             defer_barrier: false,
-        })
+        }
+    }
+
+    fn open_hint(mode: WalStreamMode) -> OpenHint {
+        match mode {
+            WalStreamMode::SyncSectorIsolated => OpenHint::MutableSyncLog,
+            WalStreamMode::BufferedImmediateOsCache | WalStreamMode::BufferedUserSpaceCoalesced => {
+                OpenHint::MutableBufferedLog
+            }
+        }
+    }
+
+    /// Opens an existing WAL stream without creating or preallocating a missing file. Returns
+    /// `Ok(None)` when `file_name` does not exist so `WalDamagePolicy::Fail` recovery leaves the
+    /// directory untouched.
+    pub fn open_existing_unallocated(
+        fs: &impl PlatformFs<File = F>,
+        file_name: &str,
+        target_size: u64,
+        active_epoch: u64,
+        mode: WalStreamMode,
+    ) -> io::Result<Option<Self>> {
+        let total_sectors = Self::validate_wal_target_size(target_size)?;
+        let hint = Self::open_hint(mode);
+        match fs.open_file(file_name, false, true, hint) {
+            Ok(file) => Ok(Some(Self::init_with_file(
+                file,
+                mode,
+                total_sectors,
+                active_epoch,
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Opens the stream like [`Self::open`] but leaves a file that is shorter than `target_size`
+    /// as it is, so that recovery can read it and a refused open changes nothing. The caller must
+    /// call [`Self::allocate_to_target`] before the first append.
+    pub fn open_unallocated(
+        fs: &impl PlatformFs<File = F>,
+        file_name: &str,
+        target_size: u64,
+        active_epoch: u64,
+        mode: WalStreamMode,
+    ) -> io::Result<Self> {
+        let total_sectors = Self::validate_wal_target_size(target_size)?;
+        let hint = Self::open_hint(mode);
+        let file = match fs.open_file(file_name, false, true, hint) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs.open_file(file_name, true, true, hint)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Self::init_with_file(
+            file,
+            mode,
+            total_sectors,
+            active_epoch,
+        ))
     }
 
     /// Lengthens the file to the size the stream was opened with, if it is shorter.
@@ -516,17 +569,22 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     /// Rotates the WAL stream to a new `WalEpoch` in $O(1)$ time without truncating or zero-filling
     /// the underlying file on disk.
-    pub fn reset_for_new_epoch(&mut self, new_epoch: u64) {
-        assert!(
-            new_epoch > self.active_epoch,
-            "new WAL epoch ({new_epoch}) must be strictly greater than current ({})",
-            self.active_epoch
-        );
+    pub fn reset_for_new_epoch(&mut self, new_epoch: u64) -> io::Result<()> {
+        if new_epoch <= self.active_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "new WAL epoch ({new_epoch}) must be strictly greater than current ({})",
+                    self.active_epoch
+                ),
+            ));
+        }
         self.active_epoch = new_epoch;
         self.current_sector_idx = 0;
         self.current_valid_bytes = 0;
         self.dirty_in_user_space = false;
         self.clear_sector_buf();
+        Ok(())
     }
 
     pub fn active_epoch(&self) -> u64 {
@@ -1355,7 +1413,7 @@ mod tests {
 
         // Now rotate to Epoch 2 WITHOUT zero-filling the file, and write only 2 batches (Sectors 0 and 1).
         // Sectors 2 and 3 on disk still contain valid sectors from Epoch 1!
-        writer.reset_for_new_epoch(2);
+        writer.reset_for_new_epoch(2).unwrap();
         for lsn in 10..=11 {
             let b = WalBatch::new(
                 lsn,
@@ -2302,5 +2360,55 @@ mod tests {
             drop(w);
             assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 2, 4]);
         }
+    }
+
+    #[test]
+    fn wal_writer_rejects_invalid_size_and_non_monotonic_epoch_without_panicking() {
+        let tmp = TempTestDir::new("wal_invalid_args");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        assert!(
+            WalStreamWriter::open_existing_unallocated(
+                &fs,
+                WAL_SYNC_FILE_NAME,
+                64 * 1024,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            )
+            .unwrap()
+            .is_none(),
+            "open_existing_unallocated must return None without creating missing file"
+        );
+        assert!(fs.list_files().unwrap().is_empty());
+
+        for bad_size in [0u64, 512, 4097] {
+            let err = match WalStreamWriter::open_unallocated(
+                &fs,
+                WAL_SYNC_FILE_NAME,
+                bad_size,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            ) {
+                Ok(_) => panic!("invalid WAL size {bad_size} must return Err"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        let mut writer = WalStreamWriter::open_unallocated(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            64 * 1024,
+            5,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        for bad_epoch in [0u64, 4, 5] {
+            let err = writer.reset_for_new_epoch(bad_epoch).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(writer.active_epoch(), 5);
+        writer.reset_for_new_epoch(6).unwrap();
+        assert_eq!(writer.active_epoch(), 6);
     }
 }

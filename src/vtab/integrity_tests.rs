@@ -11,7 +11,7 @@ const SPECS: [&str; 7] = [
     "k INTEGER PRIMARY KEY, u TEXT UNIQUE NOT NULL, v INT COLLATE NOCASE",
     "\"a b\" TEXT PRIMARY KEY, `u--x` INT UNIQUE",
     "k TEXT PRIMARY KEY, v INT",
-    "k TEXT, v INT",
+    "k INT PRIMARY KEY, v INT",
 ];
 
 fn texts(conn: &SqliteConnection, sql: &str) -> Vec<String> {

@@ -202,11 +202,101 @@ pub fn crc32c_software(crc: u32, mut data: &[u8]) -> u32 {
 #[target_feature(enable = "sse4.2")]
 unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86")]
-    use core::arch::x86::_mm_crc32_u8;
+    use core::arch::x86::{_mm_crc32_u8, _mm_crc32_u16, _mm_crc32_u32};
     #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u16, _mm_crc32_u32, _mm_crc32_u64};
 
     let mut c = !crc;
+
+    #[cfg(target_arch = "x86")]
+    {
+        while data.len() >= 3072 {
+            let mut c0 = c;
+            let mut c1 = 0u32;
+            let mut c2 = 0u32;
+            let ptr = data.as_ptr();
+
+            let mut offset = 0;
+            while offset < 1024 {
+                let w0 = unsafe { (ptr.add(offset) as *const u32).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(1024 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(2048 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                c0 = _mm_crc32_u32(c0, w0);
+                c1 = _mm_crc32_u32(c1, w1);
+                c2 = _mm_crc32_u32(c2, w2);
+                offset += 4;
+            }
+
+            c = apply_nibble_table(&TBL_2048, c0) ^ apply_nibble_table(&TBL_1024, c1) ^ c2;
+            data = &data[3072..];
+        }
+
+        while data.len() >= 384 {
+            let mut c0 = c;
+            let mut c1 = 0u32;
+            let mut c2 = 0u32;
+            let ptr = data.as_ptr();
+
+            let mut offset = 0;
+            while offset < 128 {
+                let w0 = unsafe { (ptr.add(offset) as *const u32).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(128 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(256 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                c0 = _mm_crc32_u32(c0, w0);
+                c1 = _mm_crc32_u32(c1, w1);
+                c2 = _mm_crc32_u32(c2, w2);
+                offset += 4;
+            }
+
+            c = apply_nibble_table(&TBL_256, c0) ^ apply_nibble_table(&TBL_128, c1) ^ c2;
+            data = &data[384..];
+        }
+
+        while data.len() >= 192 {
+            let mut c0 = c;
+            let mut c1 = 0u32;
+            let mut c2 = 0u32;
+            let ptr = data.as_ptr();
+
+            let mut offset = 0;
+            while offset < 64 {
+                let w0 = unsafe { (ptr.add(offset) as *const u32).read_unaligned().to_le() };
+                let w1 = unsafe {
+                    (ptr.add(64 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                let w2 = unsafe {
+                    (ptr.add(128 + offset) as *const u32)
+                        .read_unaligned()
+                        .to_le()
+                };
+                c0 = _mm_crc32_u32(c0, w0);
+                c1 = _mm_crc32_u32(c1, w1);
+                c2 = _mm_crc32_u32(c2, w2);
+                offset += 4;
+            }
+
+            c = apply_nibble_table(&TBL_128, c0) ^ apply_nibble_table(&TBL_64, c1) ^ c2;
+            data = &data[192..];
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -317,7 +407,17 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
         c = c64 as u32;
     }
 
-    for &b in data {
+    if data.len() >= 4 {
+        let word = unsafe { (data.as_ptr() as *const u32).read_unaligned().to_le() };
+        c = _mm_crc32_u32(c, word);
+        data = &data[4..];
+    }
+    if data.len() >= 2 {
+        let half = unsafe { (data.as_ptr() as *const u16).read_unaligned().to_le() };
+        c = _mm_crc32_u16(c, half);
+        data = &data[2..];
+    }
+    if let Some(&b) = data.first() {
         c = _mm_crc32_u8(c, b);
     }
 
@@ -327,7 +427,7 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "crc")]
 unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
-    use core::arch::aarch64::{__crc32cb, __crc32cd};
+    use core::arch::aarch64::{__crc32cb, __crc32cd, __crc32ch, __crc32cw};
 
     let mut c = !crc;
 
@@ -426,7 +526,17 @@ unsafe fn crc32c_aarch64(crc: u32, mut data: &[u8]) -> u32 {
         c = __crc32cd(c, word);
         data = &data[8..];
     }
-    for &b in data {
+    if data.len() >= 4 {
+        let word = unsafe { (data.as_ptr() as *const u32).read_unaligned().to_le() };
+        c = __crc32cw(c, word);
+        data = &data[4..];
+    }
+    if data.len() >= 2 {
+        let half = unsafe { (data.as_ptr() as *const u16).read_unaligned().to_le() };
+        c = __crc32ch(c, half);
+        data = &data[2..];
+    }
+    if let Some(&b) = data.first() {
         c = __crc32cb(c, b);
     }
     !c

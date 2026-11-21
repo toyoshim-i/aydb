@@ -4302,12 +4302,11 @@ fn fail_policy_leaves_a_truncated_wal_file_untouched() {
     }
 }
 
-/// A log file that is missing altogether is the one exception to "a refused `Fail` open changes
-/// no file" (ARCHITECTURE.md 4.6.6): the streams are opened before the damage decision, and
-/// opening creates the file, empty. Everything else stays as it was, and the open still refuses,
-/// because the buffered batches carry a watermark that covers the lost sync batches.
+/// Even when a log file is missing altogether, a refused `Fail` open leaves the directory
+/// untouched without creating an empty WAL file before the damage decision (ARCHITECTURE.md 4.6.12):
+/// opening refuses because the buffered batches carry a watermark that covers the lost sync batches.
 #[test]
-fn fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty() {
+fn fail_policy_with_a_missing_wal_file_refuses_without_creating_it() {
     let (fs, _keys, _s2) = sync_sector_damage_fs();
     fs.st().dir.remove("wal_sync.db");
     let before = dir_state(&fs);
@@ -4323,17 +4322,9 @@ fn fail_policy_with_a_missing_wal_file_refuses_and_creates_it_empty() {
             .is_some(),
         "{err}"
     );
-    let mut after = dir_state(&fs);
-    let created = after
-        .remove("wal_sync.db")
-        .expect("the missing log file is created");
-    assert!(
-        created.0.is_empty() && created.1.is_empty(),
-        "created with {} bytes in the cache, {} on the device",
-        created.0.len(),
-        created.1.len()
-    );
-    assert!(after == before, "a file other than the missing log changed");
+    let after = dir_state(&fs);
+    assert!(!after.contains_key("wal_sync.db"));
+    assert!(after == before, "Fail open must not create or alter files");
 }
 
 /// Regression test for [W2]: when `Fail` refuses a damaged WAL, `boot_meta.db` must remain

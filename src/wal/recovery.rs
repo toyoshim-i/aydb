@@ -482,8 +482,40 @@ where
     F: PlatformFile,
     V: FnMut(&BlobPtr) -> io::Result<bool>,
 {
-    let sync_rec = recover_single_wal_stream_with_mode(sync_file, sync_epoch, scan_mode)?;
-    let buf_rec = recover_single_wal_stream_with_mode(buf_file, buf_epoch, scan_mode)?;
+    recover_two_streams_optional_with_mode(
+        Some(sync_file),
+        sync_epoch,
+        Some(buf_file),
+        buf_epoch,
+        checkpoint_lsn,
+        scan_mode,
+        validate_blob,
+    )
+}
+
+/// Like [`recover_two_streams_with_mode`], treating a missing stream (`None`) as empty without
+/// creating the file prior to the caller's damage policy check.
+pub fn recover_two_streams_optional_with_mode<F, V>(
+    sync_file: Option<&F>,
+    sync_epoch: u64,
+    buf_file: Option<&F>,
+    buf_epoch: u64,
+    checkpoint_lsn: u64,
+    scan_mode: WalScanMode,
+    validate_blob: V,
+) -> io::Result<TwoStreamRecoveryResult>
+where
+    F: PlatformFile,
+    V: FnMut(&BlobPtr) -> io::Result<bool>,
+{
+    let sync_rec = match sync_file {
+        Some(f) => recover_single_wal_stream_with_mode(f, sync_epoch, scan_mode)?,
+        None => SingleStreamRecovery::default(),
+    };
+    let buf_rec = match buf_file {
+        Some(f) => recover_single_wal_stream_with_mode(f, buf_epoch, scan_mode)?,
+        None => SingleStreamRecovery::default(),
+    };
     recover_ordered(sync_rec, buf_rec, checkpoint_lsn, validate_blob)
 }
 

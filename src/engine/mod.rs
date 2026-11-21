@@ -66,7 +66,7 @@ use crate::pal::{OpenHint, PlatformFile, PlatformFs};
 use crate::wal::{
     BlobKind, BlobPtr, DEFAULT_BUF_WAL_SIZE, DEFAULT_SYNC_WAL_SIZE, WAL_BUF_FILE_NAME,
     WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalScanMode, WalStreamMode,
-    WalStreamWriter, recover_two_streams_with_mode,
+    WalStreamWriter, recover_two_streams_optional_with_mode,
 };
 pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport};
 
@@ -768,15 +768,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let lru_base_dead: BTreeMap<(u16, u64), u64> =
             lru_blobs.iter().map(|(&k, b)| (k, b.dead_bytes)).collect();
 
-        // 4. Open `wal_sync.db` and `wal_buf.db` and run Two-Stream Recovery
-        let mut sync_wal = WalStreamWriter::open_unallocated(
+        // 4. Open existing `wal_sync.db` and `wal_buf.db` without creating missing files prior to
+        //    the `WalDamagePolicy::Fail` decision, then run Two-Stream Recovery.
+        let sync_wal_opt = WalStreamWriter::open_existing_unallocated(
             &*fs,
             WAL_SYNC_FILE_NAME,
             config.sync_wal_size_bytes,
             state_snapshot.sync_wal_epoch,
             WalStreamMode::SyncSectorIsolated,
         )?;
-        let mut buf_wal = WalStreamWriter::open_unallocated(
+        let buf_wal_opt = WalStreamWriter::open_existing_unallocated(
             &*fs,
             WAL_BUF_FILE_NAME,
             config.buf_wal_size_bytes,
@@ -789,10 +790,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             WalScanMode::StopAtEndOfLog
         };
-        let mut rec = recover_two_streams_with_mode(
-            &**sync_wal.file(),
+        let mut rec = recover_two_streams_optional_with_mode(
+            sync_wal_opt.as_ref().map(|w| &**w.file()),
             state_snapshot.sync_wal_epoch,
-            &**buf_wal.file(),
+            buf_wal_opt.as_ref().map(|w| &**w.file()),
             state_snapshot.buf_wal_epoch,
             state_snapshot.checkpoint_lsn,
             scan_mode,
@@ -826,17 +827,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             salvaged = found.txs;
         }
 
-        // Under `Fail` nothing may have been written yet: `ensure_durable()` and the seq-id
-        // reservation below may preallocate/sync `boot_meta.db` or commit metadata, so they come
-        // after this check.
+        // Under `Fail` nothing may have been written yet: `ensure_durable()` and creating/extending
+        // WAL streams below must come after this check.
         if let (WalDamagePolicy::Fail, Some(damage)) =
             (config.wal_damage_policy, &rec.report.damage)
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, damage.clone()));
         }
         meta_mgr.ensure_durable()?;
-        // A log file shorter than configured (a fresh one, or one cut short by a third party) is
-        // lengthened only now, so that a refused open leaves it as it was.
+        // Materialize missing WAL streams and extend short files only after passing the `Fail` gate.
+        let mut sync_wal = match sync_wal_opt {
+            Some(w) => w,
+            None => WalStreamWriter::open_unallocated(
+                &*fs,
+                WAL_SYNC_FILE_NAME,
+                config.sync_wal_size_bytes,
+                state_snapshot.sync_wal_epoch,
+                WalStreamMode::SyncSectorIsolated,
+            )?,
+        };
+        let mut buf_wal = match buf_wal_opt {
+            Some(w) => w,
+            None => WalStreamWriter::open_unallocated(
+                &*fs,
+                WAL_BUF_FILE_NAME,
+                config.buf_wal_size_bytes,
+                state_snapshot.buf_wal_epoch,
+                config.buf_wal_mode,
+            )?,
+        };
         sync_wal.allocate_to_target()?;
         buf_wal.allocate_to_target()?;
         // Recovery allocates no SeqID, so reserving here still precedes every allocation.

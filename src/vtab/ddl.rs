@@ -662,7 +662,7 @@ pub(super) unsafe fn parse_vtab_ddl(
             col_not_null.push(def.not_null);
             col_unique.push(def.unique);
         }
-        if col_names.is_empty() || col_names.len() >= 0x8000 {
+        if col_names.is_empty() || col_names.len() >= 0x8000 || !has_primary_key {
             return Err(SQLITE_ERROR);
         }
         let pk_affinity = col_affinities
@@ -969,10 +969,37 @@ mod tests {
             ("k INTEGER(4) PRIMARY KEY, v TEXT", false),
             ("k UNSIGNED INTEGER PRIMARY KEY, v TEXT", false),
             ("k INTEGER PRIMARY KEY DESC, v TEXT", false),
-            ("k INTEGER, v TEXT", false),
         ] {
             assert_eq!(cols(spec).pk_rowid_alias, alias, "{spec}");
         }
+    }
+
+    #[test]
+    fn missing_primary_key_is_rejected() {
+        for spec in [
+            "k INTEGER, v TEXT",
+            "a TEXT UNIQUE, b INT NOT NULL",
+            "a BLOB",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{spec}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{spec}"
+            );
+        }
+
+        let dir = crate::util::test_util::TempTestDir::new("ddl_missing_pk");
+        let fs = std::sync::Arc::new(crate::pal::OsFs::open(&dir.path, true).unwrap());
+        let engine = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::engine::StorageEngine::open(fs, crate::engine::EngineConfig::default()).unwrap(),
+        ));
+        let conn = crate::vtab::SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module_with_options(engine, false)
+            .unwrap();
+        assert!(
+            conn.execute_batch("CREATE VIRTUAL TABLE no_pk USING aydb(columns='a INT, b TEXT')")
+                .is_err()
+        );
     }
 
     #[test]

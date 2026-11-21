@@ -237,7 +237,7 @@ fn bench_wal_modes(root: &PathBuf) {
         if mode == WalStreamMode::BufferedUserSpaceCoalesced {
             let written_sectors = buf_w.current_sector_idx();
             let t_rot = Instant::now();
-            buf_w.reset_for_new_epoch(2);
+            buf_w.reset_for_new_epoch(2).unwrap();
             let rot_ns = t_rot.elapsed().as_nanos();
             drop(buf_w);
 

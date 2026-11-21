@@ -8526,3 +8526,120 @@ fn prefetch_lazy_blobs_coalesces_reads_and_isolates_bad_pointer() {
         "valid sibling blobs must still be cached despite bad peer in the same cluster"
     );
 }
+
+#[test]
+fn mem_only_secondary_scan_clamps_seek_below_prefix_like_merged_scan() {
+    use crate::lru::{encode_secondary_index_key, encode_secondary_index_prefix};
+
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 64 * 4096;
+    cfg.buf_wal_size_bytes = 64 * 4096;
+
+    let run = |flush_to_idx: bool| {
+        let dir = TempTestDir::new("scan_boundary_parity");
+        let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
+
+        // Populate table 1 (lower table_id < table 2) AND two secondary index entries on table 2.
+        engine
+            .put_row(
+                1,
+                b"k_t1",
+                b"v1",
+                &[(1, b"a1".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine
+            .put_row(
+                2,
+                b"pk1",
+                b"r1",
+                &[(1, b"alpha".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        engine
+            .put_row(
+                2,
+                b"pk2",
+                b"r2",
+                &[(1, b"beta".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        // Also ensure secondary key prefix on table 2 idx 2 exists (sorts after idx 1).
+        engine
+            .put_row(
+                2,
+                b"pk3",
+                b"r3",
+                &[(2, b"gamma".to_vec())],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+
+        if flush_to_idx {
+            engine.flush_memtable().unwrap();
+        }
+
+        // Deliberately pass `seek_key` strictly smaller than `prefix` (pointing into table 1),
+        // exercising `PreparedPrefixRange` clamping to `prefix` in both keys_only and full-row modes.
+        let prefix = encode_secondary_index_prefix(2, 1);
+        let below_prefix_seek = encode_secondary_index_key(1, 1, b"a", b"k");
+        assert!(below_prefix_seek.as_slice() < prefix.as_slice());
+
+        let mut pks_only = Vec::new();
+        let mut slab_only = Vec::new();
+        let mut spans_only = Vec::new();
+        engine
+            .scan_secondary_index_into_slab(
+                2,
+                1,
+                &prefix,
+                (&below_prefix_seek, true),
+                None,
+                16,
+                true,
+                &mut pks_only,
+                &mut slab_only,
+                &mut spans_only,
+                None,
+            )
+            .unwrap();
+
+        let mut pks_rows = Vec::new();
+        let mut slab_rows = Vec::new();
+        let mut spans_rows = Vec::new();
+        engine
+            .scan_secondary_index_into_slab(
+                2,
+                1,
+                &prefix,
+                (&below_prefix_seek, false),
+                None,
+                16,
+                false,
+                &mut pks_rows,
+                &mut slab_rows,
+                &mut spans_rows,
+                None,
+            )
+            .unwrap();
+        let rows: Vec<Vec<u8>> = spans_rows
+            .into_iter()
+            .map(|(s, e)| slab_rows[s..e].to_vec())
+            .collect();
+
+        // Check `lookup_by_secondary_index` parity too.
+        let exact = engine.lookup_by_secondary_index(2, 1, b"beta").unwrap();
+        (pks_only, rows, exact)
+    };
+
+    let mem_only = run(false);
+    let idx_backed = run(true);
+    assert_eq!(mem_only, idx_backed);
+    assert_eq!(mem_only.0, vec![b"pk1".to_vec(), b"pk2".to_vec()]);
+    assert_eq!(mem_only.1, vec![b"r1".to_vec(), b"r2".to_vec()]);
+    assert_eq!(mem_only.2, vec![b"pk2".to_vec()]);
+}

@@ -218,8 +218,15 @@ pub fn format_sqlite_float_text(f: f64) -> String {
     if f == 0.0 {
         return "0.0".to_string();
     }
-    if !f.is_finite() {
-        return format!("{f}");
+    if f.is_infinite() {
+        return if f.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "Inf".to_string()
+        };
+    }
+    if f.is_nan() {
+        return "NaN".to_string();
     }
     let abs = f.abs();
     if abs >= 1e15 || abs < 1e-4 {
@@ -1536,6 +1543,50 @@ mod tests {
         assert_eq!(format_sqlite_float_text(1e20), "1.0e+20");
         assert_eq!(format_sqlite_float_text(1.25e20), "1.25e+20");
         assert_eq!(format_sqlite_float_text(-1e-20), "-1.0e-20");
+        assert_eq!(format_sqlite_float_text(f64::INFINITY), "Inf");
+        assert_eq!(format_sqlite_float_text(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_sqlite_float_text(f64::NAN), "NaN");
+
+        {
+            use crate::vtab::ffi::{
+                SQLITE_OK, SQLITE_ROW, sqlite_column_text_bytes, sqlite3_close, sqlite3_finalize,
+                sqlite3_open, sqlite3_prepare_v2, sqlite3_step,
+            };
+            use core::ffi::c_char;
+
+            let mut db = core::ptr::null_mut();
+            let mem = b":memory:\0";
+            assert_eq!(
+                unsafe { sqlite3_open(mem.as_ptr() as *const c_char, &mut db) },
+                SQLITE_OK
+            );
+            let mut stmt = core::ptr::null_mut();
+            let sql = b"SELECT CAST(1e500 AS TEXT), CAST(-1e500 AS TEXT)\0";
+            assert_eq!(
+                unsafe {
+                    sqlite3_prepare_v2(
+                        db,
+                        sql.as_ptr() as *const c_char,
+                        -1,
+                        &mut stmt,
+                        core::ptr::null_mut(),
+                    )
+                },
+                SQLITE_OK
+            );
+            assert_eq!(unsafe { sqlite3_step(stmt) }, SQLITE_ROW);
+            let pos_inf = unsafe { sqlite_column_text_bytes(stmt, 0) };
+            let neg_inf = unsafe { sqlite_column_text_bytes(stmt, 1) };
+            assert_eq!(pos_inf, format_sqlite_float_text(f64::INFINITY).as_bytes());
+            assert_eq!(
+                neg_inf,
+                format_sqlite_float_text(f64::NEG_INFINITY).as_bytes()
+            );
+            unsafe {
+                sqlite3_finalize(stmt);
+                sqlite3_close(db);
+            }
+        }
     }
 
     #[test]

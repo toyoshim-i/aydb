@@ -279,17 +279,19 @@ impl HandlePool {
             if arc.referenced.swap(false, Ordering::AcqRel) {
                 continue;
             }
-            if let Ok(mut guard) = arc.file.try_write() {
-                if arc.keep_open.load(Ordering::Acquire)
-                    || arc.has_unsynced_writes()
-                    || Arc::strong_count(&arc) > 2
-                {
-                    continue;
-                }
-                if guard.is_some() {
-                    *guard = None;
-                    arc.descriptor_open.store(false, Ordering::Release);
-                    open_count = open_count.saturating_sub(1);
+            if let FdSlot::Pooled(ref lock) = arc.fd {
+                if let Ok(mut guard) = lock.try_write() {
+                    if arc.keep_open.load(Ordering::Acquire)
+                        || arc.has_unsynced_writes()
+                        || Arc::strong_count(&arc) > 2
+                    {
+                        continue;
+                    }
+                    if guard.is_some() {
+                        *guard = None;
+                        arc.descriptor_open.store(false, Ordering::Release);
+                        open_count = open_count.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -321,23 +323,31 @@ impl HandlePool {
     }
 }
 
+enum FdSlot {
+    /// Non-pooled handles (WAL files) keep their OS descriptor open directly with zero
+    /// `RwLock` or eviction atomic overhead.
+    Direct(File),
+    /// Pooled handles (immutable index and blob segments) participate in bounded-FD eviction.
+    Pooled(RwLock<Option<File>>),
+}
+
 /// Unix implementation of [`PlatformFile`].
 pub struct UnixPlatformFile {
     path: PathBuf,
     writable: bool,
     hint: OpenHint,
-    file: RwLock<Option<File>>,
-    /// Mirrors `file.is_some()` so the pool can count open descriptors without taking `file`.
+    fd: FdSlot,
+    /// Mirrors `fd.is_some()` so the pool can count open pooled descriptors without taking locks.
     descriptor_open: AtomicBool,
-    /// CLOCK second-chance reference bit set on every descriptor access.
+    /// CLOCK second-chance reference bit set on every pooled descriptor access.
     referenced: AtomicBool,
     /// Set once the file is about to be unlinked while still referenced: the descriptor must
     /// stay open because the path can no longer be reopened.
     keep_open: AtomicBool,
-    /// Number of writes/preallocations currently executing against this handle.
+    /// Number of writes/preallocations currently executing against a pooled handle.
     active_writers: AtomicUsize,
-    /// Monotonic counter incremented before each write/preallocation so dirty handles with
-    /// unsynced writes are never evicted (preserving Linux `errseq_t` writeback errors).
+    /// Monotonic counter incremented before each pooled write/preallocation so dirty handles
+    /// with unsynced writes are never evicted (preserving Linux `errseq_t` writeback errors).
     write_seq: AtomicU64,
     synced_seq: AtomicU64,
     pool: Option<Arc<HandlePool>>,
@@ -380,11 +390,16 @@ impl UnixPlatformFile {
             .truncate(truncate)
             .open(full_path)?;
         apply_open_hint(&file, hint);
+        let fd = if pool.is_some() {
+            FdSlot::Pooled(RwLock::new(Some(file)))
+        } else {
+            FdSlot::Direct(file)
+        };
         Ok(Self {
             path: full_path.to_path_buf(),
             writable,
             hint,
-            file: RwLock::new(Some(file)),
+            fd,
             descriptor_open: AtomicBool::new(true),
             referenced: AtomicBool::new(true),
             keep_open: AtomicBool::new(false),
@@ -397,18 +412,24 @@ impl UnixPlatformFile {
 
     #[inline]
     fn has_unsynced_writes(&self) -> bool {
-        self.active_writers.load(Ordering::Acquire) > 0
-            || self.write_seq.load(Ordering::Acquire) != self.synced_seq.load(Ordering::Acquire)
+        self.pool.is_some()
+            && (self.active_writers.load(Ordering::Acquire) > 0
+                || self.write_seq.load(Ordering::Acquire)
+                    != self.synced_seq.load(Ordering::Acquire))
     }
 
     #[inline]
-    fn mark_write_start(&self) -> ActiveWriteGuard<'_> {
+    fn mark_write_start(&self) -> Option<ActiveWriteGuard<'_>> {
+        self.pool.as_ref()?;
         self.active_writers.fetch_add(1, Ordering::AcqRel);
         self.write_seq.fetch_add(1, Ordering::AcqRel);
-        ActiveWriteGuard(&self.active_writers)
+        Some(ActiveWriteGuard(&self.active_writers))
     }
 
     fn sync_with(&self, f: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+        if self.pool.is_none() {
+            return self.with_file(f);
+        }
         let seq = self.write_seq.load(Ordering::Acquire);
         let active_before = self.active_writers.load(Ordering::Acquire);
         self.with_file(f)?;
@@ -422,14 +443,18 @@ impl UnixPlatformFile {
     }
 
     pub(crate) fn with_file<R>(&self, f: impl FnOnce(&File) -> io::Result<R>) -> io::Result<R> {
+        let lock = match &self.fd {
+            FdSlot::Direct(file) => return f(file),
+            FdSlot::Pooled(lock) => lock,
+        };
         {
-            let guard = self.file.read().unwrap();
+            let guard = lock.read().unwrap();
             if let Some(ref file) = *guard {
                 self.referenced.store(true, Ordering::Relaxed);
                 return f(file);
             }
         }
-        let mut guard = self.file.write().unwrap();
+        let mut guard = lock.write().unwrap();
         if let Some(ref file) = *guard {
             self.referenced.store(true, Ordering::Relaxed);
             return f(file);
@@ -450,7 +475,10 @@ impl UnixPlatformFile {
 
     /// Whether the underlying file descriptor is currently open in memory.
     pub fn is_descriptor_open(&self) -> bool {
-        self.descriptor_open.load(Ordering::Acquire)
+        match &self.fd {
+            FdSlot::Direct(_) => true,
+            FdSlot::Pooled(_) => self.descriptor_open.load(Ordering::Acquire),
+        }
     }
 }
 
