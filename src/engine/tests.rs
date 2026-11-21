@@ -7520,3 +7520,192 @@ fn relocate_fragmented_std_blobs_preserves_data_generation_and_does_not_recurse(
         assert_eq!(engine.get_row(1, &pk).unwrap(), Some(payload.clone()));
     }
 }
+
+#[test]
+fn prepare_compaction_and_wal_rotation_avoid_redundant_fsyncs() {
+    use crate::pal::OpenHint;
+    use std::path::Path;
+
+    struct CountedFile {
+        rel_name: String,
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+
+    impl PlatformFile for CountedFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(
+            &self,
+            target_len: u64,
+            strategy: crate::pal::PreallocStrategy,
+        ) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            *self
+                .sync_counts
+                .lock()
+                .unwrap()
+                .entry(self.rel_name.clone())
+                .or_insert(0) += 1;
+            self.inner.sync_durable()
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct CountedFs {
+        inner: OsFs,
+        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+
+    impl PlatformFs for CountedFs {
+        type File = CountedFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(CountedFile {
+                rel_name: rel_name.to_string(),
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                sync_counts: Arc::clone(&self.sync_counts),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("pm1_avoid_redundant_fsyncs");
+    let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let fs = Arc::new(CountedFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        sync_counts: Arc::clone(&sync_counts),
+    });
+
+    let mut cfg = EngineConfig::default();
+    cfg.auto_compact_segment_threshold = 2;
+    cfg.background_compaction = true;
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 300;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    // 1. Two idx segments -> prepare_compaction must not fsync boot_meta.db.
+    engine
+        .put_row(1, b"k1", b"v1", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    engine
+        .put_row(1, b"k2", b"v2", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    sync_counts.lock().unwrap().clear();
+
+    let job1 = engine.prepare_compaction().unwrap().unwrap();
+    let job2 = engine.prepare_compaction().unwrap().unwrap();
+    assert_ne!(job1.output_seq_id(), job2.output_seq_id());
+    assert_eq!(
+        sync_counts
+            .lock()
+            .unwrap()
+            .get("boot_meta.db")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "prepare_compaction must reserve SeqID in memory without committing boot_meta.db"
+    );
+    let out1 = job1.run().unwrap();
+    assert!(engine.install_compaction(out1).unwrap());
+    drop(job2);
+
+    // 2. Buffered writes followed by flush_memtable advance `last_buf_synced_lsn`, so a later
+    //    `SyncTransactional` commit does not redundantly fsync `wal_buf.db`.
+    engine
+        .put_row(1, b"buf_k", b"v_buf", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    sync_counts.lock().unwrap().clear();
+    engine
+        .put_row(
+            1,
+            b"sync_k",
+            b"v_sync",
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    assert_eq!(
+        sync_counts
+            .lock()
+            .unwrap()
+            .get("wal_buf.db")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "WAL rotation must advance last_buf_synced_lsn so SyncTransactional avoids wal_buf fsync"
+    );
+
+    // 3. Reclaiming a dead LRU segment after synchronous deletes skips `wal_buf.db` fsync.
+    engine.register_capped_table(10, 1024 * 1024).unwrap();
+    engine
+        .put_row(
+            10,
+            b"l1",
+            &[0x11u8; 200],
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    engine
+        .put_row(
+            10,
+            b"l2",
+            &[0x22u8; 200],
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    engine
+        .delete_row(10, b"l1", WriteDurability::SyncTransactional)
+        .unwrap();
+    assert_eq!(engine.active_lru_blob_segment_count(10), 2);
+    sync_counts.lock().unwrap().clear();
+
+    engine.reclaim_fully_dead_lru_blob_segments(10).unwrap();
+    assert_eq!(
+        sync_counts
+            .lock()
+            .unwrap()
+            .get("wal_buf.db")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "reclaim_fully_dead_lru_blob_segments must not fsync wal_buf.db when already synced"
+    );
+    assert_eq!(engine.active_lru_blob_segment_count(10), 1);
+}

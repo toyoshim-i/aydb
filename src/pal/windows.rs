@@ -635,6 +635,15 @@ impl WinPlatformFs {
             Err(io::Error::from_raw_os_error(err as i32))
         }
     }
+    fn remove_file_raw(&self, rel_name: &str) -> io::Result<bool> {
+        validate_flat_file_name(rel_name)?;
+        let full_path = self.root.join(OsStr::new(rel_name));
+        match std::fs::remove_file(full_path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl PlatformFs for WinPlatformFs {
@@ -664,18 +673,21 @@ impl PlatformFs for WinPlatformFs {
     }
 
     fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        validate_flat_file_name(rel_name)?;
-        let full_path = self.root.join(OsStr::new(rel_name));
-        match std::fs::remove_file(full_path) {
-            Ok(()) => {
-                // The unlink has already succeeded; a best-effort UNC parent-dir flush failure
-                // must not make callers believe the file still exists.
-                let _ = self.sync_dir_if_unc();
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        if self.remove_file_raw(rel_name)? {
+            // The unlink has already succeeded; a best-effort UNC parent-dir flush failure
+            // must not make callers believe the file still exists.
+            let _ = self.sync_dir_if_unc();
         }
+        Ok(())
+    }
+
+    fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+        self.remove_file_raw(rel_name).map(|_| ())
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        let _ = self.sync_dir_if_unc();
+        Ok(())
     }
 
     fn list_files(&self) -> io::Result<Vec<String>> {

@@ -1015,6 +1015,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let referenced = self.state.referenced_file_names();
         let standby_mf = self.standby_manifest_id.map(format_manifest_file_name);
         let mut remaining = Vec::new();
+        let mut removed_any = false;
         for file_name in self.state.pending_delete_files.drain(..) {
             if !is_managed_segment_or_manifest(&file_name)
                 || referenced.contains(&file_name)
@@ -1022,11 +1023,16 @@ impl<F: PlatformFs> BootMetaManager<F> {
             {
                 continue;
             }
-            if self.fs.remove_file(&file_name).is_err() {
+            if self.fs.remove_file_unsynced(&file_name).is_ok() {
+                removed_any = true;
+            } else {
                 remaining.push(file_name);
             }
         }
         self.state.pending_delete_files = remaining;
+        if removed_any {
+            let _ = self.fs.sync_dir();
+        }
     }
 
     fn write_current_state_to_slot(&mut self, slot: SlotIndex) -> io::Result<()> {
@@ -2983,5 +2989,84 @@ mod tests {
         assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
         assert!(tmp2.path.join(&mf_name).exists());
         assert!(tmp2.path.join(&newer_idx2).exists());
+    }
+
+    #[test]
+    fn try_process_pending_deletes_batches_into_single_sync_dir() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BatchDeleteCountFs {
+            inner: OsFs,
+            unsynced_deletes: AtomicUsize,
+            sync_dir_calls: AtomicUsize,
+        }
+
+        impl PlatformFs for BatchDeleteCountFs {
+            type File = crate::pal::OsFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: crate::pal::OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                self.inner.open_file(rel_name, create, writable, hint)
+            }
+
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+
+            fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+                self.unsynced_deletes.fetch_add(1, Ordering::Relaxed);
+                self.inner.remove_file_unsynced(rel_name)
+            }
+
+            fn sync_dir(&self) -> io::Result<()> {
+                self.sync_dir_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.sync_dir()
+            }
+
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("meta_batch_delete_sync_dir");
+        let fs = Arc::new(BatchDeleteCountFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            unsynced_deletes: AtomicUsize::new(0),
+            sync_dir_calls: AtomicUsize::new(0),
+        });
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+
+        let mut names = Vec::new();
+        for i in 0..5u64 {
+            let name = format_idx_file_name(100 + i);
+            std::fs::write(tmp.path.join(&name), b"orphan_idx").unwrap();
+            names.push(name);
+        }
+
+        fs.unsynced_deletes.store(0, Ordering::Relaxed);
+        fs.sync_dir_calls.store(0, Ordering::Relaxed);
+        mgr.commit_update(|s| {
+            for name in &names {
+                s.queue_pending_delete(name.clone());
+            }
+        })
+        .unwrap();
+
+        assert_eq!(fs.unsynced_deletes.load(Ordering::Relaxed), 5);
+        assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 1);
+        assert!(mgr.state().pending_delete_files.is_empty());
+        for name in &names {
+            assert!(!tmp.path.join(name).exists());
+        }
     }
 }

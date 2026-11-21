@@ -109,6 +109,17 @@ pub trait PlatformFs: Send + Sync + 'static {
     /// Deletes a file after all handles to it have been dropped.
     fn remove_file(&self, rel_name: &str) -> io::Result<()>;
 
+    /// Deletes a file without syncing the parent directory immediately.
+    /// Callers batching multiple deletions should call [`Self::sync_dir`] once afterward.
+    fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+        self.remove_file(rel_name)
+    }
+
+    /// Flushes parent directory metadata after batched file creations or deletions.
+    fn sync_dir(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Lists all file names currently present in the database directory.
     fn list_files(&self) -> io::Result<Vec<String>>;
 

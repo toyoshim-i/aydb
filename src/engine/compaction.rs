@@ -315,6 +315,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.idx_segments.push(Arc::new(new_reader));
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        self.last_buf_synced_lsn = self.last_buf_append_lsn;
         // `drain_pending_durable` ran first, so no group-committed batch is lost to the rotation.
         self.wal_links.rotated();
         Ok(())
@@ -370,6 +371,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         );
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
         self.buf_wal.reset_for_new_epoch(new_buf_epoch);
+        self.last_buf_synced_lsn = self.last_buf_append_lsn;
         // Callers drain the group commit first (or have nothing pending, as `open` does).
         self.wal_links.rotated();
         Ok(())
@@ -610,10 +612,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Phase 1 of background compaction (cheap, under `&mut self`): picks the same size-tiered
     /// suffix as [`Self::compact_auto_tiered`] (a full compaction when it starts at index 0),
-    /// durably reserves the output `SeqID` (a `next_seq_id` bump committed to `boot_meta.db`, so
-    /// flushes running before install can never collide with it) and snapshots the input readers
-    /// as shared handles. Returns `None` if there is nothing to merge. Does not flush the
-    /// MemTable and never touches blobs, WAL or the MemTable.
+    /// reserves the output `SeqID` in memory (unique across concurrent jobs, and recovered cleanly
+    /// on crash by `reserve_seq_ids_above_existing_files`), and snapshots the input readers as
+    /// shared handles. Returns `None` if there is nothing to merge. Does not touch `boot_meta.db`,
+    /// flush the MemTable, or touch blobs/WAL.
     ///
     /// Crash safety: until [`Self::install_compaction`] commits, the output file is an
     /// unreferenced orphan that `open()` sweeps.
@@ -633,10 +635,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if start_idx + 2 > self.idx_segments.len() {
             return Ok(None);
         }
-        let mut out_seq_id = 0u64;
-        self.meta_mgr.commit_update(|st| {
-            out_seq_id = st.allocate_seq_id();
-        })?;
+        let out_seq_id = self.meta_mgr.reserve_seq_id();
         let full = start_idx == 0;
         let level = if full {
             1
@@ -1025,10 +1024,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
-        // Ensure all buffered eviction `Delete` WAL records that killed these LRU blob segments
-        // are durable on disk before removing the segments from `boot_meta.db` and unlinking them.
-        // This also syncs the active blob writers that the buffered batches may reference.
-        self.make_buf_wal_durable(true)?;
+        // Ensure any unsynced buffered eviction `Delete` WAL records that killed these LRU blob
+        // segments are durable on disk before removing the segments from `boot_meta.db` and
+        // unlinking them. Skip when all buffered WAL writes are already synced.
+        if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+            self.make_buf_wal_durable(true)?;
+        }
 
         let deleted_files: Vec<String> = dead_lru
             .iter()

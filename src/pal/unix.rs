@@ -593,6 +593,16 @@ impl UnixPlatformFs {
             self.dir_file.sync_all()
         }
     }
+    fn remove_file_raw(&self, rel_name: &str) -> io::Result<bool> {
+        validate_flat_file_name(rel_name)?;
+        let full_path = self.root.join(rel_name);
+        self.pool.pin_open_before_unlink(&full_path)?;
+        match std::fs::remove_file(full_path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl PlatformFs for UnixPlatformFs {
@@ -638,17 +648,18 @@ impl PlatformFs for UnixPlatformFs {
     }
 
     fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        validate_flat_file_name(rel_name)?;
-        let full_path = self.root.join(rel_name);
-        self.pool.pin_open_before_unlink(&full_path)?;
-        match std::fs::remove_file(full_path) {
-            Ok(()) => {
-                self.sync_dir()?;
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        if self.remove_file_raw(rel_name)? {
+            UnixPlatformFs::sync_dir(self)?;
         }
+        Ok(())
+    }
+
+    fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+        self.remove_file_raw(rel_name).map(|_| ())
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        UnixPlatformFs::sync_dir(self)
     }
 
     fn list_files(&self) -> io::Result<Vec<String>> {
