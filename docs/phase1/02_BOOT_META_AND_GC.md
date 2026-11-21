@@ -117,10 +117,10 @@ A 4028-byte inline payload area comfortably holds over **120 segment descriptors
    * The serialized catalog payload is written directly into `slot[64 .. 64 + payload_len]`.
    * Booting or checkpointing requires **zero extra files** and **zero extra I/O**: a single 4 KB write to `boot_meta.db` commits the entire state.
 2. **Overflow Path — External Manifest Mode (`payload_bytes.len() > 4028`, `FLAG_EXTERNAL_MANIFEST = 1`):**
-   * The engine allocates a new `manifest_seq_id` from `next_seq_id` and writes `[Magic "AYMF" (4B) | Version (2B) | Reserved (2B) | PayloadLen (4B) | PayloadCRC32C (4B) | PayloadBytes...]` to an immutable file `manifest_<SeqID>.db`, followed by `sync_durable()`.
+   * The engine allocates a new `manifest_seq_id` from `next_seq_id` and writes `[Magic "AYMF" (4B) | Version (2B) | Reserved (2B) | PayloadLen (4B) | ManifestCRC32C (4B) | PayloadBytes...]` to an immutable file `manifest_<SeqID>.db`, followed by `sync_durable()`. `ManifestCRC32C` covers the first 12 header bytes (`Magic..PayloadLen`, bytes `0..12`) followed immediately by `PayloadBytes`.
    * Inside the `boot_meta.db` slot's payload area (`64..84`, `payload_len = 20`), the engine stores a 20-byte external pointer:
-     `[manifest_seq_id: u64 | manifest_file_len: u64 | manifest_payload_crc32c: u32]`.
-   * After a commit, the previous generation's manifest stays on disk while its slot is the standby fallback. A manifest that neither slot references is added to `pending_delete_files`.
+     `[manifest_seq_id: u64 | manifest_file_len: u64 | manifest_crc32c: u32]`.
+   * After a commit, the previous generation's manifest stays on disk while its slot is the standby fallback. At open, only the higher-generation slot's manifest is opened unless fallback from a corrupt primary slot is required. A manifest that neither slot references is added to `pending_delete_files`.
 
 ### 3.1 Catalog Payload Binary Format
 
