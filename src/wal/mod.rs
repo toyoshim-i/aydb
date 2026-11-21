@@ -399,6 +399,9 @@ pub struct WalStreamWriter<F: PlatformFile> {
     current_valid_bytes: usize,
     /// Whether `sector_buf` has un-flushed user-space bytes (used in `BufferedUserSpaceCoalesced`).
     dirty_in_user_space: bool,
+    /// High-water mark of non-zero bytes written to `sector_buf` (`sector_buf[sector_dirty_end..]`
+    /// is guaranteed all zeroes).
+    sector_dirty_end: usize,
     /// Scratch buffer for the currently active 4 KB sector.
     sector_buf: [u8; WAL_SECTOR_SIZE],
     /// Backup buffer for rolling back `sector_buf` on I/O error without per-append heap allocation.
@@ -464,6 +467,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             current_sector_idx: 0,
             current_valid_bytes: 0,
             dirty_in_user_space: false,
+            sector_dirty_end: 0,
             sector_buf: [0u8; WAL_SECTOR_SIZE],
             backup_sector_buf: Box::new([0u8; WAL_SECTOR_SIZE]),
             scratch_encode_buf: Vec::with_capacity(512),
@@ -486,12 +490,28 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         Ok(())
     }
 
+    #[inline]
+    fn clear_sector_buf(&mut self) {
+        if self.sector_dirty_end > 0 {
+            self.sector_buf[..self.sector_dirty_end].fill(0);
+            self.sector_dirty_end = 0;
+        }
+    }
+
+    #[inline]
+    fn advance_and_clear_sector(&mut self) {
+        self.current_sector_idx += 1;
+        self.current_valid_bytes = 0;
+        self.dirty_in_user_space = false;
+        self.clear_sector_buf();
+    }
+
     /// Positions the writer cursor right after the last valid sector recovered during startup.
     pub fn set_cursor_after_recovery(&mut self, next_sector_idx: usize) {
         self.current_sector_idx = next_sector_idx.min(self.total_sectors);
         self.current_valid_bytes = 0;
         self.dirty_in_user_space = false;
-        self.sector_buf.fill(0);
+        self.clear_sector_buf();
     }
 
     /// Rotates the WAL stream to a new `WalEpoch` in $O(1)$ time without truncating or zero-filling
@@ -506,7 +526,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         self.current_sector_idx = 0;
         self.current_valid_bytes = 0;
         self.dirty_in_user_space = false;
-        self.sector_buf.fill(0);
+        self.clear_sector_buf();
     }
 
     pub fn active_epoch(&self) -> u64 {
@@ -573,8 +593,20 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         let saved_idx = self.current_sector_idx;
         let saved_valid = self.current_valid_bytes;
         let saved_dirty = self.dirty_in_user_space;
-        if saved_valid > 0 {
-            self.backup_sector_buf.copy_from_slice(&self.sector_buf);
+        // Coalesced buffered appends that fit inside the current sector with room for another
+        // fragment header stay strictly in RAM (zero I/O), so they cannot fail or tear.
+        let infallible_coalesced = self.mode == WalStreamMode::BufferedUserSpaceCoalesced
+            && !remaining.is_empty()
+            && saved_idx < self.total_sectors
+            && saved_valid
+                .checked_add(FRAGMENT_HEADER_SIZE)
+                .and_then(|v| v.checked_add(remaining.len()))
+                .and_then(|v| v.checked_add(FRAGMENT_HEADER_SIZE))
+                .is_some_and(|total| total <= WAL_SECTOR_PAYLOAD_CAP);
+        let saved_end = WAL_SECTOR_HEADER_SIZE + saved_valid;
+        if saved_valid > 0 && !infallible_coalesced {
+            self.backup_sector_buf[WAL_SECTOR_HEADER_SIZE..saved_end]
+                .copy_from_slice(&self.sector_buf[WAL_SECTOR_HEADER_SIZE..saved_end]);
         }
         let res = self.append_raw_batch_inner(remaining);
         if res.is_err() {
@@ -582,9 +614,13 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             self.current_valid_bytes = saved_valid;
             self.dirty_in_user_space = saved_dirty;
             if saved_valid > 0 {
-                self.sector_buf.copy_from_slice(&*self.backup_sector_buf);
+                self.sector_buf[WAL_SECTOR_HEADER_SIZE..saved_end]
+                    .copy_from_slice(&self.backup_sector_buf[WAL_SECTOR_HEADER_SIZE..saved_end]);
+                self.sector_buf[saved_end..WAL_SECTOR_SIZE].fill(0);
+                self.sector_dirty_end = saved_end;
             } else {
                 self.sector_buf.fill(0);
+                self.sector_dirty_end = 0;
             }
             self.multi_sector_buf.clear();
             if saved_valid > 0 {
@@ -641,11 +677,12 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             };
 
             let write_pos = WAL_SECTOR_HEADER_SIZE + self.current_valid_bytes;
+            let write_end = write_pos + FRAGMENT_HEADER_SIZE + chunk_len;
             self.sector_buf[write_pos] = frag_type as u8;
             self.sector_buf[write_pos + 1..write_pos + 3]
                 .copy_from_slice(&(chunk_len as u16).to_le_bytes());
-            self.sector_buf[write_pos + 3..write_pos + 3 + chunk_len]
-                .copy_from_slice(&remaining[..chunk_len]);
+            self.sector_buf[write_pos + 3..write_end].copy_from_slice(&remaining[..chunk_len]);
+            self.sector_dirty_end = self.sector_dirty_end.max(write_end);
 
             self.current_valid_bytes += FRAGMENT_HEADER_SIZE + chunk_len;
             remaining = &remaining[chunk_len..];
@@ -664,10 +701,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                         }
                         self.multi_sector_buf.extend_from_slice(&self.sector_buf);
                     }
-                    self.current_sector_idx += 1;
-                    self.current_valid_bytes = 0;
-                    self.dirty_in_user_space = false;
-                    self.sector_buf.fill(0);
+                    self.advance_and_clear_sector();
                 }
                 WalStreamMode::BufferedImmediateOsCache => {
                     if !remaining.is_empty()
@@ -683,10 +717,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                             }
                             self.multi_sector_buf.extend_from_slice(&self.sector_buf);
                         }
-                        self.current_sector_idx += 1;
-                        self.current_valid_bytes = 0;
-                        self.dirty_in_user_space = false;
-                        self.sector_buf.fill(0);
+                        self.advance_and_clear_sector();
                     } else {
                         // Write the updated 4 KB sector into the OS Page Cache immediately
                         // while keeping the sector open for further dense packing.
@@ -713,10 +744,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                             }
                             self.multi_sector_buf.extend_from_slice(&self.sector_buf);
                         }
-                        self.current_sector_idx += 1;
-                        self.current_valid_bytes = 0;
-                        self.dirty_in_user_space = false;
-                        self.sector_buf.fill(0);
+                        self.advance_and_clear_sector();
                     } else {
                         self.dirty_in_user_space = true;
                     }
@@ -782,14 +810,12 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         if self.current_valid_bytes == 0 {
             return Ok(());
         }
-        if self.dirty_in_user_space || self.mode == WalStreamMode::BufferedUserSpaceCoalesced {
+        if self.dirty_in_user_space {
             self.seal_and_write_current_sector()?;
         }
-        // In `BufferedImmediateOsCache` mode the open sector was already written by the append.
-        self.current_sector_idx += 1;
-        self.current_valid_bytes = 0;
-        self.dirty_in_user_space = false;
-        self.sector_buf.fill(0);
+        // In `BufferedImmediateOsCache` (and after `flush_buffered_to_os` in
+        // `BufferedUserSpaceCoalesced`) the open sector was already written to the OS page cache.
+        self.advance_and_clear_sector();
         Ok(())
     }
 
@@ -797,7 +823,8 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// [`Self::seal_open_sector_for_durability`]) and then syncs the file: with `sync_durable`
     /// when `durable` is true, otherwise with `sync_barrier`.
     pub fn make_durable_and_seal(&mut self, durable: bool) -> io::Result<()> {
-        self.flush_buffered_to_os()?;
+        // `seal_open_sector_for_durability` writes any `dirty_in_user_space` bytes once before
+        // advancing, avoiding double CRC calculation and duplicate sector writes.
         self.seal_open_sector_for_durability()?;
         if durable {
             self.file.sync_durable()
@@ -838,9 +865,19 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     }
 
     fn seal_current_sector_in_memory(&mut self) {
-        // Zero out any trailing padding bytes in `16 + current_valid_bytes .. 4096`.
+        // Zero out any previously dirtied trailing padding bytes in `16 + current_valid_bytes .. 4096`.
         let pad_start = WAL_SECTOR_HEADER_SIZE + self.current_valid_bytes;
-        self.sector_buf[pad_start..WAL_SECTOR_SIZE].fill(0);
+        if self.sector_dirty_end > pad_start {
+            self.sector_buf[pad_start..self.sector_dirty_end].fill(0);
+            self.sector_dirty_end = pad_start;
+        }
+        self.sector_dirty_end = self.sector_dirty_end.max(WAL_SECTOR_HEADER_SIZE);
+        debug_assert!(
+            self.sector_buf[pad_start..WAL_SECTOR_SIZE]
+                .iter()
+                .all(|&b| b == 0),
+            "trailing WAL sector padding must be zero"
+        );
 
         self.sector_buf[4..12].copy_from_slice(&self.active_epoch.to_le_bytes());
         self.sector_buf[12..14].copy_from_slice(&(self.current_valid_bytes as u16).to_le_bytes());
@@ -859,10 +896,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     fn flush_and_advance_sector(&mut self) -> io::Result<()> {
         if self.current_valid_bytes > 0 {
             self.seal_and_write_current_sector()?;
-            self.current_sector_idx += 1;
-            self.current_valid_bytes = 0;
-            self.dirty_in_user_space = false;
-            self.sector_buf.fill(0);
+            self.advance_and_clear_sector();
         }
         Ok(())
     }
@@ -1691,6 +1725,7 @@ mod tests {
         fail_sync: Arc<AtomicBool>,
         /// Bytes that reach the file before an injected write failure; 0 means one full sector.
         tear_len: Arc<AtomicUsize>,
+        write_count: Arc<AtomicUsize>,
     }
 
     impl PlatformFile for FailFile {
@@ -1701,6 +1736,7 @@ mod tests {
             self.inner.read_exact_at(buf, offset)
         }
         fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.write_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_write.swap(false, Ordering::SeqCst) {
                 // Simulate a partial write: first sector lands, then error.
                 let torn = self.tear_len.load(Ordering::SeqCst);
@@ -1739,6 +1775,7 @@ mod tests {
         fail_write: Arc<AtomicBool>,
         fail_sync: Arc<AtomicBool>,
         tear_len: Arc<AtomicUsize>,
+        write_count: Arc<AtomicUsize>,
     }
 
     impl PlatformFs for FailFs {
@@ -1755,6 +1792,7 @@ mod tests {
                 fail_write: self.fail_write.clone(),
                 fail_sync: self.fail_sync.clone(),
                 tear_len: self.tear_len.clone(),
+                write_count: self.write_count.clone(),
             }))
         }
         fn remove_file(&self, n: &str) -> io::Result<()> {
@@ -1787,6 +1825,7 @@ mod tests {
             fail_write: w.clone(),
             fail_sync: s.clone(),
             tear_len: Arc::new(AtomicUsize::new(0)),
+            write_count: Arc::new(AtomicUsize::new(0)),
         };
         (tmp, fs, w, s)
     }
@@ -2108,6 +2147,90 @@ mod tests {
             assert_eq!(rec.unsupported_format, None, "version {version}");
             assert!(rec.batches.is_empty());
             assert_eq!(rec.next_sector_idx, 0);
+        }
+    }
+
+    #[test]
+    fn make_durable_and_seal_coalesced_writes_sector_once() {
+        let (_tmp, fs, _, _) = fail_fs("ph7_coalesced_single_write");
+        let mut w = WalStreamWriter::open(
+            &fs,
+            WAL_BUF_FILE_NAME,
+            64 * 1024,
+            1,
+            WalStreamMode::BufferedUserSpaceCoalesced,
+        )
+        .unwrap();
+        fs.write_count.store(0, Ordering::SeqCst);
+
+        for lsn in 1..=3 {
+            w.append_batch(&put_batch(lsn, b"k", 32)).unwrap();
+        }
+        assert_eq!(
+            fs.write_count.load(Ordering::SeqCst),
+            0,
+            "coalesced small appends must stay purely in RAM"
+        );
+
+        w.make_durable_and_seal(true).unwrap();
+        assert_eq!(
+            fs.write_count.load(Ordering::SeqCst),
+            1,
+            "make_durable_and_seal in coalesced mode must write the sector once, not twice"
+        );
+
+        for lsn in 4..=5 {
+            w.append_batch(&put_batch(lsn, b"k", 32)).unwrap();
+        }
+        w.flush_buffered_to_os().unwrap();
+        assert_eq!(fs.write_count.load(Ordering::SeqCst), 2);
+        w.make_durable_and_seal(true).unwrap();
+        assert_eq!(
+            fs.write_count.load(Ordering::SeqCst),
+            2,
+            "seal after flush_buffered_to_os must not rewrite an unmodified sector"
+        );
+        drop(w);
+
+        assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn partial_sector_backup_and_dirty_end_zeroing_preserve_torn_write_recovery() {
+        for (mode, fail_payload_len) in [
+            (WalStreamMode::BufferedImmediateOsCache, 500),
+            (WalStreamMode::BufferedUserSpaceCoalesced, 4000),
+        ] {
+            let (_tmp, fs, fail_w, _) = fail_fs("ph7_partial_backup_dirty_end");
+            let mut w = WalStreamWriter::open(&fs, WAL_BUF_FILE_NAME, 64 * 1024, 1, mode).unwrap();
+
+            w.append_batch(&put_batch(1, b"k1", 32)).unwrap();
+            w.append_batch(&put_batch(2, b"k2", 32)).unwrap();
+            let saved_valid = w.current_valid_bytes;
+            assert!(saved_valid > 0 && saved_valid < 512);
+
+            w.file()
+                .tear_len
+                .store(WAL_SECTOR_SIZE / 2, Ordering::SeqCst);
+            fail_w.store(true, Ordering::SeqCst);
+            assert!(
+                w.append_batch(&put_batch(3, b"fail", fail_payload_len))
+                    .is_err()
+            );
+            assert_eq!(w.current_valid_bytes, saved_valid);
+            assert!(
+                w.sector_buf[WAL_SECTOR_HEADER_SIZE + saved_valid..WAL_SECTOR_SIZE]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+            let mid_rec = recover_single_wal_stream(&**w.file(), 1).unwrap();
+            let mid_lsns: Vec<u64> = mid_rec.batches.iter().map(|b| b.lsn).collect();
+            assert_eq!(mid_lsns, vec![1, 2]);
+
+            w.append_batch(&put_batch(4, b"k4", 20)).unwrap();
+            w.make_durable_and_seal(true).unwrap();
+            drop(w);
+            assert_eq!(recover_lsns(&fs, WAL_BUF_FILE_NAME, 1), vec![1, 2, 4]);
         }
     }
 }
