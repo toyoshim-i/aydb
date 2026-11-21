@@ -120,6 +120,17 @@ const RANGE_FLAG_REVERSE: c_int = 0x40;
 /// to $O(1)$ memory regardless of table size while eliminating full-scan materialization on `LIMIT` queries.
 const CURSOR_STREAM_CHUNK_ROWS: usize = 256;
 
+/// Shrink `cursor.lazy_row_buf` down to this capacity on cursor reset after a huge single blob row.
+const LAZY_ROW_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Test observability: high-water mark of `cursor.slab.len()` observed in `vtab_column`.
+    static CURSOR_SLAB_MAX_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test observability: high-water mark of `cursor.lazy_row_buf.len()` observed in `vtab_column`.
+    static CURSOR_LAZY_ROW_BUF_MAX_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Returns the alternate exact-integer numeric key representation (`9`-byte `Integer(q)` vs
 /// `17`-byte `Float(q.0)`) so SQLite's `10 == 10.0` numeric key equality holds across `BLOB`
 /// and `REAL` affinities.
@@ -428,10 +439,18 @@ struct AydbCursor {
     spans: Vec<(usize, usize)>,
     /// Primary key bytes per row.
     pks: Vec<Vec<u8>>,
+    /// Lazily batch-populated persistent synthetic rowids for the current chunk's `pks`
+    /// (non-`INTEGER PRIMARY KEY` tables). Empty until `vtab_rowid` or `xColumn(-1)` runs.
+    rowids: Vec<Option<i64>>,
     /// Pending out-of-line blob pointer for lazy dereference in `vtab_column`.
-    /// When `Some(ptr)`, the row's blob payload has not been read into `slab` yet.
-    /// When `None`, the row was either inline or has already been dereferenced into `slab`.
+    /// When `Some(ptr)`, the row's blob payload has not been read into `lazy_row_buf` yet.
+    /// When `None`, the row was either inline (in `slab`) or has already been dereferenced.
     lazy_blobs: Vec<Option<LazyBlob<OsFile>>>,
+    /// Reusable single-row buffer for dereferencing the active row's out-of-line lazy blob,
+    /// preventing `slab` from accumulating up to `CURSOR_STREAM_CHUNK_ROWS` large blobs at once.
+    lazy_row_buf: Vec<u8>,
+    /// Chunk row index currently materialized in `lazy_row_buf`, if any.
+    lazy_row_pos: Option<usize>,
     /// True when the active scan only needs primary keys (`RANGE_FLAG_KEYS_ONLY`),
     /// avoiding any out-of-line blob reads or `slab` allocations.
     keys_only: bool,
@@ -1419,7 +1438,10 @@ unsafe extern "system" fn vtab_open(
             slab: Vec::with_capacity(512),
             spans: Vec::with_capacity(16),
             pks: Vec::new(),
+            rowids: Vec::new(),
             lazy_blobs: Vec::with_capacity(16),
+            lazy_row_buf: Vec::new(),
+            lazy_row_pos: None,
             keys_only: false,
             pos: 0,
             prefetch_end: 0,
@@ -1454,7 +1476,13 @@ fn clear_cursor_buffers(cursor: &mut AydbCursor) {
     cursor.slab.clear();
     cursor.spans.clear();
     cursor.pks.clear();
+    cursor.rowids.clear();
     cursor.lazy_blobs.clear();
+    cursor.lazy_row_pos = None;
+    cursor.lazy_row_buf.clear();
+    if cursor.lazy_row_buf.capacity() > LAZY_ROW_BUF_SHRINK_THRESHOLD {
+        cursor.lazy_row_buf.shrink_to(LAZY_ROW_BUF_SHRINK_THRESHOLD);
+    }
     cursor.keys_only = false;
     cursor.pos = 0;
     cursor.prefetch_end = 0;
@@ -1906,6 +1934,8 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let cursor = &mut *(p_cursor as *mut AydbCursor);
         cursor.pos += 1;
+        cursor.lazy_row_pos = None;
+        cursor.lazy_row_buf.clear();
         let len = if cursor.keys_only {
             cursor.pks.len()
         } else {
@@ -1920,6 +1950,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
             cursor.slab.clear();
             cursor.spans.clear();
             cursor.pks.clear();
+            cursor.rowids.clear();
             cursor.lazy_blobs.clear();
             cursor.pos = 0;
             cursor.prefetch_end = 0;
@@ -1942,6 +1973,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                         cursor.slab.clear();
                         cursor.spans.clear();
                         cursor.pks.clear();
+                        cursor.rowids.clear();
                         cursor.lazy_blobs.clear();
                         match eng.scan_secondary_index_into_slab_with_cache(
                             vtab.table_id,
@@ -2010,6 +2042,7 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     cursor.slab.clear();
                     cursor.spans.clear();
                     cursor.pks.clear();
+                    cursor.rowids.clear();
                     cursor.lazy_blobs.clear();
                     if let Err(e) = eng.scan_range_into_slab_with_cache(
                         vtab.table_id,
@@ -2072,6 +2105,39 @@ unsafe extern "system" fn vtab_eof(p_cursor: *mut sqlite3_vtab_cursor) -> c_int 
     .unwrap_or(1)
 }
 
+/// Resolves the SQLite `rowid` for `cursor.pos`, batch-populating `cursor.rowids` once per chunk
+/// for non-`INTEGER PRIMARY KEY` tables instead of reacquiring the engine lock on every row.
+fn resolve_cursor_rowid(cursor: &mut AydbCursor, vtab: &AydbVTab) -> io::Result<i64> {
+    if vtab.pk_rowid_alias {
+        if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
+            if let Some(id) = decode_i64_tagged_key(pk_bytes) {
+                return Ok(id);
+            }
+        }
+    } else if !cursor.pks.is_empty() {
+        if cursor.rowids.len() != cursor.pks.len() {
+            with_snapshot_read_access(
+                &vtab.engine,
+                vtab.db as usize,
+                vtab.table_id,
+                cursor.snapshot.as_ref(),
+                |eng| eng.rowids_for_pks(vtab.table_id, &cursor.pks, &mut cursor.rowids),
+            )??;
+        }
+        if let Some(Some(rid)) = cursor.rowids.get(cursor.pos) {
+            return Ok(*rid);
+        }
+    }
+    if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
+        extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref())
+    } else if cursor.lazy_row_pos == Some(cursor.pos) {
+        extract_rowid_from_row(&cursor.lazy_row_buf, vtab, cursor.snapshot.as_ref())
+    } else {
+        let (start, end) = cursor.spans[cursor.pos];
+        extract_rowid_from_row(&cursor.slab[start..end], vtab, cursor.snapshot.as_ref())
+    }
+}
+
 unsafe extern "system" fn vtab_column(
     p_cursor: *mut sqlite3_vtab_cursor,
     p_ctx: *mut sqlite3_context,
@@ -2084,16 +2150,15 @@ unsafe extern "system" fn vtab_column(
             if cursor.pos >= cursor.pks.len() {
                 return SQLITE_ERROR;
             }
-            let pk_bytes = &cursor.pks[cursor.pos];
             if i_col < 0 {
-                let rid =
-                    match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
-                        Ok(rid) => rid,
-                        Err(e) => return io_err_to_sqlite_rc(&e),
-                    };
+                let rid = match resolve_cursor_rowid(cursor, vtab) {
+                    Ok(rid) => rid,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
                 sqlite3_result_int64(p_ctx, rid);
                 return SQLITE_OK;
             }
+            let pk_bytes = &cursor.pks[cursor.pos];
             if i_col as usize == vtab.pk_col_idx {
                 if project_key_zero_copy(pk_bytes, p_ctx) {
                     return SQLITE_OK;
@@ -2107,13 +2172,7 @@ unsafe extern "system" fn vtab_column(
 
         // Fast path 1: Rowid lookup via xColumn(p_cursor, p_ctx, -1)
         if i_col < 0 {
-            let rid = if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-                extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref())
-            } else {
-                let (start, end) = cursor.spans[cursor.pos];
-                extract_rowid_from_row(&cursor.slab[start..end], vtab, cursor.snapshot.as_ref())
-            };
-            let rid = match rid {
+            let rid = match resolve_cursor_rowid(cursor, vtab) {
                 Ok(rid) => rid,
                 Err(e) => return io_err_to_sqlite_rc(&e),
             };
@@ -2130,8 +2189,16 @@ unsafe extern "system" fn vtab_column(
             }
         }
 
-        // Lazy Blob Dereference: If this row has a pending external blob that hasn't been read into slab yet
-        if let Some(Some(lazy_blob)) = cursor.lazy_blobs.get(cursor.pos).cloned() {
+        // Lazy Blob Dereference: materialize the active out-of-line row into `lazy_row_buf`
+        // rather than accumulating all 256 chunk rows' blobs inside `slab`.
+        let row_bytes: &[u8] = if cursor.lazy_row_pos == Some(cursor.pos) {
+            &cursor.lazy_row_buf
+        } else if let Some(lazy_blob) = cursor
+            .lazy_blobs
+            .get(cursor.pos)
+            .and_then(|o| o.as_ref())
+            .cloned()
+        {
             let Some(pk_bytes) = cursor.pks.get(cursor.pos) else {
                 return SQLITE_ERROR;
             };
@@ -2161,39 +2228,55 @@ unsafe extern "system" fn vtab_column(
                     if upcoming.len() > 1 {
                         let _ = eng.prefetch_lazy_blobs(vtab.table_id, &upcoming);
                     }
+                    cursor.lazy_row_buf.clear();
                     eng.dereference_lazy_blob_into(
                         vtab.table_id,
                         pk_bytes,
                         &lazy_blob,
-                        &mut cursor.slab,
+                        &mut cursor.lazy_row_buf,
                     )
                 },
             ) {
                 Ok(res) => res,
                 Err(e) => {
+                    cursor.lazy_row_buf.clear();
                     let rc = io_err_to_sqlite_rc(&e);
                     sqlite3_result_error_code(p_ctx, rc);
                     return rc;
                 }
             };
-            let span = match deref_res {
-                Ok(Some(s)) => s,
+            match deref_res {
+                Ok(Some((start, end))) => {
+                    debug_assert_eq!(start, 0);
+                    cursor.lazy_row_pos = Some(cursor.pos);
+                    cursor.lazy_blobs[cursor.pos] = None;
+                    &cursor.lazy_row_buf[start..end]
+                }
                 Ok(None) => {
+                    cursor.lazy_row_buf.clear();
                     sqlite3_result_error_code(p_ctx, SQLITE_CORRUPT);
                     return SQLITE_CORRUPT;
                 }
                 Err(e) => {
+                    cursor.lazy_row_buf.clear();
                     let rc = io_err_to_sqlite_rc(&e);
                     sqlite3_result_error_code(p_ctx, rc);
                     return rc;
                 }
-            };
-            cursor.spans[cursor.pos] = span;
-            cursor.lazy_blobs[cursor.pos] = None;
+            }
+        } else {
+            let (start, end) = cursor.spans[cursor.pos];
+            &cursor.slab[start..end]
+        };
+
+        #[cfg(test)]
+        {
+            let slab_len = cursor.slab.len();
+            CURSOR_SLAB_MAX_LEN.with(|m| m.set(m.get().max(slab_len)));
+            let lazy_len = cursor.lazy_row_buf.len();
+            CURSOR_LAZY_ROW_BUF_MAX_LEN.with(|m| m.set(m.get().max(lazy_len)));
         }
 
-        let (start, end) = cursor.spans[cursor.pos];
-        let row_bytes = &cursor.slab[start..end];
         match project_column_zero_copy(row_bytes, i_col as usize, p_ctx) {
             Ok(()) => SQLITE_OK,
             Err(_) => SQLITE_ERROR,
@@ -2207,35 +2290,17 @@ unsafe extern "system" fn vtab_rowid(
     p_rowid: *mut sqlite3_int64,
 ) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        let cursor = &*(p_cursor as *const AydbCursor);
+        let cursor = &mut *(p_cursor as *mut AydbCursor);
         let vtab = &*(cursor.base.pVtab as *const AydbVTab);
-        if cursor.keys_only {
-            if cursor.pos >= cursor.pks.len() {
-                return SQLITE_ERROR;
-            }
-            *p_rowid = match extract_rowid_from_pk_bytes(
-                &cursor.pks[cursor.pos],
-                vtab,
-                cursor.snapshot.as_ref(),
-            ) {
-                Ok(rid) => rid,
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            };
-            return SQLITE_OK;
-        }
-        if cursor.pos >= cursor.spans.len() {
+        let len = if cursor.keys_only {
+            cursor.pks.len()
+        } else {
+            cursor.spans.len()
+        };
+        if cursor.pos >= len {
             return SQLITE_ERROR;
         }
-        if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-            *p_rowid = match extract_rowid_from_pk_bytes(pk_bytes, vtab, cursor.snapshot.as_ref()) {
-                Ok(rid) => rid,
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            };
-            return SQLITE_OK;
-        }
-        let (start, end) = cursor.spans[cursor.pos];
-        let row_bytes = &cursor.slab[start..end];
-        *p_rowid = match extract_rowid_from_row(row_bytes, vtab, cursor.snapshot.as_ref()) {
+        *p_rowid = match resolve_cursor_rowid(cursor, vtab) {
             Ok(rid) => rid,
             Err(e) => return io_err_to_sqlite_rc(&e),
         };

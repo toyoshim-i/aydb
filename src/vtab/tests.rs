@@ -3751,3 +3751,147 @@ fn sql_chunked_full_scan_bypasses_block_cache_and_secondary_lookup_caches() {
     );
     assert_eq!(misses3, misses2);
 }
+
+#[test]
+fn chunked_text_pk_rowid_scan_matches_native_sqlite_and_supports_limit() {
+    let tmp = TempTestDir::new("vtab_chunked_rowid");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine).unwrap();
+    conn.execute_batch("CREATE VIRTUAL TABLE t USING aydb(columns='k TEXT PRIMARY KEY, v TEXT');")
+        .unwrap();
+
+    // Insert 350 rows to span multiple 256-row cursor chunks.
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..350 {
+        conn.query_all(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[
+                SqlValue::Text(format!("k_{i:04}")),
+                SqlValue::Text(format!("v_{i:04}")),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+
+    let scan1 = conn
+        .query_all("SELECT rowid, k, v FROM t ORDER BY k", &[])
+        .unwrap();
+    assert_eq!(scan1.len(), 350);
+
+    let mut seen_rowids = std::collections::HashSet::with_capacity(350);
+    for (i, row) in scan1.iter().enumerate() {
+        let SqlValue::Integer(rid) = row[0] else {
+            panic!("expected integer rowid, got {:?}", row[0]);
+        };
+        assert!(seen_rowids.insert(rid), "duplicate rowid {rid}");
+        assert_eq!(row[1], SqlValue::Text(format!("k_{i:04}")));
+        assert_eq!(row[2], SqlValue::Text(format!("v_{i:04}")));
+    }
+
+    // Repeated full and LIMIT scans must return identical rowids, and updates/deletes via rowid work.
+    let scan2 = conn
+        .query_all("SELECT rowid, k FROM t ORDER BY k LIMIT 5", &[])
+        .unwrap();
+    assert_eq!(scan2.len(), 5);
+    for i in 0..5 {
+        assert_eq!(scan2[i][0], scan1[i][0]);
+        assert_eq!(scan2[i][1], scan1[i][1]);
+    }
+
+    let SqlValue::Integer(target_rid) = scan1[300][0] else {
+        unreachable!();
+    };
+    conn.query_all(
+        "UPDATE t SET v = 'updated_300' WHERE rowid = ?1",
+        &[SqlValue::Integer(target_rid)],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT v FROM t WHERE k = 'k_0300'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Text("updated_300".into())]]
+    );
+    conn.query_all(
+        "DELETE FROM t WHERE rowid = ?1",
+        &[SqlValue::Integer(target_rid)],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT count(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(349)]]
+    );
+}
+
+#[test]
+fn lazy_blob_multi_column_scan_reuses_single_row_buffer_without_growing_slab() {
+    let tmp = TempTestDir::new("vtab_lazy_row_buf");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(columns='k TEXT PRIMARY KEY, tag TEXT, payload BLOB, tail TEXT');",
+    )
+    .unwrap();
+
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..60u8 {
+        let mut payload = vec![b'A'.wrapping_add(i % 26); 16 * 1024];
+        payload[0] = i;
+        conn.query_all(
+            "INSERT INTO t VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqlValue::Text(format!("k_{i:03}")),
+                SqlValue::Text(format!("tag_{i:03}")),
+                SqlValue::Blob(payload),
+                SqlValue::Text(format!("tail_{i:03}")),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    engine.write().unwrap().flush_memtable().unwrap();
+
+    CURSOR_SLAB_MAX_LEN.with(|m| m.set(0));
+    CURSOR_LAZY_ROW_BUF_MAX_LEN.with(|m| m.set(0));
+
+    let rows = conn
+        .query_all(
+            "SELECT k, tag, length(payload), substr(payload, 1, 8), tail, rowid FROM t ORDER BY k",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 60);
+    for (i, row) in rows.iter().enumerate() {
+        let b = i as u8;
+        assert_eq!(row[0], SqlValue::Text(format!("k_{i:03}")));
+        assert_eq!(row[1], SqlValue::Text(format!("tag_{i:03}")));
+        assert_eq!(row[2], SqlValue::Integer(16 * 1024));
+        let mut head = vec![b'A'.wrapping_add(b % 26); 8];
+        head[0] = b;
+        assert_eq!(row[3], SqlValue::Blob(head));
+        assert_eq!(row[4], SqlValue::Text(format!("tail_{i:03}")));
+        assert!(matches!(row[5], SqlValue::Integer(_)));
+    }
+
+    // All 60 lazy blobs (>960 KB total) must leave `cursor.slab` completely empty and keep the
+    // single-row buffer bounded to ~1 row (~16 KB) instead of accumulating all rows in a chunk.
+    let slab_max = CURSOR_SLAB_MAX_LEN.with(|m| m.get());
+    let lazy_max = CURSOR_LAZY_ROW_BUF_MAX_LEN.with(|m| m.get());
+    assert_eq!(
+        slab_max, 0,
+        "lazy blobs must not be appended into cursor.slab"
+    );
+    assert!(
+        (16 * 1024..32 * 1024).contains(&lazy_max),
+        "single-row lazy buffer max was {lazy_max} bytes (expected ~16 KB)"
+    );
+}

@@ -88,6 +88,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    pub(super) fn rowids_for_pks_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        table_id: u16,
+        pks: &[Vec<u8>],
+        out: &mut Vec<Option<i64>>,
+    ) -> io::Result<()> {
+        out.clear();
+        out.reserve(pks.len());
+        let prefix = encode_namespace_prefix(table_id, NS_ROWID_BY_PK);
+        let mut key = Vec::with_capacity(3 + 64);
+        for pk in pks {
+            key.clear();
+            key.extend_from_slice(&prefix);
+            key.extend_from_slice(pk);
+            match self.lookup_raw_entry_src(src, &key)? {
+                Some((_, IndexValue::Inline(value))) if value.len() == 8 => {
+                    out.push(Some(i64::from_le_bytes(value.try_into().unwrap())));
+                }
+                // Defer missing/invalid rowid error reporting to the row-level fallback so a
+                // LIMIT query never fails because of an unvisited row later in the chunk.
+                _ => out.push(None),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn pk_for_rowid_view(
         &self,
         view: ReadView,
@@ -224,6 +251,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 impl<FS: PlatformFs> EngineReader<'_, FS> {
     pub(crate) fn rowid_for_pk(&self, table_id: u16, pk: &[u8]) -> io::Result<Option<i64>> {
         self.eng.rowid_for_pk_src(self.cx.src, table_id, pk)
+    }
+
+    pub(crate) fn rowids_for_pks(
+        &self,
+        table_id: u16,
+        pks: &[Vec<u8>],
+        out: &mut Vec<Option<i64>>,
+    ) -> io::Result<()> {
+        self.eng.rowids_for_pks_src(self.cx.src, table_id, pks, out)
     }
 
     pub(crate) fn pk_for_rowid(&self, table_id: u16, rowid: i64) -> io::Result<Option<Vec<u8>>> {
