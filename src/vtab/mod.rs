@@ -452,6 +452,58 @@ struct AydbCursor {
 /// at an exact integer `q` adjusts inclusivity so both representations are included or excluded
 /// consistently!
 ///
+/// Returns `true` when searching a `TEXT` or `BLOB` column with an `INTEGER` or `REAL` SQLite
+/// value (e.g., `CAST(1 AS INTEGER)` or a join against an integer column).
+///
+/// Under SQLite's cross-affinity comparison rules, a single typed lookup key cannot match all
+/// storage representations (`'1'`, `'01'`, `'1.0'` for `TEXT`; integers and numeric strings under
+/// integer-affine joins for `BLOB`), so callers must fall back to a scan that lets SQLite's VDBE
+/// filter each candidate row (`omit = 0`).
+#[inline]
+fn is_cross_affinity_numeric_search(col_affinity: ColumnAffinity, val_type: c_int) -> bool {
+    matches!(col_affinity, ColumnAffinity::Text | ColumnAffinity::Blob)
+        && matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT)
+}
+
+/// Initializes a streaming primary-key full-table scan on `cursor`, used both for `PLAN_FULL_SCAN`
+/// and when an equality filter falls back on cross-affinity numeric comparison.
+fn start_pk_full_scan(
+    cursor: &mut AydbCursor,
+    eng: &EngineReader<'_, OsFs>,
+    table_id: u16,
+    keys_only: bool,
+    reverse: bool,
+) -> io::Result<()> {
+    cursor.keys_only = keys_only;
+    eng.scan_range_into_slab(
+        table_id,
+        None,
+        None,
+        reverse,
+        CURSOR_STREAM_CHUNK_ROWS,
+        keys_only,
+        &mut cursor.pks,
+        &mut cursor.slab,
+        &mut cursor.spans,
+        Some(&mut cursor.lazy_blobs),
+    )?;
+    let fetched_rows = if keys_only {
+        cursor.pks.len()
+    } else {
+        cursor.spans.len()
+    };
+    if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
+        if let Some(last_pk) = cursor.pks.last().cloned() {
+            cursor.streaming_active = true;
+            cursor.stream_lower = None;
+            cursor.stream_upper = None;
+            cursor.stream_reverse = reverse;
+            cursor.stream_last_pk = Some(last_pk);
+        }
+    }
+    Ok(())
+}
+
 /// Returns `Ok(Some((key_bytes, is_inclusive)))` for a normal bound, `Ok(None)` if the bound
 /// is unbounded in that direction, or `Err(())` if the range is unsatisfiable (empty result).
 unsafe fn pk_range_bound_to_key(
@@ -470,6 +522,9 @@ unsafe fn pk_range_bound_to_key(
         if f.is_nan() {
             return Err(());
         }
+    }
+    if is_cross_affinity_numeric_search(pk_affinity, val_type) {
+        return Ok(None);
     }
 
     let key =
@@ -527,6 +582,9 @@ unsafe fn sec_range_bound_to_key(
         if f.is_nan() {
             return Err(());
         }
+    }
+    if is_cross_affinity_numeric_search(sec_affinity, val_type) {
+        return Ok(None);
     }
 
     let col_val = unsafe {
@@ -1117,7 +1175,16 @@ unsafe extern "system" fn vtab_best_index(
                     pt_flags |= POINT_FLAG_KEYS_ONLY;
                 }
                 info.idxNum = PLAN_PK_POINT | (pt_flags << 8);
-                info.idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
+                // Do not promise at most one row when a TEXT or BLOB PK may fall back to a
+                // cross-affinity full scan where `'1'`, `'01'`, and `'1.0'` all match `1`.
+                if col == -1
+                    || matches!(
+                        vtab.pk_affinity,
+                        ColumnAffinity::Integer | ColumnAffinity::Numeric | ColumnAffinity::Real
+                    )
+                {
+                    info.idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
+                }
                 info.estimatedCost = 1.0;
                 info.estimatedRows = 1;
                 return SQLITE_OK;
@@ -1390,12 +1457,13 @@ unsafe extern "system" fn vtab_filter(
             Ok(snapshot) => snapshot,
             Err(error) => return io_err_to_sqlite_rc(&error),
         };
+        let snapshot = cursor.snapshot.take();
 
-        with_snapshot_read_access(
+        let rc = with_snapshot_read_access(
             &vtab.engine,
             conn_id,
             vtab.table_id,
-            cursor.snapshot.as_ref(),
+            snapshot.as_ref(),
             |eng| {
                 let base_plan = idx_num & 0xFF;
                 match base_plan {
@@ -1404,7 +1472,10 @@ unsafe extern "system" fn vtab_filter(
                             return SQLITE_ERROR;
                         }
                         let val_ptr = *argv.offset(0);
-                        if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                        let val_type = sqlite3_value_type(val_ptr);
+                        if val_type == SQLITE_NULL
+                            || (val_type == SQLITE_FLOAT && sqlite3_value_double(val_ptr).is_nan())
+                        {
                             return SQLITE_OK;
                         }
                         let pt_flags = (idx_num >> 8) & 0xFF;
@@ -1441,6 +1512,18 @@ unsafe extern "system" fn vtab_filter(
                             }
                             return SQLITE_OK;
                         } else {
+                            if is_cross_affinity_numeric_search(vtab.pk_affinity, val_type) {
+                                if let Err(e) = start_pk_full_scan(
+                                    cursor,
+                                    eng,
+                                    vtab.table_id,
+                                    pt_keys_only,
+                                    false,
+                                ) {
+                                    return io_err_to_sqlite_rc(&e);
+                                }
+                                return SQLITE_OK;
+                            }
                             let pk_bytes = sqlite_value_to_key_bytes_with_schema(
                                 val_ptr,
                                 vtab.pk_affinity,
@@ -1487,7 +1570,10 @@ unsafe extern "system" fn vtab_filter(
                             return SQLITE_ERROR;
                         }
                         let val_ptr = *argv.offset(0);
-                        if sqlite3_value_type(val_ptr) == SQLITE_NULL {
+                        let val_type = sqlite3_value_type(val_ptr);
+                        if val_type == SQLITE_NULL
+                            || (val_type == SQLITE_FLOAT && sqlite3_value_double(val_ptr).is_nan())
+                        {
                             return SQLITE_OK;
                         }
                         let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
@@ -1510,6 +1596,14 @@ unsafe extern "system" fn vtab_filter(
                             .get(sec_col_idx)
                             .copied()
                             .unwrap_or(ColCollation::Binary);
+                        if is_cross_affinity_numeric_search(sec_aff, val_type) {
+                            if let Err(e) =
+                                start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false)
+                            {
+                                return io_err_to_sqlite_rc(&e);
+                            }
+                            return SQLITE_OK;
+                        }
                         let col_val =
                             sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
                         let prefix = crate::lru::encode_secondary_index_exact_prefix(
@@ -1562,7 +1656,7 @@ unsafe extern "system" fn vtab_filter(
                             .unwrap_or(ColCollation::Binary);
 
                         let mut arg_pos = 0;
-                        let lower_bound = if (flags
+                        let parsed_lower = if (flags
                             & (RANGE_FLAG_LOWER_INCLUSIVE | RANGE_FLAG_LOWER_EXCLUSIVE))
                             != 0
                             && arg_pos < argc
@@ -1583,13 +1677,16 @@ unsafe extern "system" fn vtab_filter(
                                 Err(()) => return SQLITE_OK,
                             }
                         } else {
+                            None
+                        };
+                        let lower_bound = parsed_lower.or_else(|| {
                             let mut min_non_null = Vec::with_capacity(6);
                             min_non_null.extend_from_slice(
                                 &crate::lru::encode_secondary_index_prefix(vtab.table_id, index_id),
                             );
                             min_non_null.push(KEY_TAG_NULL + 1);
                             Some((min_non_null, true))
-                        };
+                        });
                         let upper_bound = if (flags
                             & (RANGE_FLAG_UPPER_INCLUSIVE | RANGE_FLAG_UPPER_EXCLUSIVE))
                             != 0
@@ -1725,34 +1822,10 @@ unsafe extern "system" fn vtab_filter(
                         let flags = idx_num >> 8;
                         let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
                         let reverse = (flags & RANGE_FLAG_REVERSE) != 0;
-                        cursor.keys_only = keys_only;
-                        if let Err(e) = eng.scan_range_into_slab(
-                            vtab.table_id,
-                            None,
-                            None,
-                            reverse,
-                            CURSOR_STREAM_CHUNK_ROWS,
-                            keys_only,
-                            &mut cursor.pks,
-                            &mut cursor.slab,
-                            &mut cursor.spans,
-                            Some(&mut cursor.lazy_blobs),
-                        ) {
+                        if let Err(e) =
+                            start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, reverse)
+                        {
                             return io_err_to_sqlite_rc(&e);
-                        }
-                        let fetched_rows = if keys_only {
-                            cursor.pks.len()
-                        } else {
-                            cursor.spans.len()
-                        };
-                        if fetched_rows >= CURSOR_STREAM_CHUNK_ROWS {
-                            if let Some(last_pk) = cursor.pks.last().cloned() {
-                                cursor.streaming_active = true;
-                                cursor.stream_lower = None;
-                                cursor.stream_upper = None;
-                                cursor.stream_reverse = reverse;
-                                cursor.stream_last_pk = Some(last_pk);
-                            }
                         }
                     }
                 }
@@ -1760,7 +1833,9 @@ unsafe extern "system" fn vtab_filter(
                 SQLITE_OK
             },
         )
-        .unwrap_or(SQLITE_ERROR)
+        .unwrap_or(SQLITE_ERROR);
+        cursor.snapshot = snapshot;
+        rc
     }))
     .unwrap_or(SQLITE_ERROR)
 }

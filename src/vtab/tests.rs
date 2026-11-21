@@ -3430,3 +3430,164 @@ fn text_primary_key_preserves_invalid_utf8_bytes_on_projection_and_lookup() {
         );
     }
 }
+
+#[test]
+fn cross_affinity_numeric_comparisons_on_text_and_blob_columns_match_native_sqlite() {
+    let tmp = TempTestDir::new("cross_affinity_numeric");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_tp USING aydb(columns='k TEXT PRIMARY KEY, v INT');
+         CREATE TABLE nat_tp(k TEXT PRIMARY KEY, v INT);
+         CREATE VIRTUAL TABLE ay_ts USING aydb(columns='id INT PRIMARY KEY, s TEXT', indexes='s');
+         CREATE TABLE nat_ts(id INT PRIMARY KEY, s TEXT);
+         CREATE INDEX nat_ts_s ON nat_ts(s);
+
+         CREATE VIRTUAL TABLE ay_bp USING aydb(columns='k BLOB PRIMARY KEY, v INT');
+         CREATE TABLE nat_bp(k BLOB PRIMARY KEY, v INT);
+         CREATE VIRTUAL TABLE ay_bs USING aydb(columns='id INT PRIMARY KEY, s BLOB', indexes='s');
+         CREATE TABLE nat_bs(id INT PRIMARY KEY, s BLOB);
+         CREATE INDEX nat_bs_s ON nat_bs(s);
+
+         CREATE TABLE t_int(id INTEGER PRIMARY KEY);
+         INSERT INTO t_int VALUES (1), (2);",
+    )
+    .unwrap();
+
+    for (i, val) in ["'1'", "'01'", "'1.0'", "'2'", "'10'", "'abc'"]
+        .iter()
+        .enumerate()
+    {
+        let id = i + 1;
+        conn.execute_batch(&format!(
+            "INSERT INTO ay_tp VALUES ({val}, {id});
+             INSERT INTO nat_tp VALUES ({val}, {id});
+             INSERT INTO ay_ts VALUES ({id}, {val});
+             INSERT INTO nat_ts VALUES ({id}, {val});"
+        ))
+        .unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO ay_ts VALUES (100, NULL);
+         INSERT INTO nat_ts VALUES (100, NULL);",
+    )
+    .unwrap();
+
+    for (i, val) in ["1", "10", "1.5", "'1'", "'01'", "'2'", "x'31'"]
+        .iter()
+        .enumerate()
+    {
+        let id = i + 1;
+        conn.execute_batch(&format!(
+            "INSERT INTO ay_bp VALUES ({val}, {id});
+             INSERT INTO nat_bp VALUES ({val}, {id});
+             INSERT INTO ay_bs VALUES ({id}, {val});
+             INSERT INTO nat_bs VALUES ({id}, {val});"
+        ))
+        .unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO ay_bs VALUES (100, NULL);
+         INSERT INTO nat_bs VALUES (100, NULL);",
+    )
+    .unwrap();
+
+    for (ay, nat, col, order_col) in [
+        ("ay_tp", "nat_tp", "k", "k"),
+        ("ay_ts", "nat_ts", "s", "id"),
+        ("ay_bp", "nat_bp", "k", "k"),
+        ("ay_bs", "nat_bs", "s", "id"),
+    ] {
+        for tmpl in [
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} = 1 ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} = CAST(1 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} = CAST(1.0 AS REAL) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} < 2 ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} < CAST(2 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} > 1 ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} > CAST(1 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} <= CAST(1 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} >= CAST(2 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} > CAST(1 AS INTEGER) AND {col} < '2' ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}) FROM {tbl} WHERE {col} > CAST(1 AS INTEGER) ORDER BY {col} DESC",
+            "SELECT typeof({col}), quote({col}) FROM {tbl} ORDER BY {col} DESC",
+            "SELECT typeof(a.{col}), quote(a.{col}), b.id FROM {tbl} a JOIN t_int b ON a.{col} = b.id ORDER BY b.id, a.{ord}",
+            "SELECT typeof(a.{col}), quote(a.{col}), b.id FROM {tbl} a JOIN t_int b ON a.{col} < b.id ORDER BY b.id, a.{ord}",
+            "SELECT typeof(a.{col}), quote(a.{col}), b.id FROM {tbl} a JOIN t_int b ON a.{col} > b.id ORDER BY b.id, a.{ord}",
+        ] {
+            let q_ay = tmpl
+                .replace("{tbl}", ay)
+                .replace("{col}", col)
+                .replace("{ord}", order_col);
+            let q_nat = tmpl
+                .replace("{tbl}", nat)
+                .replace("{col}", col)
+                .replace("{ord}", order_col);
+            let got_ay = conn.query_all(&q_ay, &[]).unwrap();
+            let got_nat = conn.query_all(&q_nat, &[]).unwrap();
+            assert_eq!(got_ay, got_nat, "mismatch on {ay}: `{q_ay}`");
+        }
+
+        // Unordered equality without `ORDER BY` must still emit every matching row (must not
+        // short-circuit at 1 row via `SQLITE_INDEX_SCAN_UNIQUE`).
+        let unordered = format!(
+            "SELECT typeof({col}), quote({col}) FROM {{tbl}} WHERE {col} = CAST(1 AS INTEGER)"
+        );
+        let mut got_ay = conn
+            .query_all(&unordered.replace("{tbl}", ay), &[])
+            .unwrap();
+        let mut got_nat = conn
+            .query_all(&unordered.replace("{tbl}", nat), &[])
+            .unwrap();
+        got_ay.sort_by_key(|row| format!("{row:?}"));
+        got_nat.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(got_ay, got_nat, "unordered equality mismatch on {ay}");
+    }
+
+    // Multi-chunk streaming (> CURSOR_STREAM_CHUNK_ROWS = 256) on cross-affinity TEXT PK lookup.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_tp_big USING aydb(columns='k TEXT PRIMARY KEY, v INT');
+         CREATE TABLE nat_tp_big(k TEXT PRIMARY KEY, v INT);",
+    )
+    .unwrap();
+    let mut batch = String::from("BEGIN;");
+    for i in 0..300 {
+        batch.push_str(&format!(
+            "INSERT INTO ay_tp_big VALUES ('row_{i:03}', {i});
+             INSERT INTO nat_tp_big VALUES ('row_{i:03}', {i});"
+        ));
+    }
+    for (i, val) in ["'001'", "'01'", "'1'", "'1.0'", "'1.00'"]
+        .iter()
+        .enumerate()
+    {
+        let v = 1000 + i;
+        batch.push_str(&format!(
+            "INSERT INTO ay_tp_big VALUES ({val}, {v});
+             INSERT INTO nat_tp_big VALUES ({val}, {v});"
+        ));
+    }
+    batch.push_str("COMMIT;");
+    conn.execute_batch(&batch).unwrap();
+
+    for tmpl in [
+        "SELECT k FROM {tbl} WHERE k = CAST(1 AS INTEGER)",
+        "SELECT k, v FROM {tbl} WHERE k = CAST(1 AS INTEGER) ORDER BY v",
+        "SELECT quote(k), v FROM {tbl} WHERE k = CAST(1.0 AS REAL) ORDER BY k",
+    ] {
+        let got_ay = conn
+            .query_all(&tmpl.replace("{tbl}", "ay_tp_big"), &[])
+            .unwrap();
+        let got_nat = conn
+            .query_all(&tmpl.replace("{tbl}", "nat_tp_big"), &[])
+            .unwrap();
+        assert_eq!(got_ay.len(), 5);
+        assert_eq!(got_ay, got_nat, "streaming mismatch on `{tmpl}`");
+    }
+}
