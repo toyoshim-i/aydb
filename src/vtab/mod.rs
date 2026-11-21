@@ -723,6 +723,26 @@ fn connect_table(
              format); recreate it",
         ));
     }
+    let unique_def = unique_key::UniqueDef::from_columns(
+        &ddl.col_unique,
+        &ddl.col_collations,
+        &ddl.col_affinities,
+    );
+    let disable_initial_unique_marker = {
+        #[cfg(test)]
+        {
+            UNIQUE_MIGRATION_DISABLED.with(|flag| flag.get())
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
+    let initial_unique_marker = if !unique_def.is_empty() && !disable_initial_unique_marker {
+        Some(unique_def.marker_value())
+    } else {
+        None
+    };
     let reg_token = if eng.check_write_allowed_for_conn(conn_id).is_err() {
         let quota_registered = ddl.max_bytes == 0
             || eng
@@ -733,7 +753,7 @@ fn connect_table(
         }
         eng.activate_persisted_vtab(table_id, &ddl.table_name)
     } else {
-        register_table(eng, ddl, plan)?
+        register_table(eng, ddl, plan, initial_unique_marker)?
     };
     // Runtime-only settings: re-derived from the DDL on every connect.
     match ddl.on_corrupt {
@@ -744,11 +764,6 @@ fn connect_table(
         Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
         None => eng.reset_table_inline_threshold(table_id),
     }
-    let unique_def = unique_key::UniqueDef::from_columns(
-        &ddl.col_unique,
-        &ddl.col_collations,
-        &ddl.col_affinities,
-    );
     let unique_ready = unique_def.is_empty()
         || eng
             .unique_marker_view(crate::engine::ReadView::Committed, table_id)
@@ -763,15 +778,17 @@ fn connect_table(
     }))
 }
 
-/// The writing part of a connect: catalog entry (with the table's rowid mapping marker, in the
-/// same atomic write) and capped quota. It only runs when no other connection has a transaction
-/// open. Returns the new holder registration token.
+/// The writing part of a connect: catalog entry (with the table's rowid mapping marker and any
+/// empty-table UNIQUE completion marker, in the same atomic write) and capped quota. It only
+/// runs when no other connection has a transaction open. Returns the new holder registration token.
 fn register_table(
     eng: &mut StorageEngine<OsFs>,
     ddl: &ParsedVtabDdl,
     plan: crate::engine::VtabPlan,
+    initial_unique_marker: Option<Vec<u8>>,
 ) -> io::Result<u64> {
-    let (table_id, reg_token) = eng.register_vtab_plan(plan, ddl.durability)?;
+    let (table_id, reg_token) =
+        eng.register_vtab_plan(plan, ddl.durability, initial_unique_marker)?;
     if ddl.max_bytes > 0 {
         if let Err(e) = eng.register_capped_table(table_id, ddl.max_bytes) {
             eng.unregister_vtab_token(table_id, reg_token);

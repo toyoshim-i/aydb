@@ -308,7 +308,9 @@ fn overwriting_a_row_without_meta_leaves_a_correct_state() {
     .iter()
     .enumerate()
     {
+        let prev = UNIQUE_MIGRATION_DISABLED.with(|flag| flag.replace(true));
         let fx = fixture(&format!("unique_index_legacy{i}"), "");
+        UNIQUE_MIGRATION_DISABLED.with(|flag| flag.set(prev));
         put_legacy_row(&fx, "L", "la", 7, "LN", "lc");
         run(&fx, sql);
     }

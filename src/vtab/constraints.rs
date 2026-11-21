@@ -28,9 +28,10 @@ pub(super) fn find_unique_conflicts(
 
 /// True when every row's UNIQUE entries are complete: the connection latched on the marker, or
 /// the marker for this definition is committed (another connection finished the migration).
-/// The marker is written outside any transaction, so the committed view is the writer's view
-/// too, and a rollback can never remove it. A connection whose own migration failed stays on
-/// the scan.
+/// When an uncommitted table is created inside an active transaction, its empty-table marker is
+/// visible in `ReadView::Owner` and trusted for that transaction without latching `unique_ready`
+/// prematurely (so a `ROLLBACK` never leaves a stale latch). A connection whose own migration
+/// failed stays on the scan.
 fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
     if vtab.unique_ready.load(Ordering::Acquire) {
         return true;
@@ -38,15 +39,22 @@ fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
     if vtab.unique_migration_failed.load(Ordering::Relaxed) {
         return false;
     }
+    let want = vtab.unique_def.marker_value();
     let marked = engine
         .unique_marker_view(crate::engine::ReadView::Committed, vtab.table_id)
         .ok()
         .flatten()
-        .is_some_and(|found| found == vtab.unique_def.marker_value());
+        .is_some_and(|found| found == want);
     if marked {
         vtab.unique_ready.store(true, Ordering::Release);
+        return true;
     }
-    marked
+    engine.in_active_transaction()
+        && engine
+            .unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)
+            .ok()
+            .flatten()
+            .is_some_and(|found| found == want)
 }
 
 /// One probe per non-NULL UNIQUE column in the owner view, which includes the writer's own

@@ -20,7 +20,7 @@ fn with_scan<R>(scan: bool, f: impl FnOnce() -> R) -> R {
 fn scan_index_and_native_sqlite_agree_on_random_statements() {
     for seed in 0..120u64 {
         let mut gen_ = StatementGen::new(seed ^ 0x5555);
-        let scanned = fixture(&format!("unique_check_scan{seed}"), "");
+        let scanned = with_scan(true, || fixture(&format!("unique_check_scan{seed}"), ""));
         let indexed = fixture(&format!("unique_check_index{seed}"), "");
         let native = SqliteConnection::open_in_memory().unwrap();
         native.execute_batch(NATIVE_DDL).unwrap();
@@ -97,7 +97,9 @@ fn an_insert_on_a_migrated_table_reads_no_row_whatever_its_size() {
         });
         by_size.push(read);
         // The same statements through the scan do read the table.
-        let scanned = fixture(&format!("unique_check_cost_scan{rows}"), "");
+        let scanned = with_scan(true, || {
+            fixture(&format!("unique_check_cost_scan{rows}"), "")
+        });
         with_scan(true, || {
             scanned
                 .conn
@@ -290,7 +292,7 @@ fn stale_entries_and_digest_collisions_are_not_conflicts() {
 
 #[test]
 fn a_connection_that_did_not_migrate_trusts_a_marker_another_one_wrote() {
-    let fx = fixture("unique_check_marker_elsewhere", "");
+    let fx = with_scan(true, || fixture("unique_check_marker_elsewhere", ""));
     // This connection never migrates; the marker is written by someone else.
     let writer = super::unique_index_tests::connect(&fx.engine, 1, "");
     writer

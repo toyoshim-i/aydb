@@ -64,6 +64,17 @@ fn marker_of(engine: &Engine, table_id: u16) -> Option<Vec<u8>> {
         .unwrap()
 }
 
+fn with_disabled_migration<R>(f: impl FnOnce() -> R) -> R {
+    let prev = UNIQUE_MIGRATION_DISABLED.with(|flag| flag.replace(true));
+    let res = f();
+    UNIQUE_MIGRATION_DISABLED.with(|flag| flag.set(prev));
+    res
+}
+
+fn legacy_fixture(name: &str, extra: &str) -> Fx {
+    with_disabled_migration(|| fixture(name, extra))
+}
+
 /// Runs write statements that change nothing until the migration is complete. Returns how many
 /// transactions it took.
 fn drive(fx: &Fx) -> usize {
@@ -86,7 +97,7 @@ fn migration_builds_the_index_for_tables_of_every_size_and_durability() {
         (10_000, "durability='sync', ", 3),
         (10_000, "", 3),
     ] {
-        let fx = fixture(&format!("unique_mig_size{rows}"), extra);
+        let fx = legacy_fixture(&format!("unique_mig_size{rows}"), extra);
         legacy_table(&fx, rows);
         assert!(marker(&fx).is_none());
         // The work is bounded per transaction: 4096 rows each.
@@ -161,13 +172,15 @@ fn a_synchronous_migration_syncs_once_regardless_of_row_count() {
 
 #[test]
 fn a_transaction_already_open_skips_the_migration_and_keeps_the_scan() {
-    let fx = fixture("unique_mig_open_tx", "");
-    fx.conn
-        .execute_batch(
-            "CREATE VIRTUAL TABLE u USING aydb(table_id=2, \
-             columns='k TEXT PRIMARY KEY, a TEXT UNIQUE')",
-        )
-        .unwrap();
+    let fx = legacy_fixture("unique_mig_open_tx", "");
+    with_disabled_migration(|| {
+        fx.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE u USING aydb(table_id=2, \
+                 columns='k TEXT PRIMARY KEY, a TEXT UNIQUE')",
+            )
+            .unwrap();
+    });
     legacy_table(&fx, 3);
     let row = encode_row(&[SqlValue::Text("u1".into()), SqlValue::Text("ua".into())]);
     {
@@ -219,7 +232,7 @@ fn a_transaction_already_open_skips_the_migration_and_keeps_the_scan() {
 
 #[test]
 fn a_connection_with_a_read_snapshot_is_not_made_stale_by_the_migration() {
-    let fx = fixture("unique_mig_snapshot", "");
+    let fx = legacy_fixture("unique_mig_snapshot", "");
     legacy_table(&fx, 4);
     fx.conn
         .execute_batch("BEGIN; SELECT count(*) FROM t;")
@@ -235,7 +248,7 @@ fn a_connection_with_a_read_snapshot_is_not_made_stale_by_the_migration() {
 
 #[test]
 fn rolling_back_the_triggering_transaction_keeps_the_marker_and_the_index() {
-    let fx = fixture("unique_mig_rollback", "");
+    let fx = legacy_fixture("unique_mig_rollback", "");
     legacy_table(&fx, 5);
     fx.conn
         .execute_batch("BEGIN; INSERT INTO t VALUES('n1','na',500,'nn','c'); ROLLBACK;")
@@ -247,7 +260,7 @@ fn rolling_back_the_triggering_transaction_keeps_the_marker_and_the_index() {
 
 #[test]
 fn legacy_duplicates_get_an_entry_for_each_row() {
-    let fx = fixture("unique_mig_duplicates", "");
+    let fx = legacy_fixture("unique_mig_duplicates", "");
     put_indexed_legacy_row(&fx, "k1", "dup", 1, "n1", "c");
     put_indexed_legacy_row(&fx, "k2", "dup", 2, "n2", "c");
     put_indexed_legacy_row(&fx, "k3", "other", 3, "n3", "c");
@@ -265,7 +278,7 @@ fn corrupt_big_row_fixture(name: &str, policy: &str) -> (Fx, usize) {
     let dir = TempTestDir::new(name);
     {
         let engine = open_engine(&dir);
-        let conn = connect(&engine, 1, "");
+        let conn = with_disabled_migration(|| connect(&engine, 1, ""));
         let fx = Fx {
             dir: TempTestDir::new(&format!("{name}_unused")),
             engine: engine.clone(),
@@ -456,11 +469,13 @@ fn writers_between_chunks_keep_the_index_exact() {
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module_with_options(engine.clone(), false)
             .unwrap();
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE u USING aydb(table_id=2, \
-             columns='k TEXT PRIMARY KEY, a TEXT UNIQUE')",
-        )
-        .unwrap();
+        with_disabled_migration(|| {
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE u USING aydb(table_id=2, \
+                 columns='k TEXT PRIMARY KEY, a TEXT UNIQUE')",
+            )
+            .unwrap();
+        });
         for i in 0..40 {
             let row = encode_row(&[
                 SqlValue::Text(format!("k{i:02}")),
@@ -532,7 +547,7 @@ fn writers_between_chunks_keep_the_index_exact() {
 
 #[test]
 fn another_connections_transaction_makes_the_migration_stand_aside() {
-    let fx = fixture("unique_mig_other_tx", "");
+    let fx = legacy_fixture("unique_mig_other_tx", "");
     legacy_table(&fx, 20);
     let other = connect(&fx.engine, 1, "");
     let def = std_def();
@@ -571,7 +586,7 @@ fn another_connections_transaction_makes_the_migration_stand_aside() {
 
 #[test]
 fn the_latch_stops_all_further_work() {
-    let fx = fixture("unique_mig_latch", "");
+    let fx = legacy_fixture("unique_mig_latch", "");
     legacy_table(&fx, 3);
     drive(&fx);
     // Remove the marker behind the connection's back: it has latched and does not look again.
@@ -683,5 +698,127 @@ fn migrate_after_pending_group_commit_preserves_new_unique_entry() {
         eng.unique_marker_view(ReadView::Committed, 1)
             .unwrap()
             .is_some()
+    );
+}
+
+#[test]
+fn new_empty_unique_table_writes_marker_atomically_on_create_and_avoids_scan_in_transaction() {
+    use crate::engine::TABLE_SCAN_ENTRIES_COPIED;
+
+    let fx = fixture("unique_atomic_create", "");
+    assert_eq!(marker(&fx), Some(std_def().marker_value()));
+
+    // 1. Creating a brand-new UNIQUE table inside BEGIN and bulk-inserting avoids O(N^2) scans.
+    fx.conn
+        .execute_batch(
+            "BEGIN;
+             CREATE VIRTUAL TABLE t1 USING aydb(table_id=2,
+                 columns='k TEXT PRIMARY KEY, a TEXT UNIQUE');",
+        )
+        .unwrap();
+    assert_eq!(
+        fx.engine
+            .read()
+            .unwrap()
+            .unique_marker_view(ReadView::Owner, 2)
+            .unwrap(),
+        Some(UniqueDef::new(vec![(1, ColCollation::Binary, ColumnAffinity::Text)]).marker_value())
+    );
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    for i in 0..200 {
+        fx.conn
+            .execute_batch(&format!("INSERT INTO t1 VALUES('k{i:03}','a{i:03}')"))
+            .unwrap();
+    }
+    assert!(
+        fx.conn
+            .execute_batch("INSERT INTO t1 VALUES('dup','a050')")
+            .is_err()
+    );
+    assert_eq!(TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()), 0);
+    fx.conn.execute_batch("COMMIT").unwrap();
+    assert!(marker_of(&fx.engine, 2).is_some());
+
+    // 2. Same when another write opened the transaction BEFORE CREATE VIRTUAL TABLE, plus ROLLBACK.
+    fx.conn
+        .execute_batch(
+            "BEGIN;
+             INSERT INTO t VALUES('seed','sa',1,'sn','c');
+             CREATE VIRTUAL TABLE t2 USING aydb(table_id=3,
+                 columns='k TEXT PRIMARY KEY, a TEXT UNIQUE');",
+        )
+        .unwrap();
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    for i in 0..200 {
+        fx.conn
+            .execute_batch(&format!("INSERT INTO t2 VALUES('k{i:03}','b{i:03}')"))
+            .unwrap();
+    }
+    assert_eq!(TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()), 0);
+    fx.conn.execute_batch("COMMIT").unwrap();
+    assert!(marker_of(&fx.engine, 3).is_some());
+
+    fx.conn
+        .execute_batch(
+            "BEGIN;
+             INSERT INTO t VALUES('seed2','sa2',2,'sn2','c');
+             CREATE VIRTUAL TABLE t3 USING aydb(table_id=4,
+                 columns='k TEXT PRIMARY KEY, a TEXT UNIQUE');
+             INSERT INTO t3 VALUES('k0','v0');
+             ROLLBACK;",
+        )
+        .unwrap();
+    assert!(marker_of(&fx.engine, 4).is_none());
+}
+
+#[test]
+fn attaching_unique_vtab_to_nonempty_explicit_table_id_does_not_write_marker() {
+    let dir = TempTestDir::new("unique_nonempty_explicit_id");
+    let engine = open_engine(&dir);
+    let pk1 = SqlValue::Text("k1".into()).to_key_bytes();
+    let pk2 = SqlValue::Text("k2".into()).to_key_bytes();
+    let pk3 = SqlValue::Text("k3".into()).to_key_bytes();
+    {
+        let mut eng = engine.write().unwrap();
+        for (pk, a) in [(&pk1, "dup_a"), (&pk2, "b2"), (&pk3, "c3")] {
+            let row = encode_row(&[
+                SqlValue::Text(String::from_utf8(pk[1..].to_vec()).unwrap()),
+                SqlValue::Text(a.into()),
+            ]);
+            eng.put_row(9, pk, &row, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            rowid_map::assign_synthetic_rowid(
+                &mut eng,
+                9,
+                pk,
+                WriteDurability::BufferedFast,
+                false,
+            )
+            .unwrap();
+        }
+    }
+
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE legacy9 USING aydb(table_id=9,
+             columns='k TEXT PRIMARY KEY, a TEXT UNIQUE')",
+    )
+    .unwrap();
+    // Attaching existing raw rows must NOT forge a UNIQUE completion marker before migration.
+    assert!(marker_of(&engine, 9).is_none());
+
+    // Duplicate insert fails (via migration or scan) and triggers migration so marker appears.
+    assert!(
+        conn.execute_batch("INSERT INTO legacy9 VALUES('k4','dup_a')")
+            .is_err()
+    );
+    assert!(marker_of(&engine, 9).is_some());
+    let eng = engine.read().unwrap();
+    assert_eq!(
+        eng.lookup_by_secondary_index(9, 0x8001, &[0x20, b'd', b'u', b'p', b'_', b'a'])
+            .unwrap(),
+        vec![pk1]
     );
 }

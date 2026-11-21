@@ -4351,7 +4351,7 @@ fn explicit_table_id_cannot_alias_or_remap_a_persisted_table() {
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     let plan = engine.plan_vtab_registration("alpha", Some(5)).unwrap();
     let (id, token) = engine
-        .register_vtab_plan(plan, WriteDurability::BufferedFast)
+        .register_vtab_plan(plan, WriteDurability::BufferedFast, None)
         .unwrap();
     assert_eq!(id, 5);
     engine
@@ -7365,7 +7365,7 @@ fn drop_table_inside_rolled_back_tx_preserves_lru_writer_policies_and_holders() 
 
     let plan = engine.plan_vtab_registration("t", None).unwrap();
     let (tid, token) = engine
-        .register_vtab_plan(plan, WriteDurability::BufferedFast)
+        .register_vtab_plan(plan, WriteDurability::BufferedFast, None)
         .unwrap();
     engine.register_capped_table(tid, 1 << 20).unwrap();
     engine.set_table_corrupt_policy(tid, CorruptPolicy::Error);

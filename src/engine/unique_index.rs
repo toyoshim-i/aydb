@@ -26,8 +26,17 @@ pub(crate) fn is_unique_index_id(index_id: u16) -> bool {
     index_id & 0x8000 != 0 && index_id != UNIQUE_MARKER_INDEX_ID
 }
 
-fn marker_key(table_id: u16) -> Vec<u8> {
+pub(super) fn marker_key(table_id: u16) -> Vec<u8> {
     encode_secondary_index_prefix(table_id, UNIQUE_MARKER_INDEX_ID).to_vec()
+}
+
+/// The record that marks a table's UNIQUE index as complete for a given definition.
+/// Written atomically with the catalog entry when creating a new empty table.
+pub(super) fn unique_marker_record(table_id: u16, value: Vec<u8>) -> WalRecord {
+    WalRecord::PutInline {
+        key: marker_key(table_id),
+        value,
+    }
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {

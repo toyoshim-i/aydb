@@ -1398,7 +1398,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<u16> {
         let plan = self.plan_vtab_registration(table_name, explicit_id)?;
-        self.register_vtab_plan(plan, durability).map(|(id, _)| id)
+        self.register_vtab_plan(plan, durability, None)
+            .map(|(id, _)| id)
     }
 
     fn add_vtab_holder(&mut self, table_id: u16) -> u64 {
@@ -1411,12 +1412,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         tok
     }
 
+    /// Returns `true` if `table_id` currently has at least one live primary row visible in
+    /// [`ReadView::Owner`].
+    fn table_has_any_primary_row(&self, table_id: u16) -> io::Result<bool> {
+        let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
+        Ok(!self
+            .scan_merged_prefix_range(&prefix, &prefix, true, None, 1, false)?
+            .is_empty())
+    }
+
     /// Registers a virtual table resolved by [`Self::plan_vtab_registration`] as live and, if the
     /// catalog does not hold it yet, persists its catalog entry. Returns `(table_id, reg_token)`.
+    ///
+    /// When creating a new entry (`!plan.persisted`) and `initial_unique_marker` is `Some`,
+    /// writes the `UNIQUE` completion marker in the same atomic batch provided `chosen_id`
+    /// currently has no primary rows (an attached non-empty `explicit_table_id` still requires
+    /// background/incremental migration).
     pub(crate) fn register_vtab_plan(
         &mut self,
         plan: VtabPlan,
         durability: WriteDurability,
+        initial_unique_marker: Option<Vec<u8>>,
     ) -> io::Result<(u16, u64)> {
         let VtabPlan {
             norm_name,
@@ -1434,18 +1450,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     "virtual table name exceeds maximum catalog key length",
                 ));
             }
-            // The rowid mapping marker goes in the same batch: a table is either absent, or in
-            // the catalog with its marker, never half created.
-            self.commit_wal_and_memtable(
-                vec![
-                    WalRecord::PutInline {
-                        key: cat_key,
-                        value: chosen_id.to_be_bytes().to_vec(),
-                    },
-                    rowid::rowid_marker_record(chosen_id),
-                ],
-                durability,
-            )?;
+            // The rowid mapping marker (and initial UNIQUE completion marker for an empty new
+            // table) goes in the same batch: a table is either absent, or in the catalog with
+            // its markers, never half created.
+            let mut records = vec![
+                WalRecord::PutInline {
+                    key: cat_key,
+                    value: chosen_id.to_be_bytes().to_vec(),
+                },
+                rowid::rowid_marker_record(chosen_id),
+            ];
+            if let Some(marker_val) = initial_unique_marker {
+                if !self.table_has_any_primary_row(chosen_id)? {
+                    records.push(unique_index::unique_marker_record(chosen_id, marker_val));
+                }
+            }
+            self.commit_wal_and_memtable(records, durability)?;
         }
         self.active_vtab_ids
             .insert(chosen_id, Arc::from(norm_name.as_str()));
