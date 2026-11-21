@@ -79,12 +79,11 @@ use crate::vtab::ffi::{
     SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE, SQLITE_INDEX_CONSTRAINT_GT,
     SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT, SQLITE_INDEX_SCAN_UNIQUE,
     SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE,
-    SQLITE_TEXT, SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite3, sqlite3_context, sqlite3_declare_vtab,
-    sqlite3_get_autocommit, sqlite3_index_info, sqlite3_int64, sqlite3_malloc, sqlite3_module,
-    sqlite3_result_error_code, sqlite3_result_int64, sqlite3_value, sqlite3_value_bytes,
-    sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type,
-    sqlite3_vtab, sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor,
-    sqlite3_vtab_on_conflict,
+    SQLITE_TEXT, SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite_value_text_bytes, sqlite3, sqlite3_context,
+    sqlite3_declare_vtab, sqlite3_get_autocommit, sqlite3_index_info, sqlite3_int64,
+    sqlite3_malloc, sqlite3_module, sqlite3_result_error_code, sqlite3_result_int64, sqlite3_value,
+    sqlite3_value_double, sqlite3_value_int64, sqlite3_value_type, sqlite3_vtab,
+    sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
 };
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
@@ -291,12 +290,10 @@ unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
         SQLITE_INTEGER => Some(unsafe { sqlite3_value_int64(val) }),
         SQLITE_FLOAT => f64_to_lossless_i64(unsafe { sqlite3_value_double(val) }),
         SQLITE_TEXT => {
-            let bytes = unsafe { sqlite3_value_bytes(val) }.max(0) as usize;
-            let text_ptr = unsafe { sqlite3_value_text(val) };
-            if text_ptr.is_null() || bytes == 0 {
+            let slice = unsafe { sqlite_value_text_bytes(val) };
+            if slice.is_empty() {
                 return None;
             }
-            let slice = unsafe { core::slice::from_raw_parts(text_ptr, bytes) };
             let s = core::str::from_utf8(slice).ok()?;
             match parse_sqlite_numeric_str(s) {
                 Some(Ok(i)) => Some(i),

@@ -14,10 +14,10 @@ use crate::engine::StorageEngine;
 use crate::pal::OsFs;
 use crate::vtab::ffi::{
     SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW, SQLITE_TEXT,
-    sqlite_transient, sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64,
-    sqlite3_bind_null, sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close,
-    sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double,
-    sqlite3_column_int64, sqlite3_column_text, sqlite3_column_type, sqlite3_create_module_v2,
+    sqlite_column_blob_bytes, sqlite_column_text_bytes, sqlite_transient, sqlite3,
+    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_count,
+    sqlite3_column_double, sqlite3_column_int64, sqlite3_column_type, sqlite3_create_module_v2,
     sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open, sqlite3_prepare_v2,
     sqlite3_reset, sqlite3_step, sqlite3_stmt,
 };
@@ -315,24 +315,12 @@ impl<'a> SqliteStatement<'a> {
                 SQLITE_INTEGER => SqlValue::Integer(sqlite3_column_int64(self.stmt, col)),
                 SQLITE_FLOAT => SqlValue::Float(sqlite3_column_double(self.stmt, col)),
                 SQLITE_TEXT => {
-                    let len = sqlite3_column_bytes(self.stmt, col) as usize;
-                    let ptr = sqlite3_column_text(self.stmt, col);
-                    if ptr.is_null() || len == 0 {
-                        SqlValue::Text(String::new())
-                    } else {
-                        let s = core::slice::from_raw_parts(ptr, len);
-                        SqlValue::Text(String::from_utf8_lossy(s).into_owned())
-                    }
+                    let s = sqlite_column_text_bytes(self.stmt, col);
+                    SqlValue::Text(String::from_utf8_lossy(s).into_owned())
                 }
                 _ => {
-                    let len = sqlite3_column_bytes(self.stmt, col) as usize;
-                    let ptr = sqlite3_column_blob(self.stmt, col) as *const u8;
-                    if ptr.is_null() || len == 0 {
-                        SqlValue::Blob(Vec::new())
-                    } else {
-                        let s = core::slice::from_raw_parts(ptr, len);
-                        SqlValue::Blob(s.to_vec())
-                    }
+                    let s = sqlite_column_blob_bytes(self.stmt, col);
+                    SqlValue::Blob(s.to_vec())
                 }
             }
         }

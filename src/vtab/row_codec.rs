@@ -5,10 +5,10 @@ use std::io::{self, ErrorKind};
 
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::vtab::ffi::{
-    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient, sqlite3_context,
-    sqlite3_result_blob, sqlite3_result_double, sqlite3_result_error_toobig, sqlite3_result_int64,
-    sqlite3_result_null, sqlite3_result_text, sqlite3_value, sqlite3_value_blob,
-    sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text,
+    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
+    sqlite_value_blob_bytes, sqlite_value_text_bytes, sqlite3_context, sqlite3_result_blob,
+    sqlite3_result_double, sqlite3_result_error_toobig, sqlite3_result_int64, sqlite3_result_null,
+    sqlite3_result_text, sqlite3_value, sqlite3_value_double, sqlite3_value_int64,
     sqlite3_value_type,
 };
 
@@ -337,24 +337,12 @@ impl SqlValue {
                 SQLITE_INTEGER => Self::Integer(sqlite3_value_int64(val)),
                 SQLITE_FLOAT => Self::Float(sqlite3_value_double(val)),
                 SQLITE_TEXT => {
-                    let len = sqlite3_value_bytes(val) as usize;
-                    let ptr = sqlite3_value_text(val);
-                    if ptr.is_null() || len == 0 {
-                        Self::Text(String::new())
-                    } else {
-                        let slice = core::slice::from_raw_parts(ptr, len);
-                        Self::Text(String::from_utf8_lossy(slice).into_owned())
-                    }
+                    let slice = sqlite_value_text_bytes(val);
+                    Self::Text(String::from_utf8_lossy(slice).into_owned())
                 }
                 _ => {
-                    let len = sqlite3_value_bytes(val) as usize;
-                    let ptr = sqlite3_value_blob(val) as *const u8;
-                    if ptr.is_null() || len == 0 {
-                        Self::Blob(Vec::new())
-                    } else {
-                        let slice = core::slice::from_raw_parts(ptr, len);
-                        Self::Blob(slice.to_vec())
-                    }
+                    let slice = sqlite_value_blob_bytes(val);
+                    Self::Blob(slice.to_vec())
                 }
             }
         }
@@ -622,10 +610,9 @@ pub unsafe fn encode_sqlite_values_direct(
                             }
                         }
                         ColumnAffinity::Text => {
-                            let ptr = sqlite3_value_text(vptr);
-                            let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                            if !ptr.is_null() && len > 0 {
-                                CoercedSlot::TextSlice(core::slice::from_raw_parts(ptr, len))
+                            let slice = sqlite_value_text_bytes(vptr);
+                            if !slice.is_empty() {
+                                CoercedSlot::TextSlice(slice)
                             } else {
                                 CoercedSlot::TextOwned(format_sqlite_float_text(f))
                             }
@@ -634,13 +621,7 @@ pub unsafe fn encode_sqlite_values_direct(
                     }
                 }
                 SQLITE_TEXT => {
-                    let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                    let ptr = sqlite3_value_text(vptr);
-                    let slice: &[u8] = if !ptr.is_null() && len > 0 {
-                        core::slice::from_raw_parts(ptr, len)
-                    } else {
-                        &[]
-                    };
+                    let slice = sqlite_value_text_bytes(vptr);
                     match aff {
                         ColumnAffinity::Integer | ColumnAffinity::Numeric => {
                             if let Ok(s) = core::str::from_utf8(slice) {
@@ -667,16 +648,7 @@ pub unsafe fn encode_sqlite_values_direct(
                         _ => CoercedSlot::TextSlice(slice),
                     }
                 }
-                _ => {
-                    let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                    let ptr = sqlite3_value_blob(vptr) as *const u8;
-                    let slice: &[u8] = if !ptr.is_null() && len > 0 {
-                        core::slice::from_raw_parts(ptr, len)
-                    } else {
-                        &[]
-                    };
-                    CoercedSlot::BlobSlice(slice)
-                }
+                _ => CoercedSlot::BlobSlice(sqlite_value_blob_bytes(vptr)),
             };
             total_payload += match &slot {
                 CoercedSlot::Null => 0,
@@ -855,11 +827,9 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                         }
                     }
                     ColumnAffinity::Text => {
-                        let ptr = sqlite3_value_text(vptr);
-                        let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                        if !ptr.is_null() && len > 0 {
-                            let slice = core::slice::from_raw_parts(ptr, len);
-                            let mut out = Vec::with_capacity(1 + len);
+                        let slice = sqlite_value_text_bytes(vptr);
+                        if !slice.is_empty() {
+                            let mut out = Vec::with_capacity(1 + slice.len());
                             out.push(KEY_TAG_TEXT);
                             collation.push_normalized_text(slice, &mut out);
                             out
@@ -881,13 +851,7 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                 }
             }
             SQLITE_TEXT => {
-                let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                let ptr = sqlite3_value_text(vptr);
-                let slice: &[u8] = if !ptr.is_null() && len > 0 {
-                    core::slice::from_raw_parts(ptr, len)
-                } else {
-                    &[]
-                };
+                let slice = sqlite_value_text_bytes(vptr);
                 match affinity {
                     ColumnAffinity::Integer | ColumnAffinity::Numeric => {
                         if let Ok(s) = core::str::from_utf8(slice) {
@@ -934,13 +898,10 @@ pub unsafe fn sqlite_value_to_key_bytes_with_schema(
                 out
             }
             _ => {
-                let len = sqlite3_value_bytes(vptr).max(0) as usize;
-                let ptr = sqlite3_value_blob(vptr) as *const u8;
-                let mut out = Vec::with_capacity(1 + len);
+                let slice = sqlite_value_blob_bytes(vptr);
+                let mut out = Vec::with_capacity(1 + slice.len());
                 out.push(KEY_TAG_BLOB);
-                if !ptr.is_null() && len > 0 {
-                    out.extend_from_slice(core::slice::from_raw_parts(ptr, len));
-                }
+                out.extend_from_slice(slice);
                 out
             }
         }
@@ -1435,5 +1396,52 @@ mod tests {
         assert_eq!(format_sqlite_float_text(1e20), "1.0e+20");
         assert_eq!(format_sqlite_float_text(1.25e20), "1.25e+20");
         assert_eq!(format_sqlite_float_text(-1e-20), "-1.0e-20");
+    }
+
+    #[test]
+    fn sqlite_pointer_before_bytes_helpers_convert_numeric_values() {
+        use crate::vtab::ffi::{
+            SQLITE_OK, SQLITE_ROW, sqlite_column_blob_bytes, sqlite_column_text_bytes,
+            sqlite3_close, sqlite3_column_value, sqlite3_finalize, sqlite3_open,
+            sqlite3_prepare_v2, sqlite3_step,
+        };
+        use core::ffi::c_char;
+
+        let mut db = core::ptr::null_mut();
+        let mem = b":memory:\0";
+        assert_eq!(
+            unsafe { sqlite3_open(mem.as_ptr() as *const c_char, &mut db) },
+            SQLITE_OK
+        );
+        let mut stmt = core::ptr::null_mut();
+        let sql = b"SELECT 123456789012345, -42.5, x'00ff'\0";
+        assert_eq!(
+            unsafe {
+                sqlite3_prepare_v2(
+                    db,
+                    sql.as_ptr() as *const c_char,
+                    -1,
+                    &mut stmt,
+                    core::ptr::null_mut(),
+                )
+            },
+            SQLITE_OK
+        );
+        assert_eq!(unsafe { sqlite3_step(stmt) }, SQLITE_ROW);
+
+        unsafe {
+            assert_eq!(
+                sqlite_value_text_bytes(sqlite3_column_value(stmt, 0)),
+                b"123456789012345"
+            );
+            assert_eq!(sqlite_column_text_bytes(stmt, 1), b"-42.5");
+            assert_eq!(
+                sqlite_value_blob_bytes(sqlite3_column_value(stmt, 2)),
+                &[0x00, 0xFF]
+            );
+            assert_eq!(sqlite_column_blob_bytes(stmt, 2), &[0x00, 0xFF]);
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
     }
 }

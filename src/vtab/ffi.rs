@@ -368,3 +368,89 @@ unsafe extern "system" {
     pub fn sqlite3_result_error_toobig(pCtx: *mut sqlite3_context);
     pub fn sqlite3_result_error_code(pCtx: *mut sqlite3_context, errCode: c_int);
 }
+
+/// Reads a `sqlite3_value` UTF-8 text slice, calling `sqlite3_value_text` before
+/// `sqlite3_value_bytes` as required by SQLite's pointer/length C API contract.
+///
+/// # Safety
+/// `val` must be a valid non-null `*mut sqlite3_value` whose buffer stays valid for `'a`.
+#[inline]
+pub(crate) unsafe fn sqlite_value_text_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
+    unsafe {
+        let ptr = sqlite3_value_text(val);
+        if ptr.is_null() {
+            return &[];
+        }
+        let len = sqlite3_value_bytes(val).max(0) as usize;
+        if len == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(ptr, len)
+        }
+    }
+}
+
+/// Reads a `sqlite3_value` blob slice, calling `sqlite3_value_blob` before `sqlite3_value_bytes`
+/// as required by SQLite's pointer/length C API contract.
+///
+/// # Safety
+/// `val` must be a valid non-null `*mut sqlite3_value` whose buffer stays valid for `'a`.
+#[inline]
+pub(crate) unsafe fn sqlite_value_blob_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
+    unsafe {
+        let ptr = sqlite3_value_blob(val) as *const u8;
+        if ptr.is_null() {
+            return &[];
+        }
+        let len = sqlite3_value_bytes(val).max(0) as usize;
+        if len == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(ptr, len)
+        }
+    }
+}
+
+/// Reads a `sqlite3_stmt` column UTF-8 text slice, calling `sqlite3_column_text` before
+/// `sqlite3_column_bytes` as required by SQLite's pointer/length C API contract.
+///
+/// # Safety
+/// `stmt` must be positioned on a valid row and the returned slice stays valid only until the
+/// next SQLite step/reset/type conversion on the same column.
+#[inline]
+pub(crate) unsafe fn sqlite_column_text_bytes<'a>(stmt: *mut sqlite3_stmt, col: c_int) -> &'a [u8] {
+    unsafe {
+        let ptr = sqlite3_column_text(stmt, col);
+        if ptr.is_null() {
+            return &[];
+        }
+        let len = sqlite3_column_bytes(stmt, col).max(0) as usize;
+        if len == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(ptr, len)
+        }
+    }
+}
+
+/// Reads a `sqlite3_stmt` column blob slice, calling `sqlite3_column_blob` before
+/// `sqlite3_column_bytes` as required by SQLite's pointer/length C API contract.
+///
+/// # Safety
+/// `stmt` must be positioned on a valid row and the returned slice stays valid only until the
+/// next SQLite step/reset/type conversion on the same column.
+#[inline]
+pub(crate) unsafe fn sqlite_column_blob_bytes<'a>(stmt: *mut sqlite3_stmt, col: c_int) -> &'a [u8] {
+    unsafe {
+        let ptr = sqlite3_column_blob(stmt, col) as *const u8;
+        if ptr.is_null() {
+            return &[];
+        }
+        let len = sqlite3_column_bytes(stmt, col).max(0) as usize;
+        if len == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(ptr, len)
+        }
+    }
+}
