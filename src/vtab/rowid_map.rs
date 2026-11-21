@@ -106,6 +106,5 @@ pub(super) fn extract_rowid_from_pk_bytes(
                 )
             })
         },
-    )
-    .unwrap_or_else(|| Err(io::Error::other("engine lock poisoned")))
+    )?
 }

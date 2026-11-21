@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct FaultFile<F> {
     inner: Arc<F>,
     is_wal: bool,
+    is_blob: bool,
     fail_next_wal_write: Arc<AtomicBool>,
+    fail_next_blob_write: Arc<AtomicBool>,
 }
 
 impl<F: PlatformFile> PlatformFile for FaultFile<F> {
@@ -24,6 +26,12 @@ impl<F: PlatformFile> PlatformFile for FaultFile<F> {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         if self.is_wal && self.fail_next_wal_write.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("simulated WAL write failure"));
+        }
+        if self.is_blob && self.fail_next_blob_write.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated blob flush failure",
+            ));
         }
         self.inner.write_all_at(buf, offset)
     }
@@ -47,6 +55,7 @@ impl<F: PlatformFile> PlatformFile for FaultFile<F> {
 struct FaultFs {
     inner: OsFs,
     fail_next_wal_write: Arc<AtomicBool>,
+    fail_next_blob_write: Arc<AtomicBool>,
 }
 
 impl PlatformFs for FaultFs {
@@ -63,7 +72,9 @@ impl PlatformFs for FaultFs {
         Ok(Arc::new(FaultFile {
             inner,
             is_wal: rel_name == "wal_sync.db" || rel_name == "wal_buf.db",
+            is_blob: rel_name.starts_with("blob_"),
             fail_next_wal_write: Arc::clone(&self.fail_next_wal_write),
+            fail_next_blob_write: Arc::clone(&self.fail_next_blob_write),
         }))
     }
     fn remove_file(&self, rel_name: &str) -> io::Result<()> {
@@ -88,13 +99,22 @@ fn config() -> EngineConfig {
     }
 }
 
-fn open(dir: &TempTestDir, flag: &Arc<AtomicBool>) -> (Arc<FaultFs>, StorageEngine<FaultFs>) {
+fn open_with_blob_flag(
+    dir: &TempTestDir,
+    wal_flag: &Arc<AtomicBool>,
+    blob_flag: &Arc<AtomicBool>,
+) -> (Arc<FaultFs>, StorageEngine<FaultFs>) {
     let fs = Arc::new(FaultFs {
         inner: OsFs::open(&dir.path, true).unwrap(),
-        fail_next_wal_write: Arc::clone(flag),
+        fail_next_wal_write: Arc::clone(wal_flag),
+        fail_next_blob_write: Arc::clone(blob_flag),
     });
     let engine = StorageEngine::open(Arc::clone(&fs), config()).unwrap();
     (fs, engine)
+}
+
+fn open(dir: &TempTestDir, flag: &Arc<AtomicBool>) -> (Arc<FaultFs>, StorageEngine<FaultFs>) {
+    open_with_blob_flag(dir, flag, &Arc::new(AtomicBool::new(false)))
 }
 
 fn seed(engine: &mut StorageEngine<FaultFs>) {
@@ -218,6 +238,7 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
     let fs = Arc::new(FaultFs {
         inner: OsFs::open(&dir.path, true).unwrap(),
         fail_next_wal_write: Arc::clone(&flag),
+        fail_next_blob_write: Arc::new(AtomicBool::new(false)),
     });
     let mut cfg = config();
     cfg.max_transaction_bytes = 512;
@@ -268,6 +289,7 @@ fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
     let fs = Arc::new(FaultFs {
         inner: OsFs::open(&dir.path, true).unwrap(),
         fail_next_wal_write: Arc::clone(&flag),
+        fail_next_blob_write: Arc::new(AtomicBool::new(false)),
     });
     let mut cfg = config();
     cfg.inline_threshold_bytes = 64;
@@ -377,4 +399,48 @@ fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
     );
     assert!(engine.is_poisoned());
     verify_scans(&mut engine);
+}
+
+#[test]
+fn with_committed_read_for_conn_propagates_blob_flush_error() {
+    let dir = TempTestDir::new("with_committed_read_flush_err");
+    let wal_flag = Arc::new(AtomicBool::new(false));
+    let blob_flag = Arc::new(AtomicBool::new(false));
+    let (_fs, mut engine) = open_with_blob_flag(&dir, &wal_flag, &blob_flag);
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(
+            UNCAPPED,
+            b"buffered_owner_blob",
+            &vec![0x55u8; 2048],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert!(engine.any_blob_unflushed());
+
+    blob_flag.store(true, Ordering::SeqCst);
+    let err = engine
+        .with_committed_read_for_conn(1, |r| r.get_row(UNCAPPED, b"buffered_owner_blob"))
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string().contains("simulated blob flush failure"),
+        "expected injected flush error, got: {err}"
+    );
+    assert!(!engine.is_poisoned());
+
+    // `try_with_committed_read_for_conn` likewise propagates flush errors and recovers once I/O clears.
+    blob_flag.store(true, Ordering::SeqCst);
+    let err2 = engine
+        .try_with_committed_read_for_conn(1, |r| r.get_row(UNCAPPED, b"buffered_owner_blob"))
+        .unwrap_err();
+    assert_eq!(err2.kind(), io::ErrorKind::PermissionDenied);
+
+    let got = engine
+        .try_with_committed_read_for_conn(1, |r| r.get_row(UNCAPPED, b"buffered_owner_blob"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, Some(vec![0x55u8; 2048]));
 }

@@ -2562,18 +2562,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.owner_read_with_tracking(true, f)
     }
 
-    pub(super) fn owner_read_with_tracking<R>(
-        &mut self,
-        track_hits: bool,
-        f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
-    ) -> io::Result<R> {
-        let (r, extra) = self.run_read_with_tracking_src(ReadSource::Owner, track_hits, f);
-        match (r, extra) {
+    pub(super) fn combine_read_result<R>(res: (io::Result<R>, Option<io::Error>)) -> io::Result<R> {
+        match res {
             (Ok(v), None) => Ok(v),
             (Ok(_), Some(e)) => Err(e),
             (Err(e), Some(flush_err)) if e.to_string() == NEED_FLUSH_MSG => Err(flush_err),
             (Err(e), _) => Err(e),
         }
+    }
+
+    pub(super) fn owner_read_with_tracking<R>(
+        &mut self,
+        track_hits: bool,
+        f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
+    ) -> io::Result<R> {
+        Self::combine_read_result(self.run_read_with_tracking_src(ReadSource::Owner, track_hits, f))
     }
 
     /// Deletes a row (`pk`) in `table_id`, cascading tombstones to its secondary indexes and LRU queue.

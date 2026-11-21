@@ -199,27 +199,31 @@ fn point_fetch(
 /// The lock choice is made while holding the shared lock: if `read_needs_exclusive` is false the
 /// body runs on a shared-access [`EngineReader`] (many readers in parallel); otherwise the shared
 /// lock is released first (never upgraded in place) and the body runs under the write lock via
-/// `with_committed_read_for_conn`, which re-resolves the state and so needs no recheck. Returns
-/// `None` if the lock is poisoned. `f` may run a second time if a shared-lock read reports that it
-/// needed exclusive access (defensive; cannot happen when the decision rules hold).
+/// `try_with_committed_read_for_conn`, which re-resolves the state and propagates blob flush
+/// errors. `f` may run a second time if a shared-lock read reports that it needed exclusive
+/// access.
 fn with_read_access<R>(
     engine: &RwLock<StorageEngine<OsFs>>,
     conn_id: usize,
     table_id: u16,
     mut f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
-) -> Option<R> {
+) -> io::Result<R> {
     {
-        let g = engine.read().ok()?;
+        let g = engine
+            .read()
+            .map_err(|_| io::Error::other("engine lock poisoned"))?;
         if !g.vtab_read_needs_exclusive(conn_id, table_id) {
             let rd = g.reader_for_conn(conn_id);
             let r = f(&rd);
             if !rd.needs_exclusive_retry() {
-                return Some(r);
+                return Ok(r);
             }
         }
     }
-    let mut g = engine.write().ok()?;
-    Some(g.with_committed_read_for_conn(conn_id, f))
+    let mut g = engine
+        .write()
+        .map_err(|_| io::Error::other("engine lock poisoned"))?;
+    g.try_with_committed_read_for_conn(conn_id, f)
 }
 
 fn with_snapshot_read_access<R>(
@@ -228,16 +232,20 @@ fn with_snapshot_read_access<R>(
     table_id: u16,
     snapshot: Option<&crate::engine::ReadSnapshotToken>,
     mut f: impl FnMut(&EngineReader<'_, OsFs>) -> R,
-) -> Option<R> {
+) -> io::Result<R> {
     if let Some(snapshot) = snapshot {
         {
-            let guard = engine.read().ok()?;
+            let guard = engine
+                .read()
+                .map_err(|_| io::Error::other("engine lock poisoned"))?;
             if !guard.snapshot_read_needs_exclusive(table_id) {
-                return Some(f(&guard.reader_for_snapshot(snapshot)));
+                return Ok(f(&guard.reader_for_snapshot(snapshot)));
             }
         }
-        let mut guard = engine.write().ok()?;
-        Some(guard.with_snapshot_read(snapshot, f))
+        let mut guard = engine
+            .write()
+            .map_err(|_| io::Error::other("engine lock poisoned"))?;
+        guard.with_snapshot_read(snapshot, f)
     } else {
         with_read_access(engine, conn_id, table_id, f)
     }
@@ -1854,9 +1862,13 @@ unsafe extern "system" fn vtab_filter(
             Some(tok) => guard.with_snapshot_read(tok, |rd| {
                 execute_vtab_filter(cursor, vtab, rd, idx_num, argc, argv)
             }),
-            None => guard.with_committed_read_for_conn(conn_id, |rd| {
+            None => guard.try_with_committed_read_for_conn(conn_id, |rd| {
                 execute_vtab_filter(cursor, vtab, rd, idx_num, argc, argv)
             }),
+        };
+        let rc = match rc {
+            Ok(rc) => rc,
+            Err(e) => return io_err_to_sqlite_rc(&e),
         };
         cursor.snapshot = snapshot;
         rc
@@ -1895,32 +1907,43 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .as_ref()
                     .map(|(b, inc)| (b.as_slice(), *inc));
                 let mut next_last_sec: Option<Vec<u8>> = None;
-                let rc = with_snapshot_read_access(
+                let rc = match with_snapshot_read_access(
                     &vtab.engine,
                     conn_id,
                     vtab.table_id,
                     cursor.snapshot.as_ref(),
-                    |eng| match eng.scan_secondary_index_into_slab(
-                        vtab.table_id,
-                        sec_index_id,
-                        &cursor.stream_sec_prefix,
-                        (last_pk.as_slice(), false),
-                        upper_ref,
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
-                    ) {
-                        Ok(last_opt) => {
-                            next_last_sec = last_opt;
-                            SQLITE_OK
+                    |eng| {
+                        cursor.slab.clear();
+                        cursor.spans.clear();
+                        cursor.pks.clear();
+                        cursor.lazy_blobs.clear();
+                        match eng.scan_secondary_index_into_slab(
+                            vtab.table_id,
+                            sec_index_id,
+                            &cursor.stream_sec_prefix,
+                            (last_pk.as_slice(), false),
+                            upper_ref,
+                            CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                            &mut cursor.pks,
+                            &mut cursor.slab,
+                            &mut cursor.spans,
+                            Some(&mut cursor.lazy_blobs),
+                        ) {
+                            Ok(last_opt) => {
+                                next_last_sec = last_opt;
+                                SQLITE_OK
+                            }
+                            Err(e) => io_err_to_sqlite_rc(&e),
                         }
-                        Err(e) => io_err_to_sqlite_rc(&e),
                     },
-                )
-                .unwrap_or(SQLITE_ERROR);
+                ) {
+                    Ok(rc) => rc,
+                    Err(e) => {
+                        cursor.streaming_active = false;
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                };
                 if rc != SQLITE_OK {
                     cursor.streaming_active = false;
                     return rc;
@@ -1951,12 +1974,16 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     .map(|(b, inc)| (b.as_slice(), *inc))
             };
 
-            let rc = with_snapshot_read_access(
+            let rc = match with_snapshot_read_access(
                 &vtab.engine,
                 conn_id,
                 vtab.table_id,
                 cursor.snapshot.as_ref(),
                 |eng| {
+                    cursor.slab.clear();
+                    cursor.spans.clear();
+                    cursor.pks.clear();
+                    cursor.lazy_blobs.clear();
                     if let Err(e) = eng.scan_range_into_slab(
                         vtab.table_id,
                         lower_ref,
@@ -1973,8 +2000,13 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     }
                     SQLITE_OK
                 },
-            )
-            .unwrap_or(SQLITE_ERROR);
+            ) {
+                Ok(rc) => rc,
+                Err(e) => {
+                    cursor.streaming_active = false;
+                    return io_err_to_sqlite_rc(&e);
+                }
+            };
             if rc != SQLITE_OK {
                 cursor.streaming_active = false;
                 return rc;
@@ -2092,7 +2124,7 @@ unsafe extern "system" fn vtab_column(
                 cursor.prefetch_end = end;
             }
 
-            let Some(deref_res) = with_snapshot_read_access(
+            let deref_res = match with_snapshot_read_access(
                 &vtab.engine,
                 conn_id,
                 vtab.table_id,
@@ -2108,8 +2140,13 @@ unsafe extern "system" fn vtab_column(
                         &mut cursor.slab,
                     )
                 },
-            ) else {
-                return SQLITE_ERROR;
+            ) {
+                Ok(res) => res,
+                Err(e) => {
+                    let rc = io_err_to_sqlite_rc(&e);
+                    sqlite3_result_error_code(p_ctx, rc);
+                    return rc;
+                }
             };
             let span = match deref_res {
                 Ok(Some(s)) => s,

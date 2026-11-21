@@ -3403,13 +3403,15 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
     assert_eq!(engine.memtable.approximate_bytes(), mem_bytes);
     assert_eq!(engine.memtable.highest_lsn(), mem_hi);
 
-    let (v, miss, scanned) = engine.with_committed_read_for_conn(2, |e| {
-        (
-            e.get_row(1, b"committed").unwrap(),
-            e.get_row(1, b"u000123").unwrap(),
-            keys_of_r(e, false),
-        )
-    });
+    let (v, miss, scanned) = engine
+        .with_committed_read_for_conn(2, |e| {
+            Ok((
+                e.get_row(1, b"committed")?,
+                e.get_row(1, b"u000123")?,
+                keys_of_r(e, false),
+            ))
+        })
+        .unwrap();
     assert_eq!(v, Some(b"c1".to_vec()));
     assert_eq!(miss, None);
     assert_eq!(scanned, vec!["committed".to_string()]);
@@ -3430,7 +3432,9 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
     assert_eq!(engine.memtable.len(), mem_len + 10_000);
     assert!(engine.tx_overlay.map.is_empty());
     assert_eq!(
-        engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"u000123").unwrap()),
+        engine
+            .with_committed_read_for_conn(2, |e| e.get_row(1, b"u000123"))
+            .unwrap(),
         Some(b"x".to_vec())
     );
 }
@@ -3483,10 +3487,14 @@ fn owner_scan_merges_overlay_with_tombstones_and_overwrites_forward_and_reverse(
             .chain(flush_first.then(|| "z".to_string()))
             .collect();
         assert_eq!(
-            engine.with_committed_read_for_conn(2, |e| keys_of_r(e, false)),
+            engine
+                .with_committed_read_for_conn(2, |e| Ok(keys_of_r(e, false)))
+                .unwrap(),
             committed
         );
-        let non_owner_c = engine.with_committed_read_for_conn(2, |e| e.get_row(1, b"c").unwrap());
+        let non_owner_c = engine
+            .with_committed_read_for_conn(2, |e| e.get_row(1, b"c"))
+            .unwrap();
         assert_eq!(
             non_owner_c,
             Some(if flush_first {

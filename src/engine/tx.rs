@@ -456,7 +456,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    /// Executes a read closure `f` for `conn_id` with exclusive engine access.
+    /// Executes a fallible read closure `f` for `conn_id` with exclusive engine access.
     ///
     /// If `conn_id` owns the active transaction (or no transaction is active), `f` sees the
     /// transaction overlay on top of the `MemTable` (read-your-own-writes). Otherwise `f` sees
@@ -466,21 +466,38 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Because access is exclusive, the closure may be re-run once after the engine flushed a
     /// buffered blob the reader needed (it must be free of side effects before its first read
     /// result), and `EagerWriteOnRead` promotions queued by the closure are applied afterwards
-    /// (their errors are not reported). Prefer [`Self::reader_for_conn`] under a shared lock
-    /// when [`Self::read_needs_exclusive`] is `false`. The closure must return read errors (not
-    /// panic on them) so the retry can happen.
-    pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, mut f: F) -> R
+    /// (their errors are not reported). If flushing buffered blobs fails, that I/O error is
+    /// returned. Prefer [`Self::reader_for_conn`] under a shared lock when
+    /// [`Self::read_needs_exclusive`] is `false`.
+    pub fn with_committed_read_for_conn<F, R>(&mut self, conn_id: usize, mut f: F) -> io::Result<R>
     where
-        F: FnMut(&EngineReader<'_, FS>) -> R,
+        F: FnMut(&EngineReader<'_, FS>) -> io::Result<R>,
     {
         let src = super::reader::ReadSource::from_view(self.read_view_for_conn(conn_id));
-        self.run_read_src(src, |eng, cx| {
+        Self::combine_read_result(self.run_read_src(src, |eng, cx| {
             f(&EngineReader {
                 eng,
                 cx: CxRef::Borrowed(cx),
             })
-        })
-        .0
+        }))
+    }
+
+    pub(crate) fn try_with_committed_read_for_conn<F, R>(
+        &mut self,
+        conn_id: usize,
+        mut f: F,
+    ) -> io::Result<R>
+    where
+        F: FnMut(&EngineReader<'_, FS>) -> R,
+    {
+        let src = super::reader::ReadSource::from_view(self.read_view_for_conn(conn_id));
+        let (r, extra) = self.run_read_src(src, |eng, cx| {
+            f(&EngineReader {
+                eng,
+                cx: CxRef::Borrowed(cx),
+            })
+        });
+        extra.map_or(Ok(r), Err)
     }
 
     /// Prepares the active transaction for commit (`xSync` two-phase commit phase 1).

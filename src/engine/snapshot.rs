@@ -206,23 +206,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Executes a read closure against a pinned `ReadSnapshotToken` with exclusive engine access
-    /// so `EagerWriteOnRead` promotions can be persisted outside active transactions.
+    /// so `EagerWriteOnRead` promotions can be persisted outside active transactions, propagating
+    /// any blob buffer flush error.
     pub(crate) fn with_snapshot_read<R>(
         &mut self,
         token: &ReadSnapshotToken<FS::File>,
         mut f: impl FnMut(&EngineReader<'_, FS>) -> R,
-    ) -> R {
+    ) -> io::Result<R> {
         assert_eq!(
             token.snapshot.engine_id, self.engine_id,
             "read snapshot token belongs to a different StorageEngine"
         );
-        self.run_read_src(ReadSource::Snapshot(&token.snapshot), |eng, cx| {
+        let (r, extra) = self.run_read_src(ReadSource::Snapshot(&token.snapshot), |eng, cx| {
             f(&EngineReader {
                 eng,
                 cx: CxRef::Borrowed(cx),
             })
-        })
-        .0
+        });
+        extra.map_or(Ok(r), Err)
     }
 
     /// A snapshot is current while it belongs to this engine and no committed data was published
