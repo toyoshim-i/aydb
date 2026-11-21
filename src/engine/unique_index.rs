@@ -220,7 +220,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 recorded_tick,
                 logical_size,
                 &keys,
-            ))
+            )?)
         };
         Ok(Some(PlannedRowReconcile {
             meta_key,

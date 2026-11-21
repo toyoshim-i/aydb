@@ -7013,7 +7013,7 @@ fn register_capped_table_reconcile_failure_does_not_leave_stale_zero_state() {
         .put_row(9, b"pk1", b"val1", &[], WriteDurability::BufferedFast)
         .unwrap();
     let meta_key = crate::lru::encode_row_meta_key(9, b"pk1");
-    let big_meta = RowMetaRecord::encode_slice(0, 7, &[(1, vec![b'x'; 4096])]);
+    let big_meta = RowMetaRecord::encode_slice(0, 7, &[(1, vec![b'x'; 4096])]).unwrap();
     let meta_ptr = engine
         .append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &big_meta)
         .unwrap();
@@ -8173,4 +8173,30 @@ fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without
     assert!(engine.statement_blob_undo.is_empty());
 
     engine.rollback_transaction_for_conn(1).unwrap();
+}
+
+#[test]
+fn table_id_allocation_returns_error_when_all_ids_exhausted() {
+    assert_eq!(find_free_table_id(|_| false).unwrap(), 1);
+    assert_eq!(find_free_table_id(|id| id < u16::MAX).unwrap(), u16::MAX);
+    let err = find_free_table_id(|_| true).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+
+    let tmp = TempTestDir::new("table_id_exhaustion");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    for id in 1..u16::MAX {
+        engine
+            .active_vtab_ids
+            .insert(id, Arc::from(format!("t_{id}")));
+    }
+    let tail_plan = engine.plan_vtab_registration("tail", None).unwrap();
+    assert_eq!(tail_plan.table_id, u16::MAX);
+    assert!(!tail_plan.persisted);
+
+    engine.active_vtab_ids.insert(u16::MAX, Arc::from("tail"));
+    let Err(err) = engine.plan_vtab_registration("overflow", None) else {
+        panic!("expected error when all 65535 table_ids are exhausted");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::Other);
 }

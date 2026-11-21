@@ -489,6 +489,23 @@ fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
     total + (cur_end - cur_start)
 }
 
+pub(crate) fn find_free_table_id(mut is_used: impl FnMut(u16) -> bool) -> io::Result<u16> {
+    let mut candidate = 1u16;
+    loop {
+        if !is_used(candidate) {
+            return Ok(candidate);
+        }
+        match candidate.checked_add(1) {
+            Some(next) => candidate = next,
+            None => {
+                return Err(io::Error::other(
+                    "all 65535 virtual table_ids are exhausted",
+                ));
+            }
+        }
+    }
+}
+
 fn account_post_catalog_gap<K: Ord + std::hash::Hash + Copy>(
     key: K,
     file_len: u64,
@@ -1582,14 +1599,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     id
                 } else {
-                    let mut candidate = 1u16;
-                    while candidate < u16::MAX
-                        && (active_vtab_ids.contains_key(&candidate)
-                            || persisted_id_to_name.contains_key(&candidate))
-                    {
-                        candidate += 1;
-                    }
-                    candidate
+                    find_free_table_id(|id| {
+                        active_vtab_ids.contains_key(&id) || persisted_id_to_name.contains_key(&id)
+                    })?
                 }
             }
         };
@@ -2066,6 +2078,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
 
+        if secondary_keys.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RowMetaRecord secondary key count exceeds u16::MAX",
+            ));
+        }
+
         let mut new_sec_keys = Vec::with_capacity(secondary_keys.len());
         for (idx_id, col_val) in secondary_keys {
             let sec_key = encode_secondary_index_key(table_id, *idx_id, col_val, pk);
@@ -2221,7 +2240,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut new_meta_blob_ptr = None;
         if need_meta {
             let meta_bytes =
-                RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys);
+                match RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if let Some(ref p) = new_row_blob_ptr {
+                            self.record_dead_blob_bytes(p);
+                        }
+                        return Err(e);
+                    }
+                };
             new_meta_blob_ptr =
                 match self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records) {
                     Ok(ptr_opt) => ptr_opt,
@@ -2380,7 +2407,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(false);
         }
 
-        let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged);
+        let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged)?;
         let new_meta_blob_ptr =
             self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
         if let Err(e) = self.commit_wal_and_memtable(records, durability) {

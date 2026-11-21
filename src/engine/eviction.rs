@@ -142,7 +142,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             key: encode_lru_queue_key(table_id, new_tick, pk),
             value: Vec::new(),
         });
-        let meta_bytes = meta.to_bytes();
+        let meta_bytes = meta.to_bytes()?;
         let mut new_m_ptr = None;
         if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
@@ -283,7 +283,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                     old_dead_ptrs.push(p);
                                 }
                                 mrec.recorded_tick = hot_tick;
-                                let meta_bytes = mrec.to_bytes();
+                                let meta_bytes = mrec.to_bytes()?;
                                 if !IndexEntry::inline_fits_in_block(
                                     meta_key.len(),
                                     meta_bytes.len(),
@@ -588,11 +588,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 value: Vec::new(),
                             });
                             let meta_key = encode_row_meta_key(tid, pk);
-                            let meta_bytes = RowMetaRecord::encode_slice(
+                            let meta_bytes = match RowMetaRecord::encode_slice(
                                 tick,
                                 meta.logical_size,
                                 &meta.secondary_keys,
-                            );
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    for p in &new_meta_ptrs {
+                                        self.record_dead_blob_bytes(p);
+                                    }
+                                    return Err(e);
+                                }
+                            };
                             match self.append_std_meta_record(
                                 meta_key,
                                 meta_bytes,
@@ -636,13 +644,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     needs_repair = true;
                     if apply_repairs {
                         let tick = self.access_tracker.next_tick();
+                        let encoded_meta =
+                            match RowMetaRecord::encode_slice(tick, logical_size, &[]) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    for p in &new_meta_ptrs {
+                                        self.record_dead_blob_bytes(p);
+                                    }
+                                    return Err(e);
+                                }
+                            };
                         missing_records.push(WalRecord::PutInline {
                             key: encode_lru_queue_key(tid, tick, pk),
                             value: Vec::new(),
                         });
                         missing_records.push(WalRecord::PutInline {
                             key: encode_row_meta_key(tid, pk),
-                            value: RowMetaRecord::encode_slice(tick, logical_size, &[]),
+                            value: encoded_meta,
                         });
                     }
                 }

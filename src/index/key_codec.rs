@@ -239,20 +239,50 @@ impl RowMetaRecord {
         recorded_tick: u64,
         logical_size: u32,
         secondary_keys: &[(u16, Vec<u8>)],
-    ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(14 + secondary_keys.len() * 12);
+    ) -> io::Result<Vec<u8>> {
+        let sec_count = u16::try_from(secondary_keys.len()).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "RowMetaRecord secondary key count exceeds u16::MAX",
+            )
+        })?;
+        let mut total_len = 14usize;
+        for (_, col_val) in secondary_keys {
+            if col_val.len() > u16::MAX as usize {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "RowMetaRecord secondary key value exceeds u16::MAX",
+                ));
+            }
+            total_len = total_len
+                .checked_add(4)
+                .and_then(|n| n.checked_add(col_val.len()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "RowMetaRecord encoded size overflow",
+                    )
+                })?;
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(total_len).map_err(|_| {
+            io::Error::new(
+                ErrorKind::OutOfMemory,
+                "failed to allocate RowMetaRecord buffer",
+            )
+        })?;
         out.extend_from_slice(&recorded_tick.to_be_bytes());
         out.extend_from_slice(&logical_size.to_be_bytes());
-        out.extend_from_slice(&(secondary_keys.len() as u16).to_be_bytes());
+        out.extend_from_slice(&sec_count.to_be_bytes());
         for (idx_id, col_val) in secondary_keys {
             out.extend_from_slice(&idx_id.to_be_bytes());
             out.extend_from_slice(&(col_val.len() as u16).to_be_bytes());
             out.extend_from_slice(col_val);
         }
-        out
+        Ok(out)
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         Self::encode_slice(self.recorded_tick, self.logical_size, &self.secondary_keys)
     }
 
@@ -266,10 +296,29 @@ impl RowMetaRecord {
         let recorded_tick = u64::from_be_bytes(buf[0..8].try_into().unwrap());
         let logical_size = u32::from_be_bytes(buf[8..12].try_into().unwrap());
         let sec_count = u16::from_be_bytes(buf[12..14].try_into().unwrap()) as usize;
-        let mut pos = 14;
-        let mut secondary_keys = Vec::with_capacity(sec_count);
+        let min_sec_bytes = sec_count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "RowMetaRecord secondary key count overflow",
+            )
+        })?;
+        if min_sec_bytes > buf.len() - 14 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "RowMetaRecord secondary key count exceeds buffer length",
+            ));
+        }
+
+        let mut pos = 14usize;
+        let mut secondary_keys = Vec::new();
+        secondary_keys.try_reserve_exact(sec_count).map_err(|_| {
+            io::Error::new(
+                ErrorKind::OutOfMemory,
+                "failed to allocate secondary keys in RowMetaRecord",
+            )
+        })?;
         for _ in 0..sec_count {
-            if pos + 4 > buf.len() {
+            if buf.len() - pos < 4 {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "truncated secondary key header in RowMetaRecord",
@@ -278,7 +327,7 @@ impl RowMetaRecord {
             let idx_id = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
             let vlen = u16::from_be_bytes(buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            if pos + vlen > buf.len() {
+            if buf.len() - pos < vlen {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "truncated secondary key payload in RowMetaRecord",
@@ -287,10 +336,84 @@ impl RowMetaRecord {
             secondary_keys.push((idx_id, buf[pos..pos + vlen].to_vec()));
             pos += vlen;
         }
+        if pos != buf.len() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "trailing bytes in RowMetaRecord",
+            ));
+        }
         Ok(Self {
             recorded_tick,
             logical_size,
             secondary_keys,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_meta_record_rejects_u16_overflow_truncation_and_trailing_bytes() {
+        let valid = RowMetaRecord {
+            recorded_tick: 42,
+            logical_size: 128,
+            secondary_keys: vec![(1, b"alpha".to_vec()), (2, vec![0u8; 32])],
+        };
+        let encoded = valid.to_bytes().unwrap();
+        assert_eq!(RowMetaRecord::from_bytes(&encoded).unwrap(), valid);
+
+        // Trailing bytes must be rejected rather than silently ignored.
+        let mut with_trailing = encoded.clone();
+        with_trailing.push(0x99);
+        assert_eq!(
+            RowMetaRecord::from_bytes(&with_trailing)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        // Truncated header / payload must fail cleanly.
+        assert_eq!(
+            RowMetaRecord::from_bytes(&encoded[..13])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            RowMetaRecord::from_bytes(&encoded[..encoded.len() - 1])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        // Bogus `sec_count = 65535` on a short buffer must be rejected BEFORE allocation.
+        let mut bogus_count = vec![0u8; 14];
+        bogus_count[12..14].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            RowMetaRecord::from_bytes(&bogus_count).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+
+        // Secondary key value longer than `u16::MAX` must be rejected cleanly without truncation.
+        let oversized_val = vec![(1, vec![0xAAu8; u16::MAX as usize + 1])];
+        assert_eq!(
+            RowMetaRecord::encode_slice(1, 2, &oversized_val)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+
+        // More than `u16::MAX` secondary keys must be rejected cleanly without truncation.
+        let too_many_keys: Vec<(u16, Vec<u8>)> = (0..=u16::MAX as usize)
+            .map(|i| (i as u16, Vec::new()))
+            .collect();
+        assert_eq!(
+            RowMetaRecord::encode_slice(1, 2, &too_many_keys)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
     }
 }

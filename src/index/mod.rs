@@ -99,12 +99,25 @@ pub struct IndexEntry {
 }
 
 impl IndexEntry {
+    /// Returns the checked total byte cost of encoding this entry + its 2-byte `u16` offset slot
+    /// inside a 4096-byte data block, or `None` on arithmetic overflow.
+    #[inline]
+    pub fn checked_block_footprint_bytes(&self) -> Option<usize> {
+        11usize
+            .checked_add(self.key.len())
+            .and_then(|n| n.checked_add(self.value.encoded_payload_len()))
+            .and_then(|n| n.checked_add(2))
+    }
+
     /// Returns the total byte cost of encoding this entry + its 2-byte `u16` offset slot
     /// inside a 4096-byte data block.
     #[inline]
     pub fn block_footprint_bytes(&self) -> usize {
         // 11B entry header (`key_len: u16 | type: u8 | lsn: u64`) + key + value_payload + 2B offset
-        11 + self.key.len() + self.value.encoded_payload_len() + 2
+        11usize
+            .saturating_add(self.key.len())
+            .saturating_add(self.value.encoded_payload_len())
+            .saturating_add(2)
     }
 
     /// Returns `true` if an `IndexValue::Inline` entry with `(key_len, val_len)` fits in a single
@@ -179,24 +192,124 @@ impl IdxBlockBuilder {
         Some(&self.buf[11..11 + klen])
     }
 
+    pub fn last_key(&self) -> Option<&[u8]> {
+        let start = *self.offsets.last()? as usize;
+        let klen = u16::from_le_bytes([self.buf[start], self.buf[start + 1]]) as usize;
+        Some(&self.buf[start + 11..start + 11 + klen])
+    }
+
     /// Returns `true` if `entry` fits in the remaining space of this 4 KB block.
     pub fn can_fit(&self, entry: &IndexEntry) -> bool {
-        let needed = entry.block_footprint_bytes();
+        let Some(needed) = entry.checked_block_footprint_bytes() else {
+            return false;
+        };
         let used = self.write_pos + (self.offsets.len() * 2);
-        used + needed <= IDX_BLOCK_USABLE_SIZE
+        used.checked_add(needed)
+            .is_some_and(|total| total <= IDX_BLOCK_USABLE_SIZE)
     }
 
     /// Returns `true` if a raw entry with `(key_len, val_type, val_len)` fits in this 4 KB block.
     #[inline]
     pub fn can_fit_raw(&self, key_len: usize, val_type: u8, val_len: usize) -> bool {
         let payload_len = match val_type {
-            1 => 2 + val_len,
-            2 => BLOB_PTR_ENCODED_LEN,
-            _ => 0,
+            1 => match val_len.checked_add(2) {
+                Some(n) => n,
+                None => return false,
+            },
+            2 if val_len == BLOB_PTR_ENCODED_LEN => BLOB_PTR_ENCODED_LEN,
+            3 if val_len == 0 => 0,
+            _ => return false,
         };
-        let needed = 11 + key_len + payload_len + 2;
+        let Some(needed) = 11usize
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(payload_len))
+            .and_then(|n| n.checked_add(2))
+        else {
+            return false;
+        };
         let used = self.write_pos + (self.offsets.len() * 2);
-        used + needed <= IDX_BLOCK_USABLE_SIZE
+        used.checked_add(needed)
+            .is_some_and(|total| total <= IDX_BLOCK_USABLE_SIZE)
+    }
+
+    fn validate_raw_entry_params(
+        key_len: usize,
+        val_type: u8,
+        val_len: usize,
+    ) -> io::Result<(u16, u16)> {
+        let klen = u16::try_from(key_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
+        })?;
+        let (vlen, payload_len) = match val_type {
+            1 => {
+                let vlen = u16::try_from(val_len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inline value length exceeds u16::MAX",
+                    )
+                })?;
+                let payload_len = val_len.checked_add(2).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inline value footprint overflow",
+                    )
+                })?;
+                (vlen, payload_len)
+            }
+            2 => {
+                if val_len != BLOB_PTR_ENCODED_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "BlobPtr raw value must be 23 bytes",
+                    ));
+                }
+                (0, BLOB_PTR_ENCODED_LEN)
+            }
+            3 => {
+                if val_len != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Tombstone raw value must be empty",
+                    ));
+                }
+                (0, 0)
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown IndexValue type_tag: {other}"),
+                ));
+            }
+        };
+        let fits_single_block = 11usize
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(payload_len))
+            .and_then(|n| n.checked_add(2))
+            .is_some_and(|total| total <= IDX_BLOCK_USABLE_SIZE);
+        if !fits_single_block {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IndexEntry exceeds single 4 KB block capacity",
+            ));
+        }
+        Ok((klen, vlen))
+    }
+
+    fn check_key_order_and_start(&self, key: &[u8]) -> io::Result<u16> {
+        if let Some(prev) = self.last_key() {
+            if key <= prev {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "idx block keys must be added in strictly ascending order",
+                ));
+            }
+        }
+        u16::try_from(self.write_pos).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx block write offset exceeds u16::MAX",
+            )
+        })
     }
 
     /// Appends a raw borrowed entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to this block.
@@ -207,18 +320,17 @@ impl IdxBlockBuilder {
         val_type: u8,
         val_bytes: &[u8],
     ) -> io::Result<()> {
+        let (klen, vlen) = Self::validate_raw_entry_params(key.len(), val_type, val_bytes.len())?;
         if !self.can_fit_raw(key.len(), val_type, val_bytes.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "RawIdxEntry exceeds remaining 4 KB block capacity",
             ));
         }
-        let klen = u16::try_from(key.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
-        })?;
+        let start_u16 = self.check_key_order_and_start(key)?;
 
         let start = self.write_pos;
-        self.offsets.push(start as u16);
+        self.offsets.push(start_u16);
 
         self.buf[start..start + 2].copy_from_slice(&klen.to_le_bytes());
         self.buf[start + 2] = val_type;
@@ -230,12 +342,6 @@ impl IdxBlockBuilder {
 
         match val_type {
             1 => {
-                let vlen = u16::try_from(val_bytes.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inline value length exceeds u16::MAX",
-                    )
-                })?;
                 self.buf[pos..pos + 2].copy_from_slice(&vlen.to_le_bytes());
                 pos += 2;
                 self.buf[pos..pos + val_bytes.len()].copy_from_slice(val_bytes);
@@ -246,12 +352,7 @@ impl IdxBlockBuilder {
                 pos += BLOB_PTR_ENCODED_LEN;
             }
             3 => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown IndexValue type_tag: {other}"),
-                ));
-            }
+            _ => unreachable!("val_type validated above"),
         }
 
         self.write_pos = pos;
@@ -260,18 +361,23 @@ impl IdxBlockBuilder {
 
     /// Appends `entry` (which must be in strictly ascending key order) to this block.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
+        let val_len = match &entry.value {
+            IndexValue::Inline(v) => v.len(),
+            IndexValue::Blob(_) => BLOB_PTR_ENCODED_LEN,
+            IndexValue::Tombstone => 0,
+        };
+        let (klen, vlen) =
+            Self::validate_raw_entry_params(entry.key.len(), entry.value.type_tag(), val_len)?;
         if !self.can_fit(entry) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "IndexEntry exceeds remaining 4 KB block capacity",
             ));
         }
-        let klen = u16::try_from(entry.key.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
-        })?;
+        let start_u16 = self.check_key_order_and_start(&entry.key)?;
 
         let start = self.write_pos;
-        self.offsets.push(start as u16);
+        self.offsets.push(start_u16);
 
         self.buf[start..start + 2].copy_from_slice(&klen.to_le_bytes());
         self.buf[start + 2] = entry.value.type_tag();
@@ -283,12 +389,6 @@ impl IdxBlockBuilder {
 
         match &entry.value {
             IndexValue::Inline(val) => {
-                let vlen = u16::try_from(val.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inline value length exceeds u16::MAX",
-                    )
-                })?;
                 self.buf[pos..pos + 2].copy_from_slice(&vlen.to_le_bytes());
                 pos += 2;
                 self.buf[pos..pos + val.len()].copy_from_slice(val);
@@ -676,6 +776,28 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
 
     /// Adds a sorted [`IndexEntry`] to the segment, flushing a 4 KB data block whenever full.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
+        let val_len = match &entry.value {
+            IndexValue::Inline(v) => v.len(),
+            IndexValue::Blob(_) => BLOB_PTR_ENCODED_LEN,
+            IndexValue::Tombstone => 0,
+        };
+        IdxBlockBuilder::validate_raw_entry_params(
+            entry.key.len(),
+            entry.value.type_tag(),
+            val_len,
+        )?;
+        if self.record_count > 0 && entry.key.as_slice() <= self.last_key.as_slice() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment keys must be added in strictly ascending order",
+            ));
+        }
+        let next_count = self.record_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment record count exceeds u32::MAX",
+            )
+        })?;
         if !self.block_builder.is_empty() && !self.block_builder.can_fit(entry) {
             self.flush_current_data_block()?;
         }
@@ -685,7 +807,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(&entry.key);
-        self.record_count += 1;
+        self.record_count = next_count;
         Ok(())
     }
 
@@ -698,6 +820,19 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         val_type: u8,
         val_bytes: &[u8],
     ) -> io::Result<()> {
+        IdxBlockBuilder::validate_raw_entry_params(key.len(), val_type, val_bytes.len())?;
+        if self.record_count > 0 && key <= self.last_key.as_slice() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment keys must be added in strictly ascending order",
+            ));
+        }
+        let next_count = self.record_count.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment record count exceeds u32::MAX",
+            )
+        })?;
         if !self.block_builder.is_empty()
             && !self
                 .block_builder
@@ -712,7 +847,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
-        self.record_count += 1;
+        self.record_count = next_count;
         Ok(())
     }
 
@@ -731,6 +866,12 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         if self.block_builder.is_empty() {
             return Ok(());
         }
+        let next_num_blocks = self.num_blocks.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment block count exceeds u32::MAX",
+            )
+        })?;
         let first_key = self
             .block_builder
             .first_key()
@@ -745,7 +886,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         }
         self.write_buf.extend_from_slice(&block_bytes);
         self.write_offset += IDX_BLOCK_SIZE as u64;
-        self.num_blocks += 1;
+        self.num_blocks = next_num_blocks;
         self.fence_pointers.push(FencePointer {
             first_key,
             block_idx,
@@ -2429,5 +2570,89 @@ mod tests {
         for (idx, entry) in merged.iter().enumerate() {
             assert_eq!(entry.key, format!("batch_key_{idx:05}").into_bytes());
         }
+    }
+
+    #[test]
+    fn idx_block_and_segment_builders_reject_malformed_and_unsorted_entries_without_corrupting_state()
+     {
+        let mut blk = IdxBlockBuilder::new();
+        blk.add_raw_entry(b"k20", 1, 1, b"val20").unwrap();
+        assert_eq!(blk.num_entries(), 1);
+        assert_eq!(blk.last_key(), Some(b"k20".as_slice()));
+
+        // Invalid type tag, wrong BlobPtr length, non-empty tombstone, duplicate key, and unsorted key
+        // must all fail cleanly BEFORE mutating `offsets` or `write_pos`.
+        assert_eq!(
+            blk.add_raw_entry(b"k30", 2, 99, b"").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            blk.add_raw_entry(b"k30", 2, 2, &[0u8; 12])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            blk.add_raw_entry(b"k30", 2, 3, b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            blk.add_raw_entry(b"k20", 2, 1, b"dup").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            blk.add_raw_entry(b"k10", 2, 1, b"back").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(blk.num_entries(), 1);
+
+        blk.add_raw_entry(b"k30", 3, 1, b"val30").unwrap();
+        let raw_block = blk.finish_and_reset();
+        let reader = IdxBlockReader::open_verified(&raw_block).unwrap();
+        assert_eq!(reader.num_entries, 2);
+        assert_eq!(
+            reader.lookup_binary_search(b"k20").unwrap(),
+            Some((1, IndexValue::Inline(b"val20".to_vec())))
+        );
+        assert_eq!(
+            reader.lookup_binary_search(b"k30").unwrap(),
+            Some((3, IndexValue::Inline(b"val30".to_vec())))
+        );
+
+        // IdxSegmentBuilder must also reject out-of-order / duplicate keys across block boundaries
+        // and oversized single entries without corrupting previously buffered entries.
+        let tmp = TempTestDir::new("builder_validation");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+        let mut seg = IdxSegmentBuilder::create(&fs, 7, 0, 10).unwrap();
+        let pad_val = vec![0x55u8; 512];
+        for i in 0..16u32 {
+            let k = format!("k_{i:04}").into_bytes();
+            seg.add_raw_entry(&k, i as u64 + 1, 1, &pad_val).unwrap();
+        }
+        assert!(seg.fence_pointers.len() >= 2);
+        assert_eq!(
+            seg.add_raw_entry(b"k_0005", 100, 1, b"v")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            seg.add_raw_entry(b"k_0015", 100, 1, b"v")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            seg.add_entry(&IndexEntry {
+                key: b"z_huge".to_vec(),
+                lsn: 101,
+                value: IndexValue::Inline(vec![0u8; IDX_BLOCK_SIZE]),
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let seg_reader = seg.finish().unwrap();
+        assert_eq!(seg_reader.scan_all().unwrap().len(), 16);
     }
 }
