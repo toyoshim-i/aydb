@@ -8340,3 +8340,189 @@ fn open_inner_wal_replay_skips_idx_reads_for_non_blob_namespaces() {
             .is_some()
     );
 }
+
+#[test]
+fn prefetch_lazy_blobs_coalesces_reads_and_isolates_bad_pointer() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+
+    struct BlobReadSpyFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        is_blob: bool,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl PlatformFile for BlobReadSpyFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            if self.is_blob {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct BlobReadSpyFs {
+        inner: OsFs,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl PlatformFs for BlobReadSpyFs {
+        type File = BlobReadSpyFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(BlobReadSpyFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                is_blob: rel_name.starts_with("blob_std_"),
+                reads: Arc::clone(&self.reads),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("prefetch_coalesce_isolate");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let fs = Arc::new(BlobReadSpyFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        reads: Arc::clone(&reads),
+    });
+
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    cfg.blob_cache_bytes = 4 * 1024 * 1024;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    let mut expected_vals = Vec::new();
+    for i in 0..6u8 {
+        let pk = format!("pk_{i}").into_bytes();
+        let val = vec![0x30 + i; 2048];
+        engine
+            .put_row(1, &pk, &val, &[], WriteDurability::BufferedFast)
+            .unwrap();
+        expected_vals.push((pk, val));
+    }
+
+    let mut pks = Vec::new();
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    let mut lazy = Vec::new();
+    engine
+        .scan_range_into_slab(
+            1,
+            None,
+            None,
+            false,
+            16,
+            false,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+            Some(&mut lazy),
+        )
+        .unwrap();
+    assert_eq!(pks.len(), 6);
+    assert!(lazy.iter().all(Option::is_some));
+
+    let seg_id = lazy[0].as_ref().unwrap().ptr.seg_id;
+    let cands: Vec<(&[u8], &LazyBlob<_>)> = pks
+        .iter()
+        .zip(lazy.iter())
+        .map(|(pk, lb)| (pk.as_slice(), lb.as_ref().unwrap()))
+        .collect();
+
+    // 1. Coalesces all 6 adjacent 2 KB blobs into at most 2 contiguous reads, and caches them.
+    reads.store(0, Ordering::Relaxed);
+    engine.prefetch_lazy_blobs(1, &cands).unwrap();
+    let coalesced_reads = reads.load(Ordering::Relaxed);
+    assert!(
+        (1..=2).contains(&coalesced_reads),
+        "expected <= 2 coalesced reads for 6 blobs, got {coalesced_reads}"
+    );
+
+    reads.store(0, Ordering::Relaxed);
+    for (idx, (pk, val)) in expected_vals.iter().enumerate() {
+        let mut out = Vec::new();
+        let (s, e) = engine
+            .dereference_lazy_blob_into(1, pk, lazy[idx].as_ref().unwrap(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[s..e], val.as_slice());
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "cached blobs must not issue extra disk reads"
+    );
+
+    // 2. Clear blob cache and add an out-of-bounds pointer inside the <= 16 KB gap so the
+    //    coalesced cluster read fails; fallback must still verify and cache all 6 valid siblings.
+    engine
+        .blob_cache
+        .invalidate_blob_segment(crate::wal::BlobKind::Standard as u8, 0, seg_id);
+    let last_ptr = lazy.last().unwrap().as_ref().unwrap().ptr;
+    let file_len = engine.std_blobs[&seg_id].file_len;
+    let bad_lazy = LazyBlob {
+        ptr: crate::wal::BlobPtr {
+            offset: (file_len + 1024) as u32,
+            len: 2048,
+            crc32c: 0x1234_5678,
+            ..last_ptr
+        },
+        reader: lazy.last().unwrap().as_ref().unwrap().reader.clone(),
+    };
+    let bad_pk = b"pk_bad".to_vec();
+    let mut mixed_cands = cands;
+    mixed_cands.push((bad_pk.as_slice(), &bad_lazy));
+
+    engine.prefetch_lazy_blobs(1, &mixed_cands).unwrap();
+
+    reads.store(0, Ordering::Relaxed);
+    for (idx, (pk, val)) in expected_vals.iter().enumerate() {
+        let mut out = Vec::new();
+        let (s, e) = engine
+            .dereference_lazy_blob_into(1, pk, lazy[idx].as_ref().unwrap(), &mut out)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[s..e], val.as_slice());
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "valid sibling blobs must still be cached despite bad peer in the same cluster"
+    );
+}

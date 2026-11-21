@@ -3286,26 +3286,46 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         struct PrefetchItem<'a, F: PlatformFile> {
             cache_key: BlobCacheKey,
-            row_key: Vec<u8>,
+            key_range: core::ops::Range<usize>,
             ptr: BlobPtr,
             reader: &'a BlobSegmentReader<F>,
         }
 
+        let mut key_slab: Vec<u8> = Vec::new();
         let mut to_fetch: Vec<PrefetchItem<'_, FS::File>> = Vec::with_capacity(candidates.len());
+        let mut stack_key = [0u8; 64];
+        let mut heap_key = Vec::new();
         for (pk, lazy) in candidates {
             let ptr = &lazy.ptr;
-            if !self.is_blob_eligible_for_cache(ptr) {
+            if !self.is_blob_eligible_for_cache(ptr)
+                || (ptr.len as usize) < BLOB_RECORD_HEADER_LEN
+                || (ptr.offset as u64).checked_add(ptr.len as u64).is_none()
+            {
                 continue;
             }
             if let Some(ref reader) = lazy.reader {
-                let row_key = encode_primary_row_key(table_id, pk);
-                let cache_key = BlobCacheKey::from_ptr(ptr, &row_key);
+                let row_key: &[u8] = if 3 + pk.len() <= stack_key.len() {
+                    let tb = table_id.to_be_bytes();
+                    stack_key[0] = tb[0];
+                    stack_key[1] = tb[1];
+                    stack_key[2] = NS_PRIMARY_ROW;
+                    stack_key[3..3 + pk.len()].copy_from_slice(pk);
+                    &stack_key[..3 + pk.len()]
+                } else {
+                    heap_key.clear();
+                    heap_key.extend_from_slice(&encode_namespace_prefix(table_id, NS_PRIMARY_ROW));
+                    heap_key.extend_from_slice(pk);
+                    heap_key.as_slice()
+                };
+                let cache_key = BlobCacheKey::from_ptr(ptr, row_key);
                 if self.blob_cache.contains(&cache_key) {
                     continue;
                 }
+                let start = key_slab.len();
+                key_slab.extend_from_slice(row_key);
                 to_fetch.push(PrefetchItem {
                     cache_key,
-                    row_key,
+                    key_range: start..key_slab.len(),
                     ptr: *ptr,
                     reader,
                 });
@@ -3316,8 +3336,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
 
-        to_fetch.sort_unstable_by_key(|c| (c.ptr.kind as u8, c.ptr.table_id, c.ptr.seg_id));
+        to_fetch.sort_unstable_by_key(|c| {
+            (c.ptr.kind as u8, c.ptr.table_id, c.ptr.seg_id, c.ptr.offset)
+        });
 
+        let verify_and_cache = |cand: &PrefetchItem<'_, FS::File>, record_buf: &[u8]| {
+            if let Some(val) = BlobSegmentReader::<FS::File>::verify_blob_record(
+                record_buf,
+                cand.ptr.crc32c,
+                Some(&key_slab[cand.key_range.clone()]),
+            ) {
+                self.blob_cache.insert(cand.cache_key, val);
+            }
+        };
+
+        let mut scratch: Vec<u8> = Vec::new();
         let mut group_start = 0;
         while group_start < to_fetch.len() {
             let cur_kind = to_fetch[group_start].ptr.kind;
@@ -3336,26 +3369,66 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let group = &to_fetch[group_start..group_end];
             let reader = group[0].reader;
 
-            let mut bufs: Vec<Vec<u8>> = group
-                .iter()
-                .map(|c| vec![0u8; c.ptr.len as usize])
-                .collect();
-            let mut reqs: Vec<(u64, &mut [u8])> = group
-                .iter()
-                .zip(bufs.iter_mut())
-                .map(|(c, buf)| (c.ptr.offset as u64, buf.as_mut_slice()))
-                .collect();
-
-            if reader.file().read_many_at(&mut reqs).is_ok() {
-                for (cand, buf) in group.iter().zip(bufs.iter()) {
-                    if let Some(val) = BlobSegmentReader::<FS::File>::verify_blob_record(
-                        buf,
-                        cand.ptr.crc32c,
-                        Some(&cand.row_key),
-                    ) {
-                        self.blob_cache.insert(cand.cache_key, val);
+            let mut i = 0;
+            while i < group.len() {
+                let cluster_start = group[i].ptr.offset as u64;
+                let mut cluster_end = cluster_start + group[i].ptr.len as u64;
+                let mut j = i + 1;
+                while j < group.len() {
+                    let next_start = group[j].ptr.offset as u64;
+                    let next_end = next_start + group[j].ptr.len as u64;
+                    let gap = next_start.saturating_sub(cluster_end);
+                    let new_span = next_end.max(cluster_end) - cluster_start;
+                    if gap <= 16 * 1024 && new_span <= 64 * 1024 {
+                        cluster_end = cluster_end.max(next_end);
+                        j += 1;
+                    } else {
+                        break;
                     }
                 }
+
+                if j == i + 1 {
+                    let cand = &group[i];
+                    let len = cand.ptr.len as usize;
+                    scratch.resize(len, 0);
+                    if reader
+                        .file()
+                        .read_exact_at(&mut scratch[..len], cluster_start)
+                        .is_ok()
+                    {
+                        verify_and_cache(cand, &scratch[..len]);
+                    }
+                } else {
+                    let span = (cluster_end - cluster_start) as usize;
+                    scratch.resize(span, 0);
+                    if reader
+                        .file()
+                        .read_exact_at(&mut scratch[..span], cluster_start)
+                        .is_ok()
+                    {
+                        for cand in &group[i..j] {
+                            let rel = (cand.ptr.offset as u64 - cluster_start) as usize;
+                            let len = cand.ptr.len as usize;
+                            verify_and_cache(cand, &scratch[rel..rel + len]);
+                        }
+                    } else {
+                        // Fault isolation: fall back to per-item reads so a single corrupt or
+                        // out-of-bounds pointer never discards valid sibling blobs.
+                        for cand in &group[i..j] {
+                            let len = cand.ptr.len as usize;
+                            scratch.resize(len, 0);
+                            if reader
+                                .file()
+                                .read_exact_at(&mut scratch[..len], cand.ptr.offset as u64)
+                                .is_ok()
+                            {
+                                verify_and_cache(cand, &scratch[..len]);
+                            }
+                        }
+                    }
+                }
+
+                i = j;
             }
 
             group_start = group_end;
