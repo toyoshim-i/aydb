@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::meta::{format_lru_blob_file_name, format_std_blob_file_name};
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
-use crate::util::crc32c::crc32c;
+use crate::util::crc32c::{crc32c, crc32c_append};
 use crate::wal::{BlobKind, BlobPtr};
 
 /// Default value size threshold (1024 bytes) at or above which values are stored out-of-line
@@ -352,6 +352,23 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         self.append_blob_into(ptr, expected_key, out)
     }
 
+    fn checked_ptr_end_in_file(&self, ptr: &BlobPtr) -> io::Result<Option<u64>> {
+        if (ptr.len as usize) < BLOB_RECORD_HEADER_LEN {
+            return Ok(None);
+        }
+        let Some(end_offset) = (ptr.offset as u64).checked_add(ptr.len as u64) else {
+            return Ok(None);
+        };
+        if end_offset > self.known_file_len.load(Ordering::Acquire) {
+            let file_len = self.file.file_len()?;
+            self.known_file_len.fetch_max(file_len, Ordering::Release);
+            if end_offset > file_len {
+                return Ok(None);
+            }
+        }
+        Ok(Some(end_offset))
+    }
+
     /// Appends the verified blob payload referenced by `ptr` onto the end of `out` in place
     /// without allocating an intermediate frame buffer.
     pub fn append_blob_into(
@@ -360,21 +377,10 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         expected_key: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
-        let len = ptr.len as usize;
-        if len < BLOB_RECORD_HEADER_LEN {
-            return Ok(false);
-        }
-
-        let Some(end_offset) = (ptr.offset as u64).checked_add(ptr.len as u64) else {
+        let Some(_) = self.checked_ptr_end_in_file(ptr)? else {
             return Ok(false);
         };
-        if end_offset > self.known_file_len.load(Ordering::Acquire) {
-            let file_len = self.file.file_len()?;
-            self.known_file_len.fetch_max(file_len, Ordering::Release);
-            if end_offset > file_len {
-                return Ok(false);
-            }
-        }
+        let len = ptr.len as usize;
 
         let orig_len = out.len();
         let new_len = orig_len.checked_add(len).ok_or_else(|| {
@@ -423,14 +429,90 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         Ok(true)
     }
 
-    /// Validates whether `ptr` points to an intact, CRC-verified blob record on disk.
+    /// Validates whether `ptr` points to an intact, CRC-verified blob record on disk using O(1)
+    /// bounded scratch memory rather than loading the entire payload into heap.
     /// Used by the WAL recovery coordinator (`recover_two_streams`) to filter out uncommitted blobs.
     ///
     /// Returns `Ok(false)` when the record is absent or fails verification (the blob was never
     /// durably written) and `Err` for genuine I/O errors, which must not be mistaken for an
     /// uncommitted record.
     pub fn validate_blob_ptr(&self, ptr: &BlobPtr) -> io::Result<bool> {
-        Ok(self.read_blob(ptr, None)?.is_some())
+        const STACK_BUF_LEN: usize = 16 * 1024;
+        const STREAM_CHUNK_LEN: usize = 64 * 1024;
+
+        let Some(_) = self.checked_ptr_end_in_file(ptr)? else {
+            return Ok(false);
+        };
+        let total_len = ptr.len as usize;
+
+        let mut stack_buf = [0u8; STACK_BUF_LEN];
+        let first_len = total_len.min(STACK_BUF_LEN);
+        match self
+            .file
+            .read_exact_at(&mut stack_buf[..first_len], ptr.offset as u64)
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
+        }
+
+        if total_len <= STACK_BUF_LEN {
+            return Ok(
+                Self::verify_blob_record(&stack_buf[..total_len], ptr.crc32c, None).is_some(),
+            );
+        }
+
+        if &stack_buf[0..4] != BLOB_RECORD_MAGIC {
+            return Ok(false);
+        }
+        let stored_crc =
+            u32::from_le_bytes([stack_buf[4], stack_buf[5], stack_buf[6], stack_buf[7]]);
+        if stored_crc != ptr.crc32c {
+            return Ok(false);
+        }
+        let key_len =
+            u32::from_le_bytes([stack_buf[8], stack_buf[9], stack_buf[10], stack_buf[11]]) as usize;
+        let val_len =
+            u32::from_le_bytes([stack_buf[12], stack_buf[13], stack_buf[14], stack_buf[15]])
+                as usize;
+        if BLOB_RECORD_HEADER_LEN
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(val_len))
+            != Some(total_len)
+        {
+            return Ok(false);
+        }
+
+        let mut running_crc = crc32c(&stack_buf[8..first_len]);
+        let mut file_pos = (ptr.offset as u64) + first_len as u64;
+        let mut remaining = total_len - first_len;
+
+        let mut heap_buf = Vec::new();
+        let chunk_buf: &mut [u8] = if remaining > STACK_BUF_LEN {
+            let cap = remaining.min(STREAM_CHUNK_LEN);
+            if heap_buf.try_reserve_exact(cap).is_ok() {
+                heap_buf.resize(cap, 0);
+                &mut heap_buf
+            } else {
+                &mut stack_buf
+            }
+        } else {
+            &mut stack_buf
+        };
+
+        while remaining > 0 {
+            let to_read = remaining.min(chunk_buf.len());
+            match self.file.read_exact_at(&mut chunk_buf[..to_read], file_pos) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            running_crc = crc32c_append(running_crc, &chunk_buf[..to_read]);
+            file_pos += to_read as u64;
+            remaining -= to_read;
+        }
+
+        Ok(running_crc == ptr.crc32c)
     }
 }
 
@@ -860,5 +942,138 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn validate_blob_ptr_streams_large_blob_in_bounded_chunks_and_detects_corruption() {
+        use crate::pal::OsFile;
+        use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+        const INJECT_NONE: u8 = 0;
+        const INJECT_EOF_SECOND_READ: u8 = 1;
+        const INJECT_IO_ERR_SECOND_READ: u8 = 2;
+
+        struct SpyStreamFile {
+            inner: Arc<OsFile>,
+            max_read_len: AtomicUsize,
+            read_calls: AtomicUsize,
+            inject_mode: AtomicU8,
+        }
+
+        impl PlatformFile for SpyStreamFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                let call = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_read_len.fetch_max(buf.len(), Ordering::SeqCst);
+                if call == 2 {
+                    match self.inject_mode.load(Ordering::SeqCst) {
+                        INJECT_EOF_SECOND_READ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "injected mid-stream EOF",
+                            ));
+                        }
+                        INJECT_IO_ERR_SECOND_READ => {
+                            return Err(io::Error::other("injected mid-stream I/O error"));
+                        }
+                        _ => {}
+                    }
+                }
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(
+                &self,
+                target_len: u64,
+                strategy: crate::pal::PreallocStrategy,
+            ) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        let dir = TempTestDir::new("blob_stream_validate");
+        let fs = OsFs::open(&dir.path, true).unwrap();
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let mut payload = vec![0u8; 256 * 1024];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) & 0xFF) as u8;
+        }
+        let ptr = writer.append_blob(b"large-key", &payload).unwrap();
+        writer.sync_durable().unwrap();
+        drop(writer);
+
+        let rw_file = fs
+            .open_file(
+                &format_std_blob_file_name(1),
+                false,
+                true,
+                OpenHint::ImmutableSequential,
+            )
+            .unwrap();
+        let file_len = rw_file.file_len().unwrap();
+        let spy = Arc::new(SpyStreamFile {
+            inner: Arc::clone(&rw_file),
+            max_read_len: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            inject_mode: AtomicU8::new(INJECT_NONE),
+        });
+        let reader = BlobSegmentReader::new_with_len(Arc::clone(&spy), 1, file_len);
+
+        // Intact 256 KB blob must validate in bounded <= 64 KB chunks over multiple reads.
+        assert!(reader.validate_blob_ptr(&ptr).unwrap());
+        assert!(spy.max_read_len.load(Ordering::SeqCst) <= 64 * 1024);
+        assert!(spy.read_calls.load(Ordering::SeqCst) >= 5);
+
+        // Wrong pointer CRC must fail closed cleanly.
+        let bad_crc = BlobPtr {
+            crc32c: ptr.crc32c ^ 1,
+            ..ptr
+        };
+        assert!(!reader.validate_blob_ptr(&bad_crc).unwrap());
+
+        // Mid-stream UnexpectedEof resolves to Ok(false); real I/O error propagates Err.
+        spy.read_calls.store(0, Ordering::SeqCst);
+        spy.inject_mode
+            .store(INJECT_EOF_SECOND_READ, Ordering::SeqCst);
+        assert!(!reader.validate_blob_ptr(&ptr).unwrap());
+
+        spy.read_calls.store(0, Ordering::SeqCst);
+        spy.inject_mode
+            .store(INJECT_IO_ERR_SECOND_READ, Ordering::SeqCst);
+        assert_eq!(
+            reader.validate_blob_ptr(&ptr).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        spy.inject_mode.store(INJECT_NONE, Ordering::SeqCst);
+
+        // Flipping a byte near the tail of the 256 KB payload must fail streaming CRC32C check.
+        let tail_off = file_len - 7;
+        let mut orig = [0u8; 1];
+        rw_file.read_exact_at(&mut orig, tail_off).unwrap();
+        rw_file.write_all_at(&[orig[0] ^ 0x80], tail_off).unwrap();
+        assert!(!reader.validate_blob_ptr(&ptr).unwrap());
+
+        // Restore tail byte, then corrupt magic bytes -> must also return Ok(false).
+        rw_file.write_all_at(&orig, tail_off).unwrap();
+        assert!(reader.validate_blob_ptr(&ptr).unwrap());
+        rw_file.write_all_at(b"XXXX", ptr.offset as u64).unwrap();
+        assert!(!reader.validate_blob_ptr(&ptr).unwrap());
     }
 }
