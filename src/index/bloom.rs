@@ -108,6 +108,11 @@ fn compute_bloom_sizing(num_keys: usize, bits_per_key: usize) -> (usize, u32) {
     (num_bytes, num_bits)
 }
 
+#[inline(always)]
+fn fastrange32(hash: u32, range: u32) -> usize {
+    (((hash as u64).wrapping_mul(range as u64)) >> 32) as usize
+}
+
 impl BloomFilter {
     /// Creates an empty filter disabled (`bits_per_key == 0`) or sized for `num_keys`.
     pub fn new(num_keys: usize, bits_per_key: usize) -> Self {
@@ -139,7 +144,7 @@ impl BloomFilter {
     fn insert_pair(&mut self, h1: u32, h2: u32) {
         let mut h = h1;
         for _ in 0..self.num_probes {
-            let bit_idx = (h % self.num_bits) as usize;
+            let bit_idx = fastrange32(h, self.num_bits);
             self.bits[bit_idx >> 3] |= 1u8 << (bit_idx & 7);
             h = h.wrapping_add(h2);
         }
@@ -200,7 +205,7 @@ impl BloomFilter {
         }
         let mut h = h1;
         for _ in 0..self.num_probes {
-            let bit_idx = (h % self.num_bits) as usize;
+            let bit_idx = fastrange32(h, self.num_bits);
             if (self.bits[bit_idx >> 3] & (1u8 << (bit_idx & 7))) == 0 {
                 return false;
             }
@@ -363,6 +368,38 @@ mod tests {
         assert!(
             false_positives < 250,
             "unexpectedly high false positive rate: {false_positives}/10000"
+        );
+    }
+
+    #[test]
+    fn fastrange32_stays_in_bounds_and_bloom_fp_rate_stays_low() {
+        for range in [1u32, 64, 65, 1000, u32::MAX] {
+            assert_eq!(fastrange32(0, range), 0);
+            assert!(fastrange32(u32::MAX, range) < range as usize);
+            for h in [1u32, 0x1234_5678, 0x7FFF_FFFF, 0x8000_0000, u32::MAX - 1] {
+                assert!(fastrange32(h, range) < range as usize);
+            }
+        }
+
+        let mut filter = BloomFilter::new(2000, 10);
+        for i in 0..2000u32 {
+            let k = format!("equal_len_{i:06}");
+            filter.insert(k.as_bytes());
+        }
+        for i in 0..2000u32 {
+            let k = format!("equal_len_{i:06}");
+            assert!(filter.may_contain(k.as_bytes()));
+        }
+        let mut false_positives = 0usize;
+        for i in 2000..12_000u32 {
+            let k = format!("equal_len_{i:06}");
+            if filter.may_contain(k.as_bytes()) {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives < 250,
+            "unexpectedly high fastrange32 false positive rate: {false_positives}/10000"
         );
     }
 }

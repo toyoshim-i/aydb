@@ -8200,3 +8200,143 @@ fn table_id_allocation_returns_error_when_all_ids_exhausted() {
     };
     assert_eq!(err.kind(), io::ErrorKind::Other);
 }
+
+#[test]
+fn open_inner_wal_replay_skips_idx_reads_for_non_blob_namespaces() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+
+    struct IdxBlockSpyFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        is_idx: bool,
+        block_reads: Arc<AtomicUsize>,
+    }
+
+    impl PlatformFile for IdxBlockSpyFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            if self.is_idx && buf.len() == crate::index::IDX_BLOCK_SIZE {
+                self.block_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+
+    struct IdxBlockSpyFs {
+        inner: OsFs,
+        block_reads: Arc<AtomicUsize>,
+    }
+
+    impl PlatformFs for IdxBlockSpyFs {
+        type File = IdxBlockSpyFile;
+
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(IdxBlockSpyFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                is_idx: rel_name.starts_with("idx_"),
+                block_reads: Arc::clone(&self.block_reads),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("wal_replay_skip_idx");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut cfg = EngineConfig::default();
+    cfg.bloom_bits_per_key = 0; // Disable bloom so any idx.get() in range reads a 4 KB block.
+    cfg.inline_threshold_bytes = 256;
+
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, cfg.clone()).unwrap();
+        // Flush an idx segment containing a standard blob and secondary index keys bracketing idx_id 1..10.
+        engine
+            .put_row(
+                1,
+                b"pk_blob",
+                &vec![0xAB; 2048],
+                &[(1, b"s1".to_vec()), (10, b"s9".to_vec())],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Append non-blob-bearing namespace WAL records strictly inside [idx_id 1 .. idx_id 10].
+        let wal_recs = vec![
+            WalRecord::PutInline {
+                key: crate::lru::encode_secondary_index_key(1, 5, b"mid", b"pk_x"),
+                value: Vec::new(),
+            },
+            WalRecord::Delete {
+                key: crate::lru::encode_secondary_index_key(1, 6, b"mid2", b"pk_y"),
+            },
+            WalRecord::PutInline {
+                key: crate::lru::encode_lru_queue_key(1, 50, b"pk_x"),
+                value: Vec::new(),
+            },
+        ];
+        engine
+            .commit_wal_and_memtable(wal_recs, WriteDurability::SyncTransactional)
+            .unwrap();
+        // Drop without flushing MemTable so next open replays the WAL records above.
+    }
+
+    let spy_fs = Arc::new(IdxBlockSpyFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        block_reads: Arc::clone(&reads),
+    });
+    reads.store(0, Ordering::Relaxed);
+    let mut reopened = StorageEngine::open(spy_fs, cfg).unwrap();
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "replaying non-'r'/'t' WAL records must not read 4 KB idx blocks"
+    );
+    assert_eq!(
+        reopened.get_row(1, b"pk_blob").unwrap().unwrap().len(),
+        2048
+    );
+    assert!(
+        reopened
+            .lookup_raw_entry(&crate::lru::encode_secondary_index_key(
+                1, 5, b"mid", b"pk_x"
+            ))
+            .unwrap()
+            .is_some()
+    );
+}

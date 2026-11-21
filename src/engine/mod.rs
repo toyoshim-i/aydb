@@ -907,22 +907,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => None,
                 };
                 if let Some(key) = key_opt {
-                    let old_ptr = if let Some(mem_entry) = memtable.get(key) {
-                        match mem_entry.value {
-                            IndexValue::Blob(ptr) => Some(ptr),
-                            _ => None,
+                    let may_have_blob = (!std_blobs.is_empty() || !lru_blobs.is_empty())
+                        && (key.len() < 3 || matches!(key[2], NS_PRIMARY_ROW | NS_ROW_META));
+                    let old_ptr = if may_have_blob {
+                        if let Some(mem_entry) = memtable.get(key) {
+                            match mem_entry.value {
+                                IndexValue::Blob(ptr) => Some(ptr),
+                                _ => None,
+                            }
+                        } else {
+                            let mut found = None;
+                            for seg in idx_segments.iter().rev() {
+                                if let Some((_lsn, val)) = seg.get(key)? {
+                                    if let IndexValue::Blob(ptr) = val {
+                                        found = Some(ptr);
+                                    }
+                                    break;
+                                }
+                            }
+                            found
                         }
                     } else {
-                        let mut found = None;
-                        for seg in idx_segments.iter().rev() {
-                            if let Some((_lsn, val)) = seg.get(key)? {
-                                if let IndexValue::Blob(ptr) = val {
-                                    found = Some(ptr);
-                                }
-                                break;
-                            }
-                        }
-                        found
+                        None
                     };
                     if let Some(ptr) = old_ptr {
                         match ptr.kind {

@@ -410,9 +410,8 @@ impl IdxBlockBuilder {
         Ok(())
     }
 
-    /// Seals the 4 KB block by writing the `u16` Entry Offset Directory (`4088 - 2*K .. 4088`),
-    /// the entry count, and the `block_crc32c` trailer (`4092..4096`), then resets `self`.
-    pub fn finish_and_reset(&mut self) -> [u8; IDX_BLOCK_SIZE] {
+    /// Seals the 4 KB block in place without resetting `self`.
+    fn seal_in_place(&mut self) {
         let count = self.offsets.len();
         let dir_start = IDX_BLOCK_USABLE_SIZE - (count * 2);
 
@@ -428,9 +427,22 @@ impl IdxBlockBuilder {
         self.buf[4090..4092].copy_from_slice(&0u16.to_le_bytes());
         let crc = crc32c(&self.buf[0..4092]);
         self.buf[4092..4096].copy_from_slice(&crc.to_le_bytes());
+    }
 
+    /// Seals the 4 KB block, appends it directly to `dst`, and resets `self` for the next block
+    /// without returning a 4 KB stack array or zeroing the entire scratch buffer.
+    pub fn finish_into(&mut self, dst: &mut Vec<u8>) {
+        self.seal_in_place();
+        dst.extend_from_slice(&self.buf);
+        self.write_pos = 0;
+        self.offsets.clear();
+    }
+
+    /// Seals the 4 KB block by writing the `u16` Entry Offset Directory (`4088 - 2*K .. 4088`),
+    /// the entry count, and the `block_crc32c` trailer (`4092..4096`), then resets `self`.
+    pub fn finish_and_reset(&mut self) -> [u8; IDX_BLOCK_SIZE] {
+        self.seal_in_place();
         let finished = self.buf;
-        self.buf.fill(0);
         self.write_pos = 0;
         self.offsets.clear();
         finished
@@ -879,12 +891,10 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             .to_vec()
             .into_boxed_slice();
         let block_idx = self.num_blocks;
-        let block_bytes = self.block_builder.finish_and_reset();
-
         if self.write_buf.is_empty() {
             self.buf_start_offset = self.write_offset;
         }
-        self.write_buf.extend_from_slice(&block_bytes);
+        self.block_builder.finish_into(&mut self.write_buf);
         self.write_offset += IDX_BLOCK_SIZE as u64;
         self.num_blocks = next_num_blocks;
         self.fence_pointers.push(FencePointer {
@@ -2765,5 +2775,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, target_key);
         assert_eq!(*offsets.lock().unwrap(), vec![expected_offset]);
+    }
+
+    #[test]
+    fn idx_block_builder_finish_into_zeroes_padding_across_reused_blocks() {
+        let mut builder = IdxBlockBuilder::new();
+        let noisy = vec![0xFFu8; 512];
+        for i in 0..6u32 {
+            let k = format!("noisy_{i:02}").into_bytes();
+            builder.add_raw_entry(&k, i as u64 + 1, 1, &noisy).unwrap();
+        }
+        let mut out = Vec::new();
+        builder.finish_into(&mut out);
+        assert_eq!(out.len(), IDX_BLOCK_SIZE);
+        let b1: &[u8; IDX_BLOCK_SIZE] = (&out[..IDX_BLOCK_SIZE]).try_into().unwrap();
+        assert!(IdxBlockReader::open_verified(b1).is_ok());
+
+        // Second block contains only one short entry, leaving > 4000 bytes of padding that used
+        // to hold 0xFF from the first block.
+        out.clear();
+        builder.add_raw_entry(b"tiny", 10, 1, b"ok").unwrap();
+        builder.finish_into(&mut out);
+        assert_eq!(out.len(), IDX_BLOCK_SIZE);
+        let b2: &[u8; IDX_BLOCK_SIZE] = (&out[..IDX_BLOCK_SIZE]).try_into().unwrap();
+        let reader2 = IdxBlockReader::open_verified(b2).unwrap();
+        assert_eq!(reader2.num_entries(), 1);
+        assert_eq!(
+            reader2.lookup_binary_search(b"tiny").unwrap(),
+            Some((10, IndexValue::Inline(b"ok".to_vec())))
+        );
+
+        let entry_end = 11 + 4 + 2 + 2;
+        let dir_start = IDX_BLOCK_USABLE_SIZE - 2;
+        assert!(
+            b2[entry_end..dir_start].iter().all(|&b| b == 0),
+            "unused gap in reused IdxBlockBuilder must be zeroed"
+        );
     }
 }
