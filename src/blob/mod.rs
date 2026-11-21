@@ -126,6 +126,9 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
             self.known_file_len
                 .fetch_max(self.buf_start_offset, Ordering::Release);
             self.write_buf.clear();
+            if self.write_buf.capacity() > BLOB_WRITE_BUFFER_CAPACITY * 2 {
+                self.write_buf.shrink_to(BLOB_WRITE_BUFFER_CAPACITY);
+            }
         }
         Ok(())
     }
@@ -186,6 +189,11 @@ impl<F: PlatformFile> BlobSegmentWriter<F> {
         if self.write_buf.len() >= BLOB_WRITE_BUFFER_CAPACITY {
             if let Err(e) = self.flush_buffer() {
                 self.write_buf.truncate(rec_start);
+                if self.write_buf.is_empty()
+                    && self.write_buf.capacity() > BLOB_WRITE_BUFFER_CAPACITY * 2
+                {
+                    self.write_buf.shrink_to(BLOB_WRITE_BUFFER_CAPACITY);
+                }
                 return Err(e);
             }
         }
@@ -1075,5 +1083,36 @@ mod tests {
         assert!(reader.validate_blob_ptr(&ptr).unwrap());
         rw_file.write_all_at(b"XXXX", ptr.offset as u64).unwrap();
         assert!(!reader.validate_blob_ptr(&ptr).unwrap());
+    }
+
+    #[test]
+    fn blob_writer_shrinks_write_buf_after_oversized_blob_flush() {
+        let dir = TempTestDir::new("blob_writer_shrink");
+        let fs = OsFs::open(&dir.path, true).unwrap();
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let huge = vec![0xCDu8; 1024 * 1024];
+        let ptr_huge = writer.append_blob(b"huge", &huge).unwrap();
+        assert!(writer.write_buf.is_empty());
+        assert!(
+            writer.write_buf.capacity() <= BLOB_WRITE_BUFFER_CAPACITY * 2,
+            "oversized write_buf capacity should shrink after flush (got {})",
+            writer.write_buf.capacity()
+        );
+
+        let small = vec![0x34u8; 4096];
+        let ptr_small = writer.append_blob(b"small", &small).unwrap();
+        writer.sync_durable().unwrap();
+        drop(writer);
+
+        let reader = BlobSegmentReader::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        assert_eq!(
+            reader.read_blob(&ptr_huge, Some(b"huge")).unwrap(),
+            Some(huge)
+        );
+        assert_eq!(
+            reader.read_blob(&ptr_small, Some(b"small")).unwrap(),
+            Some(small)
+        );
     }
 }

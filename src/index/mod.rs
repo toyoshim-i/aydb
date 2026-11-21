@@ -1444,7 +1444,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         }
         let start_pos = self
             .fence_pointers
-            .partition_point(|fp| fp.first_key.as_ref() < effective_start);
+            .partition_point(|fp| fp.first_key.as_ref() <= effective_start);
         let first_block = start_pos.saturating_sub(1) as u32;
 
         let mut block_buf = [0u8; IDX_BLOCK_SIZE];
@@ -1859,7 +1859,7 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
 
         let start_pos = seg
             .fence_pointers
-            .partition_point(|fp| fp.first_key.as_ref() < lower_key);
+            .partition_point(|fp| fp.first_key.as_ref() <= lower_key);
         cursor.next_block_idx = start_pos.saturating_sub(1) as u32;
 
         while cursor.next_block_idx < seg.num_blocks {
@@ -2654,5 +2654,116 @@ mod tests {
         );
         let seg_reader = seg.finish().unwrap();
         assert_eq!(seg_reader.scan_all().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn fence_pointer_seek_exact_block_boundary_skips_prior_block() {
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        struct SpyOffsetFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            is_idx: bool,
+            offsets: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl PlatformFile for SpyOffsetFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                if self.is_idx {
+                    self.offsets.lock().unwrap().push(offset);
+                }
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(
+                &self,
+                target_len: u64,
+                strategy: crate::pal::PreallocStrategy,
+            ) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+
+        struct SpyOffsetFs {
+            inner: OsFs,
+            offsets: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl PlatformFs for SpyOffsetFs {
+            type File = SpyOffsetFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(SpyOffsetFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    is_idx: rel_name.starts_with("idx_"),
+                    offsets: Arc::clone(&self.offsets),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("fence_exact_boundary");
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let fs = SpyOffsetFs {
+            inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
+            offsets: Arc::clone(&offsets),
+        };
+
+        let val = vec![0x7Au8; 512];
+        let mut seg = IdxSegmentBuilder::create(&fs, 1, 0, 10).unwrap();
+        for i in 0..32u32 {
+            let k = format!("fp_{i:04}").into_bytes();
+            seg.add_raw_entry(&k, i as u64 + 1, 1, &val).unwrap();
+        }
+        let seg_reader = seg.finish().unwrap();
+        assert!(seg_reader.fence_pointers.len() >= 4);
+        let target_key = seg_reader.fence_pointers[2].first_key.to_vec();
+        let expected_offset = 2 * IDX_BLOCK_SIZE as u64;
+
+        // 1. cursor_from (inclusive) seeking to block 2's exact first_key must read block 2 directly.
+        offsets.lock().unwrap().clear();
+        let cur = seg_reader.cursor_from(&target_key, true).unwrap();
+        assert_eq!(cur.current_key(), Some(target_key.as_slice()));
+        assert_eq!(*offsets.lock().unwrap(), vec![expected_offset]);
+
+        // 2. scan_prefix_range seeking to block 2's exact first_key must also skip block 1.
+        offsets.lock().unwrap().clear();
+        let rows = seg_reader
+            .scan_prefix_range(b"fp_", &target_key, None, 1)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, target_key);
+        assert_eq!(*offsets.lock().unwrap(), vec![expected_offset]);
     }
 }

@@ -57,19 +57,58 @@ fn split_if_large(chunks: &mut Vec<Chunk>, i: usize) {
     if len <= MAX_CHUNK_ENTRIES {
         return;
     }
-    let Some(mid) = chunks[i].map.keys().nth(len / 2).cloned() else {
+    if len <= MAX_CHUNK_ENTRIES * 2 {
+        let Some(mid) = chunks[i].map.keys().nth(len / 2).cloned() else {
+            return;
+        };
+        let right = Arc::make_mut(&mut chunks[i].map).split_off(mid.as_slice());
+        chunks.insert(
+            i + 1,
+            Chunk {
+                min: Arc::from(mid),
+                map: Arc::new(right),
+            },
+        );
         return;
-    };
-    let right = Arc::make_mut(&mut chunks[i].map).split_off(mid.as_slice());
-    chunks.insert(
-        i + 1,
-        Chunk {
-            min: Arc::from(mid),
-            map: Arc::new(right),
-        },
-    );
-    split_if_large(chunks, i + 1);
-    split_if_large(chunks, i);
+    }
+
+    let pieces = len.div_ceil(MAX_CHUNK_ENTRIES);
+    let base = len / pieces;
+    let rem = len % pieces;
+    let map = std::mem::take(Arc::make_mut(&mut chunks[i].map));
+    let mut iter = map.into_iter();
+
+    let first_count = base + usize::from(0 < rem);
+    let mut first_map = BTreeMap::new();
+    for _ in 0..first_count {
+        if let Some((k, v)) = iter.next() {
+            first_map.insert(k, v);
+        }
+    }
+    chunks[i].map = Arc::new(first_map);
+
+    let mut extra = Vec::with_capacity(pieces - 1);
+    for p in 1..pieces {
+        let count = base + usize::from(p < rem);
+        let mut piece_map = BTreeMap::new();
+        let mut piece_min: Option<Arc<[u8]>> = None;
+        for _ in 0..count {
+            let Some((k, v)) = iter.next() else {
+                break;
+            };
+            if piece_min.is_none() {
+                piece_min = Some(Arc::from(k.as_slice()));
+            }
+            piece_map.insert(k, v);
+        }
+        if let Some(min) = piece_min {
+            extra.push(Chunk {
+                min,
+                map: Arc::new(piece_map),
+            });
+        }
+    }
+    chunks.splice(i + 1..i + 1, extra);
 }
 
 /// Value and mutation sequence number stored for a key inside [`MemTable`].
@@ -179,8 +218,8 @@ impl MemTable {
         }
         self.generation += 1;
         // Bulk path: when the overlay is not tiny relative to the table, hand each chunk its
-        // slice of the overlay and merge with `BTreeMap::append` (overlay wins on equal keys)
-        // instead of m separate O(log n) inserts. Only the touched chunks are made unique.
+        // slice of the overlay and move entries directly (empty chunks take ownership with zero
+        // lookups; populated chunks update via a single per-key insert) instead of double scans.
         if entries.len().saturating_mul(8) >= self.len {
             let chunks = Arc::make_mut(&mut self.chunks);
             // Walk the chunks from the back so that splits never shift a pending index.
@@ -188,7 +227,7 @@ impl MemTable {
                 if entries.is_empty() {
                     break;
                 }
-                let mut part = if i == 0 {
+                let part = if i == 0 {
                     std::mem::take(&mut entries)
                 } else {
                     entries.split_off(&*chunks[i].min)
@@ -196,23 +235,40 @@ impl MemTable {
                 if part.is_empty() {
                     continue;
                 }
-                let mut replaced = 0usize;
-                for (k, e) in &part {
-                    if let Some(old) = chunks[i].map.get(k) {
-                        replaced += 1;
+                if chunks[i].map.is_empty() {
+                    for (k, e) in &part {
                         self.approximate_bytes = self
                             .approximate_bytes
-                            .saturating_sub(old.approx_heap_bytes(k.len()));
+                            .saturating_add(e.approx_heap_bytes(k.len()));
+                        if e.lsn > self.highest_lsn {
+                            self.highest_lsn = e.lsn;
+                        }
                     }
-                    self.approximate_bytes = self
-                        .approximate_bytes
-                        .saturating_add(e.approx_heap_bytes(k.len()));
-                    if e.lsn > self.highest_lsn {
-                        self.highest_lsn = e.lsn;
+                    self.len += part.len();
+                    chunks[i].map = Arc::new(part);
+                } else {
+                    let dst = Arc::make_mut(&mut chunks[i].map);
+                    for (k, e) in part {
+                        let k_len = k.len();
+                        let new_bytes = e.approx_heap_bytes(k_len);
+                        if e.lsn > self.highest_lsn {
+                            self.highest_lsn = e.lsn;
+                        }
+                        match dst.insert(k, e) {
+                            Some(old) => {
+                                self.approximate_bytes = self
+                                    .approximate_bytes
+                                    .saturating_sub(old.approx_heap_bytes(k_len))
+                                    .saturating_add(new_bytes);
+                            }
+                            None => {
+                                self.len += 1;
+                                self.approximate_bytes =
+                                    self.approximate_bytes.saturating_add(new_bytes);
+                            }
+                        }
                     }
                 }
-                self.len += part.len() - replaced;
-                Arc::make_mut(&mut chunks[i].map).append(&mut part);
                 split_if_large(chunks, i);
             }
             return;
@@ -1006,6 +1062,88 @@ mod tests {
                     .count(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn absorb_bulk_split_is_balanced_zero_clone_on_empty_and_tracks_bytes_accurately() {
+        let mut entries = BTreeMap::new();
+        let val_a = vec![0xAAu8; 20];
+        for i in 0..3000u32 {
+            let k = format!("bulk_{i:05}").into_bytes();
+            entries.insert(
+                k,
+                MemEntry {
+                    lsn: (i + 1) as u64,
+                    value: IndexValue::Inline(val_a.clone()),
+                },
+            );
+        }
+
+        let mut mt = MemTable::new(16 * 1024 * 1024);
+        let clones_before = mem_entry_clones();
+        mt.absorb(entries);
+        assert_eq!(
+            mem_entry_clones() - clones_before,
+            0,
+            "bulk absorb into empty chunk must not clone MemEntry"
+        );
+        assert_eq!(mt.len(), 3000);
+        assert_eq!(mt.highest_lsn(), 3000);
+        assert!(mt.chunks.len() >= 6);
+        for chunk in mt.chunks.iter() {
+            assert!(
+                chunk.map.len() <= MAX_CHUNK_ENTRIES,
+                "chunk length {} exceeded MAX_CHUNK_ENTRIES",
+                chunk.map.len()
+            );
+        }
+
+        // Second overlapping bulk absorb updates replaced entries accurately.
+        let mut updates = BTreeMap::new();
+        let val_b = vec![0xBBu8; 40];
+        for i in (0..3000u32).step_by(2) {
+            let k = format!("bulk_{i:05}").into_bytes();
+            updates.insert(
+                k,
+                MemEntry {
+                    lsn: 5000 + i as u64,
+                    value: IndexValue::Inline(val_b.clone()),
+                },
+            );
+        }
+        // Also insert 500 new keys.
+        for i in 3000..3500u32 {
+            let k = format!("bulk_{i:05}").into_bytes();
+            updates.insert(
+                k,
+                MemEntry {
+                    lsn: 8000 + i as u64,
+                    value: IndexValue::Inline(val_b.clone()),
+                },
+            );
+        }
+        let expected_clones = 0usize;
+        let clones_before_second = mem_entry_clones();
+        mt.absorb(updates);
+        assert_eq!(mem_entry_clones() - clones_before_second, expected_clones);
+        assert_eq!(mt.len(), 3500);
+        assert_eq!(mt.highest_lsn(), 8000 + 3499);
+
+        let expected_bytes: usize = mt
+            .iter_range(Bound::Unbounded, Bound::Unbounded)
+            .map(|(k, e)| e.approx_heap_bytes(k.len()))
+            .sum();
+        assert_eq!(mt.approximate_bytes(), expected_bytes);
+        for i in 0..3500u32 {
+            let k = format!("bulk_{i:05}").into_bytes();
+            let got = mt.get(&k).unwrap();
+            let expected_val = if i >= 3000 || i % 2 == 0 {
+                &val_b
+            } else {
+                &val_a
+            };
+            assert_eq!(got.value, IndexValue::Inline(expected_val.clone()));
         }
     }
 }
