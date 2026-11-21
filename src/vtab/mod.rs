@@ -103,6 +103,7 @@ const PLAN_PK_POINT: c_int = 1;
 const PLAN_SECONDARY_EQ: c_int = 2;
 const PLAN_PK_RANGE: c_int = 3;
 const PLAN_SECONDARY_RANGE: c_int = 4;
+const PLAN_UNIQUE_EQ: c_int = 5;
 
 const POINT_FLAG_BY_ROWID: c_int = 0x01;
 /// Point lookup only needs existence + primary key (no value read), so a corrupt out-of-line
@@ -129,6 +130,20 @@ thread_local! {
     static CURSOR_SLAB_MAX_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test observability: high-water mark of `cursor.lazy_row_buf.len()` observed in `vtab_column`.
     static CURSOR_LAZY_ROW_BUF_MAX_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test observability: last `(idxNum, orderByConsumed, argv_indexes)` chosen by `vtab_best_index`.
+    static LAST_BEST_INDEX_PLAN: std::cell::RefCell<Option<(c_int, c_int, Vec<c_int>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_best_index_plan(
+    info: &sqlite3_index_info,
+    usages: &[crate::vtab::ffi::sqlite3_index_constraint_usage],
+) {
+    let args = usages.iter().map(|u| u.argvIndex).collect();
+    LAST_BEST_INDEX_PLAN.with(|cell| {
+        *cell.borrow_mut() = Some((info.idxNum, info.orderByConsumed, args));
+    });
 }
 
 /// Returns the alternate exact-integer numeric key representation (`9`-byte `Integer(q)` vs
@@ -1174,6 +1189,82 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
     .unwrap_or(SQLITE_ERROR)
 }
 
+#[inline]
+unsafe fn order_by_slice<'a>(
+    n_order_by: c_int,
+    a_order_by: *const crate::vtab::ffi::sqlite3_index_orderby,
+) -> &'a [crate::vtab::ffi::sqlite3_index_orderby] {
+    let n = usize::try_from(n_order_by).unwrap_or(0);
+    if n == 0 || a_order_by.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(a_order_by, n) }
+    }
+}
+
+/// Returns `Some(reverse)` if a primary-key scan satisfies `order_by` directly. Because primary
+/// keys are unique under their column collation, any trailing tie-breaker columns after `pk`
+/// never re-order equal rows.
+#[inline]
+fn pk_order_by(
+    order_by: &[crate::vtab::ffi::sqlite3_index_orderby],
+    pk_col_idx: usize,
+) -> Option<bool> {
+    // Integer affinity also accepts REAL/TEXT/BLOB keys with synthetic rowids; only `pk_col_idx`
+    // order (never `iColumn == -1`) is guaranteed to match the LSM key sort order.
+    let first = order_by.first()?;
+    if first.iColumn == pk_col_idx as i32 {
+        Some(first.desc != 0)
+    } else {
+        None
+    }
+}
+
+/// Returns `true` when an equality probe on `col_idx` satisfies `order_by`.
+///
+/// An equality scan yields matching rows in ascending `pk` order (including any cross-affinity
+/// fallback via `start_pk_full_scan`), and for numeric/real/integer affinities every match has an
+/// equal key so `ORDER BY col_idx[, pk ASC]` is also satisfied.
+#[inline]
+fn eq_index_consumes_order_by(
+    order_by: &[crate::vtab::ffi::sqlite3_index_orderby],
+    col_idx: usize,
+    col_aff: ColumnAffinity,
+    pk_col_idx: usize,
+) -> bool {
+    let Some(first) = order_by.first() else {
+        return false;
+    };
+    if first.iColumn == pk_col_idx as i32 && first.desc == 0 {
+        return true;
+    }
+    if matches!(col_aff, ColumnAffinity::Text | ColumnAffinity::Blob) {
+        return false;
+    }
+    if first.iColumn == col_idx as i32 {
+        return order_by.len() == 1
+            || (order_by[1].iColumn == pk_col_idx as i32 && order_by[1].desc == 0);
+    }
+    false
+}
+
+/// Returns `true` when an ascending secondary-index range scan (`Escaped(col_val) | pk`)
+/// satisfies `ORDER BY sec_col_idx ASC` or `ORDER BY sec_col_idx ASC, pk ASC`.
+#[inline]
+fn sec_range_consumes_order_by(
+    order_by: &[crate::vtab::ffi::sqlite3_index_orderby],
+    sec_col_idx: usize,
+    pk_col_idx: usize,
+) -> bool {
+    let Some(first) = order_by.first() else {
+        return false;
+    };
+    if first.iColumn != sec_col_idx as i32 || first.desc != 0 {
+        return false;
+    }
+    order_by.len() == 1 || (order_by[1].iColumn == pk_col_idx as i32 && order_by[1].desc == 0)
+}
+
 unsafe extern "system" fn vtab_best_index(
     p_vtab: *mut sqlite3_vtab,
     p_info: *mut sqlite3_index_info,
@@ -1198,6 +1289,26 @@ unsafe extern "system" fn vtab_best_index(
                 core::slice::from_raw_parts_mut(info.aConstraintUsage, n),
             )
         };
+        let rc = select_best_index(vtab, p_info, info, constraints, usages);
+        #[cfg(test)]
+        if rc == SQLITE_OK {
+            record_best_index_plan(info, usages);
+        }
+        rc
+    }))
+    .unwrap_or(SQLITE_ERROR)
+}
+
+unsafe fn select_best_index(
+    vtab: &AydbVTab,
+    p_info: *mut sqlite3_index_info,
+    info: &mut sqlite3_index_info,
+    constraints: &[crate::vtab::ffi::sqlite3_index_constraint],
+    usages: &mut [crate::vtab::ffi::sqlite3_index_constraint_usage],
+) -> c_int {
+    unsafe {
+        let n = constraints.len();
+        let order_by = order_by_slice(info.nOrderBy, info.aOrderBy);
 
         // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected
         let can_use_keys_only = info.colUsed == 0
@@ -1234,125 +1345,188 @@ unsafe extern "system" fn vtab_best_index(
                 {
                     info.idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
                 }
+                if (info.idxFlags == SQLITE_INDEX_SCAN_UNIQUE && !order_by.is_empty())
+                    || order_by
+                        .first()
+                        .is_some_and(|ob| ob.iColumn == vtab.pk_col_idx as i32 && ob.desc == 0)
+                {
+                    info.orderByConsumed = 1;
+                }
                 info.estimatedCost = 1.0;
                 info.estimatedRows = 1;
                 return SQLITE_OK;
             }
         }
 
-        // 2. Check for usable equality constraint (`=`) on a Secondary Index column
+        // 2. Check for usable equality constraint (`=`) on a trusted persistent UNIQUE column
+        if vtab.unique_ready.load(Ordering::Acquire) {
+            let mut best_unique: Option<(usize, usize, bool)> = None;
+            for i in 0..n {
+                if constraints[i].usable == 0 || constraints[i].op != SQLITE_INDEX_CONSTRAINT_EQ {
+                    continue;
+                }
+                let col = constraints[i].iColumn;
+                if col < 0 {
+                    continue;
+                }
+                let col_idx = col as usize;
+                if col_idx >= 0x7FFF || vtab.col_unique.get(col_idx) != Some(&true) {
+                    continue;
+                }
+                if !constraint_matches_col_collation(p_info, i, vtab.col_collations[col_idx]) {
+                    continue;
+                }
+                let ob = eq_index_consumes_order_by(
+                    order_by,
+                    col_idx,
+                    vtab.col_affinities[col_idx],
+                    vtab.pk_col_idx,
+                );
+                if best_unique.is_none_or(|(_, _, prev_ob)| !prev_ob && ob) {
+                    best_unique = Some((i, col_idx, ob));
+                    if ob {
+                        break;
+                    }
+                }
+            }
+            if let Some((i, col_idx, ob_consumed)) = best_unique {
+                usages[i].argvIndex = 1;
+                // Keep `omit = 0` so digest collisions and cross-affinity fallbacks filter exact values.
+                usages[i].omit = 0;
+                let eq_flags = if can_use_keys_only {
+                    RANGE_FLAG_KEYS_ONLY
+                } else {
+                    0
+                };
+                info.idxNum = PLAN_UNIQUE_EQ
+                    | (((col_idx as c_int) & 0xFFFF) << 8)
+                    | ((eq_flags & 0x7F) << 24);
+                if ob_consumed {
+                    info.orderByConsumed = 1;
+                    info.estimatedCost = 1.8;
+                } else {
+                    info.estimatedCost = 2.0;
+                }
+                info.estimatedRows = 1;
+                return SQLITE_OK;
+            }
+        }
+
+        // 3. Check for usable equality constraint (`=`) on a Secondary Index column
+        let mut best_sec_eq: Option<(usize, usize, u16, bool)> = None;
         for i in 0..n {
             if constraints[i].usable == 0 || constraints[i].op != SQLITE_INDEX_CONSTRAINT_EQ {
                 continue;
             }
             let col = constraints[i].iColumn;
             if col >= 0 {
-                if let Some(&(_, index_id)) = vtab
-                    .secondary_indexes
-                    .iter()
-                    .find(|&&(c, _)| c == col as usize)
+                let col_idx = col as usize;
+                if let Some(&(_, index_id)) =
+                    vtab.secondary_indexes.iter().find(|&&(c, _)| c == col_idx)
                 {
-                    if !constraint_matches_col_collation(
-                        p_info,
-                        i,
-                        vtab.col_collations[col as usize],
-                    ) {
+                    if !constraint_matches_col_collation(p_info, i, vtab.col_collations[col_idx]) {
                         continue;
                     }
-                    usages[i].argvIndex = 1;
-                    // Do not set `omit = 1` on secondary index lookups so SQLite verifies the
-                    // exact column type and value (`NULL` vs `""` vs `X''`).
-                    usages[i].omit = 0;
-                    let eq_flags = if can_use_keys_only {
-                        RANGE_FLAG_KEYS_ONLY
-                    } else {
-                        0
-                    };
-                    info.idxNum = PLAN_SECONDARY_EQ
-                        | (((index_id as c_int) & 0xFFFF) << 8)
-                        | ((eq_flags & 0x7F) << 24);
-                    info.estimatedCost = 5.0;
-                    info.estimatedRows = 4;
-                    return SQLITE_OK;
+                    let ob = eq_index_consumes_order_by(
+                        order_by,
+                        col_idx,
+                        vtab.col_affinities[col_idx],
+                        vtab.pk_col_idx,
+                    );
+                    if best_sec_eq.is_none_or(|(_, _, _, prev_ob)| !prev_ob && ob) {
+                        best_sec_eq = Some((i, col_idx, index_id, ob));
+                        if ob {
+                            break;
+                        }
+                    }
                 }
             }
         }
-
-        // 3. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on Primary Key
-        let mut lower_idx: Option<(usize, c_int)> = None;
-        let mut upper_idx: Option<(usize, c_int)> = None;
-        for i in 0..n {
-            if constraints[i].usable == 0 {
-                continue;
+        if let Some((i, _, index_id, ob_consumed)) = best_sec_eq {
+            usages[i].argvIndex = 1;
+            // Do not set `omit = 1` on secondary index lookups so SQLite verifies the
+            // exact column type and value (`NULL` vs `""` vs `X''`).
+            usages[i].omit = 0;
+            let eq_flags = if can_use_keys_only {
+                RANGE_FLAG_KEYS_ONLY
+            } else {
+                0
+            };
+            info.idxNum = PLAN_SECONDARY_EQ
+                | (((index_id as c_int) & 0xFFFF) << 8)
+                | ((eq_flags & 0x7F) << 24);
+            if ob_consumed {
+                info.orderByConsumed = 1;
+                info.estimatedCost = 4.5;
+            } else {
+                info.estimatedCost = 5.0;
             }
-            if constraints[i].iColumn != vtab.pk_col_idx as i32 {
+            info.estimatedRows = 4;
+            return SQLITE_OK;
+        }
+
+        // 4. Compare usable range constraints (`>`, `>=`, `<`, `<=`) across PK and Secondary
+        //    Indexes so bounded ranges beat one-sided ranges (`bounded PK < bounded secondary <
+        //    one-sided PK < one-sided secondary`).
+        struct RangeCandidate {
+            is_pk: bool,
+            index_id: u16,
+            lower: Option<(usize, c_int)>,
+            upper: Option<(usize, c_int)>,
+            ob_consumed: bool,
+            reverse: bool,
+            cost: f64,
+            rows: i64,
+        }
+
+        let mut best_range: Option<RangeCandidate> = None;
+
+        let mut pk_lower: Option<(usize, c_int)> = None;
+        let mut pk_upper: Option<(usize, c_int)> = None;
+        for i in 0..n {
+            if constraints[i].usable == 0 || constraints[i].iColumn != vtab.pk_col_idx as i32 {
                 continue;
             }
             if !constraint_matches_col_collation(p_info, i, vtab.pk_collation) {
                 continue;
             }
             match constraints[i].op {
-                SQLITE_INDEX_CONSTRAINT_GE if lower_idx.is_none() => {
-                    lower_idx = Some((i, RANGE_FLAG_LOWER_INCLUSIVE));
+                SQLITE_INDEX_CONSTRAINT_GE if pk_lower.is_none() => {
+                    pk_lower = Some((i, RANGE_FLAG_LOWER_INCLUSIVE));
                 }
-                SQLITE_INDEX_CONSTRAINT_GT if lower_idx.is_none() => {
-                    lower_idx = Some((i, RANGE_FLAG_LOWER_EXCLUSIVE));
+                SQLITE_INDEX_CONSTRAINT_GT if pk_lower.is_none() => {
+                    pk_lower = Some((i, RANGE_FLAG_LOWER_EXCLUSIVE));
                 }
-                SQLITE_INDEX_CONSTRAINT_LE if upper_idx.is_none() => {
-                    upper_idx = Some((i, RANGE_FLAG_UPPER_INCLUSIVE));
+                SQLITE_INDEX_CONSTRAINT_LE if pk_upper.is_none() => {
+                    pk_upper = Some((i, RANGE_FLAG_UPPER_INCLUSIVE));
                 }
-                SQLITE_INDEX_CONSTRAINT_LT if upper_idx.is_none() => {
-                    upper_idx = Some((i, RANGE_FLAG_UPPER_EXCLUSIVE));
+                SQLITE_INDEX_CONSTRAINT_LT if pk_upper.is_none() => {
+                    pk_upper = Some((i, RANGE_FLAG_UPPER_EXCLUSIVE));
                 }
                 _ => {}
             }
         }
-
-        // Check if `ORDER BY pk ASC` or `ORDER BY pk DESC` can be satisfied directly by the memcomparable PK scan
-        let mut order_by_pk_consumed = false;
-        let mut order_by_pk_reverse = false;
-        if info.nOrderBy == 1 && !info.aOrderBy.is_null() {
-            let ob = &*info.aOrderBy;
-            // Integer affinity also accepts REAL/TEXT/BLOB keys with synthetic rowids. Another
-            // connection can insert one after planning, so only PK order is guaranteed here.
-            let is_pk_order = ob.iColumn == vtab.pk_col_idx as i32;
-            if is_pk_order {
-                order_by_pk_consumed = true;
-                order_by_pk_reverse = ob.desc != 0;
-            }
-        }
-
-        if lower_idx.is_some() || upper_idx.is_some() {
-            let mut flags = if can_use_keys_only {
-                RANGE_FLAG_KEYS_ONLY
-            } else {
-                0
+        let pk_ob = pk_order_by(order_by, vtab.pk_col_idx);
+        if pk_lower.is_some() || pk_upper.is_some() {
+            let bounded = pk_lower.is_some() && pk_upper.is_some();
+            let cost = match (bounded, pk_ob.is_some()) {
+                (true, true) => 14.0,
+                (true, false) => 15.0,
+                (false, true) => 75.0,
+                (false, false) => 80.0,
             };
-            let mut next_arg = 1;
-            if let Some((i, fl)) = lower_idx {
-                usages[i].argvIndex = next_arg;
-                usages[i].omit = 0;
-                next_arg += 1;
-                flags |= fl;
-            }
-            if let Some((i, fl)) = upper_idx {
-                usages[i].argvIndex = next_arg;
-                usages[i].omit = 0;
-                flags |= fl;
-            }
-            if order_by_pk_consumed {
-                info.orderByConsumed = 1;
-                if order_by_pk_reverse {
-                    flags |= RANGE_FLAG_REVERSE;
-                }
-            }
-            info.idxNum = PLAN_PK_RANGE | (flags << 8);
-            info.estimatedCost = 25.0;
-            info.estimatedRows = 32;
-            return SQLITE_OK;
+            best_range = Some(RangeCandidate {
+                is_pk: true,
+                index_id: 0,
+                lower: pk_lower,
+                upper: pk_upper,
+                ob_consumed: pk_ob.is_some(),
+                reverse: pk_ob.unwrap_or(false),
+                cost,
+                rows: if bounded { 16 } else { 128 },
+            });
         }
 
-        // 4. Check for usable range constraints (`>`, `>=`, `<`, `<=`) on a Secondary Index column
         for &(sec_col_idx, index_id) in &vtab.secondary_indexes {
             let mut sec_lower: Option<(usize, c_int)> = None;
             let mut sec_upper: Option<(usize, c_int)> = None;
@@ -1380,30 +1554,64 @@ unsafe extern "system" fn vtab_best_index(
                 }
             }
             if sec_lower.is_some() || sec_upper.is_some() {
-                let mut flags = if can_use_keys_only {
-                    RANGE_FLAG_KEYS_ONLY
-                } else {
-                    0
+                let bounded = sec_lower.is_some() && sec_upper.is_some();
+                let ob_consumed =
+                    sec_range_consumes_order_by(order_by, sec_col_idx, vtab.pk_col_idx);
+                let cost = match (bounded, ob_consumed) {
+                    (true, true) => 25.0,
+                    (true, false) => 30.0,
+                    (false, true) => 100.0,
+                    (false, false) => 120.0,
                 };
-                let mut next_arg = 1;
-                if let Some((i, fl)) = sec_lower {
-                    usages[i].argvIndex = next_arg;
-                    usages[i].omit = 0;
-                    next_arg += 1;
-                    flags |= fl;
+                if best_range.as_ref().is_none_or(|prev| cost < prev.cost) {
+                    best_range = Some(RangeCandidate {
+                        is_pk: false,
+                        index_id,
+                        lower: sec_lower,
+                        upper: sec_upper,
+                        ob_consumed,
+                        reverse: false,
+                        cost,
+                        rows: if bounded { 16 } else { 128 },
+                    });
                 }
-                if let Some((i, fl)) = sec_upper {
-                    usages[i].argvIndex = next_arg;
-                    usages[i].omit = 0;
-                    flags |= fl;
-                }
-                info.idxNum = PLAN_SECONDARY_RANGE
-                    | (((index_id as c_int) & 0xFFFF) << 8)
-                    | ((flags & 0x7F) << 24);
-                info.estimatedCost = 40.0;
-                info.estimatedRows = 32;
-                return SQLITE_OK;
             }
+        }
+
+        if let Some(winner) = best_range {
+            let mut flags = if can_use_keys_only {
+                RANGE_FLAG_KEYS_ONLY
+            } else {
+                0
+            };
+            let mut next_arg = 1;
+            if let Some((i, fl)) = winner.lower {
+                usages[i].argvIndex = next_arg;
+                usages[i].omit = 0;
+                next_arg += 1;
+                flags |= fl;
+            }
+            if let Some((i, fl)) = winner.upper {
+                usages[i].argvIndex = next_arg;
+                usages[i].omit = 0;
+                flags |= fl;
+            }
+            if winner.ob_consumed {
+                info.orderByConsumed = 1;
+                if winner.reverse {
+                    flags |= RANGE_FLAG_REVERSE;
+                }
+            }
+            info.idxNum = if winner.is_pk {
+                PLAN_PK_RANGE | (flags << 8)
+            } else {
+                PLAN_SECONDARY_RANGE
+                    | (((winner.index_id as c_int) & 0xFFFF) << 8)
+                    | ((flags & 0x7F) << 24)
+            };
+            info.estimatedCost = winner.cost;
+            info.estimatedRows = winner.rows;
+            return SQLITE_OK;
         }
 
         // 5. Fallback: Full Table Scan (let SQLite's VDBE enforce LIMIT/OFFSET after any
@@ -1413,9 +1621,9 @@ unsafe extern "system" fn vtab_best_index(
         } else {
             0
         };
-        if order_by_pk_consumed {
+        if let Some(reverse) = pk_ob {
             info.orderByConsumed = 1;
-            if order_by_pk_reverse {
+            if reverse {
                 full_scan_flags |= RANGE_FLAG_REVERSE;
             }
         }
@@ -1423,8 +1631,7 @@ unsafe extern "system" fn vtab_best_index(
         info.estimatedCost = 10_000.0;
         info.estimatedRows = 1_000;
         SQLITE_OK
-    }))
-    .unwrap_or(SQLITE_ERROR)
+    }
 }
 
 unsafe extern "system" fn vtab_open(
@@ -1493,6 +1700,78 @@ fn clear_cursor_buffers(cursor: &mut AydbCursor) {
     cursor.stream_last_pk = None;
     cursor.stream_sec_index_id = None;
     cursor.stream_sec_prefix.clear();
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn execute_exact_index_lookup(
+    cursor: &mut AydbCursor,
+    vtab: &AydbVTab,
+    eng: &EngineReader<'_, OsFs>,
+    col_idx: usize,
+    index_id: u16,
+    keys_only: bool,
+    val_ptr: *mut sqlite3_value,
+    is_unique: bool,
+) -> c_int {
+    unsafe {
+        let val_type = sqlite3_value_type(val_ptr);
+        if val_type == SQLITE_NULL
+            || (val_type == SQLITE_FLOAT && sqlite3_value_double(val_ptr).is_nan())
+        {
+            return SQLITE_OK;
+        }
+        cursor.keys_only = keys_only;
+        let col_aff = vtab
+            .col_affinities
+            .get(col_idx)
+            .copied()
+            .unwrap_or(ColumnAffinity::Blob);
+        let col_coll = vtab
+            .col_collations
+            .get(col_idx)
+            .copied()
+            .unwrap_or(ColCollation::Binary);
+        if is_cross_affinity_numeric_search(col_aff, val_type) {
+            if let Err(e) = start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false) {
+                return io_err_to_sqlite_rc(&e);
+            }
+            return SQLITE_OK;
+        }
+        let encoded = sqlite_value_to_key_bytes_with_schema(val_ptr, col_aff, col_coll, true);
+        let lookup_key = if is_unique {
+            let canon = unique_key::canon_unique_key(&encoded);
+            unique_key::unique_index_component(&canon)
+        } else {
+            encoded
+        };
+        let prefix =
+            crate::lru::encode_secondary_index_exact_prefix(vtab.table_id, index_id, &lookup_key);
+        let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
+            vtab.table_id,
+            index_id,
+            &prefix,
+            (&prefix, true),
+            None,
+            CURSOR_STREAM_CHUNK_ROWS,
+            keys_only,
+            true,
+            &mut cursor.pks,
+            &mut cursor.slab,
+            &mut cursor.spans,
+            Some(&mut cursor.lazy_blobs),
+        ) {
+            Ok(last_opt) => last_opt,
+            Err(e) => return io_err_to_sqlite_rc(&e),
+        };
+        if let Some(last_sec_key) = next_last_sec {
+            cursor.streaming_active = true;
+            cursor.stream_sec_index_id = Some(index_id);
+            cursor.stream_sec_prefix = prefix;
+            cursor.stream_upper = None;
+            cursor.stream_last_pk = Some(last_sec_key);
+        }
+        SQLITE_OK
+    }
 }
 
 unsafe fn execute_vtab_filter(
@@ -1605,70 +1884,49 @@ unsafe fn execute_vtab_filter(
                 if argc < 1 {
                     return SQLITE_ERROR;
                 }
-                let val_ptr = *argv.offset(0);
-                let val_type = sqlite3_value_type(val_ptr);
-                if val_type == SQLITE_NULL
-                    || (val_type == SQLITE_FLOAT && sqlite3_value_double(val_ptr).is_nan())
-                {
-                    return SQLITE_OK;
-                }
                 let index_id = ((idx_num >> 8) & 0xFFFF) as u16;
                 let flags = (idx_num >> 24) & 0x7F;
                 let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                cursor.keys_only = keys_only;
                 let sec_col_idx = vtab
                     .secondary_indexes
                     .iter()
                     .find(|&&(_, id)| id == index_id)
                     .map(|&(c, _)| c)
                     .unwrap_or(0);
-                let sec_aff = vtab
-                    .col_affinities
-                    .get(sec_col_idx)
-                    .copied()
-                    .unwrap_or(ColumnAffinity::Blob);
-                let sec_coll = vtab
-                    .col_collations
-                    .get(sec_col_idx)
-                    .copied()
-                    .unwrap_or(ColCollation::Binary);
-                if is_cross_affinity_numeric_search(sec_aff, val_type) {
-                    if let Err(e) = start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false)
-                    {
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                    return SQLITE_OK;
-                }
-                let col_val =
-                    sqlite_value_to_key_bytes_with_schema(val_ptr, sec_aff, sec_coll, true);
-                let prefix = crate::lru::encode_secondary_index_exact_prefix(
-                    vtab.table_id,
+                let rc = execute_exact_index_lookup(
+                    cursor,
+                    vtab,
+                    eng,
+                    sec_col_idx,
                     index_id,
-                    &col_val,
-                );
-                let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
-                    vtab.table_id,
-                    index_id,
-                    &prefix,
-                    (&prefix, true),
-                    None,
-                    CURSOR_STREAM_CHUNK_ROWS,
                     keys_only,
+                    *argv.offset(0),
+                    false,
+                );
+                if rc != SQLITE_OK {
+                    return rc;
+                }
+            }
+            PLAN_UNIQUE_EQ => {
+                if argc < 1 {
+                    return SQLITE_ERROR;
+                }
+                let col_idx = ((idx_num >> 8) & 0xFFFF) as usize;
+                let flags = (idx_num >> 24) & 0x7F;
+                let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
+                let index_id = unique_key::unique_index_id(col_idx);
+                let rc = execute_exact_index_lookup(
+                    cursor,
+                    vtab,
+                    eng,
+                    col_idx,
+                    index_id,
+                    keys_only,
+                    *argv.offset(0),
                     true,
-                    &mut cursor.pks,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                    Some(&mut cursor.lazy_blobs),
-                ) {
-                    Ok(last_opt) => last_opt,
-                    Err(e) => return io_err_to_sqlite_rc(&e),
-                };
-                if let Some(last_sec_key) = next_last_sec {
-                    cursor.streaming_active = true;
-                    cursor.stream_sec_index_id = Some(index_id);
-                    cursor.stream_sec_prefix = prefix;
-                    cursor.stream_upper = None;
-                    cursor.stream_last_pk = Some(last_sec_key);
+                );
+                if rc != SQLITE_OK {
+                    return rc;
                 }
             }
             PLAN_SECONDARY_RANGE => {

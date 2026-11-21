@@ -3895,3 +3895,227 @@ fn lazy_blob_multi_column_scan_reuses_single_row_buffer_without_growing_slab() {
         "single-row lazy buffer max was {lazy_max} bytes (expected ~16 KB)"
     );
 }
+
+#[test]
+fn unique_column_equality_uses_unique_index_across_types_collations_and_digests() {
+    use crate::engine::TABLE_SCAN_ENTRIES_COPIED;
+
+    let tmp = TempTestDir::new("vtab_unique_eq_lookup");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    // Note: no `indexes = ...` clause; all equality lookups below rely on persistent UNIQUE indexes.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(table_id = 1,
+            columns = 'k TEXT PRIMARY KEY, email TEXT UNIQUE COLLATE NOCASE, code REAL UNIQUE, big TEXT UNIQUE');",
+    )
+    .unwrap();
+
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..100 {
+        let email = if i == 50 {
+            "User_050@Example.COM".to_string()
+        } else {
+            format!("User_{i:03}@Example.COM")
+        };
+        let code = if i == 42 { 42.0 } else { (i as f64) + 0.5 };
+        let big = format!("B{i:03}_{}", "x".repeat(600));
+        conn.query_all(
+            "INSERT INTO u VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqlValue::Text(format!("k_{i:03}")),
+                SqlValue::Text(email),
+                SqlValue::Float(code),
+                SqlValue::Text(big),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+
+    let copied = |f: &dyn Fn()| {
+        TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+        f();
+        TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get())
+    };
+
+    // 1. NOCASE UNIQUE equality without `indexes=` reads 0 rows via full scan.
+    let scan1 = copied(&|| {
+        let r = conn
+            .query_all(
+                "SELECT k, email FROM u WHERE email = 'user_050@example.com'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            r,
+            vec![vec![
+                SqlValue::Text("k_050".into()),
+                SqlValue::Text("User_050@Example.COM".into()),
+            ]]
+        );
+    });
+    assert_eq!(scan1, 0);
+
+    // 2. REAL UNIQUE matched by an exact integer constant (canonicalized 17B -> 9B).
+    let scan2 = copied(&|| {
+        let r = conn
+            .query_all("SELECT k, code FROM u WHERE code = 42", &[])
+            .unwrap();
+        assert_eq!(
+            r,
+            vec![vec![SqlValue::Text("k_042".into()), SqlValue::Float(42.0)]]
+        );
+    });
+    assert_eq!(scan2, 0);
+
+    // 3. Long >256-byte TEXT UNIQUE using digest index lookup + residual VDBE confirmation.
+    let target_big = format!("B077_{}", "x".repeat(600));
+    let scan3 = copied(&|| {
+        let r = conn
+            .query_all(
+                "SELECT k FROM u WHERE big = ?1",
+                &[SqlValue::Text(target_big.clone())],
+            )
+            .unwrap();
+        assert_eq!(r, vec![vec![SqlValue::Text("k_077".into())]]);
+    });
+    assert_eq!(scan3, 0);
+
+    // 4. Collation mismatch (`COLLATE BINARY`) and cross-affinity numeric compare stay SQLite-exact.
+    assert!(
+        conn.query_all(
+            "SELECT k FROM u WHERE email = 'user_050@example.com' COLLATE BINARY",
+            &[],
+        )
+        .unwrap()
+        .is_empty()
+    );
+    conn.execute_batch("INSERT INTO u VALUES ('k_num', '42', 999.5, 'small_42')")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k FROM u WHERE email = 42", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Text("k_num".into())]]
+    );
+
+    // 5. An un-migrated table (`unique_ready == false`) must NOT use PLAN_UNIQUE_EQ.
+    let prev = UNIQUE_MIGRATION_DISABLED.with(|flag| flag.replace(true));
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u_unmig USING aydb(table_id = 2,
+            columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');",
+    )
+    .unwrap();
+    UNIQUE_MIGRATION_DISABLED.with(|flag| flag.set(prev));
+    // Seed a raw legacy row without its `'i'` entry; if vtab wrongly trusted UNIQUE index it
+    // would miss this row.
+    {
+        let mut eng = engine.write().unwrap();
+        let pk = SqlValue::Text("k1".into()).to_key_bytes();
+        let row = encode_row(&[
+            SqlValue::Text("k1".into()),
+            SqlValue::Text("legacy_a".into()),
+        ]);
+        eng.put_row(2, &pk, &row, &[], WriteDurability::BufferedFast)
+            .unwrap();
+        rowid_map::assign_synthetic_rowid(&mut eng, 2, &pk, WriteDurability::BufferedFast, false)
+            .unwrap();
+    }
+    assert_eq!(
+        conn.query_all("SELECT k FROM u_unmig WHERE a = 'legacy_a'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Text("k1".into())]]
+    );
+}
+
+#[test]
+fn best_index_expands_order_by_consumption_and_differentiates_range_costs() {
+    let tmp = TempTestDir::new("vtab_best_index_opts");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine).unwrap();
+    let native = SqliteConnection::open_in_memory().unwrap();
+
+    let ddl_aydb = "CREATE VIRTUAL TABLE r USING aydb(table_id = 1,
+        columns = 'k INTEGER PRIMARY KEY, a TEXT, s INTEGER, b INTEGER',
+        indexes = 'a, s, b');";
+    let ddl_native = "CREATE TABLE r(k INTEGER PRIMARY KEY, a TEXT, s INTEGER, b INTEGER);
+        CREATE INDEX idx_a ON r(a); CREATE INDEX idx_s ON r(s); CREATE INDEX idx_b ON r(b);";
+    conn.execute_batch(ddl_aydb).unwrap();
+    native.execute_batch(ddl_native).unwrap();
+
+    for i in 1..=80i64 {
+        let a = if i % 2 == 0 { "even" } else { "odd" };
+        let s = (81 - i) / 2;
+        let b = i;
+        let args = [
+            SqlValue::Integer(i),
+            SqlValue::Text(a.into()),
+            SqlValue::Integer(s),
+            SqlValue::Integer(b),
+        ];
+        conn.query_all("INSERT INTO r VALUES (?1, ?2, ?3, ?4)", &args)
+            .unwrap();
+        native
+            .query_all("INSERT INTO r VALUES (?1, ?2, ?3, ?4)", &args)
+            .unwrap();
+    }
+
+    let assert_no_temp_sort_and_parity = |sql: &str| {
+        LAST_BEST_INDEX_PLAN.with(|cell| *cell.borrow_mut() = None);
+        let eqp = format!(
+            "{:?}",
+            conn.query_all(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
+                .unwrap()
+        );
+        assert!(
+            !eqp.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "unexpected temp B-tree sort for `{sql}`: {eqp}"
+        );
+        assert_eq!(
+            conn.query_all(sql, &[]).unwrap(),
+            native.query_all(sql, &[]).unwrap(),
+            "SQL parity mismatch for `{sql}`"
+        );
+    };
+
+    // 1. Multi-column ORDER BY on PK prefix + tie-breaker
+    assert_no_temp_sort_and_parity("SELECT k, a FROM r ORDER BY k DESC, a ASC");
+    // 2. Secondary EQ + ORDER BY k ASC
+    assert_no_temp_sort_and_parity("SELECT k, a FROM r WHERE a = 'even' ORDER BY k ASC");
+    // 3. Secondary RANGE + ORDER BY sec ASC / ORDER BY sec ASC, k ASC
+    assert_no_temp_sort_and_parity("SELECT k, s FROM r WHERE s >= 10 AND s <= 30 ORDER BY s ASC");
+    assert_no_temp_sort_and_parity(
+        "SELECT k, s FROM r WHERE s >= 10 AND s <= 30 ORDER BY s ASC, k ASC",
+    );
+
+    // 4. Range cost differentiation: bounded secondary range on `b` (index_id 3) beats both
+    //    one-sided PK range (`k >= 10`) and one-sided secondary range (`s >= 5`), while
+    //    consuming `ORDER BY b ASC, k ASC`.
+    assert_no_temp_sort_and_parity(
+        "SELECT k, b FROM r WHERE k >= 10 AND s >= 5 AND b >= 20 AND b <= 30 ORDER BY b ASC, k ASC",
+    );
+    let (idx_num, ob_consumed, args) = LAST_BEST_INDEX_PLAN
+        .with(|cell| cell.borrow().clone())
+        .expect("vtab_best_index recorded a plan");
+    assert_eq!(idx_num & 0xFF, PLAN_SECONDARY_RANGE);
+    assert_eq!((idx_num >> 8) & 0xFFFF, 3);
+    assert_eq!(ob_consumed, 1);
+    assert_eq!(args.iter().filter(|&&a| a > 0).count(), 2);
+
+    // 5. Bounded PK range beats bounded secondary range (`SELECT ... WHERE k >= 10 AND k <= 30 AND b >= 20 AND b <= 40`).
+    assert_no_temp_sort_and_parity(
+        "SELECT k, b FROM r WHERE k >= 10 AND k <= 30 AND b >= 20 AND b <= 40 ORDER BY k DESC",
+    );
+    let (pk_idx_num, pk_ob_consumed, _) = LAST_BEST_INDEX_PLAN
+        .with(|cell| cell.borrow().clone())
+        .expect("vtab_best_index recorded a PK range plan");
+    assert_eq!(pk_idx_num & 0xFF, PLAN_PK_RANGE);
+    assert_eq!(pk_ob_consumed, 1);
+}
