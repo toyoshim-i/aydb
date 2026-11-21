@@ -12,6 +12,7 @@ use crate::memtable::MemEntry;
 use crate::pal::PlatformFs;
 use crate::wal::BlobPtr;
 
+use super::reader::ReadSource;
 use super::{CorruptPolicy, LazyBlob, ReadCtx, ReadView, StorageEngine};
 
 /// Result of [`StorageEngine::scan_table_batch`]: the readable rows and the resume cursor.
@@ -168,7 +169,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn scan_keys_range_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
@@ -234,7 +235,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_range_into_slab_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         lower: Option<(&[u8], bool)>,
         upper: Option<(&[u8], bool)>,
@@ -294,7 +295,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // corrupt rows must vanish (`CorruptPolicy::Evict`) verify blobs eagerly during the scan.
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
 
-        if self.idx_segments_for_view(cx.view).is_empty() && !reverse {
+        if self.idx_segments_for(cx.src).is_empty() && !reverse {
             let lo = match lower {
                 Some((_, false)) => Bound::Excluded(seek_key),
                 _ => Bound::Included(seek_key),
@@ -305,7 +306,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 None => Bound::Unbounded,
             };
             let mut last_pk_buf: Vec<u8> = Vec::new();
-            for (k, entry, _) in self.mem_view_for(cx.view, lo, hi) {
+            for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
                 if !k.starts_with(&prefix) {
                     break;
                 }
@@ -337,14 +338,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     IndexValue::Blob(ptr) => {
                         if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                             spans_out.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, ptr)));
+                            lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, ptr)));
                             pks_out.push(k[3..].to_vec());
                             if spans_out.len() >= limit {
                                 break;
                             }
                         } else {
                             let start = slab_out.len();
-                            if self.read_flushed_blob_append_into_view(cx.view, ptr, k, slab_out)? {
+                            if self.read_flushed_blob_append_into_src(cx.src, ptr, k, slab_out)? {
                                 spans_out.push((start, slab_out.len()));
                                 if let Some(lazy_blobs) = &mut lazy_blobs_out {
                                     lazy_blobs.push(None);
@@ -394,12 +395,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 MergedValueRef::Blob(ptr) => {
                     if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
                         spans_out.push((0, 0));
-                        lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
+                        lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, &ptr)));
                         pks_out.push(key[3..].to_vec());
                         Ok(true)
                     } else {
                         let start = slab_out.len();
-                        if self.read_flushed_blob_append_into_view(cx.view, &ptr, key, slab_out)? {
+                        if self.read_flushed_blob_append_into_src(cx.src, &ptr, key, slab_out)? {
                             spans_out.push((start, slab_out.len()));
                             if let Some(lazy_blobs) = &mut lazy_blobs_out {
                                 lazy_blobs.push(None);
@@ -418,8 +419,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         if reverse {
-            self.visit_merged_prefix_range_reverse_view(
-                cx.view,
+            self.visit_merged_prefix_range_reverse_src(
+                cx.src,
                 &prefix,
                 seek_key,
                 lo_inc,
@@ -428,8 +429,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 &mut emit_entry,
             )?;
         } else {
-            self.visit_merged_prefix_range_view(
-                cx.view,
+            self.visit_merged_prefix_range_src(
+                cx.src,
                 &prefix,
                 seek_key,
                 lo_inc,
@@ -686,7 +687,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_secondary_index_into_slab_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         index_id: u16,
         prefix: &[u8],
@@ -716,7 +717,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut last_sec_key_buf: Vec<u8> = Vec::new();
 
         if keys_only {
-            if self.idx_segments_for_view(cx.view).is_empty() {
+            if self.idx_segments_for(cx.src).is_empty() {
                 let lo = if cur_inc {
                     Bound::Included(seek_slice)
                 } else {
@@ -727,7 +728,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Some((ub, false)) => Bound::Excluded(ub),
                     None => Bound::Unbounded,
                 };
-                for (k, entry, _) in self.mem_view_for(cx.view, lo, hi) {
+                for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
                     if !k.starts_with(prefix) {
                         break;
                     }
@@ -744,8 +745,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                 }
             } else {
-                self.visit_merged_prefix_range_view(
-                    cx.view,
+                self.visit_merged_prefix_range_src(
+                    cx.src,
                     prefix,
                     seek_slice,
                     cur_inc,
@@ -777,7 +778,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             batch_pks.clear();
             let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
 
-            if self.idx_segments_for_view(cx.view).is_empty() {
+            if self.idx_segments_for(cx.src).is_empty() {
                 let lo = if cur_inc {
                     Bound::Included(active_seek)
                 } else {
@@ -788,7 +789,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Some((ub, false)) => Bound::Excluded(ub),
                     None => Bound::Unbounded,
                 };
-                for (k, entry, _) in self.mem_view_for(cx.view, lo, hi) {
+                for (k, entry, _) in self.mem_view_for(cx.src, lo, hi) {
                     if !k.starts_with(prefix) {
                         break;
                     }
@@ -805,8 +806,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                 }
             } else {
-                self.visit_merged_prefix_range_view(
-                    cx.view,
+                self.visit_merged_prefix_range_src(
+                    cx.src,
                     prefix,
                     active_seek,
                     cur_inc,
@@ -971,6 +972,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        on_live: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
+    {
+        self.visit_merged_prefix_range_src(
+            ReadSource::from_view(view),
+            prefix,
+            seek_key,
+            lower_inclusive,
+            upper_key_bound,
+            limit,
+            on_live,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn visit_merged_prefix_range_src<F>(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        prefix: &[u8],
+        seek_key: &[u8],
+        lower_inclusive: bool,
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
         mut on_live: F,
     ) -> io::Result<()>
     where
@@ -986,9 +1012,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable_for_view(view)
+            self.memtable_for(src)
                 .iter_range(range.lo_bound(), range.hi_bound()),
-            self.visible_overlay(view)
+            self.visible_overlay_src(src)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             false,
         );
@@ -998,9 +1024,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             seek_key == prefix && upper_key_bound.is_none() && limit == usize::MAX;
         let populate_cache = !is_unbounded_full_scan;
 
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for_view(view).len());
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
         let upper_for_overlap = range.upper_for_overlap();
-        for seg in self.idx_segments_for_view(view) {
+        for seg in self.idx_segments_for(src) {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
@@ -1137,6 +1163,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lower_inclusive: bool,
         upper_key_bound: Option<(&[u8], bool)>,
         limit: usize,
+        on_live: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
+    {
+        self.visit_merged_prefix_range_reverse_src(
+            ReadSource::from_view(view),
+            prefix,
+            seek_key,
+            lower_inclusive,
+            upper_key_bound,
+            limit,
+            on_live,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn visit_merged_prefix_range_reverse_src<F>(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        prefix: &[u8],
+        seek_key: &[u8],
+        lower_inclusive: bool,
+        upper_key_bound: Option<(&[u8], bool)>,
+        limit: usize,
         mut on_live: F,
     ) -> io::Result<()>
     where
@@ -1152,9 +1203,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut mem_iter = MemView::new(
-            self.memtable_for_view(view)
+            self.memtable_for(src)
                 .iter_range(range.lo_bound(), range.hi_bound()),
-            self.visible_overlay(view)
+            self.visible_overlay_src(src)
                 .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
             true,
         );
@@ -1166,8 +1217,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let seg_upper_arg = range.seg_upper_arg();
         let upper_for_overlap = range.upper_for_overlap();
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for_view(view).len());
-        for seg in self.idx_segments_for_view(view) {
+        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
+        for seg in self.idx_segments_for(src) {
             if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
                 continue;
             }
@@ -1387,27 +1438,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// current reader.
     #[inline]
     pub(super) fn mem_view<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> MemView<'a> {
-        self.mem_view_for(ReadView::Owner, lo, hi)
+        self.mem_view_for(ReadSource::Owner, lo, hi)
     }
 
     #[inline]
     pub(super) fn mem_view_for<'a>(
         &'a self,
-        view: ReadView,
+        src: ReadSource<'a, FS::File>,
         lo: Bound<&'a [u8]>,
         hi: Bound<&'a [u8]>,
     ) -> MemView<'a> {
         static EMPTY: std::collections::BTreeMap<Vec<u8>, crate::memtable::MemEntry> =
             std::collections::BTreeMap::new();
-        let ov_range = if view != ReadView::Owner || !self.tx_overlay.overlaps_range(lo, hi) {
+        let ov_range = if !src.is_owner() || !self.tx_overlay.overlaps_range(lo, hi) {
             EMPTY.range::<[u8], _>((lo, hi))
         } else {
             self.tx_overlay.map.range::<[u8], _>((lo, hi))
         };
-        MemView::new(
-            self.memtable_for_view(view).iter_range(lo, hi),
-            ov_range,
-            false,
-        )
+        MemView::new(self.memtable_for(src).iter_range(lo, hi), ov_range, false)
     }
 }

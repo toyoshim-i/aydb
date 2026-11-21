@@ -2,144 +2,206 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use crate::blob::BlobSegmentReader;
 use crate::index::IdxSegmentReader;
 use crate::memtable::MemTable;
-use crate::pal::{PlatformFile, PlatformFs};
+use crate::pal::{OsFile, PlatformFile, PlatformFs};
 use crate::wal::{BlobKind, BlobPtr};
 
-use super::{CxRef, EngineReader, ReadCtx, ReadView, StorageEngine};
+use super::reader::ReadSource;
+use super::{CxRef, EngineReader, ReadCtx, StorageEngine};
 
-/// Keeps a captured committed view alive across statements or streaming cursor batches.
-#[derive(Clone)]
-pub(crate) struct ReadSnapshotToken {
-    id: u64,
-    keep_alive: Arc<()>,
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a process-wide unique identifier for a [`StorageEngine`] instance.
+pub(super) fn alloc_engine_id() -> u64 {
+    let id = NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(id != u64::MAX, "storage engine identifier overflow");
+    id
 }
+
+type CachedSegments<F> = Arc<Vec<Arc<IdxSegmentReader<F>>>>;
+type CachedStdBlobs<F> = Arc<BTreeMap<u64, BlobSegmentReader<F>>>;
+type CachedLruBlobs<F> = Arc<BTreeMap<(u16, u64), BlobSegmentReader<F>>>;
 
 pub(super) struct ReadSnapshot<F: PlatformFile> {
-    token: Weak<()>,
+    engine_id: u64,
     data_generation: u64,
     memtable: MemTable,
-    idx_segments: Vec<Arc<IdxSegmentReader<F>>>,
-    std_blobs: BTreeMap<u64, BlobSegmentReader<F>>,
-    lru_blobs: BTreeMap<(u16, u64), BlobSegmentReader<F>>,
+    idx_segments: CachedSegments<F>,
+    std_blobs: CachedStdBlobs<F>,
+    lru_blobs: CachedLruBlobs<F>,
 }
 
-/// Registry of live read snapshots, mutable through a shared engine reference.
+/// Keeps a captured committed view alive across statements or streaming cursor batches.
+pub(crate) struct ReadSnapshotToken<F: PlatformFile = OsFile> {
+    snapshot: Arc<ReadSnapshot<F>>,
+}
+
+impl<F: PlatformFile> Clone for ReadSnapshotToken<F> {
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: Arc::clone(&self.snapshot),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<F: PlatformFile> ReadSnapshotToken<F> {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.snapshot, &other.snapshot)
+    }
+
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.snapshot)
+    }
+}
+
+/// Engine-side cache of immutable snapshot components and the latest [`ReadSnapshot`].
 ///
-/// Captures and releases only touch this registry and clone immutable sources, so they run under
-/// the shared engine lock and concurrent readers do not serialize on the exclusive lock. The
-/// engine publishes a commit under the exclusive lock, so a capture under the shared lock sees
-/// either all of a commit or none of it.
-pub(super) struct SnapshotRegistry<F: PlatformFile> {
-    snapshots: RwLock<BTreeMap<u64, Arc<ReadSnapshot<F>>>>,
-    next_id: AtomicU64,
+/// Repeated captures at the same committed state reuse both the top-level `Arc<ReadSnapshot>` and
+/// the inner `Arc` collections without cloning `BTreeMap`s or bumping `MemTable` CoW refcounts
+/// once writers invalidate stale slots before mutating engine state.
+pub(super) struct SnapshotCache<F: PlatformFile> {
+    snapshot: Option<Arc<ReadSnapshot<F>>>,
+    idx_segments: Option<CachedSegments<F>>,
+    std_blobs: Option<CachedStdBlobs<F>>,
+    lru_blobs: Option<CachedLruBlobs<F>>,
 }
 
-impl<F: PlatformFile> SnapshotRegistry<F> {
+impl<F: PlatformFile> SnapshotCache<F> {
     pub(super) fn new() -> Self {
         Self {
-            snapshots: RwLock::new(BTreeMap::new()),
-            next_id: AtomicU64::new(1),
+            snapshot: None,
+            idx_segments: None,
+            std_blobs: None,
+            lru_blobs: None,
         }
-    }
-
-    fn read(&self) -> RwLockReadGuard<'_, BTreeMap<u64, Arc<ReadSnapshot<F>>>> {
-        self.snapshots
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<u64, Arc<ReadSnapshot<F>>>> {
-        self.snapshots
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.read().len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.read().is_empty()
-    }
-
-    fn prune(&self) {
-        // Skip the exclusive registry lock when nothing is dead; the common release path of a
-        // statement that shares a still-live snapshot then only takes the shared lock.
-        if self
-            .read()
-            .values()
-            .all(|snapshot| snapshot.token.strong_count() > 0)
-        {
-            return;
-        }
-        self.write()
-            .retain(|_, snapshot| snapshot.token.strong_count() > 0);
     }
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
+    fn snapshot_cache_mut(&mut self) -> &mut SnapshotCache<FS::File> {
+        self.snapshot_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Clears the cached composite snapshot before mutating `self.memtable`.
+    #[inline]
+    pub(super) fn invalidate_snapshot_memtable(&mut self) {
+        self.snapshot_cache_mut().snapshot = None;
+    }
+
+    /// Clears cached snapshot and segment-list `Arc`s before replacing/dropping `idx_segments`.
+    #[inline]
+    pub(super) fn invalidate_snapshot_idx_segments(&mut self) {
+        let cache = self.snapshot_cache_mut();
+        cache.snapshot = None;
+        cache.idx_segments = None;
+    }
+
+    /// Clears cached snapshot and standard-blob map `Arc`s before mutating `std_blobs`.
+    #[inline]
+    pub(super) fn invalidate_snapshot_std_blobs(&mut self) {
+        let cache = self.snapshot_cache_mut();
+        cache.snapshot = None;
+        cache.std_blobs = None;
+    }
+
+    /// Clears cached snapshot and LRU-blob map `Arc`s before mutating `lru_blobs`.
+    #[inline]
+    pub(super) fn invalidate_snapshot_lru_blobs(&mut self) {
+        let cache = self.snapshot_cache_mut();
+        cache.snapshot = None;
+        cache.lru_blobs = None;
+    }
+
     /// Captures the committed sources. Runs under the shared engine lock: every source is
     /// mutated only through `&mut self`, so the captured memtable, segment list and blob maps
     /// belong to one consistent published state.
-    pub(crate) fn capture_read_snapshot(&self) -> ReadSnapshotToken {
-        let registry = &self.read_snapshots;
-        let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
-        assert!(id != u64::MAX, "read snapshot identifier overflow");
-        let token = ReadSnapshotToken {
-            id,
-            keep_alive: Arc::new(()),
-        };
+    pub(crate) fn capture_read_snapshot(&self) -> ReadSnapshotToken<FS::File> {
+        {
+            let cache = self
+                .snapshot_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(snapshot) = &cache.snapshot {
+                return ReadSnapshotToken {
+                    snapshot: Arc::clone(snapshot),
+                };
+            }
+        }
+
+        let mut cache = self
+            .snapshot_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(snapshot) = &cache.snapshot {
+            return ReadSnapshotToken {
+                snapshot: Arc::clone(snapshot),
+            };
+        }
+
+        let idx_segments = Arc::clone(
+            cache
+                .idx_segments
+                .get_or_insert_with(|| Arc::new(self.idx_segments.clone())),
+        );
+        let std_blobs = Arc::clone(cache.std_blobs.get_or_insert_with(|| {
+            Arc::new(
+                self.std_blobs
+                    .iter()
+                    .map(|(&id, b)| (id, b.reader.clone()))
+                    .collect(),
+            )
+        }));
+        let lru_blobs = Arc::clone(cache.lru_blobs.get_or_insert_with(|| {
+            Arc::new(
+                self.lru_blobs
+                    .iter()
+                    .map(|(&id, b)| (id, b.reader.clone()))
+                    .collect(),
+            )
+        }));
+
         let snapshot = Arc::new(ReadSnapshot {
-            token: Arc::downgrade(&token.keep_alive),
+            engine_id: self.engine_id,
             data_generation: self.data_generation,
             memtable: self.memtable.clone(),
-            idx_segments: self.idx_segments.clone(),
-            std_blobs: self
-                .std_blobs
-                .iter()
-                .map(|(&id, b)| (id, b.reader.clone()))
-                .collect(),
-            lru_blobs: self
-                .lru_blobs
-                .iter()
-                .map(|(&id, b)| (id, b.reader.clone()))
-                .collect(),
+            idx_segments,
+            std_blobs,
+            lru_blobs,
         });
-        registry.prune();
-        registry.write().insert(id, snapshot);
-        token
-    }
-
-    pub(crate) fn release_read_snapshot(&self, token: ReadSnapshotToken) {
-        drop(token);
-        self.cleanup_read_snapshots();
+        cache.snapshot = Some(Arc::clone(&snapshot));
+        ReadSnapshotToken { snapshot }
     }
 
     #[cfg(test)]
-    pub(crate) fn live_read_snapshots(&self) -> usize {
-        self.read_snapshots.len()
+    pub(crate) fn cached_snapshot_strong_count(&self) -> Option<usize> {
+        self.snapshot_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .map(Arc::strong_count)
     }
 
-    pub(crate) fn cleanup_read_snapshots(&self) {
-        self.read_snapshots.prune();
-    }
-
-    /// The reader borrows `token`, which keeps the snapshot registered while it is in use.
+    /// The reader borrows `token`, keeping its committed sources alive while in use.
     pub(crate) fn reader_for_snapshot<'a>(
         &'a self,
-        token: &'a ReadSnapshotToken,
+        token: &'a ReadSnapshotToken<FS::File>,
     ) -> EngineReader<'a, FS> {
+        assert_eq!(
+            token.snapshot.engine_id, self.engine_id,
+            "read snapshot token belongs to a different StorageEngine"
+        );
         EngineReader {
             eng: self,
-            cx: CxRef::Owned(ReadCtx::new(ReadView::Snapshot(token.id), false)),
+            cx: CxRef::Owned(ReadCtx::new(ReadSource::Snapshot(&token.snapshot), false)),
         }
     }
 
@@ -147,10 +209,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// so `EagerWriteOnRead` promotions can be persisted outside active transactions.
     pub(crate) fn with_snapshot_read<R>(
         &mut self,
-        token: &ReadSnapshotToken,
+        token: &ReadSnapshotToken<FS::File>,
         mut f: impl FnMut(&EngineReader<'_, FS>) -> R,
     ) -> R {
-        self.run_read(ReadView::Snapshot(token.id), |eng, cx| {
+        assert_eq!(
+            token.snapshot.engine_id, self.engine_id,
+            "read snapshot token belongs to a different StorageEngine"
+        );
+        self.run_read_src(ReadSource::Snapshot(&token.snapshot), |eng, cx| {
             f(&EngineReader {
                 eng,
                 cx: CxRef::Borrowed(cx),
@@ -159,25 +225,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         .0
     }
 
-    /// A snapshot is current while no committed data was published since capture. This compares
-    /// the data publication generation (ignoring internal `EagerWriteOnRead` LRU promotions),
-    /// rather than LSNs or `MemTable::generation`: a flush inside a commit can make the
-    /// checkpoint LSN equal an in-flight transaction's LSN, and an eager LRU promotion bumps the
-    /// `MemTable` generation without changing user data.
-    pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken) -> bool {
-        self.pending_group.is_empty()
-            && self
-                .read_snapshots
-                .read()
-                .get(&token.id)
-                .is_some_and(|snapshot| snapshot.data_generation == self.data_generation)
+    /// A snapshot is current while it belongs to this engine and no committed data was published
+    /// since capture. This compares the data publication generation (ignoring internal
+    /// `EagerWriteOnRead` LRU promotions), rather than LSNs or `MemTable::generation`: a flush
+    /// inside a commit can make the checkpoint LSN equal an in-flight transaction's LSN, and an
+    /// eager LRU promotion bumps the `MemTable` generation without changing user data.
+    pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken<FS::File>) -> bool {
+        token.snapshot.engine_id == self.engine_id
+            && self.pending_group.is_empty()
+            && token.snapshot.data_generation == self.data_generation
     }
 
     pub(crate) fn check_snapshot_write_upgrade(
         &self,
         conn_id: usize,
-        token: &ReadSnapshotToken,
+        token: &ReadSnapshotToken<FS::File>,
     ) -> io::Result<()> {
+        if token.snapshot.engine_id != self.engine_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read snapshot token belongs to a different StorageEngine",
+            ));
+        }
         self.check_write_allowed_for_conn(conn_id)?;
         if !self.snapshot_is_current(token) {
             return Err(io::Error::new(
@@ -188,45 +257,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    fn snapshot_for_view(&self, view: ReadView) -> Option<&ReadSnapshot<FS::File>> {
-        let ReadView::Snapshot(id) = view else {
-            return None;
-        };
-        let snapshot = Arc::as_ptr(
-            self.read_snapshots
-                .read()
-                .get(&id)
-                .expect("live read snapshot token must retain its sources"),
-        );
-        // SAFETY: the registry drops an entry only after the last `ReadSnapshotToken` of the
-        // snapshot is gone, and a `ReadView::Snapshot` is only handed out by
-        // `reader_for_snapshot`, whose reader borrows a token. The `Arc` allocation therefore
-        // outlives every reference returned here, even though the registry lock is released.
-        Some(unsafe { &*snapshot })
+    #[inline]
+    pub(super) fn memtable_for<'a>(&'a self, src: ReadSource<'a, FS::File>) -> &'a MemTable {
+        match src {
+            ReadSource::Snapshot(s) => &s.memtable,
+            ReadSource::Owner | ReadSource::Committed => &self.memtable,
+        }
     }
 
-    pub(super) fn memtable_for_view(&self, view: ReadView) -> &MemTable {
-        self.snapshot_for_view(view)
-            .map_or(&self.memtable, |s| &s.memtable)
+    #[inline]
+    pub(super) fn idx_segments_for<'a>(
+        &'a self,
+        src: ReadSource<'a, FS::File>,
+    ) -> &'a [Arc<IdxSegmentReader<FS::File>>] {
+        match src {
+            ReadSource::Snapshot(s) => &s.idx_segments,
+            ReadSource::Owner | ReadSource::Committed => &self.idx_segments,
+        }
     }
 
-    pub(super) fn idx_segments_for_view(
-        &self,
-        view: ReadView,
-    ) -> &[Arc<IdxSegmentReader<FS::File>>] {
-        self.snapshot_for_view(view)
-            .map_or(&self.idx_segments, |s| &s.idx_segments)
-    }
-
-    pub(super) fn blob_reader_for_view(
-        &self,
-        view: ReadView,
+    #[inline]
+    pub(super) fn blob_reader_for<'a>(
+        &'a self,
+        src: ReadSource<'a, FS::File>,
         ptr: &BlobPtr,
-    ) -> Option<&BlobSegmentReader<FS::File>> {
-        if let Some(snapshot) = self.snapshot_for_view(view) {
+    ) -> Option<&'a BlobSegmentReader<FS::File>> {
+        if let ReadSource::Snapshot(s) = src {
             return match ptr.kind {
-                BlobKind::Standard => snapshot.std_blobs.get(&ptr.seg_id),
-                BlobKind::Lru => snapshot.lru_blobs.get(&(ptr.table_id, ptr.seg_id)),
+                BlobKind::Standard => s.std_blobs.get(&ptr.seg_id),
+                BlobKind::Lru => s.lru_blobs.get(&(ptr.table_id, ptr.seg_id)),
             };
         }
         match ptr.kind {
@@ -341,8 +400,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&slab[span.0..span.1], blob);
-        engine.release_read_snapshot(snapshot);
-        assert!(engine.read_snapshots.is_empty());
+        assert_eq!(snapshot.strong_count(), 1);
+        drop(snapshot);
+        assert_eq!(engine.cached_snapshot_strong_count(), None);
     }
 
     #[test]
@@ -366,11 +426,19 @@ mod tests {
             Some(b"committed".to_vec())
         );
         let cursor_token = token.clone();
-        engine.release_read_snapshot(token);
-        assert_eq!(engine.read_snapshots.len(), 1);
+        drop(token);
+        assert!(cursor_token.strong_count() >= 2);
+        assert_eq!(
+            engine
+                .reader_for_snapshot(&cursor_token)
+                .get_row(1, b"key")
+                .unwrap(),
+            Some(b"committed".to_vec())
+        );
         engine.rollback_transaction().unwrap();
-        engine.release_read_snapshot(cursor_token);
-        assert!(engine.read_snapshots.is_empty());
+        assert_eq!(cursor_token.strong_count(), 2);
+        drop(cursor_token);
+        assert_eq!(engine.cached_snapshot_strong_count(), Some(1));
     }
 
     #[test]
@@ -417,7 +485,7 @@ mod tests {
             engine.get_row(1, b"key").unwrap(),
             Some(b"pending".to_vec())
         );
-        engine.release_read_snapshot(token);
+        drop(token);
     }
 
     #[test]
@@ -450,7 +518,7 @@ mod tests {
                 assert_ne!(seen.as_deref(), Some(value.as_slice()));
                 violations.push(i);
             }
-            engine.release_read_snapshot(token);
+            drop(token);
         }
         assert!(
             violations.is_empty(),
@@ -471,37 +539,31 @@ mod tests {
         engine.check_snapshot_write_upgrade(1, &token).unwrap();
         engine.put_row(1, b"key", b"b", &[], sync).unwrap();
         assert!(!engine.snapshot_is_current(&token));
-        engine.release_read_snapshot(token);
+        drop(token);
     }
 
     #[test]
-    fn writers_prune_snapshot_releases_deferred_by_a_busy_engine_lock() {
-        let tmp = TempTestDir::new("read_snapshot_deferred_release");
+    fn writers_invalidate_stale_cached_snapshot_without_external_registry() {
+        let tmp = TempTestDir::new("read_snapshot_cache_invalidation");
         let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
         let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
         let token = engine.capture_read_snapshot();
-        // A trace callback may have to drop its token while another writer owns the engine.
+        assert_eq!(token.strong_count(), 2);
         drop(token);
-        assert_eq!(engine.read_snapshots.len(), 1);
-        engine.begin_transaction_for_conn(1).unwrap();
-        assert!(engine.read_snapshots.is_empty());
-        engine.rollback_transaction().unwrap();
-
-        let token = engine.capture_read_snapshot();
-        drop(token);
+        assert_eq!(engine.cached_snapshot_strong_count(), Some(1));
         engine
             .put_row(1, b"key", b"value", &[], WriteDurability::BufferedFast)
             .unwrap();
-        assert!(engine.read_snapshots.is_empty());
+        assert_eq!(engine.cached_snapshot_strong_count(), None);
     }
 
     #[test]
     fn capture_and_release_need_only_a_shared_engine_reference() {
         fn capture_cycle(engine: &StorageEngine<OsFs>) -> usize {
             let token = engine.capture_read_snapshot();
-            let live = engine.read_snapshots.len();
-            engine.release_read_snapshot(token);
-            live
+            let count = token.strong_count();
+            drop(token);
+            count
         }
 
         let tmp = TempTestDir::new("read_snapshot_shared_lock");
@@ -521,9 +583,9 @@ mod tests {
                     let token = guard.capture_read_snapshot();
                     barrier.wait();
                     assert!(guard.snapshot_is_current(&token));
-                    guard.release_read_snapshot(token);
+                    drop(token);
                     for _ in 0..100 {
-                        capture_cycle(&guard);
+                        assert!(capture_cycle(&guard) >= 2);
                     }
                 })
             })
@@ -532,8 +594,7 @@ mod tests {
             handle.join().unwrap();
         }
         let guard = engine.read().unwrap();
-        guard.cleanup_read_snapshots();
-        assert!(guard.read_snapshots.is_empty());
+        assert_eq!(guard.cached_snapshot_strong_count(), Some(1));
     }
 
     #[test]
@@ -570,7 +631,6 @@ mod tests {
                             other => panic!("torn snapshot: {other:?}"),
                         }
                         checked += 1;
-                        guard.release_read_snapshot(token);
                     }
                     checked
                 })
@@ -603,8 +663,89 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let checked: u32 = readers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(checked > 0);
-        let guard = engine.read().unwrap();
-        guard.cleanup_read_snapshots();
-        assert!(guard.read_snapshots.is_empty());
+        let _guard = engine.read().unwrap();
+    }
+
+    #[test]
+    fn cross_engine_snapshot_token_is_rejected_without_ub() {
+        let tmp_a = TempTestDir::new("cross_eng_snap_a");
+        let tmp_b = TempTestDir::new("cross_eng_snap_b");
+        let fs_a = Arc::new(OsFs::open(&tmp_a.path, true).unwrap());
+        let fs_b = Arc::new(OsFs::open(&tmp_b.path, true).unwrap());
+        let mut engine_a = StorageEngine::open(fs_a, EngineConfig::default()).unwrap();
+        let engine_b = StorageEngine::open(fs_b, EngineConfig::default()).unwrap();
+        engine_a
+            .put_row(1, b"k", b"v", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let tok_a = engine_a.capture_read_snapshot();
+        assert!(!engine_b.snapshot_is_current(&tok_a));
+        let err = engine_b
+            .check_snapshot_write_upgrade(1, &tok_a)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = engine_b.reader_for_snapshot(&tok_a);
+        }));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cached_snapshot_reuses_arc_and_avoids_cow_copy_after_release() {
+        let tmp = TempTestDir::new("snap_cache_cow");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        for i in 0..50u32 {
+            let key = format!("k{i:04}");
+            engine
+                .put_row(
+                    1,
+                    key.as_bytes(),
+                    b"val",
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+        }
+        let tok1 = engine.capture_read_snapshot();
+        let tok2 = engine.capture_read_snapshot();
+        assert!(tok1.ptr_eq(&tok2));
+        assert_eq!(tok1.strong_count(), 3);
+        drop(tok1);
+        drop(tok2);
+        assert_eq!(engine.cached_snapshot_strong_count(), Some(1));
+
+        let clones_before = crate::memtable::mem_entry_clones();
+        engine
+            .put_row(1, b"k0000", b"updated", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let clones_after = crate::memtable::mem_entry_clones();
+        assert_eq!(clones_after - clones_before, 0);
+        assert_eq!(engine.cached_snapshot_strong_count(), None);
+    }
+
+    #[test]
+    fn compaction_drops_cached_snapshot_handles_before_unlinking() {
+        let tmp = TempTestDir::new("snap_cache_compaction_unlink");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut config = EngineConfig::default();
+        config.auto_compact_segment_threshold = 0;
+        let mut engine = StorageEngine::open(fs, config).unwrap();
+        let sync = WriteDurability::BufferedFast;
+        engine.put_row(1, b"a", b"v1", &[], sync).unwrap();
+        engine.flush_memtable().unwrap();
+        engine.put_row(1, b"a", b"v2", &[], sync).unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Populate `snapshot_cache` with a now-dropped snapshot right before compacting.
+        let tok = engine.capture_read_snapshot();
+        drop(tok);
+        assert_eq!(engine.cached_snapshot_strong_count(), Some(1));
+
+        engine.compact().unwrap();
+        assert_eq!(engine.cached_snapshot_strong_count(), None);
+        assert!(
+            engine.meta_mgr.state().pending_delete_files.is_empty(),
+            "cached snapshot must release old handles so dead segments unlink immediately"
+        );
     }
 }

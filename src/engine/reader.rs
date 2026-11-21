@@ -9,8 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::ops::Deref;
 
-use crate::pal::PlatformFs;
+use crate::pal::{PlatformFile, PlatformFs};
 
+use super::snapshot::ReadSnapshot;
 use super::{LazyBlob, StorageEngine};
 
 /// Which version of the data a read observes.
@@ -23,14 +24,58 @@ pub enum ReadView {
     /// Committed data only: another connection's uncommitted writes are invisible.
     Committed,
     /// Committed sources captured before subsequent transactions published their changes.
-    Snapshot(u64),
+    Snapshot,
+}
+
+/// Internal zero-cost read source threaded through `&self` engine paths.
+pub(super) enum ReadSource<'a, F: PlatformFile> {
+    Owner,
+    Committed,
+    Snapshot(&'a ReadSnapshot<F>),
+}
+
+impl<F: PlatformFile> Clone for ReadSource<'_, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F: PlatformFile> Copy for ReadSource<'_, F> {}
+
+impl<F: PlatformFile> ReadSource<'_, F> {
+    #[inline]
+    pub(super) fn from_view(view: ReadView) -> Self {
+        match view {
+            ReadView::Owner => Self::Owner,
+            ReadView::Committed => Self::Committed,
+            ReadView::Snapshot => {
+                unreachable!(
+                    "ReadView::Snapshot cannot resolve sources without a ReadSnapshotToken"
+                )
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_owner(self) -> bool {
+        matches!(self, Self::Owner)
+    }
+
+    #[inline]
+    pub(super) fn read_view(self) -> ReadView {
+        match self {
+            Self::Owner => ReadView::Owner,
+            Self::Committed => ReadView::Committed,
+            Self::Snapshot(_) => ReadView::Snapshot,
+        }
+    }
 }
 
 pub(super) const NEED_FLUSH_MSG: &str = "unflushed blob requires exclusive access";
 
 /// Per-read state threaded through the `*_cx` read paths.
-pub(crate) struct ReadCtx {
-    pub(super) view: ReadView,
+pub(crate) struct ReadCtx<'a, F: PlatformFile> {
+    pub(super) src: ReadSource<'a, F>,
     /// True when the caller holds exclusive access (so eager LRU promotions can be queued and
     /// buffered blobs flushed on request).
     pub(super) eager_ok: bool,
@@ -41,14 +86,18 @@ pub(crate) struct ReadCtx {
     pub(super) eager_hits: RefCell<Vec<(u16, Vec<u8>)>>,
 }
 
-impl ReadCtx {
-    pub(super) fn new(view: ReadView, eager_ok: bool) -> Self {
-        Self::new_with_tracking(view, eager_ok, true)
+impl<'a, F: PlatformFile> ReadCtx<'a, F> {
+    pub(super) fn new(src: ReadSource<'a, F>, eager_ok: bool) -> Self {
+        Self::new_with_tracking(src, eager_ok, true)
     }
 
-    pub(super) fn new_with_tracking(view: ReadView, eager_ok: bool, track_hits: bool) -> Self {
+    pub(super) fn new_with_tracking(
+        src: ReadSource<'a, F>,
+        eager_ok: bool,
+        track_hits: bool,
+    ) -> Self {
         Self {
-            view,
+            src,
             eager_ok,
             track_hits,
             need_flush: Cell::new(false),
@@ -57,14 +106,14 @@ impl ReadCtx {
     }
 }
 
-pub(crate) enum CxRef<'a> {
-    Owned(ReadCtx),
-    Borrowed(&'a ReadCtx),
+pub(crate) enum CxRef<'a, F: PlatformFile> {
+    Owned(ReadCtx<'a, F>),
+    Borrowed(&'a ReadCtx<'a, F>),
 }
 
-impl Deref for CxRef<'_> {
-    type Target = ReadCtx;
-    fn deref(&self) -> &ReadCtx {
+impl<'a, F: PlatformFile> Deref for CxRef<'a, F> {
+    type Target = ReadCtx<'a, F>;
+    fn deref(&self) -> &ReadCtx<'a, F> {
         match self {
             CxRef::Owned(c) => c,
             CxRef::Borrowed(c) => c,
@@ -79,13 +128,13 @@ impl Deref for CxRef<'_> {
 /// flushed and `EagerWriteOnRead` promotions applied on the caller's behalf).
 pub struct EngineReader<'a, FS: PlatformFs> {
     pub(super) eng: &'a StorageEngine<FS>,
-    pub(super) cx: CxRef<'a>,
+    pub(super) cx: CxRef<'a, FS::File>,
 }
 
 impl<FS: PlatformFs> EngineReader<'_, FS> {
     /// The view this reader observes.
     pub fn view(&self) -> ReadView {
-        self.cx.view
+        self.cx.src.read_view()
     }
 
     /// True if a read through this reader failed because it needed exclusive access (an
@@ -149,7 +198,7 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
     /// Whether a live row with primary key `pk` exists in this view.
     pub fn row_exists(&self, table_id: u16, pk: &[u8]) -> io::Result<bool> {
         let row_key = crate::lru::encode_primary_row_key(table_id, pk);
-        Ok(self.eng.check_existing_row_view(self.cx.view, &row_key)?
+        Ok(self.eng.check_existing_row_src(self.cx.src, &row_key)?
             != super::ExistingRowStatus::NotFound)
     }
 

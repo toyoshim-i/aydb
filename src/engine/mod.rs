@@ -41,7 +41,7 @@ mod wal_link_tests;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::blob::{
     BLOB_RECORD_HEADER_LEN, BlobSegmentReader, BlobSegmentWriter, DEFAULT_INLINE_THRESHOLD,
@@ -70,7 +70,7 @@ use crate::wal::{
 };
 pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport};
 
-use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx};
+use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx, ReadSource};
 pub use self::reader::{EngineReader, ReadView};
 use self::tx::{SavepointMarker, TxMetaSnapshot};
 use self::wal_links::LogStream;
@@ -305,7 +305,8 @@ pub(super) struct TrackedLruBlob<F: PlatformFile> {
 
 /// Unified Phase 1 Storage Engine.
 pub struct StorageEngine<FS: PlatformFs> {
-    read_snapshots: snapshot::SnapshotRegistry<FS::File>,
+    engine_id: u64,
+    snapshot_cache: RwLock<snapshot::SnapshotCache<FS::File>>,
     pub(super) fs: Arc<FS>,
     pub(super) config: EngineConfig,
     pub(super) meta_mgr: BootMetaManager<FS>,
@@ -1115,7 +1116,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let mut engine = Self {
-            read_snapshots: snapshot::SnapshotRegistry::new(),
+            engine_id: snapshot::alloc_engine_id(),
+            snapshot_cache: RwLock::new(snapshot::SnapshotCache::new()),
             fs,
             config,
             meta_mgr,
@@ -2331,12 +2333,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn get_row_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         pk: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
         let row_key = encode_primary_row_key(table_id, pk);
-        let Some((_lsn, idx_val)) = self.lookup_raw_entry_view(cx.view, &row_key)? else {
+        let Some((_lsn, idx_val)) = self.lookup_raw_entry_src(cx.src, &row_key)? else {
             return Ok(None);
         };
 
@@ -2344,7 +2346,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             IndexValue::Inline(bytes) => Some(bytes),
             IndexValue::Blob(ptr) => {
                 self.ensure_flushed_cx(cx, &ptr)?;
-                match self.read_blob_ref_view(cx.view, &ptr, &row_key)? {
+                match self.read_blob_ref_src(cx.src, &ptr, &row_key)? {
                     Some(v) => Some(v),
                     None => {
                         self.note_corrupt_blob(&row_key, &ptr)?;
@@ -2367,14 +2369,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// configured; otherwise coalesced in RAM (interior-mutable tracker, safe under a shared
     /// lock and inside transactions).
     #[inline]
-    pub(super) fn track_read_hit(&self, cx: &ReadCtx, table_id: u16, pk: &[u8]) {
+    pub(super) fn track_read_hit(&self, cx: &ReadCtx<'_, FS::File>, table_id: u16, pk: &[u8]) {
         if !cx.track_hits || !self.capped_tables.contains_key(&table_id) {
             return;
         }
         if cx.eager_ok
             && self.tx_depth == 0
             && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
-            && matches!(cx.view, ReadView::Owner | ReadView::Snapshot(_))
+            && matches!(cx.src, ReadSource::Owner | ReadSource::Snapshot(_))
         {
             cx.eager_hits.borrow_mut().push((table_id, pk.to_vec()));
         } else {
@@ -2415,12 +2417,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// uncommitted blobs: the read is aborted with `cx.need_flush` set and the exclusive caller
     /// flushes and retries.
     #[inline]
-    pub(super) fn ensure_flushed_cx(&self, cx: &ReadCtx, ptr: &BlobPtr) -> io::Result<()> {
+    pub(super) fn ensure_flushed_cx(
+        &self,
+        cx: &ReadCtx<'_, FS::File>,
+        ptr: &BlobPtr,
+    ) -> io::Result<()> {
         if !self.blob_unflushed(ptr) {
             return Ok(());
         }
         debug_assert!(
-            cx.view == ReadView::Owner,
+            cx.src.is_owner(),
             "committed-view read hit an unflushed blob pointer"
         );
         cx.need_flush.set(true);
@@ -2428,8 +2434,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Owner-view scans that read blob payloads need every buffered byte on the OS handle.
-    pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx) -> io::Result<()> {
-        if cx.view == ReadView::Owner && self.tx_depth > 0 && self.any_blob_unflushed() {
+    pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx<'_, FS::File>) -> io::Result<()> {
+        if cx.src.is_owner() && self.tx_depth > 0 && self.any_blob_unflushed() {
             cx.need_flush.set(true);
             return Err(io::Error::other(NEED_FLUSH_MSG));
         }
@@ -2491,32 +2497,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// [`Self::read_needs_exclusive`] is `false`; otherwise reads may fail with an
     /// "unflushed blob" error and `EagerWriteOnRead` is downgraded to coalesced tracking.
     pub fn reader_for_conn(&self, conn_id: usize) -> EngineReader<'_, FS> {
+        let src = ReadSource::from_view(self.read_view_for_conn(conn_id));
         EngineReader {
             eng: self,
-            cx: CxRef::Owned(ReadCtx::new(self.read_view_for_conn(conn_id), false)),
+            cx: CxRef::Owned(ReadCtx::new(src, false)),
         }
     }
 
-    /// Runs `f` with exclusive access in `view`: flushes buffered blobs and retries when the
+    /// Runs `f` with exclusive access in `src`: flushes buffered blobs and retries when the
     /// reader asks for it, then applies queued eager LRU promotions on a best-effort basis. The
     /// second tuple element carries a flush error (the read result itself is returned untouched).
-    pub(super) fn run_read<R>(
+    fn run_read_src<R>(
         &mut self,
-        view: ReadView,
-        f: impl FnMut(&Self, &ReadCtx) -> R,
+        src: ReadSource<'_, FS::File>,
+        f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> R,
     ) -> (R, Option<io::Error>) {
-        self.run_read_with_tracking(view, true, f)
+        self.run_read_with_tracking_src(src, true, f)
     }
 
-    pub(super) fn run_read_with_tracking<R>(
+    fn run_read_with_tracking_src<R>(
         &mut self,
-        view: ReadView,
+        src: ReadSource<'_, FS::File>,
         track_hits: bool,
-        mut f: impl FnMut(&Self, &ReadCtx) -> R,
+        mut f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> R,
     ) -> (R, Option<io::Error>) {
         let mut attempts = 0;
         loop {
-            let cx = ReadCtx::new_with_tracking(view, track_hits, track_hits);
+            let cx = ReadCtx::new_with_tracking(src, track_hits, track_hits);
             let r = f(&*self, &cx);
             if cx.need_flush.get() && attempts < 2 {
                 attempts += 1;
@@ -2550,7 +2557,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn owner_read<R>(
         &mut self,
-        f: impl FnMut(&Self, &ReadCtx) -> io::Result<R>,
+        f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
     ) -> io::Result<R> {
         self.owner_read_with_tracking(true, f)
     }
@@ -2558,9 +2565,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(super) fn owner_read_with_tracking<R>(
         &mut self,
         track_hits: bool,
-        f: impl FnMut(&Self, &ReadCtx) -> io::Result<R>,
+        f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
     ) -> io::Result<R> {
-        let (r, extra) = self.run_read_with_tracking(ReadView::Owner, track_hits, f);
+        let (r, extra) = self.run_read_with_tracking_src(ReadSource::Owner, track_hits, f);
         match (r, extra) {
             (Ok(v), None) => Ok(v),
             (Ok(_), Some(e)) => Err(e),
@@ -2665,7 +2672,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn get_row_into_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         pk: &[u8],
         slab: &mut Vec<u8>,
@@ -2686,7 +2693,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
 
         let mut hit = false;
-        if let Some(mem_entry) = self.mem_get_view(cx.view, row_key) {
+        if let Some(mem_entry) = self.mem_get_src(cx.src, row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -2706,7 +2713,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         } else {
             let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments_for_view(cx.view).iter().rev() {
+            for seg in self.idx_segments_for(cx.src).iter().rev() {
                 let start = slab.len();
                 let probe =
                     seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
@@ -2754,7 +2761,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn get_row_into_lazy_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         pk: &[u8],
         slab: &mut Vec<u8>,
@@ -2781,7 +2788,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.ensure_all_flushed_cx(cx)?;
         }
         let mut hit = false;
-        if let Some(mem_entry) = self.mem_get_view(cx.view, row_key) {
+        if let Some(mem_entry) = self.mem_get_src(cx.src, row_key) {
             match &mem_entry.value {
                 IndexValue::Inline(bytes) => {
                     let start = slab.len();
@@ -2793,11 +2800,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 IndexValue::Blob(ptr) => {
                     if lazy_ok {
                         spans.push((0, 0));
-                        lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, ptr)));
+                        lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, ptr)));
                         hit = true;
                     } else {
                         let start = slab.len();
-                        if self.read_flushed_blob_append_into_view(cx.view, ptr, row_key, slab)? {
+                        if self.read_flushed_blob_append_into_src(cx.src, ptr, row_key, slab)? {
                             spans.push((start, slab.len()));
                             lazy_blobs.push(None);
                             hit = true;
@@ -2808,7 +2815,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         } else {
             let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments_for_view(cx.view).iter().rev() {
+            for seg in self.idx_segments_for(cx.src).iter().rev() {
                 let start = slab.len();
                 let probe =
                     seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
@@ -2822,10 +2829,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         SegProbe::Blob(ptr) => {
                             if lazy_ok {
                                 spans.push((0, 0));
-                                lazy_blobs.push(Some(self.pin_lazy_blob_view(cx.view, &ptr)));
+                                lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, &ptr)));
                                 hit = true;
                             } else if self
-                                .read_flushed_blob_append_into_view(cx.view, &ptr, row_key, slab)?
+                                .read_flushed_blob_append_into_src(cx.src, &ptr, row_key, slab)?
                             {
                                 spans.push((start, slab.len()));
                                 lazy_blobs.push(None);
@@ -3014,8 +3021,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Captures `ptr` together with a pinned handle to its segment file (see [`LazyBlob`]).
-    pub(super) fn pin_lazy_blob_view(&self, view: ReadView, ptr: &BlobPtr) -> LazyBlob<FS::File> {
-        let reader = self.blob_reader_for_view(view, ptr).cloned();
+    fn pin_lazy_blob_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        ptr: &BlobPtr,
+    ) -> LazyBlob<FS::File> {
+        let reader = self.blob_reader_for(src, ptr).cloned();
         LazyBlob { ptr: *ptr, reader }
     }
 
@@ -3034,7 +3045,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn dereference_lazy_blob_into_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         pk: &[u8],
         lazy: &LazyBlob<FS::File>,
@@ -3100,7 +3111,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn prefetch_lazy_blobs_cx(
         &self,
-        _cx: &ReadCtx,
+        _cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         candidates: &[(&[u8], &LazyBlob<FS::File>)],
     ) -> io::Result<()> {
@@ -3305,6 +3316,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         return Err(e);
                     }
+                    self.invalidate_snapshot_std_blobs();
                     self.std_blobs.insert(
                         seq_id,
                         TrackedStdBlob {
@@ -3362,6 +3374,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         return Err(e);
                     }
+                    self.invalidate_snapshot_lru_blobs();
                     self.lru_blobs.insert(
                         (table_id, seq_id),
                         TrackedLruBlob {
@@ -3496,12 +3509,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         ptr: &BlobPtr,
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
-        self.read_blob_ref_view(ReadView::Owner, ptr, expected_key)
+        self.read_blob_ref_src(ReadSource::Owner, ptr, expected_key)
     }
 
-    fn read_blob_ref_view(
+    fn read_blob_ref_src(
         &self,
-        view: ReadView,
+        src: ReadSource<'_, FS::File>,
         ptr: &BlobPtr,
         expected_key: &[u8],
     ) -> io::Result<Option<Vec<u8>>> {
@@ -3511,7 +3524,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(Some(out));
         }
 
-        let res = match self.blob_reader_for_view(view, ptr) {
+        let res = match self.blob_reader_for(src, ptr) {
             Some(reader) => reader.read_blob(ptr, Some(expected_key))?,
             None => return Ok(None),
         };
@@ -3526,18 +3539,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn dereference_blob_append_into_cx(
         &self,
-        cx: &ReadCtx,
+        cx: &ReadCtx<'_, FS::File>,
         ptr: &BlobPtr,
         expected_key: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
         self.ensure_flushed_cx(cx, ptr)?;
-        self.read_flushed_blob_append_into_view(cx.view, ptr, expected_key, out)
+        self.read_flushed_blob_append_into_src(cx.src, ptr, expected_key, out)
     }
 
-    pub(super) fn read_flushed_blob_append_into_view(
+    fn read_flushed_blob_append_into_src(
         &self,
-        view: ReadView,
+        src: ReadSource<'_, FS::File>,
         ptr: &BlobPtr,
         expected_key: &[u8],
         out: &mut Vec<u8>,
@@ -3549,7 +3562,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(true);
         }
 
-        let reader = self.blob_reader_for_view(view, ptr);
+        let reader = self.blob_reader_for(src, ptr);
         let ok = match reader {
             Some(reader) if out.is_empty() => {
                 reader.read_blob_into(ptr, Some(expected_key), out)?
@@ -3583,7 +3596,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if count_as_data_write || self.tx_depth > 0 {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         }
-        self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;
 
@@ -3640,6 +3652,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.scratch_wal_encoded = raw;
         res?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
+        self.invalidate_snapshot_memtable();
         self.memtable.apply_wal_batch_owned(batch);
         if count_as_data_write && has_records {
             self.data_generation += 1;
@@ -3770,15 +3783,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn check_existing_row(&self, key: &[u8]) -> io::Result<ExistingRowStatus> {
-        self.check_existing_row_view(ReadView::Owner, key)
+        self.check_existing_row_src(ReadSource::Owner, key)
     }
 
-    pub(super) fn check_existing_row_view(
+    fn check_existing_row_src(
         &self,
-        view: ReadView,
+        src: ReadSource<'_, FS::File>,
         key: &[u8],
     ) -> io::Result<ExistingRowStatus> {
-        if let Some(mem_entry) = self.mem_get_view(view, key) {
+        if let Some(mem_entry) = self.mem_get_src(src, key) {
             return Ok(match &mem_entry.value {
                 IndexValue::Tombstone => ExistingRowStatus::NotFound,
                 IndexValue::Inline(_) => ExistingRowStatus::Inline,
@@ -3786,7 +3799,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             });
         }
         let hash = BloomFilter::hash_pair(key);
-        for seg in self.idx_segments_for_view(view).iter().rev() {
+        for seg in self.idx_segments_for(src).iter().rev() {
             let status = seg.visit_hashed(key, hash, |raw| match raw.val_type {
                 1 => Ok(ExistingRowStatus::Inline),
                 2 => Ok(ExistingRowStatus::Blob(RawIdxEntry::decode_blob_ptr(
@@ -3902,30 +3915,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok((keys, (pk.len() + value_len) as u64))
     }
 
-    /// Newest in-memory entry for `key` as seen by `view`: the transaction overlay (hidden for
-    /// the committed view) over the committed `MemTable`.
+    /// Newest in-memory entry for `key` as seen by `src`: the transaction overlay (hidden for
+    /// non-owner sources) over the committed `MemTable`.
     #[inline]
-    pub(super) fn mem_get_view(
-        &self,
-        view: ReadView,
+    fn mem_get_src<'a>(
+        &'a self,
+        src: ReadSource<'a, FS::File>,
         key: &[u8],
-    ) -> Option<&crate::memtable::MemEntry> {
-        if view == ReadView::Owner && self.tx_overlay.may_contain_key(key) {
+    ) -> Option<&'a crate::memtable::MemEntry> {
+        if src.is_owner() && self.tx_overlay.may_contain_key(key) {
             if let Some(e) = self.tx_overlay.map.get(key) {
                 return Some(e);
             }
         }
-        self.memtable_for_view(view).get(key)
+        self.memtable_for(src).get(key)
     }
 
-    /// Overlay map visible to `view` (empty for the committed view or empty overlay).
+    /// Overlay map visible to `src` (empty for non-owner sources or empty overlay).
     #[inline]
-    pub(super) fn visible_overlay(
+    fn visible_overlay_src(
         &self,
-        view: ReadView,
+        src: ReadSource<'_, FS::File>,
     ) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
         static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
-        if view != ReadView::Owner || self.tx_overlay.is_empty() {
+        if !src.is_owner() || self.tx_overlay.is_empty() {
             &EMPTY
         } else {
             &self.tx_overlay.map
@@ -3933,7 +3946,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
-        self.lookup_raw_entry_view(ReadView::Owner, key)
+        self.lookup_raw_entry_src(ReadSource::Owner, key)
     }
 
     pub(super) fn lookup_raw_entry_view(
@@ -3941,11 +3954,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         view: ReadView,
         key: &[u8],
     ) -> io::Result<Option<(u64, IndexValue)>> {
-        if let Some(mem_entry) = self.mem_get_view(view, key) {
+        self.lookup_raw_entry_src(ReadSource::from_view(view), key)
+    }
+
+    fn lookup_raw_entry_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        key: &[u8],
+    ) -> io::Result<Option<(u64, IndexValue)>> {
+        if let Some(mem_entry) = self.mem_get_src(src, key) {
             return Ok(Some((mem_entry.lsn, mem_entry.value.clone())));
         }
         let hash = BloomFilter::hash_pair(key);
-        for seg in self.idx_segments_for_view(view).iter().rev() {
+        for seg in self.idx_segments_for(src).iter().rev() {
             if let Some((lsn, val)) = seg.get_hashed(key, hash)? {
                 return Ok(Some((lsn, val)));
             }

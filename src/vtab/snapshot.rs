@@ -17,13 +17,17 @@ pub(super) const TRACE_PROFILE: c_uint = 2;
 
 /// All virtual tables on a connection use one committed view of their shared engine.
 pub(super) struct ReadSession {
+    #[cfg(test)]
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     token: Mutex<Option<ReadSnapshotToken>>,
 }
 
 impl ReadSession {
     pub(super) fn new(engine: Arc<RwLock<StorageEngine<OsFs>>>) -> Self {
+        #[cfg(not(test))]
+        drop(engine);
         Self {
+            #[cfg(test)]
             engine,
             token: Mutex::new(None),
         }
@@ -33,13 +37,20 @@ impl ReadSession {
         self.token.lock().ok()?.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn for_cursor(&self, connection: usize) -> io::Result<Option<ReadSnapshotToken>> {
-        // Capturing only clones immutable sources into the snapshot registry, so it runs under
-        // the shared engine lock like the read it serves.
         let engine = self
             .engine
             .read()
             .map_err(|_| io::Error::other("engine lock poisoned"))?;
+        self.for_cursor_locked(&engine, connection)
+    }
+
+    pub(super) fn for_cursor_locked(
+        &self,
+        engine: &StorageEngine<OsFs>,
+        connection: usize,
+    ) -> io::Result<Option<ReadSnapshotToken>> {
         if engine.in_active_transaction()
             && engine.read_view_for_conn(connection) == ReadView::Owner
         {
@@ -56,17 +67,12 @@ impl ReadSession {
         ))
     }
 
+    pub(super) fn clear(&self) {
+        let _ = self.token.lock().ok().and_then(|mut token| token.take());
+    }
+
     fn end_transaction(&self) {
-        let token = self.token.lock().ok().and_then(|mut token| token.take());
-        // SQLite can finish a nested statement while an engine callback holds this lock; a
-        // writer then prunes the released snapshot at its next transaction or commit.
-        if let Ok(engine) = self.engine.try_read() {
-            if let Some(token) = token {
-                engine.release_read_snapshot(token);
-            } else {
-                engine.cleanup_read_snapshots();
-            }
-        }
+        self.clear();
     }
 }
 
@@ -170,6 +176,7 @@ mod tests {
         worker.join().unwrap();
         assert!(session.current().is_none());
         session.end_transaction();
-        assert_eq!(shared.live_read_snapshots(), 0);
+        let live = shared.capture_read_snapshot();
+        assert_eq!(live.strong_count(), 2);
     }
 }

@@ -298,6 +298,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             !settled.dead_blob_files.is_empty() || !lingering.is_empty(),
         );
 
+        self.invalidate_snapshot_idx_segments();
         self.memtable.clear();
         self.idx_segments.push(Arc::new(new_reader));
         self.sync_wal.reset_for_new_epoch(new_sync_epoch);
@@ -729,6 +730,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Err(e);
         }
 
+        if !dead_std_seqs.is_empty() {
+            self.invalidate_snapshot_std_blobs();
+        }
+        if !dead_lru_keys.is_empty() {
+            self.invalidate_snapshot_lru_blobs();
+        }
+        self.invalidate_snapshot_idx_segments();
+
         for seq in dead_std_seqs {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
@@ -856,6 +865,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         dead_lru_keys: Vec<(u16, u64)>,
         delete_attempted: bool,
     ) {
+        if !dead_std_seqs.is_empty() {
+            self.invalidate_snapshot_std_blobs();
+        }
+        if !dead_lru_keys.is_empty() {
+            self.invalidate_snapshot_lru_blobs();
+        }
+
         for seq in dead_std_seqs {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
@@ -949,6 +965,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             st.lru_blob_segments = lru_metas;
         })?;
 
+        self.invalidate_snapshot_lru_blobs();
         for &(tid, seq) in &dead_lru {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
@@ -985,6 +1002,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         })?;
 
+        if !dead_std.is_empty() {
+            self.invalidate_snapshot_std_blobs();
+        }
+        if !dead_lru.is_empty() {
+            self.invalidate_snapshot_lru_blobs();
+        }
         for seq in dead_std {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);

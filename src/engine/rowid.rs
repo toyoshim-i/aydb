@@ -9,6 +9,7 @@ use crate::wal::WalRecord;
 
 #[cfg(test)]
 use super::WriteDurability;
+use super::reader::ReadSource;
 use super::{EngineReader, ReadView, StorageEngine};
 
 pub(super) const NS_ROWID_BY_PK: u8 = b'u';
@@ -65,8 +66,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         pk: &[u8],
     ) -> io::Result<Option<i64>> {
+        self.rowid_for_pk_src(ReadSource::from_view(view), table_id, pk)
+    }
+
+    pub(super) fn rowid_for_pk_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        table_id: u16,
+        pk: &[u8],
+    ) -> io::Result<Option<i64>> {
         let key = rowid_key(table_id, NS_ROWID_BY_PK, pk);
-        match self.lookup_raw_entry_view(view, &key)? {
+        match self.lookup_raw_entry_src(src, &key)? {
             Some((_, IndexValue::Inline(value))) if value.len() == 8 => {
                 Ok(Some(i64::from_le_bytes(value.try_into().unwrap())))
             }
@@ -84,8 +94,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         rowid: i64,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.pk_for_rowid_src(ReadSource::from_view(view), table_id, rowid)
+    }
+
+    pub(super) fn pk_for_rowid_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        table_id: u16,
+        rowid: i64,
+    ) -> io::Result<Option<Vec<u8>>> {
         let key = rowid_key(table_id, NS_PK_BY_ROWID, &rowid.to_le_bytes());
-        match self.lookup_raw_entry_view(view, &key)? {
+        match self.lookup_raw_entry_src(src, &key)? {
             Some((_, IndexValue::Inline(pk))) => Ok(Some(pk)),
             Some((_, IndexValue::Tombstone)) | None => Ok(None),
             _ => Err(io::Error::new(
@@ -204,10 +223,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
 impl<FS: PlatformFs> EngineReader<'_, FS> {
     pub(crate) fn rowid_for_pk(&self, table_id: u16, pk: &[u8]) -> io::Result<Option<i64>> {
-        self.eng.rowid_for_pk_view(self.view(), table_id, pk)
+        self.eng.rowid_for_pk_src(self.cx.src, table_id, pk)
     }
 
     pub(crate) fn pk_for_rowid(&self, table_id: u16, rowid: i64) -> io::Result<Option<Vec<u8>>> {
-        self.eng.pk_for_rowid_view(self.view(), table_id, rowid)
+        self.eng.pk_for_rowid_src(self.cx.src, table_id, rowid)
     }
 }

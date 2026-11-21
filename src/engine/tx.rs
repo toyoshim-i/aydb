@@ -391,7 +391,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.cleanup_read_snapshots();
         if self.tx_depth == 0 {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
@@ -414,7 +413,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// an active transaction on this `StorageEngine`.
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.cleanup_read_snapshots();
         self.check_not_poisoned()?;
         if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
             return Err(io::Error::new(
@@ -475,8 +473,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     where
         F: FnMut(&EngineReader<'_, FS>) -> R,
     {
-        let view = self.read_view_for_conn(conn_id);
-        self.run_read(view, |eng, cx| {
+        let src = super::reader::ReadSource::from_view(self.read_view_for_conn(conn_id));
+        self.run_read_src(src, |eng, cx| {
             f(&EngineReader {
                 eng,
                 cx: CxRef::Borrowed(cx),
@@ -754,6 +752,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if !entries.is_empty() {
                     self.data_generation += 1;
                 }
+                self.invalidate_snapshot_memtable();
                 self.memtable.absorb(entries);
             }
         }
@@ -805,6 +804,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !overlay.is_empty() {
             self.data_generation += 1;
         }
+        self.invalidate_snapshot_memtable();
         self.memtable.absorb(overlay);
         self.finalize_tx_state();
 

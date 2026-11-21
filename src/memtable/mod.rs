@@ -98,6 +98,12 @@ impl Clone for MemEntry {
     }
 }
 
+/// Returns the number of `MemEntry` clones performed on the current thread so far.
+#[cfg(test)]
+pub(crate) fn mem_entry_clones() -> usize {
+    MEM_ENTRY_CLONES.with(|c| c.get())
+}
+
 impl MemEntry {
     #[inline]
     fn approx_heap_bytes(&self, key_len: usize) -> usize {
