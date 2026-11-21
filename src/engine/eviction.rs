@@ -19,7 +19,7 @@ use super::reader::ReadView;
 use super::{ExistingRowStatus, MetaLookup, StorageEngine, WriteDurability};
 
 #[inline]
-fn est_wal_record_bytes(rec: &WalRecord) -> usize {
+pub(super) fn est_wal_record_bytes(rec: &WalRecord) -> usize {
     match rec {
         WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
         WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),

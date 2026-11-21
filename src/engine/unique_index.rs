@@ -11,11 +11,31 @@ use crate::lru::{
     RowMetaRecord, encode_primary_row_key, encode_row_meta_key, encode_secondary_index_key,
 };
 use crate::pal::PlatformFs;
-use crate::wal::WalRecord;
+use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
+use super::eviction::est_wal_record_bytes;
 use super::{
     BLOB_RECORD_HEADER_LEN, ExistingRowStatus, MetaLookup, ReadView, StorageEngine, WriteDurability,
 };
+
+/// Per-row input for [`StorageEngine::reconcile_unique_keys_batch`]: `(pk, row_value_len, desired_keys)`.
+pub(crate) type UniqueReconcileItem = (Vec<u8>, usize, Vec<(u16, Vec<u8>)>);
+
+struct PlannedRowReconcile {
+    meta_key: Vec<u8>,
+    records: Vec<WalRecord>,
+    meta_write: Option<Vec<u8>>,
+    old_meta_blob_ptr: Option<BlobPtr>,
+}
+
+#[derive(Default)]
+struct ReconcileBatchState {
+    records: Vec<WalRecord>,
+    est_bytes: usize,
+    new_meta_ptrs: Vec<BlobPtr>,
+    old_meta_ptrs: Vec<BlobPtr>,
+    wrote_any_meta: bool,
+}
 
 /// Index id under which the completion marker is stored.
 pub(crate) const UNIQUE_MARKER_INDEX_ID: u16 = 0xFFFF;
@@ -88,40 +108,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    /// Makes the UNIQUE entries of an existing row equal `desired`, in one WAL batch.
-    ///
-    /// `desired` is derived by the caller from the row it just read under the same engine lock,
-    /// so it describes the row's current value. Entries recorded in the row's `'t'` record under
-    /// a UNIQUE index id that `desired` lacks (a column that is no longer UNIQUE, or a different
-    /// collation or affinity) are deleted, missing ones are added, and the record is rewritten
-    /// with the declared-index pairs first and `desired` after them, as `put_row` would. The row
-    /// value, blob pointer, `recorded_tick` and logical size stay as they are.
-    ///
-    /// Returns `Ok(false)` when nothing had to change (idempotent; also an absent row, or a row
-    /// without keys that needs none). A row whose `'t'` record is unreadable, or a capped row
-    /// without one, is `InvalidData` and nothing is written.
-    pub(crate) fn reconcile_unique_keys(
+    fn plan_row_unique_reconcile(
         &mut self,
         table_id: u16,
         pk: &[u8],
         desired: &[(u16, Vec<u8>)],
-        durability: WriteDurability,
-    ) -> io::Result<bool> {
-        self.check_not_poisoned()?;
-        self.drain_group_for_autocommit()?;
-        self.drain_corrupt_evictions()?;
+        may_have_meta: bool,
+        is_capped: bool,
+        known_row_value_len: Option<usize>,
+    ) -> io::Result<Option<PlannedRowReconcile>> {
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "primary key exceeds maximum length (2048 bytes)",
             ));
         }
-        let row_key = encode_primary_row_key(table_id, pk);
-        if self.check_existing_row(&row_key)? == ExistingRowStatus::NotFound {
-            return Ok(false);
-        }
+        let row_key = if known_row_value_len.is_none() {
+            let rk = encode_primary_row_key(table_id, pk);
+            if self.check_existing_row(&rk)? == ExistingRowStatus::NotFound {
+                return Ok(None);
+            }
+            Some(rk)
+        } else {
+            None
+        };
         let meta_key = encode_row_meta_key(table_id, pk);
-        let lookup = if self.may_have_row_meta(table_id)? {
+        let lookup = if may_have_meta {
             self.get_row_meta_lookup(&meta_key)?
         } else {
             MetaLookup::Absent
@@ -136,7 +148,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 ));
             }
         };
-        if old_meta.is_none() && self.capped_tables.contains_key(&table_id) {
+        if old_meta.is_none() && is_capped {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "row of a capped table has no metadata; unique keys cannot be reconciled",
@@ -145,12 +157,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let (recorded_tick, logical_size, old_keys) = match old_meta {
             Some(m) => (m.recorded_tick, m.logical_size, m.secondary_keys),
             None => {
-                let value_len = match self.lookup_raw_entry(&row_key)? {
-                    Some((_, IndexValue::Inline(v))) => v.len(),
-                    Some((_, IndexValue::Blob(p))) => {
-                        (p.len as usize).saturating_sub(BLOB_RECORD_HEADER_LEN + row_key.len())
-                    }
-                    _ => 0,
+                let value_len = match (known_row_value_len, row_key.as_deref()) {
+                    (Some(len), _) => len,
+                    (None, Some(rk)) => match self.lookup_raw_entry(rk)? {
+                        Some((_, IndexValue::Inline(v))) => v.len(),
+                        Some((_, IndexValue::Blob(p))) => {
+                            (p.len as usize).saturating_sub(BLOB_RECORD_HEADER_LEN + rk.len())
+                        }
+                        _ => 0,
+                    },
+                    (None, None) => 0,
                 };
                 (0, (pk.len() + value_len) as u32, Vec::new())
             }
@@ -193,18 +209,101 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             keys.push(pair.clone());
         }
         if records.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
 
         // An uncapped row left without any key needs no record at all.
-        let mut new_meta_blob_ptr = None;
-        let wrote_meta = !(keys.is_empty() && recorded_tick == 0);
-        if !wrote_meta {
-            records.push(WalRecord::Delete { key: meta_key });
+        let meta_write = if keys.is_empty() && recorded_tick == 0 {
+            None
         } else {
-            let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &keys);
-            new_meta_blob_ptr =
-                self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
+            Some(RowMetaRecord::encode_slice(
+                recorded_tick,
+                logical_size,
+                &keys,
+            ))
+        };
+        Ok(Some(PlannedRowReconcile {
+            meta_key,
+            records,
+            meta_write,
+            old_meta_blob_ptr,
+        }))
+    }
+
+    fn commit_reconcile_sub_batch(
+        &mut self,
+        table_id: u16,
+        durability: WriteDurability,
+        state: &mut ReconcileBatchState,
+    ) -> io::Result<()> {
+        if state.records.is_empty() {
+            return Ok(());
+        }
+        if !state.new_meta_ptrs.is_empty()
+            && durability == WriteDurability::SyncTransactional
+            && self.tx_depth == 0
+        {
+            if let Err(e) = self.sync_active_std_writer() {
+                for p in state.new_meta_ptrs.drain(..) {
+                    self.record_dead_blob_bytes(&p);
+                }
+                return Err(e);
+            }
+        }
+        let batch = std::mem::take(&mut state.records);
+        if let Err(e) = self.commit_wal_and_memtable(batch, durability) {
+            for p in state.new_meta_ptrs.drain(..) {
+                self.record_dead_blob_bytes(&p);
+            }
+            return Err(e);
+        }
+        if state.wrote_any_meta {
+            self.table_has_row_meta.insert(table_id, true);
+        }
+        for p in state.old_meta_ptrs.drain(..) {
+            self.record_dead_blob_bytes(&p);
+        }
+        state.new_meta_ptrs.clear();
+        state.wrote_any_meta = false;
+        state.est_bytes = 0;
+        Ok(())
+    }
+
+    /// Makes the UNIQUE entries of an existing row equal `desired`, in one WAL batch.
+    #[cfg(test)]
+    pub(crate) fn reconcile_unique_keys(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        desired: &[(u16, Vec<u8>)],
+        durability: WriteDurability,
+    ) -> io::Result<bool> {
+        self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
+        self.drain_corrupt_evictions()?;
+        let may_have_meta = self.may_have_row_meta(table_id)?;
+        let is_capped = self.capped_tables.contains_key(&table_id);
+        let Some(planned) =
+            self.plan_row_unique_reconcile(table_id, pk, desired, may_have_meta, is_capped, None)?
+        else {
+            return Ok(false);
+        };
+
+        let mut records = planned.records;
+        let mut new_meta_blob_ptr = None;
+        let wrote_meta = planned.meta_write.is_some();
+        match planned.meta_write {
+            None => records.push(WalRecord::Delete {
+                key: planned.meta_key,
+            }),
+            Some(meta_bytes) => {
+                new_meta_blob_ptr = self.append_std_meta_record(
+                    planned.meta_key,
+                    meta_bytes,
+                    durability,
+                    &mut records,
+                )?;
+            }
         }
         if let Err(e) = self.commit_wal_and_memtable(records, durability) {
             if let Some(ref p) = new_meta_blob_ptr {
@@ -215,9 +314,136 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if wrote_meta {
             self.table_has_row_meta.insert(table_id, true);
         }
-        if let Some(old_m_ptr) = old_meta_blob_ptr {
+        if let Some(old_m_ptr) = planned.old_meta_blob_ptr {
             self.record_dead_blob_bytes(&old_m_ptr);
         }
         Ok(true)
+    }
+
+    /// Reconciles the UNIQUE index entries of a batch of live rows that the caller just scanned
+    /// under the same exclusive engine lock, committing them in as few WAL batches as fit within
+    /// the WAL safety cap (normally one batch per migration chunk).
+    ///
+    /// Each item is `(pk, row_value_len, desired_unique_keys)`. Because the caller already
+    /// verified row liveness and read the row payload under the same lock, this skips per-row
+    /// existence checks and row-length lookups. Returns the number of rows whose metadata or
+    /// index entries changed.
+    pub(crate) fn reconcile_unique_keys_batch(
+        &mut self,
+        table_id: u16,
+        rows: &[UniqueReconcileItem],
+        durability: WriteDurability,
+    ) -> io::Result<usize> {
+        self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
+        self.drain_corrupt_evictions()?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let may_have_meta = self.may_have_row_meta(table_id)?;
+        let is_capped = self.capped_tables.contains_key(&table_id);
+        let max_batch_wal_bytes = if self.tx_depth == 0 {
+            let wal_bytes = match durability {
+                WriteDurability::SyncTransactional => {
+                    self.sync_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
+                }
+                WriteDurability::BufferedFast => {
+                    self.buf_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
+                }
+            };
+            (wal_bytes / 2).clamp(4096, 512 * 1024)
+        } else {
+            usize::MAX
+        };
+
+        let mut state = ReconcileBatchState::default();
+        let mut reconciled_rows = 0usize;
+
+        let res: io::Result<()> = (|| {
+            for (pk, row_value_len, desired) in rows {
+                let Some(planned) = self.plan_row_unique_reconcile(
+                    table_id,
+                    pk,
+                    desired,
+                    may_have_meta,
+                    is_capped,
+                    Some(*row_value_len),
+                )?
+                else {
+                    continue;
+                };
+
+                let meta_est_bytes = match &planned.meta_write {
+                    None => 5 + planned.meta_key.len(),
+                    Some(mb)
+                        if !IndexEntry::inline_fits_in_block(planned.meta_key.len(), mb.len()) =>
+                    {
+                        28 + planned.meta_key.len()
+                    }
+                    Some(mb) => 9 + planned.meta_key.len() + mb.len(),
+                };
+                let row_est_bytes = planned
+                    .records
+                    .iter()
+                    .map(est_wal_record_bytes)
+                    .sum::<usize>()
+                    .saturating_add(meta_est_bytes);
+
+                if !state.records.is_empty()
+                    && state.est_bytes.saturating_add(row_est_bytes) > max_batch_wal_bytes
+                {
+                    self.commit_reconcile_sub_batch(table_id, durability, &mut state)?;
+                }
+
+                state.records.extend(planned.records);
+                match planned.meta_write {
+                    None => {
+                        state.records.push(WalRecord::Delete {
+                            key: planned.meta_key,
+                        });
+                    }
+                    Some(meta_bytes) => {
+                        state.wrote_any_meta = true;
+                        if !IndexEntry::inline_fits_in_block(
+                            planned.meta_key.len(),
+                            meta_bytes.len(),
+                        ) {
+                            let ptr = self.append_to_blob_segment(
+                                BlobKind::Standard,
+                                0,
+                                &planned.meta_key,
+                                &meta_bytes,
+                            )?;
+                            state.new_meta_ptrs.push(ptr);
+                            state.records.push(WalRecord::PutBlobPtr {
+                                key: planned.meta_key,
+                                blob_ptr: ptr,
+                            });
+                        } else {
+                            state.records.push(WalRecord::PutInline {
+                                key: planned.meta_key,
+                                value: meta_bytes,
+                            });
+                        }
+                    }
+                }
+                if let Some(old_m_ptr) = planned.old_meta_blob_ptr {
+                    state.old_meta_ptrs.push(old_m_ptr);
+                }
+                state.est_bytes = state.est_bytes.saturating_add(row_est_bytes);
+                reconciled_rows += 1;
+            }
+
+            self.commit_reconcile_sub_batch(table_id, durability, &mut state)
+        })();
+
+        if let Err(e) = res {
+            for p in state.new_meta_ptrs.drain(..) {
+                self.record_dead_blob_bytes(&p);
+            }
+            return Err(e);
+        }
+        Ok(reconciled_rows)
     }
 }

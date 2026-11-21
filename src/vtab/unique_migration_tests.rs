@@ -822,3 +822,122 @@ fn attaching_unique_vtab_to_nonempty_explicit_table_id_does_not_write_marker() {
         vec![pk1]
     );
 }
+
+#[test]
+fn unique_migration_chunk_commits_in_single_wal_batch_and_recovers() {
+    let dir = TempTestDir::new("unique_mig_single_batch");
+    let def = UniqueDef::new(vec![
+        (1, ColCollation::Binary, ColumnAffinity::Text),
+        (2, ColCollation::NoCase, ColumnAffinity::Text),
+    ]);
+    {
+        let engine = open_engine(&dir);
+        {
+            let mut eng = engine.write().unwrap();
+            for i in 0..200 {
+                let k = format!("k{i:03}");
+                let pk = SqlValue::Text(k.clone()).to_key_bytes();
+                let a = if i % 10 == 0 {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text(format!("A{i:03}"))
+                };
+                let n = SqlValue::Text(format!("N{i:03}"));
+                let c = SqlValue::Text("declared".into());
+                let row = encode_row(&[SqlValue::Text(k), a, n, c.clone()]);
+                // Mix legacy rows with and without declared-index `'t'` metadata.
+                let declared = if i % 2 == 0 {
+                    vec![(1u16, c.to_key_bytes())]
+                } else {
+                    Vec::new()
+                };
+                eng.put_row(1, &pk, &row, &declared, WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.checkpoint().unwrap();
+        }
+
+        let lsn_before = engine.read().unwrap().next_lsn();
+        let params = Params {
+            table_id: 1,
+            durability: WriteDurability::SyncTransactional,
+            def: &def,
+            chunk_rows: 512,
+            budget_rows: 512,
+        };
+        let outcome = unique_migration::migrate(&engine, &params, &mut None);
+        assert!(matches!(outcome, Outcome::Complete), "{outcome:?}");
+
+        let lsn_after = engine.read().unwrap().next_lsn();
+        // 1 WAL batch for the entire 200-row chunk + 1 WAL batch for the completion marker.
+        assert_eq!(
+            lsn_after - lsn_before,
+            2,
+            "expected single chunk batch + single marker batch, consumed {} LSNs",
+            lsn_after - lsn_before
+        );
+    }
+
+    // Reopen from disk and verify every row's UNIQUE entries and `'t'` record survived.
+    let reopened = open_engine(&dir);
+    let mut eng = reopened.write().unwrap();
+    assert_eq!(
+        eng.unique_marker_view(ReadView::Committed, 1).unwrap(),
+        Some(def.marker_value())
+    );
+    for i in 0..200 {
+        let pk = SqlValue::Text(format!("k{i:03}")).to_key_bytes();
+        let n_key = SqlValue::Text(format!("n{i:03}")).to_key_bytes();
+        assert_eq!(
+            eng.lookup_by_secondary_index(1, 0x8002, &n_key).unwrap(),
+            vec![pk.clone()]
+        );
+        if i % 10 != 0 {
+            let a_key = SqlValue::Text(format!("A{i:03}")).to_key_bytes();
+            assert_eq!(
+                eng.lookup_by_secondary_index(1, 0x8001, &a_key).unwrap(),
+                vec![pk.clone()]
+            );
+        }
+        let meta = eng.test_row_meta(1, &pk).unwrap().unwrap();
+        let expected_ids: Vec<u16> = match (i % 2 == 0, i % 10 != 0) {
+            (true, true) => vec![1, 0x8001, 0x8002],
+            (true, false) => vec![1, 0x8002],
+            (false, true) => vec![0x8001, 0x8002],
+            (false, false) => vec![0x8002],
+        };
+        let got_ids: Vec<u16> = meta.secondary_keys.iter().map(|p| p.0).collect();
+        assert_eq!(got_ids, expected_ids, "row {i}");
+    }
+}
+
+#[test]
+fn reconcile_unique_keys_batch_splits_sub_batches_cleanly_on_small_wal_ring() {
+    let dir = TempTestDir::new("unique_mig_small_wal_split");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 32 * 1024;
+    cfg.buf_wal_size_bytes = 32 * 1024;
+    let mut eng = StorageEngine::open(fs, cfg).unwrap();
+
+    let mut batch_rows = Vec::new();
+    for i in 0..160u32 {
+        let pk = format!("pk{i:04}_pad_to_trigger_sub_batch_split").into_bytes();
+        let row = vec![b'r'; 200];
+        eng.put_row(1, &pk, &row, &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let desired = vec![(0x8001u16, format!("val_{i:04}").into_bytes())];
+        batch_rows.push((pk, row.len(), desired));
+    }
+
+    let lsn_before = eng.next_lsn();
+    let updated = eng
+        .reconcile_unique_keys_batch(1, &batch_rows, WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(updated, 160);
+    let batches = eng.next_lsn() - lsn_before;
+    assert!(
+        (2..10).contains(&batches),
+        "expected a few bounded sub-batches on 32 KB WAL ring, got {batches}"
+    );
+}

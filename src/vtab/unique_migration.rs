@@ -99,16 +99,18 @@ pub(crate) fn migrate<FS: PlatformFs>(
             Ok(batch) => batch,
             Err(e) => return Outcome::Failed(e),
         };
+        let mut batch_rows = Vec::with_capacity(rows.len());
         for (pk, row) in rows {
             let desired = match p.def.entries(&row) {
                 Ok(desired) => desired,
                 Err(e) => return Outcome::Failed(e),
             };
-            if let Err(e) =
-                eng.reconcile_unique_keys(p.table_id, &pk, &desired, WriteDurability::BufferedFast)
-            {
-                return Outcome::Failed(e);
-            }
+            batch_rows.push((pk, row.len(), desired));
+        }
+        if let Err(e) =
+            eng.reconcile_unique_keys_batch(p.table_id, &batch_rows, WriteDurability::BufferedFast)
+        {
+            return Outcome::Failed(e);
         }
         done += p.chunk_rows;
         match next {
