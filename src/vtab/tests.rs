@@ -3098,7 +3098,7 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
         pk_col_idx: 0,
         pk_affinity: ColumnAffinity::Integer,
         pk_rowid_alias: true,
-        auto_key_cache: std::sync::Mutex::new((u64::MAX, 0)),
+        auto_key_cache: std::sync::Mutex::new(None),
         unsupported: None,
         pk_collation: ColCollation::Binary,
         secondary_indexes: Vec::new(),
@@ -4118,4 +4118,139 @@ fn best_index_expands_order_by_consumption_and_differentiates_range_costs() {
         .expect("vtab_best_index recorded a PK range plan");
     assert_eq!(pk_idx_num & 0xFF, PLAN_PK_RANGE);
     assert_eq!(pk_ob_consumed, 1);
+}
+
+#[test]
+fn auto_key_cache_survives_writes_and_rollbacks_on_other_tables_but_invalidates_on_own_mutations() {
+    use crate::engine::TABLE_SCAN_ENTRIES_COPIED;
+
+    let tmp = TempTestDir::new("auto_key_cache_per_table");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t1 USING aydb(table_id = 1, columns = 'k INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIRTUAL TABLE t2 USING aydb(table_id = 2, columns = 'k INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+
+    conn.execute_batch("INSERT INTO t1 VALUES (NULL, 'a')")
+        .unwrap();
+    let t1_epoch_after_first = engine.read().unwrap().table_mutation_epoch(1);
+    let t2_epoch_initial = engine.read().unwrap().table_mutation_epoch(2);
+    assert!(t1_epoch_after_first > 0);
+
+    // Mutations, rollbacks, and savepoint rollbacks on `t2` must NOT invalidate `t1`'s epoch.
+    conn.execute_batch(
+        "INSERT INTO t2 VALUES (NULL, 'x'), (NULL, 'y');
+         UPDATE t2 SET v = 'x2' WHERE k = 1;
+         DELETE FROM t2 WHERE k = 2;
+         BEGIN; INSERT INTO t2 VALUES (NULL, 'rolled'); ROLLBACK;
+         BEGIN; SAVEPOINT sp; INSERT INTO t2 VALUES (NULL, 'sp_rolled'); ROLLBACK TO sp; COMMIT;",
+    )
+    .unwrap();
+    {
+        let eng = engine.read().unwrap();
+        assert_eq!(eng.table_mutation_epoch(1), t1_epoch_after_first);
+        assert!(eng.table_mutation_epoch(2) > t2_epoch_initial);
+    }
+
+    // Automatic key insert on `t1` uses the cached `next = 2` with zero table scans.
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    conn.execute_batch("INSERT INTO t1 VALUES (NULL, 'b')")
+        .unwrap();
+    assert_eq!(TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()), 0);
+    assert_eq!(
+        conn.query_all("SELECT k, v FROM t1 ORDER BY k", &[])
+            .unwrap(),
+        vec![
+            vec![SqlValue::Integer(1), SqlValue::Text("a".into())],
+            vec![SqlValue::Integer(2), SqlValue::Text("b".into())],
+        ]
+    );
+
+    // Rolling back a write on `t1` MUST bump `t1`'s epoch so `next = 3` is reused without a gap.
+    let t1_before_rb = engine.read().unwrap().table_mutation_epoch(1);
+    conn.execute_batch("BEGIN; INSERT INTO t1 VALUES (NULL, 'aborted'); ROLLBACK;")
+        .unwrap();
+    assert!(engine.read().unwrap().table_mutation_epoch(1) > t1_before_rb);
+
+    conn.execute_batch("INSERT INTO t1 VALUES (NULL, 'c')")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT k, v FROM t1 ORDER BY k", &[])
+            .unwrap(),
+        vec![
+            vec![SqlValue::Integer(1), SqlValue::Text("a".into())],
+            vec![SqlValue::Integer(2), SqlValue::Text("b".into())],
+            vec![SqlValue::Integer(3), SqlValue::Text("c".into())],
+        ]
+    );
+}
+
+#[test]
+fn integer_pk_table_tracks_synthetic_rowid_flag_and_cleans_mixed_keys() {
+    let tmp = TempTestDir::new("synthetic_rowid_hint_tracking");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO t VALUES (1, 'one'), (2, 'two'), (NULL, 'three');
+         DELETE FROM t WHERE k = 2;",
+    )
+    .unwrap();
+
+    // Pure integer inserts/deletes leave zero synthetic rowid entries, and raw delete_row caches `false`.
+    assert!(
+        engine
+            .read()
+            .unwrap()
+            .test_live_keys(1, b'u')
+            .unwrap()
+            .is_empty()
+    );
+    {
+        let mut eng = engine.write().unwrap();
+        let pk1 = encode_i64_tagged_key(1);
+        assert!(
+            eng.delete_row(1, &pk1, WriteDurability::BufferedFast)
+                .unwrap()
+        );
+        assert_eq!(eng.test_table_has_synthetic_rowids(1), Some(false));
+    }
+
+    // Inserting a non-integer PK into an `INTEGER PRIMARY KEY` column creates a synthetic rowid
+    // mapping and flips the cached flag to `Some(true)`.
+    conn.execute_batch("INSERT INTO t VALUES ('text_key', 'txt')")
+        .unwrap();
+    assert_eq!(
+        engine.read().unwrap().test_table_has_synthetic_rowids(1),
+        Some(true)
+    );
+    assert_eq!(
+        engine
+            .read()
+            .unwrap()
+            .test_live_keys(1, b'u')
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Deleting both the remaining integer PK and `'text_key'` leaves zero orphan `'u'` or `'v'` entries.
+    conn.execute_batch("DELETE FROM t WHERE k = 3; DELETE FROM t WHERE k = 'text_key';")
+        .unwrap();
+    let eng = engine.read().unwrap();
+    assert!(eng.test_live_keys(1, b'u').unwrap().is_empty());
+    // Only the 3-byte `[0, 1, 'v']` rowid marker should remain in `NS_PK_BY_ROWID`.
+    let v_keys = eng.test_live_keys(1, b'v').unwrap();
+    assert_eq!(v_keys.len(), 1);
+    assert_eq!(v_keys[0].len(), 3);
 }

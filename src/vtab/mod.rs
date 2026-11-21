@@ -421,11 +421,10 @@ pub(super) struct AydbVTab {
     pub(super) pk_affinity: ColumnAffinity,
     /// The key is `INTEGER PRIMARY KEY`, a rowid alias: NULL on insert assigns the next key.
     pk_rowid_alias: bool,
-    /// `(engine mutation epoch, next automatic key)` as left by this table's last automatic
-    /// insert. Valid only while the epoch is unchanged: no other write, commit or rollback has
-    /// happened since, so `max key + 1` is still the next key. Otherwise the key is derived from
-    /// the rows again.
-    auto_key_cache: std::sync::Mutex<(u64, i64)>,
+    /// `(table mutation epoch, next automatic key)` as left by this table's last automatic
+    /// insert. Valid only while the table's epoch is unchanged: unrelated writes on other tables
+    /// do not invalidate it, while any write/commit/rollback/drop on this table bumps it.
+    auto_key_cache: std::sync::Mutex<Option<(u64, i64)>>,
     /// The declaration has a clause that is not honoured (`CHECK`, `DEFAULT`):
     /// every write that stores a row fails with this message.
     unsupported: Option<&'static str>,
@@ -1074,7 +1073,7 @@ unsafe fn vtab_create_or_connect(
             pk_col_idx: ddl.pk_col_idx,
             pk_affinity: ddl.pk_affinity,
             pk_rowid_alias: ddl.pk_rowid_alias,
-            auto_key_cache: std::sync::Mutex::new((u64::MAX, 0)),
+            auto_key_cache: std::sync::Mutex::new(None),
             unsupported: ddl.unsupported,
             pk_collation: ddl.pk_collation,
             secondary_indexes: ddl.secondary_indexes,
@@ -2583,6 +2582,9 @@ unsafe extern "system" fn vtab_update(
             return io_err_to_sqlite_rc(&e);
         }
 
+        let needs_synthetic_delete_check =
+            |pk: &[u8]| -> bool { !(vtab.pk_rowid_alias && decode_i64_tagged_key(pk).is_some()) };
+
         // Case 1: DELETE (`argc == 1`)
         if argc == 1 {
             let arg0 = *argv.offset(0);
@@ -2597,7 +2599,13 @@ unsafe extern "system" fn vtab_update(
                     Err(e) => return io_err_to_sqlite_rc(&e),
                 };
                 if let Some(old_pk) = old_pk_opt {
-                    if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
+                    let check_syn = needs_synthetic_delete_check(&old_pk);
+                    if let Err(e) = eng.delete_row_with_rowid_hint(
+                        vtab.table_id,
+                        &old_pk,
+                        vtab.durability,
+                        check_syn,
+                    ) {
                         return io_err_to_sqlite_rc(&e);
                     }
                 }
@@ -2609,7 +2617,13 @@ unsafe extern "system" fn vtab_update(
                     vtab.pk_collation,
                     false,
                 );
-                if let Err(e) = eng.delete_row(vtab.table_id, &old_pk, vtab.durability) {
+                let check_syn = needs_synthetic_delete_check(&old_pk);
+                if let Err(e) = eng.delete_row_with_rowid_hint(
+                    vtab.table_id,
+                    &old_pk,
+                    vtab.durability,
+                    check_syn,
+                ) {
                     return io_err_to_sqlite_rc(&e);
                 }
             }
@@ -2704,14 +2718,16 @@ unsafe extern "system" fn vtab_update(
                 // below takes over.
                 //
                 // The previous automatic insert of this table left `max + 1` behind together
-                // with the engine's mutation epoch. While the epoch is the same nothing else
-                // wrote, committed or rolled back since, so that value still is `max + 1`.
+                // with the table's mutation epoch. While the epoch is unchanged nothing modified
+                // this table's rows or rowids since, so that value still is `max + 1`.
+                let table_epoch = eng.table_mutation_epoch(vtab.table_id);
                 let cached = vtab
                     .auto_key_cache
                     .lock()
                     .ok()
-                    .filter(|cache| cache.0 == eng.mutation_epoch())
-                    .map(|cache| cache.1);
+                    .and_then(|guard| *guard)
+                    .filter(|(epoch, _)| *epoch == table_epoch)
+                    .map(|(_, next)| next);
                 let mut candidate = match cached {
                     Some(next) => next,
                     None => match max_integer_rowid(&mut eng, vtab.db as usize, vtab.table_id) {
@@ -2788,9 +2804,6 @@ unsafe extern "system" fn vtab_update(
             &vtab.col_collations,
             &vtab.secondary_indexes,
         );
-        if let Err(e) = constraints::push_unique_entries(vtab, &row_bytes, &mut sec_keys) {
-            return io_err_to_sqlite_rc(&e);
-        }
 
         let coerced_int_pk = if vtab.pk_rowid_alias {
             decode_i64_tagged_key(&new_pk)
@@ -2890,10 +2903,18 @@ unsafe extern "system" fn vtab_update(
         };
         let mut known_absent = auto_assigned;
         let mut pk_conflict_to_delete: Option<Vec<u8>> = None;
+        let unique_probes = if vtab.unique_def.is_empty() {
+            Vec::new()
+        } else {
+            match vtab.unique_def.probes(&row_bytes) {
+                Ok(p) => p,
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            }
+        };
         let unique_conflicts = match constraints::find_unique_conflicts(
             &mut eng,
             vtab,
-            &row_bytes,
+            &unique_probes,
             old_pk_opt.as_deref(),
         ) {
             Ok(conflicts) => conflicts,
@@ -2926,6 +2947,9 @@ unsafe extern "system" fn vtab_update(
                 known_absent = true;
             }
         }
+        if !unique_probes.is_empty() {
+            sec_keys.extend(unique_probes.into_iter().map(|p| (p.index_id, p.component)));
+        }
 
         // A row whose key changes keeps its rowid, as on a native table. SQLite addresses the
         // rows it still has queued by their old rowids, so a rowid that moved to another row
@@ -2957,17 +2981,35 @@ unsafe extern "system" fn vtab_update(
         }
         let applied = (|| -> io::Result<i64> {
             for conflict_pk in pk_conflict_to_delete.into_iter().chain(unique_conflicts) {
-                eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)?;
+                let check_syn = needs_synthetic_delete_check(&conflict_pk);
+                eng.delete_row_with_rowid_hint(
+                    vtab.table_id,
+                    &conflict_pk,
+                    vtab.durability,
+                    check_syn,
+                )?;
             }
 
             if let Some(conflict_pk) = rowid_conflict_pk {
-                eng.delete_row(vtab.table_id, &conflict_pk, vtab.durability)?;
+                let check_syn = needs_synthetic_delete_check(&conflict_pk);
+                eng.delete_row_with_rowid_hint(
+                    vtab.table_id,
+                    &conflict_pk,
+                    vtab.durability,
+                    check_syn,
+                )?;
             }
 
             // If UPDATE changed the physical PK bytes, delete the old PK row
             if let Some(old_pk) = old_pk_opt {
                 if old_pk.as_slice() != new_pk.as_slice() {
-                    eng.delete_row(vtab.table_id, &old_pk, vtab.durability)?;
+                    let check_syn = needs_synthetic_delete_check(&old_pk);
+                    eng.delete_row_with_rowid_hint(
+                        vtab.table_id,
+                        &old_pk,
+                        vtab.durability,
+                        check_syn,
+                    )?;
                     if same_pk {
                         known_absent = true;
                     }
@@ -3028,8 +3070,8 @@ unsafe extern "system" fn vtab_update(
             Err(e) => return io_err_to_sqlite_rc(&e),
         };
         if let (Some(next), Ok(mut cache)) = (cache_next_key, vtab.auto_key_cache.lock()) {
-            // After this insert's own writes: anything that happens later moves the epoch.
-            *cache = (eng.mutation_epoch(), next);
+            // After this insert's own writes: anything touching this table later moves its epoch.
+            *cache = Some((eng.table_mutation_epoch(vtab.table_id), next));
         }
         if !p_rowid.is_null() {
             *p_rowid = rid;

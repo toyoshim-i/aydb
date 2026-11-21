@@ -60,6 +60,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    pub(super) fn may_have_synthetic_rowids(&mut self, table_id: u16) -> io::Result<bool> {
+        if let Some(&has) = self.table_has_synthetic_rowids.get(&table_id) {
+            return Ok(has);
+        }
+        let by_pk_prefix = encode_namespace_prefix(table_id, NS_ROWID_BY_PK);
+        let mut has = !self
+            .scan_merged_prefix_range(&by_pk_prefix, &by_pk_prefix, true, None, 1, false)?
+            .is_empty();
+        if !has {
+            // Skip the 3-byte empty-suffix marker `[tid | 'v']` with `lower_inclusive = false`.
+            let pk_by_rowid_prefix = encode_namespace_prefix(table_id, NS_PK_BY_ROWID);
+            has = !self
+                .scan_merged_prefix_range(
+                    &pk_by_rowid_prefix,
+                    &pk_by_rowid_prefix,
+                    false,
+                    None,
+                    1,
+                    false,
+                )?
+                .is_empty();
+        }
+        self.table_has_synthetic_rowids.insert(table_id, has);
+        Ok(has)
+    }
+
     pub(crate) fn rowid_for_pk_view(
         &self,
         view: ReadView,
@@ -75,6 +101,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         pk: &[u8],
     ) -> io::Result<Option<i64>> {
+        if !matches!(src, ReadSource::Snapshot(_))
+            && self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
+        {
+            return Ok(None);
+        }
         let key = rowid_key(table_id, NS_ROWID_BY_PK, pk);
         match self.lookup_raw_entry_src(src, &key)? {
             Some((_, IndexValue::Inline(value))) if value.len() == 8 => {
@@ -130,6 +161,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         rowid: i64,
     ) -> io::Result<Option<Vec<u8>>> {
+        if !matches!(src, ReadSource::Snapshot(_))
+            && self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
+        {
+            return Ok(None);
+        }
         let key = rowid_key(table_id, NS_PK_BY_ROWID, &rowid.to_le_bytes());
         match self.lookup_raw_entry_src(src, &key)? {
             Some((_, IndexValue::Inline(pk))) => Ok(Some(pk)),
@@ -231,11 +267,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn append_rowid_deletes(
-        &self,
+        &mut self,
         table_id: u16,
         pk: &[u8],
         records: &mut Vec<WalRecord>,
     ) -> io::Result<()> {
+        if !self.may_have_synthetic_rowids(table_id)? {
+            return Ok(());
+        }
         if let Some(rowid) = self.rowid_for_pk_view(ReadView::Owner, table_id, pk)? {
             records.push(WalRecord::Delete {
                 key: rowid_key(table_id, NS_ROWID_BY_PK, pk),

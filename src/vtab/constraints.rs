@@ -7,22 +7,22 @@ use super::*;
 /// mutation so ABORT and IGNORE never leave partially replaced rows behind.
 ///
 /// Once the UNIQUE index is trusted (see [`index_is_trusted`]) the check is one index probe per
-/// non-NULL UNIQUE column of the new row. Before that, and for a connection whose migration
-/// failed, it scans the table, which is correct at any stage. Conflicts are returned in
+/// non-NULL UNIQUE column of the new row (`probes`). Before that, and for a connection whose
+/// migration failed, it scans the table, which is correct at any stage. Conflicts are returned in
 /// primary-key order either way.
 pub(super) fn find_unique_conflicts(
     engine: &mut StorageEngine<OsFs>,
     vtab: &AydbVTab,
-    row: &[u8],
+    probes: &[unique_key::UniqueProbe],
     old_pk: Option<&[u8]>,
 ) -> io::Result<Vec<Vec<u8>>> {
-    if vtab.unique_def.is_empty() {
+    if probes.is_empty() {
         return Ok(Vec::new());
     }
     if index_is_trusted(engine, vtab) {
-        find_conflicts_by_index(engine, vtab, row, old_pk)
+        find_conflicts_by_index(engine, vtab, probes, old_pk)
     } else {
-        find_conflicts_by_scan(engine, vtab, row, old_pk)
+        find_conflicts_by_scan(engine, vtab, probes, old_pk)
     }
 }
 
@@ -65,11 +65,11 @@ fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
 fn find_conflicts_by_index(
     engine: &mut StorageEngine<OsFs>,
     vtab: &AydbVTab,
-    row: &[u8],
+    probes: &[unique_key::UniqueProbe],
     old_pk: Option<&[u8]>,
 ) -> io::Result<Vec<Vec<u8>>> {
     let mut conflicts = std::collections::BTreeSet::new();
-    for probe in vtab.unique_def.probes(row)? {
+    for probe in probes {
         let digest = is_digest_component(&probe.component);
         for pk in
             engine.lookup_by_secondary_index(vtab.table_id, probe.index_id, &probe.component)?
@@ -98,23 +98,10 @@ fn find_conflicts_by_index(
 fn find_conflicts_by_scan(
     engine: &mut StorageEngine<OsFs>,
     vtab: &AydbVTab,
-    row: &[u8],
+    probes: &[unique_key::UniqueProbe],
     old_pk: Option<&[u8]>,
 ) -> io::Result<Vec<Vec<u8>>> {
     const BATCH_SIZE: usize = 128;
-    let mut keys = Vec::new();
-    for (index, &unique) in vtab.col_unique.iter().enumerate() {
-        if unique {
-            let key =
-                extract_column_key_bytes_with_collation(row, index, vtab.col_collations[index])?;
-            if key.first() != Some(&KEY_TAG_NULL) {
-                keys.push((index, key));
-            }
-        }
-    }
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let mut conflicts = Vec::new();
     let mut cursor: Option<Vec<u8>> = None;
@@ -131,16 +118,9 @@ fn find_conflicts_by_scan(
             if old_pk == Some(pk.as_slice()) {
                 continue;
             }
-            for (index, key) in &keys {
-                let existing = extract_column_key_bytes_with_collation(
-                    &existing_row,
-                    *index,
-                    vtab.col_collations[*index],
-                )?;
-                if existing == *key
-                    || build_numeric_alt_key(&existing).as_ref() == Some(key)
-                    || build_numeric_alt_key(key).as_ref() == Some(&existing)
-                {
+            for probe in probes {
+                let existing = unique_key_of_row(&existing_row, probe.col, probe.collation)?;
+                if existing.as_deref() == Some(probe.key.as_slice()) {
                     conflicts.push(pk);
                     break;
                 }
@@ -152,15 +132,4 @@ fn find_conflicts_by_scan(
         }
     }
     Ok(conflicts)
-}
-
-/// Adds the UNIQUE index entry of every `UNIQUE` column to `sec_keys`, derived from the finished
-/// row bytes (`UniqueDef::entries`).
-pub(super) fn push_unique_entries(
-    vtab: &AydbVTab,
-    row: &[u8],
-    sec_keys: &mut Vec<(u16, Vec<u8>)>,
-) -> io::Result<()> {
-    sec_keys.extend(vtab.unique_def.entries(row)?);
-    Ok(())
 }

@@ -392,6 +392,13 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
     /// rows (a cache) stays valid exactly as long as the epoch does not move.
     pub(super) mutation_epoch: u64,
+    /// Per-table counterpart to [`Self::mutation_epoch`]: bumped only for tables whose primary rows
+    /// or persistent rowid mappings changed, preventing writes on unrelated tables from
+    /// invalidating another table's `auto_key_cache`.
+    pub(super) table_mutation_epochs: HashMap<u16, u64>,
+    /// Lazy per-table cache indicating whether `table_id` may contain synthetic rowid mappings in
+    /// `NS_ROWID_BY_PK` (`'u'`) or non-marker `NS_PK_BY_ROWID` (`'v'`) entries.
+    pub(super) table_has_synthetic_rowids: BTreeMap<u16, bool>,
     /// Monotonic counter of committed user-data publications, incremented when committed batches
     /// (other than internal `EagerWriteOnRead` LRU tick updates) enter the `MemTable`. Used by
     /// read snapshots to detect concurrent writes without false write-upgrade aborts.
@@ -1172,6 +1179,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             next_vtab_token: 1,
             active_vtab_holders: HashMap::new(),
             mutation_epoch: 0,
+            table_mutation_epochs: HashMap::new(),
+            table_has_synthetic_rowids: BTreeMap::new(),
             data_generation: 0,
             table_has_row_meta: BTreeMap::new(),
             last_buf_append_lsn: 0,
@@ -1697,9 +1706,58 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.active_vtab_ids.get(&table_id).map(|s| s.to_string())
     }
 
-    /// The mutation epoch (see the field): equal values mean no row changed in between.
-    pub(crate) fn mutation_epoch(&self) -> u64 {
-        self.mutation_epoch
+    /// Per-table mutation epoch for `table_id` (0 if the table has not mutated since open).
+    pub(crate) fn table_mutation_epoch(&self, table_id: u16) -> u64 {
+        self.table_mutation_epochs
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_table_has_synthetic_rowids(&self, table_id: u16) -> Option<bool> {
+        self.table_has_synthetic_rowids.get(&table_id).copied()
+    }
+
+    pub(super) fn bump_table_mutation_epoch(&mut self, table_id: u16) {
+        let e = self.table_mutation_epochs.entry(table_id).or_insert(0);
+        *e = e.wrapping_add(1);
+    }
+
+    /// Updates per-table mutation epochs and synthetic-rowid tracking for committed or overlayed WAL
+    /// records whose keys belong to user-row or rowid namespaces.
+    pub(super) fn note_records_table_mutations(&mut self, records: &[WalRecord]) {
+        let mut last_tid: Option<u16> = None;
+        for rec in records {
+            let (key, is_put) = match rec {
+                WalRecord::PutInline { key, .. } => (key.as_slice(), true),
+                WalRecord::PutBlobPtr { key, .. } | WalRecord::Delete { key } => {
+                    (key.as_slice(), false)
+                }
+                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => continue,
+            };
+            if key.len() < 3 {
+                continue;
+            }
+            let tid = u16::from_be_bytes([key[0], key[1]]);
+            if tid == 0 {
+                continue;
+            }
+            let ns = key[2];
+            if is_put
+                && (ns == rowid::NS_ROWID_BY_PK || (ns == rowid::NS_PK_BY_ROWID && key.len() > 3))
+            {
+                self.table_has_synthetic_rowids.insert(tid, true);
+            }
+            if matches!(
+                ns,
+                NS_PRIMARY_ROW | rowid::NS_ROWID_BY_PK | rowid::NS_PK_BY_ROWID
+            ) && last_tid != Some(tid)
+            {
+                last_tid = Some(tid);
+                self.bump_table_mutation_epoch(tid);
+            }
+        }
     }
 
     /// Unregisters a live virtual table handle identified by `(table_id, token)`, removing the
@@ -1908,6 +1966,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_inline_thresholds.remove(&table_id);
         let was_capped = self.capped_tables.remove(&table_id).is_some();
         self.table_has_row_meta.insert(table_id, false);
+        self.bump_table_mutation_epoch(table_id);
         self.blob_cache.invalidate_table_blobs(table_id);
         if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
             q.retain(|(tid, _), _| *tid != table_id);
@@ -1919,6 +1978,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.dropped_tables_in_tx.push((table_id, was_capped));
         if internal_tx {
             self.commit_transaction()?;
+            self.table_has_synthetic_rowids.insert(table_id, false);
+        } else {
+            self.table_has_synthetic_rowids.remove(&table_id);
         }
         Ok(())
     }
@@ -2638,6 +2700,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         pk: &[u8],
         durability: WriteDurability,
     ) -> io::Result<bool> {
+        self.delete_row_with_rowid_hint(table_id, pk, durability, true)
+    }
+
+    /// Deletes a row (`pk`) in `table_id`, checking persistent synthetic rowid mappings only when
+    /// `check_synthetic_rowid` is `true` (callers on `INTEGER PRIMARY KEY` tables with an exact
+    /// integer `pk` know no synthetic rowid entry can exist for `pk`).
+    pub(crate) fn delete_row_with_rowid_hint(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        durability: WriteDurability,
+        check_synthetic_rowid: bool,
+    ) -> io::Result<bool> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
@@ -2660,7 +2735,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut records = vec![WalRecord::Delete {
             key: row_key.clone(),
         }];
-        self.append_rowid_deletes(table_id, pk, &mut records)?;
+        if check_synthetic_rowid {
+            self.append_rowid_deletes(table_id, pk, &mut records)?;
+        }
         let mut old_logical_size = 0u64;
         let mut old_meta_blob_ptr = None;
 
@@ -3746,6 +3823,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
             self.pending_tx_record_count += records.len() as u32;
+            self.note_records_table_mutations(&records);
             let record_undo = !self.savepoints.is_empty();
             for rec in records {
                 self.tx_overlay.apply(lsn, rec, record_undo);
@@ -3765,6 +3843,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.scratch_wal_encoded = raw;
         res?;
         self.next_lsn = self.next_lsn.max(lsn + 1);
+        if count_as_data_write && has_records {
+            self.note_records_table_mutations(&batch.records);
+        }
         self.invalidate_snapshot_memtable();
         self.memtable.apply_wal_batch_owned(batch);
         if count_as_data_write && has_records {

@@ -779,6 +779,60 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    fn bump_table_epochs_from_overlay_map(&mut self) {
+        let mut tids: Vec<u16> = Vec::new();
+        let mut last_tid: Option<u16> = None;
+        for key in self.tx_overlay.map.keys() {
+            if key.len() < 3 {
+                continue;
+            }
+            let tid = u16::from_be_bytes([key[0], key[1]]);
+            if tid != 0
+                && last_tid != Some(tid)
+                && matches!(
+                    key[2],
+                    crate::lru::NS_PRIMARY_ROW
+                        | super::rowid::NS_ROWID_BY_PK
+                        | super::rowid::NS_PK_BY_ROWID
+                )
+            {
+                last_tid = Some(tid);
+                tids.push(tid);
+            }
+        }
+        for tid in tids {
+            self.bump_table_mutation_epoch(tid);
+        }
+    }
+
+    fn bump_table_epochs_from_undo_suffix(&mut self, undo_target_len: usize) {
+        let mut tids: Vec<u16> = Vec::new();
+        let mut last_tid: Option<u16> = None;
+        for (key, _) in &self.tx_overlay.undo[undo_target_len..] {
+            if key.len() < 3 {
+                continue;
+            }
+            let tid = u16::from_be_bytes([key[0], key[1]]);
+            if tid != 0
+                && last_tid != Some(tid)
+                && matches!(
+                    key[2],
+                    crate::lru::NS_PRIMARY_ROW
+                        | super::rowid::NS_ROWID_BY_PK
+                        | super::rowid::NS_PK_BY_ROWID
+                )
+            {
+                last_tid = Some(tid);
+                if !tids.contains(&tid) {
+                    tids.push(tid);
+                }
+            }
+        }
+        for tid in tids {
+            self.bump_table_mutation_epoch(tid);
+        }
+    }
+
     fn absorb_durable_through(&mut self, target: u64) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         while self
@@ -789,6 +843,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Some((_, entries)) = self.pending_group.pop_front() {
                 if !entries.is_empty() {
                     self.data_generation += 1;
+                    let mut last_tid: Option<u16> = None;
+                    for key in entries.keys() {
+                        if key.len() < 3 {
+                            continue;
+                        }
+                        let tid = u16::from_be_bytes([key[0], key[1]]);
+                        if tid == 0 || last_tid == Some(tid) {
+                            continue;
+                        }
+                        if matches!(
+                            key[2],
+                            crate::lru::NS_PRIMARY_ROW
+                                | super::rowid::NS_ROWID_BY_PK
+                                | super::rowid::NS_PK_BY_ROWID
+                        ) {
+                            last_tid = Some(tid);
+                            let e = self.table_mutation_epochs.entry(tid).or_insert(0);
+                            *e = e.wrapping_add(1);
+                        }
+                    }
                 }
                 self.invalidate_snapshot_memtable();
                 self.memtable.absorb(entries);
@@ -848,6 +922,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
         let mut dropped_any_capped = false;
         for (tid, was_capped) in dropped_tables {
+            self.table_has_synthetic_rowids.remove(&tid);
             self.access_tracker.remove_table(tid);
             if let Some(mut old_w) = self.active_lru_writers.remove(&tid) {
                 // Left unpoisoned on purpose: every byte of this segment is dead from here on, so
@@ -928,6 +1003,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             return Ok(());
         }
+        self.bump_table_epochs_from_overlay_map();
         self.tx_depth = 0;
         self.vtabs_created_in_tx.clear();
         self.tx_owner_conn = None;
@@ -1145,6 +1221,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// needed: the overlay only contains this transaction's own writes and clears cleanly.
     fn rollback_to_transaction_start(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.bump_table_epochs_from_overlay_map();
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
@@ -1160,6 +1237,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     fn restore_statement_tx_state(&mut self, undo_target_len: usize, st: &StatementMetaSnapshot) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.bump_table_epochs_from_undo_suffix(undo_target_len);
         self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = st.next_lsn;
         while self.statement_blob_undo.len() > st.blob_undo_len {
@@ -1254,6 +1332,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn restore_tx_state(&mut self, undo_target_len: usize, snap: &TxMetaSnapshot) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.bump_table_epochs_from_undo_suffix(undo_target_len);
         self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = snap.next_lsn;
         for (&seq, b) in &mut self.std_blobs {
