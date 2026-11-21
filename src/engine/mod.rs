@@ -373,6 +373,8 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) tx_overlay: tx::TxOverlay,
     pub(super) tx_start_meta: TxMetaSnapshot,
     pub(super) savepoints: Vec<SavepointMarker>,
+    pub(super) statement_savepoint_active: bool,
+    pub(super) statement_blob_undo: Vec<tx::BlobUndo>,
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
@@ -1161,6 +1163,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_overlay: tx::TxOverlay::default(),
             tx_start_meta: TxMetaSnapshot::default(),
             savepoints: Vec::new(),
+            statement_savepoint_active: false,
+            statement_blob_undo: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
             vtabs_created_in_tx: Vec::new(),
             quotas_modified_in_tx: false,
@@ -1580,11 +1584,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.active_vtab_ids.insert(table_id, name.clone());
             }
             for marker in &mut self.savepoints {
-                if marker.meta_snapshot.active_vtab_ids.get(&table_id) == orig.as_ref() {
-                    marker
-                        .meta_snapshot
-                        .active_vtab_ids
-                        .insert(table_id, name.clone());
+                if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
+                    if snap.active_vtab_ids.get(&table_id) == orig.as_ref() {
+                        snap.active_vtab_ids.insert(table_id, name.clone());
+                    }
                 }
             }
             self.tx_start_meta.active_vtab_ids.insert(table_id, name);
@@ -1700,8 +1703,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             {
                 self.tx_start_meta.active_vtab_ids.remove(&table_id);
                 for marker in &mut self.savepoints {
-                    if marker.meta_snapshot.active_vtab_ids.get(&table_id) == Some(&removed_name) {
-                        marker.meta_snapshot.active_vtab_ids.remove(&table_id);
+                    if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
+                        if snap.active_vtab_ids.get(&table_id) == Some(&removed_name) {
+                            snap.active_vtab_ids.remove(&table_id);
+                        }
                     }
                 }
             }
@@ -3360,7 +3365,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let writer = self.active_std_writer.as_mut().unwrap();
                 let ptr = writer.append_blob(key, value)?;
                 if let Some(b) = self.std_blobs.get_mut(&writer.seq_id()) {
+                    let prev_len = b.file_len;
                     b.file_len = writer.current_len();
+                    if self.statement_savepoint_active {
+                        let delta = b.file_len.saturating_sub(prev_len);
+                        if delta > 0 {
+                            self.statement_blob_undo.push(tx::BlobUndo::Appended {
+                                kind: BlobKind::Standard,
+                                table_id: 0,
+                                seg_id: writer.seq_id(),
+                                len: delta,
+                            });
+                        }
+                    }
                 }
                 Ok(ptr)
             }
@@ -3419,7 +3436,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let writer = self.active_lru_writers.get_mut(&table_id).unwrap();
                 let ptr = writer.append_blob(key, value)?;
                 if let Some(b) = self.lru_blobs.get_mut(&(table_id, writer.seq_id())) {
+                    let prev_len = b.file_len;
                     b.file_len = writer.current_len();
+                    if self.statement_savepoint_active {
+                        let delta = b.file_len.saturating_sub(prev_len);
+                        if delta > 0 {
+                            self.statement_blob_undo.push(tx::BlobUndo::Appended {
+                                kind: BlobKind::Lru,
+                                table_id,
+                                seg_id: writer.seq_id(),
+                                len: delta,
+                            });
+                        }
+                    }
                 }
                 Ok(ptr)
             }
@@ -3430,12 +3459,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         match ptr.kind {
             BlobKind::Standard => {
                 if let Some(b) = self.std_blobs.get_mut(&ptr.seg_id) {
+                    let prev_dead = b.dead_bytes;
                     b.dead_bytes = b.dead_bytes.saturating_add(ptr.len as u64);
+                    if self.statement_savepoint_active {
+                        let delta = b.dead_bytes.saturating_sub(prev_dead);
+                        if delta > 0 {
+                            self.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                                kind: BlobKind::Standard,
+                                table_id: 0,
+                                seg_id: ptr.seg_id,
+                                len: delta,
+                            });
+                        }
+                    }
                 }
             }
             BlobKind::Lru => {
                 if let Some(b) = self.lru_blobs.get_mut(&(ptr.table_id, ptr.seg_id)) {
+                    let prev_dead = b.dead_bytes;
                     b.dead_bytes = b.dead_bytes.saturating_add(ptr.len as u64);
+                    if self.statement_savepoint_active {
+                        let delta = b.dead_bytes.saturating_sub(prev_dead);
+                        if delta > 0 {
+                            self.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                                kind: BlobKind::Lru,
+                                table_id: ptr.table_id,
+                                seg_id: ptr.seg_id,
+                                len: delta,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -3957,34 +4010,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok((keys, (pk.len() + value_len) as u64))
     }
 
-    /// Newest in-memory entry for `key` as seen by `src`: the transaction overlay (hidden for
-    /// non-owner sources) over the committed `MemTable`.
+    /// Newest in-memory entry for `key` as seen by `src`: the transaction overlay, followed
+    /// inside an active transaction by unflushed `pending_group` batches (hidden from autocommit
+    /// and non-owner readers), over the committed `MemTable`.
     #[inline]
     fn mem_get_src<'a>(
         &'a self,
         src: ReadSource<'a, FS::File>,
         key: &[u8],
     ) -> Option<&'a crate::memtable::MemEntry> {
-        if src.is_owner() && self.tx_overlay.may_contain_key(key) {
-            if let Some(e) = self.tx_overlay.map.get(key) {
-                return Some(e);
+        if src.is_owner() {
+            if self.tx_overlay.may_contain_key(key) {
+                if let Some(e) = self.tx_overlay.map.get(key) {
+                    return Some(e);
+                }
+            }
+            if self.tx_depth > 0 && !self.pending_group.is_empty() {
+                for (_, entries) in self.pending_group.iter().rev() {
+                    if let Some(e) = entries.get(key) {
+                        return Some(e);
+                    }
+                }
             }
         }
         self.memtable_for(src).get(key)
-    }
-
-    /// Overlay map visible to `src` (empty for non-owner sources or empty overlay).
-    #[inline]
-    fn visible_overlay_src(
-        &self,
-        src: ReadSource<'_, FS::File>,
-    ) -> &BTreeMap<Vec<u8>, crate::memtable::MemEntry> {
-        static EMPTY: BTreeMap<Vec<u8>, crate::memtable::MemEntry> = BTreeMap::new();
-        if !src.is_owner() || self.tx_overlay.is_empty() {
-            &EMPTY
-        } else {
-            &self.tx_overlay.map
-        }
     }
 
     pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {

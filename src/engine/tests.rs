@@ -5129,7 +5129,14 @@ fn publish_committed_transaction_does_not_reabsorb_flushed_pending_group_entries
         }
         let ticket = commit_into_group(&mut engine, 1, b"seeded_k", b"v1");
         engine.begin_transaction_for_conn(2).unwrap();
-        assert!(engine.tx_overlay.map.contains_key(&seeded_row_key));
+        assert!(
+            !engine.tx_overlay.map.contains_key(&seeded_row_key),
+            "pending_group entries must be shared directly without cloning into tx_overlay"
+        );
+        assert_eq!(
+            engine.get_row(1, b"seeded_k").unwrap(),
+            Some(b"v1".to_vec())
+        );
         for i in 0..4u32 {
             let k = format!("tx2_{i:02}");
             engine
@@ -7939,4 +7946,231 @@ fn multi_chunk_sync_transaction_uses_single_wal_barrier_and_recovers_cleanly() {
         let expected = vec![(i as u8).wrapping_add(11); 3_000];
         assert_eq!(reopened2.get_row(1, pk.as_bytes()).unwrap(), Some(expected));
     }
+}
+
+#[test]
+fn pending_group_visible_to_next_writer_without_cloning_into_overlay() {
+    let tmp = TempTestDir::new("ph6_pending_group_layer");
+    let mut engine = open_group_engine(&tmp);
+
+    // tx1 writes k1=a, k2=b into pending_group.
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine.put_row(1, b"k1", b"a", &[], GROUP_SYNC).unwrap();
+    engine.put_row(1, b"k2", b"b", &[], GROUP_SYNC).unwrap();
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    let CommitStep::AwaitingGroup {
+        lsn: lsn1,
+        file: file1,
+        ..
+    } = engine.begin_commit_for_conn(1).unwrap()
+    else {
+        panic!("expected group commit for tx1");
+    };
+
+    // tx2 overwrites k2=c, adds k3=d, and deletes k1 into pending_group.
+    engine.begin_transaction_for_conn(2).unwrap();
+    engine.put_row(1, b"k2", b"c", &[], GROUP_SYNC).unwrap();
+    engine.put_row(1, b"k3", b"d", &[], GROUP_SYNC).unwrap();
+    engine.delete_row(1, b"k1", GROUP_SYNC).unwrap();
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    let CommitStep::AwaitingGroup { lsn: lsn2, .. } = engine.begin_commit_for_conn(2).unwrap()
+    else {
+        panic!("expected group commit for tx2");
+    };
+
+    // Autocommit / non-owner readers must see nothing until durable flush.
+    assert_eq!(row_visible_to(&engine, 9, b"k2"), None);
+
+    // tx3 begins: overlay must stay empty (zero clones from pending_group).
+    engine.begin_transaction_for_conn(3).unwrap();
+    assert!(engine.tx_overlay.map.is_empty());
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(b"c".to_vec()));
+    assert_eq!(engine.get_row(1, b"k3").unwrap(), Some(b"d".to_vec()));
+
+    let fwd = engine.scan_table_range(1, None, None, 100).unwrap();
+    assert_eq!(
+        fwd,
+        vec![
+            (b"k2".to_vec(), b"c".to_vec()),
+            (b"k3".to_vec(), b"d".to_vec()),
+        ]
+    );
+    let mut pks = Vec::new();
+    let mut slab = Vec::new();
+    let mut spans = Vec::new();
+    let mut lazy = Vec::new();
+    engine
+        .scan_range_into_slab(
+            1,
+            None,
+            None,
+            true,
+            100,
+            false,
+            &mut pks,
+            &mut slab,
+            &mut spans,
+            Some(&mut lazy),
+        )
+        .unwrap();
+    assert_eq!(pks, vec![b"k3".to_vec(), b"k2".to_vec()]);
+    assert_eq!(
+        spans.iter().map(|&(s, e)| &slab[s..e]).collect::<Vec<_>>(),
+        vec![b"d", b"c"]
+    );
+
+    // Inside a savepoint in tx3, overwrite k2 then roll back: pending_group k2=c still wins.
+    engine.savepoint_for_conn(3, 1).unwrap();
+    engine.put_row(1, b"k2", b"e", &[], GROUP_SYNC).unwrap();
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(b"e".to_vec()));
+    engine.rollback_to_savepoint_for_conn(3, 1).unwrap();
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(b"c".to_vec()));
+    engine.rollback_transaction_for_conn(3).unwrap();
+
+    // Flush tx1 only while tx2 remains in pending_group, then flush tx2.
+    engine
+        .finish_group_flush(lsn1, file1.sync_barrier())
+        .unwrap();
+    assert_eq!(row_visible_to(&engine, 9, b"k2"), Some(b"b".to_vec()));
+    engine.begin_transaction_for_conn(4).unwrap();
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(b"c".to_vec()));
+    engine.rollback_transaction_for_conn(4).unwrap();
+
+    engine.finish_group_flush(lsn2, Ok(())).unwrap();
+    assert_eq!(row_visible_to(&engine, 9, b"k1"), None);
+    assert_eq!(row_visible_to(&engine, 9, b"k2"), Some(b"c".to_vec()));
+    assert_eq!(row_visible_to(&engine, 9, b"k3"), Some(b"d".to_vec()));
+}
+
+#[test]
+fn tx_overlay_rollback_preserves_filter_and_bounds_without_false_negatives() {
+    let mut overlay = tx::TxOverlay::default();
+    let rec = |v: &[u8]| crate::wal::WalRecord::PutInline {
+        key: v.to_vec(),
+        value: v.to_vec(),
+    };
+    overlay.apply(1, rec(b"b"), true);
+    overlay.apply(2, rec(b"d"), true);
+    let outer_undo = overlay.undo.len();
+
+    overlay.apply(3, rec(b"a"), true);
+    overlay.apply(4, rec(b"c"), true);
+    overlay.apply(5, rec(b"z"), true);
+    assert_eq!(overlay.min_key.as_deref(), Some(b"a".as_slice()));
+    assert_eq!(overlay.max_key.as_deref(), Some(b"z".as_slice()));
+
+    // Roll back inner mutations: surviving keys keep no false negatives and shrink min/max bounds.
+    overlay.rollback_to(outer_undo);
+    assert!(overlay.may_contain_key(b"b"));
+    assert!(overlay.may_contain_key(b"d"));
+    assert_eq!(overlay.min_key.as_deref(), Some(b"b".as_slice()));
+    assert_eq!(overlay.max_key.as_deref(), Some(b"d".as_slice()));
+
+    // Emptying the overlay clears min/max bounds and resets the filter.
+    overlay.rollback_to(0);
+    assert!(overlay.map.is_empty());
+    assert_eq!(overlay.min_key, None);
+    assert_eq!(overlay.max_key, None);
+    assert_eq!(overlay.filter, [0; 16]);
+}
+
+#[test]
+fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without_full_snapshot() {
+    let tmp = TempTestDir::new("ph6_stmt_savepoint");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    engine.register_capped_table(7, 100_000).unwrap();
+    let payload1 = vec![0x11u8; 256];
+    engine
+        .put_row(
+            7,
+            b"k1",
+            &payload1,
+            &[(1, b"tag1".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    let initial_dead: u64 = engine
+        .lru_blobs
+        .iter()
+        .filter(|&(&(tid, _), _)| tid == 7)
+        .map(|(_, b)| b.dead_bytes)
+        .sum();
+    let initial_len: u64 = engine
+        .lru_blobs
+        .iter()
+        .filter(|&(&(tid, _), _)| tid == 7)
+        .map(|(_, b)| b.file_len)
+        .sum();
+    let initial_logical_bytes = engine.capped_table_state(7).unwrap().current_logical_bytes;
+    let initial_row_meta = engine.table_has_row_meta.clone();
+
+    engine.statement_savepoint_for_conn(1, 7).unwrap();
+    assert!(engine.statement_savepoint_active);
+    assert!(matches!(
+        engine.savepoints.last().unwrap().meta,
+        tx::SavepointMeta::Statement(_)
+    ));
+
+    // Delete k1 (marks k1 blob dead) and insert k2 (appends new blob).
+    assert!(
+        engine
+            .delete_row(7, b"k1", WriteDurability::BufferedFast)
+            .unwrap()
+    );
+    let payload2 = vec![0x22u8; 256];
+    engine
+        .put_row(
+            7,
+            b"k2",
+            &payload2,
+            &[(1, b"tag2".to_vec())],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    let after_len: u64 = engine
+        .lru_blobs
+        .iter()
+        .filter(|&(&(tid, _), _)| tid == 7)
+        .map(|(_, b)| b.file_len)
+        .sum();
+    let aborted_len = after_len - initial_len;
+    assert!(aborted_len > 0);
+
+    engine
+        .rollback_to_savepoint_for_conn(1, STATEMENT_SAVEPOINT)
+        .unwrap();
+    engine
+        .release_savepoint_for_conn(1, STATEMENT_SAVEPOINT)
+        .unwrap();
+
+    let final_dead: u64 = engine
+        .lru_blobs
+        .iter()
+        .filter(|&(&(tid, _), _)| tid == 7)
+        .map(|(_, b)| b.dead_bytes)
+        .sum();
+    assert_eq!(
+        final_dead,
+        initial_dead + aborted_len,
+        "rollback must unmark deleted k1 blob and mark only aborted k2 blob bytes as dead"
+    );
+    assert_eq!(
+        engine.capped_table_state(7).unwrap().current_logical_bytes,
+        initial_logical_bytes
+    );
+    assert_eq!(engine.table_has_row_meta, initial_row_meta);
+    assert_eq!(engine.get_row(7, b"k1").unwrap(), Some(payload1));
+    assert_eq!(engine.get_row(7, b"k2").unwrap(), None);
+    assert!(!engine.statement_savepoint_active);
+    assert!(engine.statement_blob_undo.is_empty());
+
+    engine.rollback_transaction_for_conn(1).unwrap();
 }

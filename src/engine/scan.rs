@@ -1056,13 +1056,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         };
 
-        let mut mem_iter = MemView::new(
-            self.memtable_for(src)
-                .iter_range(range.lo_bound(), range.hi_bound()),
-            self.visible_overlay_src(src)
-                .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
-            false,
-        );
+        let mut mem_iter = self.mem_view_for_dir(src, range.lo_bound(), range.hi_bound(), false);
         let mut mem_exhausted = false;
 
         let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
@@ -1246,13 +1240,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         };
 
-        let mut mem_iter = MemView::new(
-            self.memtable_for(src)
-                .iter_range(range.lo_bound(), range.hi_bound()),
-            self.visible_overlay_src(src)
-                .range::<[u8], _>((range.lo_bound(), range.hi_bound())),
-            true,
-        );
+        let mut mem_iter = self.mem_view_for_dir(src, range.lo_bound(), range.hi_bound(), true);
         let mut mem_exhausted = false;
 
         let seg_upper_arg = range.seg_upper_arg();
@@ -1381,17 +1369,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 }
 
 type MemRange<'a> = std::collections::btree_map::Range<'a, Vec<u8>, MemEntry>;
+type MemHead<'a> = Option<(&'a Vec<u8>, &'a MemEntry)>;
 
-/// Single ordered source made of the committed `MemTable` and the visible transaction overlay.
+#[derive(Clone, Copy)]
+enum MemSource {
+    Overlay,
+    Pending(usize),
+    Mem,
+}
+
+/// Single ordered source made of the active transaction overlay, any unflushed `pending_group`
+/// commits (visible only to the owner of an active transaction), and the committed `MemTable`.
 ///
-/// Yields `(key, entry, from_overlay)`; when both hold a key the overlay entry is returned and the
-/// `MemTable` entry is skipped (source precedence, independent of LSN values). `reverse` selects
-/// descending order (both ranges are consumed from the back).
+/// Yields `(key, entry, from_overlay)` in strict source-precedence order (`overlay > newest pending
+/// > ... > oldest pending > MemTable`, independent of LSN values). `reverse` selects descending order.
 pub(super) struct MemView<'a> {
     mem: crate::memtable::MemTableRange<'a>,
     ov: MemRange<'a>,
-    mem_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
-    ov_head: Option<(&'a Vec<u8>, &'a MemEntry)>,
+    pending: Vec<(MemRange<'a>, MemHead<'a>)>,
+    mem_head: MemHead<'a>,
+    ov_head: MemHead<'a>,
     reverse: bool,
 }
 
@@ -1399,20 +1396,51 @@ impl<'a> MemView<'a> {
     fn new(
         mut mem: crate::memtable::MemTableRange<'a>,
         mut ov: MemRange<'a>,
+        pending_ranges: Vec<MemRange<'a>>,
         reverse: bool,
     ) -> Self {
-        let mem_head = if reverse { mem.next_back() } else { mem.next() };
-        let ov_head = if reverse { ov.next_back() } else { ov.next() };
+        let mem_head = Self::step_mem(&mut mem, reverse);
+        let ov_head = Self::step_range(&mut ov, reverse);
+        let pending = pending_ranges
+            .into_iter()
+            .map(|mut r| {
+                let head = Self::step_range(&mut r, reverse);
+                (r, head)
+            })
+            .collect();
         Self {
             mem,
             ov,
+            pending,
             mem_head,
             ov_head,
             reverse,
         }
     }
 
-    /// True when the overlay head is emitted before (or instead of) the memtable head.
+    #[inline]
+    fn step_mem(
+        iter: &mut crate::memtable::MemTableRange<'a>,
+        reverse: bool,
+    ) -> Option<(&'a Vec<u8>, &'a MemEntry)> {
+        if reverse {
+            iter.next_back()
+        } else {
+            iter.next()
+        }
+    }
+
+    #[inline]
+    fn step_range(iter: &mut MemRange<'a>, reverse: bool) -> Option<(&'a Vec<u8>, &'a MemEntry)> {
+        if reverse {
+            iter.next_back()
+        } else {
+            iter.next()
+        }
+    }
+
+    /// True when the overlay head is emitted before (or instead of) the memtable head (fast path
+    /// when no `pending_group` batches are layered).
     #[inline]
     fn overlay_first(&self) -> Option<bool> {
         match (self.mem_head, self.ov_head) {
@@ -1428,39 +1456,93 @@ impl<'a> MemView<'a> {
     }
 
     #[inline]
+    fn key_beats(&self, cand: &[u8], cur: &[u8]) -> bool {
+        if self.reverse { cand > cur } else { cand < cur }
+    }
+
+    fn best_source(&self) -> Option<(MemSource, &'a [u8])> {
+        let mut best: Option<(MemSource, &'a [u8])> = self
+            .ov_head
+            .map(|(k, _)| (MemSource::Overlay, k.as_slice()));
+        for (idx, (_, head)) in self.pending.iter().enumerate() {
+            if let Some((pk, _)) = head {
+                let pks = pk.as_slice();
+                if best.is_none_or(|(_, bk)| self.key_beats(pks, bk)) {
+                    best = Some((MemSource::Pending(idx), pks));
+                }
+            }
+        }
+        if let Some((mk, _)) = self.mem_head {
+            let mks = mk.as_slice();
+            if best.is_none_or(|(_, bk)| self.key_beats(mks, bk)) {
+                best = Some((MemSource::Mem, mks));
+            }
+        }
+        best
+    }
+
+    #[inline]
     fn peek_key(&self) -> Option<&'a [u8]> {
-        match self.overlay_first()? {
-            true => self.ov_head.map(|(k, _)| k.as_slice()),
-            false => self.mem_head.map(|(k, _)| k.as_slice()),
+        if self.pending.is_empty() {
+            match self.overlay_first()? {
+                true => self.ov_head.map(|(k, _)| k.as_slice()),
+                false => self.mem_head.map(|(k, _)| k.as_slice()),
+            }
+        } else {
+            self.best_source().map(|(_, k)| k)
         }
     }
 
     fn advance(&mut self) -> Option<(&'a Vec<u8>, &'a MemEntry, bool)> {
-        let from_overlay = self.overlay_first()?;
-        if from_overlay {
-            let (k, e) = self.ov_head.take()?;
-            self.ov_head = if self.reverse {
-                self.ov.next_back()
+        if self.pending.is_empty() {
+            let from_overlay = self.overlay_first()?;
+            if from_overlay {
+                let (k, e) = self.ov_head.take()?;
+                self.ov_head = Self::step_range(&mut self.ov, self.reverse);
+                if self.mem_head.is_some_and(|(mk, _)| mk == k) {
+                    self.mem_head = Self::step_mem(&mut self.mem, self.reverse);
+                }
+                return Some((k, e, true));
             } else {
-                self.ov.next()
-            };
-            if self.mem_head.is_some_and(|(mk, _)| mk == k) {
-                self.mem_head = if self.reverse {
-                    self.mem.next_back()
-                } else {
-                    self.mem.next()
-                };
+                let (k, e) = self.mem_head.take()?;
+                self.mem_head = Self::step_mem(&mut self.mem, self.reverse);
+                return Some((k, e, false));
             }
-            Some((k, e, true))
-        } else {
-            let (k, e) = self.mem_head.take()?;
-            self.mem_head = if self.reverse {
-                self.mem.next_back()
-            } else {
-                self.mem.next()
-            };
-            Some((k, e, false))
         }
+
+        let (winner, _) = self.best_source()?;
+        let (k, e, from_overlay) = match winner {
+            MemSource::Overlay => {
+                let (k, e) = self.ov_head.take()?;
+                self.ov_head = Self::step_range(&mut self.ov, self.reverse);
+                (k, e, true)
+            }
+            MemSource::Pending(win_idx) => {
+                let (ref mut r, ref mut head) = self.pending[win_idx];
+                let (k, e) = head.take()?;
+                *head = Self::step_range(r, self.reverse);
+                (k, e, true)
+            }
+            MemSource::Mem => {
+                let (k, e) = self.mem_head.take()?;
+                self.mem_head = Self::step_mem(&mut self.mem, self.reverse);
+                (k, e, false)
+            }
+        };
+        let start_pending = match winner {
+            MemSource::Overlay => 0,
+            MemSource::Pending(win_idx) => win_idx + 1,
+            MemSource::Mem => self.pending.len(),
+        };
+        for (r, head) in &mut self.pending[start_pending..] {
+            if head.is_some_and(|(pk, _)| pk == k) {
+                *head = Self::step_range(r, self.reverse);
+            }
+        }
+        if !matches!(winner, MemSource::Mem) && self.mem_head.is_some_and(|(mk, _)| mk == k) {
+            self.mem_head = Self::step_mem(&mut self.mem, self.reverse);
+        }
+        Some((k, e, from_overlay))
     }
 }
 
@@ -1474,11 +1556,11 @@ impl<'a> Iterator for MemView<'a> {
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
-    /// Ascending view over the committed `MemTable` plus the transaction overlay visible to the
-    /// current reader.
+    /// Ascending view over the committed `MemTable` plus any transaction overlay / pending group
+    /// batches visible to the current reader.
     #[inline]
     pub(super) fn mem_view<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> MemView<'a> {
-        self.mem_view_for(ReadSource::Owner, lo, hi)
+        self.mem_view_for_dir(ReadSource::Owner, lo, hi, false)
     }
 
     #[inline]
@@ -1488,6 +1570,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         lo: Bound<&'a [u8]>,
         hi: Bound<&'a [u8]>,
     ) -> MemView<'a> {
+        self.mem_view_for_dir(src, lo, hi, false)
+    }
+
+    #[inline]
+    pub(super) fn mem_view_for_dir<'a>(
+        &'a self,
+        src: ReadSource<'a, FS::File>,
+        lo: Bound<&'a [u8]>,
+        hi: Bound<&'a [u8]>,
+        reverse: bool,
+    ) -> MemView<'a> {
         static EMPTY: std::collections::BTreeMap<Vec<u8>, crate::memtable::MemEntry> =
             std::collections::BTreeMap::new();
         let ov_range = if !src.is_owner() || !self.tx_overlay.overlaps_range(lo, hi) {
@@ -1495,6 +1588,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             self.tx_overlay.map.range::<[u8], _>((lo, hi))
         };
-        MemView::new(self.memtable_for(src).iter_range(lo, hi), ov_range, false)
+        let pending_ranges =
+            if src.is_owner() && self.tx_depth > 0 && !self.pending_group.is_empty() {
+                let mut ranges = Vec::with_capacity(self.pending_group.len());
+                for (_, entries) in self.pending_group.iter().rev() {
+                    ranges.push(entries.range::<[u8], _>((lo, hi)));
+                }
+                ranges
+            } else {
+                Vec::new()
+            };
+        MemView::new(
+            self.memtable_for(src).iter_range(lo, hi),
+            ov_range,
+            pending_ranges,
+            reverse,
+        )
     }
 }

@@ -5,7 +5,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::index::IndexValue;
+use crate::index::{BloomFilter, IndexValue};
 use crate::lru::CappedTableState;
 use crate::memtable::MemEntry;
 use crate::pal::{PlatformFile, PlatformFs};
@@ -201,6 +201,37 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) quotas_modified_in_tx: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BlobUndo {
+    Appended {
+        kind: crate::wal::BlobKind,
+        table_id: u16,
+        seg_id: u64,
+        len: u64,
+    },
+    MarkedDead {
+        kind: crate::wal::BlobKind,
+        table_id: u16,
+        seg_id: u64,
+        len: u64,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct StatementMetaSnapshot {
+    pub(super) next_lsn: u64,
+    pub(super) table_id: u16,
+    pub(super) capped_table: Option<CappedTableState>,
+    pub(super) table_has_row_meta: Option<bool>,
+    pub(super) blob_undo_len: usize,
+}
+
+#[derive(Clone)]
+pub(crate) enum SavepointMeta {
+    Full(Box<TxMetaSnapshot>),
+    Statement(StatementMetaSnapshot),
+}
+
 /// Private, ordered write set of the active explicit transaction.
 ///
 /// While `tx_depth > 0` every mutation lands here instead of in the shared `MemTable`, so the
@@ -224,17 +255,20 @@ pub(crate) struct TxOverlay {
 }
 
 impl TxOverlay {
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
     pub(super) fn clear(&mut self) {
         self.map.clear();
         self.undo.clear();
         self.min_key = None;
         self.max_key = None;
         self.filter = [0; 16];
+    }
+
+    #[inline]
+    fn bloom_indices(key: &[u8]) -> ((usize, u64), (usize, u64)) {
+        let (h1, h2) = BloomFilter::hash_pair(key);
+        let slot1 = ((h1 as usize & 1023) / 64, 1u64 << (h1 & 63));
+        let slot2 = ((h2 as usize & 1023) / 64, 1u64 << (h2 & 63));
+        (slot1, slot2)
     }
 
     #[inline]
@@ -252,15 +286,8 @@ impl TxOverlay {
                 return false;
             }
         }
-        let h1 = crate::util::crc32c::crc32c_append(0, key);
-        if (self.filter[(h1 as usize & 1023) / 64] & (1 << (h1 & 63))) == 0 {
-            return false;
-        }
-        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, key);
-        if (self.filter[(h2 as usize & 1023) / 64] & (1 << (h2 & 63))) == 0 {
-            return false;
-        }
-        true
+        let ((w1, m1), (w2, m2)) = Self::bloom_indices(key);
+        (self.filter[w1] & m1) != 0 && (self.filter[w2] & m2) != 0
     }
 
     #[inline]
@@ -300,18 +327,9 @@ impl TxOverlay {
             None => self.max_key = Some(key.to_vec()),
             _ => {}
         }
-        let h1 = crate::util::crc32c::crc32c_append(0, key);
-        let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, key);
-        self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
-        self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
-    }
-
-    /// Adds `entries`, which belong to earlier transactions, without an undo record.
-    fn seed(&mut self, entries: &BTreeMap<Vec<u8>, MemEntry>) {
-        for (key, entry) in entries {
-            self.note_key(key);
-            self.map.insert(key.clone(), entry.clone());
-        }
+        let ((w1, m1), (w2, m2)) = Self::bloom_indices(key);
+        self.filter[w1] |= m1;
+        self.filter[w2] |= m2;
     }
 
     pub(super) fn apply(&mut self, lsn: u64, rec: WalRecord, record_undo: bool) {
@@ -335,6 +353,7 @@ impl TxOverlay {
     /// Pops undo entries until `undo.len() == target_len`, restoring the overlay exactly.
     pub(super) fn rollback_to(&mut self, target_len: usize) {
         let mut popped = false;
+        let mut removed_min_or_max = false;
         while self.undo.len() > target_len {
             popped = true;
             let (key, prev) = self.undo.pop().unwrap();
@@ -343,6 +362,11 @@ impl TxOverlay {
                     self.map.insert(key, e);
                 }
                 None => {
+                    if self.min_key.as_deref() == Some(key.as_slice())
+                        || self.max_key.as_deref() == Some(key.as_slice())
+                    {
+                        removed_min_or_max = true;
+                    }
                     self.map.remove(&key);
                 }
             }
@@ -352,17 +376,12 @@ impl TxOverlay {
                 self.min_key = None;
                 self.max_key = None;
                 self.filter = [0; 16];
-            } else {
+            } else if removed_min_or_max {
                 self.min_key = self.map.first_key_value().map(|(k, _)| k.clone());
                 self.max_key = self.map.last_key_value().map(|(k, _)| k.clone());
-                self.filter = [0; 16];
-                for k in self.map.keys() {
-                    let h1 = crate::util::crc32c::crc32c_append(0, k);
-                    let h2 = crate::util::crc32c::crc32c_append(0x9E37_79B9, k);
-                    self.filter[(h1 as usize & 1023) / 64] |= 1 << (h1 & 63);
-                    self.filter[(h2 as usize & 1023) / 64] |= 1 << (h2 & 63);
-                }
             }
+            // Bloom bits remain conservatively valid until the overlay empties (zero false
+            // negatives), avoiding an O(M) filter rebuild on partial rollback.
         }
     }
 }
@@ -376,7 +395,7 @@ pub(crate) struct SavepointMarker {
     pub(super) pending_tx_sync: bool,
     pub(super) implicit_tx: bool,
     pub(super) undo_len: usize,
-    pub(super) meta_snapshot: TxMetaSnapshot,
+    pub(super) meta: SavepointMeta,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
@@ -403,7 +422,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_prepared = false;
             self.tx_preparing = false;
             self.pending_tx_bytes = 0;
-            self.seed_overlay_from_pending();
         }
         self.tx_depth += 1;
     }
@@ -432,7 +450,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_prepared = false;
             self.tx_preparing = false;
             self.pending_tx_bytes = 0;
-            self.seed_overlay_from_pending();
         }
         self.tx_depth += 1;
         Ok(())
@@ -667,10 +684,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let lsn = self.next_lsn - 1;
-        let first_own_lsn = self.tx_start_meta.next_lsn;
-        let mut own_entries = core::mem::take(&mut self.tx_overlay.map);
+        let own_entries = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
-        own_entries.retain(|_, entry| entry.lsn >= first_own_lsn);
+        debug_assert!(
+            !self.tx_start_meta.active
+                || own_entries
+                    .values()
+                    .all(|entry| entry.lsn >= self.tx_start_meta.next_lsn)
+        );
         self.pending_group.push_back((lsn, own_entries));
         self.commit_gate.note_appended(lsn);
         self.tx_depth = 0;
@@ -775,17 +796,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    fn seed_overlay_from_pending(&mut self) {
-        let Self {
-            pending_group,
-            tx_overlay,
-            ..
-        } = self;
-        for (_, entries) in pending_group.iter() {
-            tx_overlay.seed(entries);
-        }
-    }
-
     /// Clears the per-transaction state once the transaction no longer owns the writer slot.
     fn finalize_tx_state(&mut self) {
         self.tx_owner_conn = None;
@@ -793,6 +803,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_preparing = false;
         self.pending_tx_bytes = 0;
         self.savepoints.clear();
+        self.statement_savepoint_active = false;
+        self.statement_blob_undo.clear();
         self.vtabs_created_in_tx.clear();
         self.tx_start_meta = TxMetaSnapshot::default();
         self.commit_gate.tx_ended();
@@ -810,14 +822,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
         self.vtabs_created_in_tx.clear();
-        let first_own_lsn = if self.tx_start_meta.active {
-            self.tx_start_meta.next_lsn
-        } else {
-            0
-        };
-        let mut overlay = core::mem::take(&mut self.tx_overlay.map);
+        let overlay = core::mem::take(&mut self.tx_overlay.map);
         self.tx_overlay.clear();
-        overlay.retain(|_, entry| entry.lsn >= first_own_lsn);
+        debug_assert!(
+            !self.tx_start_meta.active
+                || overlay
+                    .values()
+                    .all(|entry| entry.lsn >= self.tx_start_meta.next_lsn)
+        );
         if !overlay.is_empty() {
             self.data_generation += 1;
         }
@@ -924,6 +936,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_prepared = false;
         self.tx_preparing = false;
         self.savepoints.clear();
+        self.statement_savepoint_active = false;
+        self.statement_blob_undo.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
@@ -939,6 +953,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn rollback_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
         self.check_write_allowed_for_conn(conn_id)?;
         self.rollback_transaction()
+    }
+
+    fn refresh_statement_savepoint_active(&mut self) {
+        let active = self
+            .savepoints
+            .iter()
+            .any(|s| matches!(s.meta, SavepointMeta::Statement(_)));
+        self.statement_savepoint_active = active;
+        if !active {
+            self.statement_blob_undo.clear();
+        }
     }
 
     /// Opens a transaction savepoint (`xSavepoint`).
@@ -975,8 +1000,56 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             pending_tx_sync: self.pending_tx_sync,
             implicit_tx,
             undo_len: self.tx_overlay.undo.len(),
-            meta_snapshot,
+            meta: SavepointMeta::Full(Box::new(meta_snapshot)),
         });
+    }
+
+    /// Opens a lightweight statement-scoped savepoint for a single `vtab_update` call on
+    /// `table_id`, capturing only the per-statement fields an `xUpdate` can mutate.
+    pub(crate) fn statement_savepoint_for_conn(
+        &mut self,
+        conn_id: usize,
+        table_id: u16,
+    ) -> io::Result<()> {
+        self.check_write_allowed_for_conn(conn_id)?;
+        self.tx_prepared = false;
+        let mut implicit_tx = false;
+        if self.tx_depth == 0 {
+            self.begin_transaction();
+            self.tx_owner_conn = Some(conn_id);
+            implicit_tx = true;
+        }
+        if self
+            .savepoints
+            .iter()
+            .any(|s| s.sp_id == STATEMENT_SAVEPOINT)
+        {
+            return Ok(());
+        }
+        let buf_offset = if self.pending_tx_record_count == 0 {
+            0
+        } else {
+            self.pending_tx_buf.len()
+        };
+        let stmt_meta = StatementMetaSnapshot {
+            next_lsn: self.next_lsn,
+            table_id,
+            capped_table: self.capped_tables.get(&table_id).cloned(),
+            table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
+            blob_undo_len: self.statement_blob_undo.len(),
+        };
+        self.savepoints.push(SavepointMarker {
+            sp_id: STATEMENT_SAVEPOINT,
+            buf_offset,
+            record_count: self.pending_tx_record_count,
+            pending_tx_bytes: self.pending_tx_bytes,
+            pending_tx_sync: self.pending_tx_sync,
+            implicit_tx,
+            undo_len: self.tx_overlay.undo.len(),
+            meta: SavepointMeta::Statement(stmt_meta),
+        });
+        self.statement_savepoint_active = true;
+        Ok(())
     }
 
     /// Opens a transaction savepoint for SQLite connection `conn_id`.
@@ -1003,6 +1076,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(pos) = pos {
             let implicit_tx = self.savepoints[pos].implicit_tx;
             self.savepoints.truncate(pos);
+            self.refresh_statement_savepoint_active();
             if self.savepoints.is_empty() {
                 self.tx_overlay.undo.clear();
             }
@@ -1044,8 +1118,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             return Ok(());
         };
-        let marker = self.savepoints[pos].clone();
         self.savepoints.truncate(pos + 1);
+        let marker = self.savepoints.pop().unwrap();
         if marker.record_count == 0 {
             self.pending_tx_buf.clear();
         } else {
@@ -1054,24 +1128,96 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.pending_tx_record_count = marker.record_count;
         self.pending_tx_bytes = marker.pending_tx_bytes;
         self.pending_tx_sync = marker.pending_tx_sync;
-        self.restore_tx_state(marker.undo_len, &marker.meta_snapshot);
+        match &marker.meta {
+            SavepointMeta::Statement(st) => {
+                self.restore_statement_tx_state(marker.undo_len, st);
+            }
+            SavepointMeta::Full(snap) => {
+                self.restore_tx_state(marker.undo_len, snap);
+            }
+        }
+        self.savepoints.push(marker);
+        self.refresh_statement_savepoint_active();
         Ok(())
     }
 
     /// Undoes everything the active transaction did while keeping it open. No undo log is
-    /// needed: the overlay is rebuilt from the state the transaction started with.
+    /// needed: the overlay only contains this transaction's own writes and clears cleanly.
     fn rollback_to_transaction_start(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.savepoints.clear();
+        self.statement_savepoint_active = false;
+        self.statement_blob_undo.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
         self.pending_tx_sync = false;
         self.tx_overlay.clear();
-        self.seed_overlay_from_pending();
         let snap = core::mem::take(&mut self.tx_start_meta);
         self.restore_tx_state(0, &snap);
         self.tx_start_meta = snap;
+    }
+
+    fn restore_statement_tx_state(&mut self, undo_target_len: usize, st: &StatementMetaSnapshot) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.tx_overlay.rollback_to(undo_target_len);
+        self.next_lsn = st.next_lsn;
+        while self.statement_blob_undo.len() > st.blob_undo_len {
+            let entry = self.statement_blob_undo.pop().unwrap();
+            match entry {
+                BlobUndo::Appended {
+                    kind: crate::wal::BlobKind::Standard,
+                    seg_id,
+                    len,
+                    ..
+                } => {
+                    if let Some(b) = self.std_blobs.get_mut(&seg_id) {
+                        b.dead_bytes = b.dead_bytes.saturating_add(len);
+                    }
+                }
+                BlobUndo::Appended {
+                    kind: crate::wal::BlobKind::Lru,
+                    table_id,
+                    seg_id,
+                    len,
+                } => {
+                    if let Some(b) = self.lru_blobs.get_mut(&(table_id, seg_id)) {
+                        b.dead_bytes = b.dead_bytes.saturating_add(len);
+                    }
+                }
+                BlobUndo::MarkedDead {
+                    kind: crate::wal::BlobKind::Standard,
+                    seg_id,
+                    len,
+                    ..
+                } => {
+                    if let Some(b) = self.std_blobs.get_mut(&seg_id) {
+                        b.dead_bytes = b.dead_bytes.saturating_sub(len);
+                    }
+                }
+                BlobUndo::MarkedDead {
+                    kind: crate::wal::BlobKind::Lru,
+                    table_id,
+                    seg_id,
+                    len,
+                } => {
+                    if let Some(b) = self.lru_blobs.get_mut(&(table_id, seg_id)) {
+                        b.dead_bytes = b.dead_bytes.saturating_sub(len);
+                    }
+                }
+            }
+        }
+        if let Some(ct) = &st.capped_table {
+            self.capped_tables.insert(st.table_id, ct.clone());
+        }
+        match st.table_has_row_meta {
+            Some(v) => {
+                self.table_has_row_meta.insert(st.table_id, v);
+            }
+            None => {
+                self.table_has_row_meta.remove(&st.table_id);
+            }
+        }
     }
 
     /// Rolls back to savepoint `sp_id` for SQLite connection `conn_id`.

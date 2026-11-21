@@ -2611,7 +2611,7 @@ unsafe extern "system" fn vtab_update(
                 .as_ref()
                 .is_some_and(|old_pk| old_pk.as_slice() != new_pk.as_slice());
         if removes_rows {
-            if let Err(e) = eng.savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT) {
+            if let Err(e) = eng.statement_savepoint_for_conn(vtab.db as usize, vtab.table_id) {
                 return io_err_to_sqlite_rc(&e);
             }
         }
