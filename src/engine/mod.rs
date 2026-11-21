@@ -358,6 +358,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
     /// compaction pending in background mode.
     pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Generation id of the worker that owns [`Self::compaction_hook`] so an older worker's teardown
+    /// cannot clear a newly registered worker's hook.
+    pub(super) compaction_hook_id: u64,
     /// True if `prepare_commit_transaction()` (`xSync`) has already run for the current commit.
     pub(super) tx_prepared: bool,
     /// True while `prepare_commit_transaction()` is running internal quota eviction.
@@ -1148,6 +1151,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             auto_compaction_due: false,
             relocating_std_blobs: false,
             compaction_hook: None,
+            compaction_hook_id: 0,
             tx_prepared: false,
             tx_preparing: false,
             pending_tx_buf: Vec::new(),
@@ -1325,6 +1329,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the caller's `&mut self`, so it must only signal (e.g. a `Condvar`), never lock the engine.
     pub fn set_compaction_hook(&mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.compaction_hook = hook;
+    }
+
+    pub(crate) fn install_compaction_hook(
+        &mut self,
+        worker_id: u64,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        if worker_id >= self.compaction_hook_id {
+            self.compaction_hook_id = worker_id;
+            self.compaction_hook = Some(hook);
+            self.config.background_compaction = true;
+        }
+    }
+
+    pub(crate) fn clear_compaction_hook(&mut self, worker_id: u64) {
+        if self.compaction_hook_id == worker_id {
+            self.compaction_hook = None;
+            self.config.background_compaction = false;
+        }
     }
 
     /// Returns the number of currently active `idx_<SeqID>.db` segments.
