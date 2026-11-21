@@ -237,6 +237,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && token.snapshot.data_generation == self.data_generation
     }
 
+    pub(crate) fn check_snapshot_current_for_upgrade(
+        &self,
+        token: &ReadSnapshotToken<FS::File>,
+    ) -> io::Result<()> {
+        if token.snapshot.engine_id != self.engine_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read snapshot token belongs to a different StorageEngine",
+            ));
+        }
+        if !self.snapshot_is_current(token) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "read snapshot changed before write upgrade; restart the transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn check_snapshot_write_upgrade(
         &self,
         conn_id: usize,
@@ -249,13 +269,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
         self.check_write_allowed_for_conn(conn_id)?;
-        if !self.snapshot_is_current(token) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "read snapshot changed before write upgrade; restart the transaction",
-            ));
-        }
-        Ok(())
+        self.check_snapshot_current_for_upgrade(token)
     }
 
     #[inline]

@@ -258,3 +258,165 @@ fn stale_read_transaction_cannot_upgrade_via_create_virtual_table() {
         vec![vec![SqlValue::Text("v1".into())]]
     );
 }
+
+#[test]
+fn snapshot_write_upgrade_waits_and_succeeds_after_other_writer_rolls_back() {
+    let tmp = TempTestDir::new("vtab_snap_upgrade_wait_rollback");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.writer_wait_timeout_ms = 5_000;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let a = SqliteConnection::open_in_memory().unwrap();
+    a.register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    a.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, s TEXT');
+         INSERT INTO t VALUES ('seed', 'v0');",
+    )
+    .unwrap();
+
+    let (b_connected_tx, b_connected_rx) = std::sync::mpsc::channel();
+    let (a_tx_started_tx, a_tx_started_rx) = std::sync::mpsc::channel();
+    let (b_upgrading_tx, b_upgrading_rx) = std::sync::mpsc::channel();
+    let engine_b = engine.clone();
+    let worker = std::thread::spawn(move || {
+        let b = SqliteConnection::open_in_memory().unwrap();
+        b.register_aydb_module_with_options(engine_b, false)
+            .unwrap();
+        b.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, s TEXT');",
+        )
+        .unwrap();
+        b_connected_tx.send(()).unwrap();
+        a_tx_started_rx.recv().unwrap();
+
+        b.execute_batch("BEGIN;").unwrap();
+        assert_eq!(
+            query(&b, "SELECT s FROM t WHERE k='seed'"),
+            vec![vec![SqlValue::Text("v0".into())]]
+        );
+        b_upgrading_tx.send(()).unwrap();
+        // Must wait for A's uncommitted transaction, then succeed once A rolls back.
+        b.execute_batch("INSERT INTO t VALUES ('from_b', 'ok'); COMMIT;")
+            .unwrap();
+    });
+
+    b_connected_rx.recv().unwrap();
+    a.execute_batch("BEGIN; INSERT INTO t VALUES ('uncommitted_a', 'temp');")
+        .unwrap();
+    a_tx_started_tx.send(()).unwrap();
+
+    b_upgrading_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    a.execute_batch("ROLLBACK;").unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(
+        query(&a, "SELECT s FROM t WHERE k='from_b'"),
+        vec![vec![SqlValue::Text("ok".into())]]
+    );
+    assert!(query(&a, "SELECT s FROM t WHERE k='uncommitted_a'").is_empty());
+}
+
+#[test]
+fn snapshot_write_upgrade_waits_then_fails_busy_when_other_writer_commits() {
+    let tmp = TempTestDir::new("vtab_snap_upgrade_wait_commit");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.writer_wait_timeout_ms = 5_000;
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+    let a = SqliteConnection::open_in_memory().unwrap();
+    a.register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    a.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, s TEXT');
+         INSERT INTO t VALUES ('seed', 'v0');",
+    )
+    .unwrap();
+
+    let (b_connected_tx, b_connected_rx) = std::sync::mpsc::channel();
+    let (a_tx_started_tx, a_tx_started_rx) = std::sync::mpsc::channel();
+    let (b_upgrading_tx, b_upgrading_rx) = std::sync::mpsc::channel();
+    let engine_b = engine.clone();
+    let worker = std::thread::spawn(move || {
+        let b = SqliteConnection::open_in_memory().unwrap();
+        b.register_aydb_module_with_options(engine_b, false)
+            .unwrap();
+        b.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, s TEXT');",
+        )
+        .unwrap();
+        b_connected_tx.send(()).unwrap();
+        a_tx_started_rx.recv().unwrap();
+
+        b.execute_batch("BEGIN;").unwrap();
+        assert_eq!(
+            query(&b, "SELECT s FROM t WHERE k='seed'"),
+            vec![vec![SqlValue::Text("v0".into())]]
+        );
+        b_upgrading_tx.send(()).unwrap();
+        let err = b
+            .execute_batch("INSERT INTO t VALUES ('from_b', 'stale');")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("snapshot")
+                || err.to_string().contains("locked")
+                || err.to_string().contains("busy"),
+            "expected busy/snapshot failure after peer commit, got: {err}"
+        );
+        b.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    b_connected_rx.recv().unwrap();
+    a.execute_batch("BEGIN; INSERT INTO t VALUES ('from_a', 'committed');")
+        .unwrap();
+    a_tx_started_tx.send(()).unwrap();
+
+    b_upgrading_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    a.execute_batch("COMMIT;").unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(
+        query(&a, "SELECT s FROM t WHERE k='from_a'"),
+        vec![vec![SqlValue::Text("committed".into())]]
+    );
+    assert!(query(&a, "SELECT s FROM t WHERE k='from_b'").is_empty());
+}
+
+#[test]
+fn snapshot_write_upgrade_releases_pre_upgrade_snapshot() {
+    let tmp = TempTestDir::new("vtab_snap_upgrade_releases_old");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine.clone(), false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k TEXT PRIMARY KEY, s TEXT');
+         INSERT INTO t VALUES ('seed', 'v0');
+         BEGIN;",
+    )
+    .unwrap();
+    assert_eq!(
+        query(&conn, "SELECT s FROM t WHERE k='seed'"),
+        vec![vec![SqlValue::Text("v0".into())]]
+    );
+
+    // 1 ref in `SnapshotCache`, 1 ref in `conn`'s `ReadSession`, 1 ref in `pre_snap`.
+    let pre_snap = engine.read().unwrap().capture_read_snapshot();
+    assert_eq!(pre_snap.strong_count(), 3);
+
+    // Upgrading the read transaction to a write transaction releases `ReadSession`'s reference
+    // immediately instead of pinning pre-upgrade state until `COMMIT`/`ROLLBACK`.
+    conn.execute_batch("INSERT INTO t VALUES ('k2', 'v2');")
+        .unwrap();
+    assert_eq!(pre_snap.strong_count(), 2);
+
+    conn.execute_batch("COMMIT;").unwrap();
+    assert_eq!(pre_snap.strong_count(), 1);
+}

@@ -911,7 +911,7 @@ unsafe fn vtab_create_or_connect(
             };
             if join_user_tx && !began_here && !eng.conn_has_open_transaction(db as usize) {
                 if let Some(snapshot) = aux.read_session.current() {
-                    if let Err(error) = eng.check_snapshot_write_upgrade(db as usize, &snapshot) {
+                    if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
                         if !pz_err.is_null() {
                             *pz_err = sqlite_error_message(&error.to_string());
                         }
@@ -919,7 +919,10 @@ unsafe fn vtab_create_or_connect(
                     }
                 }
                 match eng.begin_transaction_for_conn(db as usize) {
-                    Ok(()) => began_here = true,
+                    Ok(()) => {
+                        began_here = true;
+                        aux.read_session.clear();
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if !wait_for_other_transaction(eng, &mut deadline) {
                             return SQLITE_BUSY;
@@ -2752,22 +2755,19 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 Err(_) => return SQLITE_ERROR,
             };
             if let Some(snapshot) = vtab.read_session.current() {
-                if let Err(error) = eng.check_snapshot_write_upgrade(vtab.db as usize, &snapshot) {
+                if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
                     return io_err_to_sqlite_rc(&error);
                 }
             }
             match eng.begin_transaction_for_conn(vtab.db as usize) {
-                Ok(()) => break,
+                Ok(()) => {
+                    vtab.read_session.clear();
+                    break;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    let end = *deadline.get_or_insert(now + eng.writer_wait_timeout());
-                    if now >= end {
+                    if !wait_for_other_transaction(eng, &mut deadline) {
                         return io_err_to_sqlite_rc(&e);
                     }
-                    let gate = eng.commit_gate();
-                    let seen = gate.tx_end_count();
-                    drop(eng);
-                    gate.wait_tx_end(seen, end - now);
                 }
                 Err(e) => return io_err_to_sqlite_rc(&e),
             }
