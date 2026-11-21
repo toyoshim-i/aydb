@@ -2429,7 +2429,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Owner-view scans that read blob payloads need every buffered byte on the OS handle.
     pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx) -> io::Result<()> {
-        if cx.view == ReadView::Owner && self.any_blob_unflushed() {
+        if cx.view == ReadView::Owner && self.tx_depth > 0 && self.any_blob_unflushed() {
             cx.need_flush.set(true);
             return Err(io::Error::other(NEED_FLUSH_MSG));
         }
@@ -2982,7 +2982,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// only deleted if its record still points to the same corrupt `BlobPtr` (it may have been
     /// overwritten or deleted since). Deletes use `BufferedFast` durability.
     pub(super) fn drain_corrupt_evictions(&mut self) -> io::Result<()> {
-        if self.tx_depth > 0 || self.poisoned.is_some() || !self.has_pending_corrupt_evictions() {
+        if self.tx_depth > 0 || self.is_poisoned() || !self.has_pending_corrupt_evictions() {
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -2991,13 +2991,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Ok(mut q) if !q.is_empty() => q.drain().collect(),
                 _ => return Ok(()),
             };
-        for ((table_id, pk), ev) in pending {
-            let still_corrupt = matches!(
-                self.lookup_raw_entry(&ev.key)?,
-                Some((_, IndexValue::Blob(p))) if p == ev.ptr
-            );
-            if still_corrupt {
-                self.delete_row(table_id, &pk, WriteDurability::BufferedFast)?;
+        let mut iter = pending.into_iter();
+        while let Some(((table_id, pk), ev)) = iter.next() {
+            let step = match self.lookup_raw_entry(&ev.key) {
+                Ok(Some((_, IndexValue::Blob(p)))) if p == ev.ptr => self
+                    .delete_row(table_id, &pk, WriteDurability::BufferedFast)
+                    .map(|_| ()),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = step {
+                if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
+                    q.entry((table_id, pk)).or_insert(ev);
+                    for (k, v) in iter {
+                        q.entry(k).or_insert(v);
+                    }
+                }
+                return Err(e);
             }
         }
         Ok(())

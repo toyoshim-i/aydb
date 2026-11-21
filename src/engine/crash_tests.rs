@@ -4219,6 +4219,35 @@ fn crash_during_a_salvage_open_reopens_to_the_same_list_or_cleanly() {
     assert!(same > 0 && clean > 0, "same {same}, clean {clean}");
 }
 
+#[test]
+fn salvage_does_not_misattribute_rows_after_discarded_drop_and_create_reusing_table_id() {
+    let fs = damaged_fs(|e| {
+        e.drop_table(1, None).unwrap();
+        let reused = e
+            .register_or_resolve_vtab_with_durability("reused", Some(1), SYNC)
+            .unwrap();
+        assert_eq!(reused, 1);
+        e.put_row(1, b"new_row", b"from_reused", &[], SYNC).unwrap();
+        e.put_row(2, b"keep_indexed", b"ok", &[], SYNC).unwrap();
+    });
+
+    let (e, salvaged) = open_salvage(&fs);
+    let damage = e
+        .last_wal_recovery()
+        .damage
+        .as_ref()
+        .expect("damaged WAL must report damage");
+    assert!(
+        damage.unsalvageable >= 3,
+        "discarded drop, create, and recycled-table insert must count as unsalvageable: {damage:?}"
+    );
+    assert_eq!(salvaged.len(), 1, "unexpected salvaged txs: {salvaged:?}");
+    assert_eq!(
+        salvaged[0].ops,
+        vec![put_op("indexed", b"keep_indexed", b"ok")]
+    );
+}
+
 // =============================================================================================
 // Minimal reproductions of bugs found by the group-commit and media-damage modes
 // =============================================================================================

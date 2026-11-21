@@ -128,7 +128,7 @@ pub(super) fn salvage<F: PlatformFile>(
     if discarded.is_empty() {
         return Ok(out);
     }
-    let names = catalog_names(segments, prefix_batches)?;
+    let mut names = catalog_names(segments, prefix_batches)?;
     let read_blob = |ptr: &BlobPtr, key: &[u8]| -> io::Result<Option<Vec<u8>>> {
         let reader = match ptr.kind {
             BlobKind::Standard => std_blobs.get(&ptr.seg_id).map(|b| &b.reader),
@@ -159,6 +159,16 @@ pub(super) fn salvage<F: PlatformFile>(
             if table_id == 0 && ns == CATALOG_PREFIX[2] {
                 out.unsalvageable += 1;
                 bad = true;
+                ops.clear();
+                if key.len() > CATALOG_PREFIX.len() {
+                    let cat_name = String::from_utf8_lossy(&key[CATALOG_PREFIX.len()..]);
+                    names.retain(|_, v| v.as_str() != cat_name.as_ref());
+                }
+                if let Some(Ok(val)) = put {
+                    if let Some(reused_tid) = table_id_of(&val) {
+                        names.remove(&reused_tid);
+                    }
+                }
                 continue;
             }
             if table_id == 0 || ns != NS_PRIMARY_ROW {
@@ -167,6 +177,7 @@ pub(super) fn salvage<F: PlatformFile>(
             let Some(table) = names.get(&table_id) else {
                 out.unsalvageable += 1;
                 bad = true;
+                ops.clear();
                 continue;
             };
             let value = match put {
@@ -177,11 +188,12 @@ pub(super) fn salvage<F: PlatformFile>(
                     None => {
                         out.unsalvageable += 1;
                         bad = true;
+                        ops.clear();
                         continue;
                     }
                 },
             };
-            if keep_values {
+            if keep_values && !bad {
                 let key = key[3..].to_vec();
                 let table = table.clone();
                 ops.push(match value {

@@ -260,3 +260,121 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
     assert_eq!(engine.get_row(UNCAPPED, b"tx_k").unwrap(), None);
     engine.commit_transaction_for_conn(1).unwrap();
 }
+
+#[test]
+fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
+    let dir = TempTestDir::new("read_unflushed_rolled_back_blob");
+    let flag = Arc::new(AtomicBool::new(false));
+    let fs = Arc::new(FaultFs {
+        inner: OsFs::open(&dir.path, true).unwrap(),
+        fail_next_wal_write: Arc::clone(&flag),
+    });
+    let mut cfg = config();
+    cfg.inline_threshold_bytes = 64;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    seed(&mut engine);
+    engine
+        .put_row(
+            UNCAPPED,
+            b"committed_blob",
+            &[0x33u8; 256],
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+
+    // Appending a large blob inside an uncommitted transaction leaves buffered bytes inside the
+    // active blob writer even after rollback_transaction() unwinds the overlay.
+    engine.begin_transaction();
+    engine
+        .put_row(
+            UNCAPPED,
+            b"aborted_blob",
+            &[0x77u8; 256],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert!(engine.any_blob_unflushed());
+    engine.rollback_transaction().unwrap();
+    assert_eq!(engine.tx_depth, 0);
+    assert!(engine.any_blob_unflushed());
+
+    let verify_scans = |eng: &mut StorageEngine<FaultFs>| {
+        let mut pks = Vec::new();
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        let mut lazy = Vec::new();
+        eng.reader_for_conn(1)
+            .scan_range_into_slab(
+                UNCAPPED,
+                None,
+                None,
+                false,
+                100,
+                false,
+                &mut pks,
+                &mut slab,
+                &mut spans,
+                Some(&mut lazy),
+            )
+            .expect("shared &self owner-view scan must not fail with NEED_FLUSH after rollback");
+        assert!(pks.iter().any(|k| k.as_slice() == b"committed_blob"));
+        assert!(!pks.iter().any(|k| k.as_slice() == b"aborted_blob"));
+        assert_eq!(pks.len(), 6);
+        assert_eq!(spans.len(), 6);
+        assert_eq!(lazy.len(), 6);
+
+        // Also exercise the eager-value slab path (`lazy_blobs_out = None`).
+        let mut eager_pks = Vec::new();
+        let mut eager_slab = Vec::new();
+        let mut eager_spans = Vec::new();
+        eng.reader_for_conn(1)
+            .scan_range_into_slab(
+                UNCAPPED,
+                None,
+                None,
+                false,
+                100,
+                false,
+                &mut eager_pks,
+                &mut eager_slab,
+                &mut eager_spans,
+                None,
+            )
+            .expect("shared &self eager-value scan must not fail with NEED_FLUSH after rollback");
+        assert_eq!(eager_spans.len(), 6);
+        assert!(
+            eager_spans
+                .iter()
+                .any(|&(s, e)| eager_slab[s..e] == [0x33u8; 256])
+        );
+
+        let rows = eng.scan_table(UNCAPPED).unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows.iter()
+                .any(|(k, v)| k.as_slice() == b"committed_blob" && v == &[0x33u8; 256])
+        );
+    };
+
+    verify_scans(&mut engine);
+
+    // Poisoning the engine must not break scans either, even while the rolled-back bytes remain
+    // unflushed in the active blob writer buffer.
+    flag.store(true, Ordering::SeqCst);
+    assert!(
+        engine
+            .put_row(
+                UNCAPPED,
+                b"fail",
+                b"x",
+                &[],
+                WriteDurability::SyncTransactional
+            )
+            .is_err()
+    );
+    assert!(engine.is_poisoned());
+    verify_scans(&mut engine);
+}
