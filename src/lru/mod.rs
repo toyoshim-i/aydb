@@ -4,8 +4,10 @@
 pub use crate::index::key_codec;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+
+const TRACKER_SHARDS: usize = 16;
 
 pub use key_codec::{
     NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX, RowMetaRecord,
@@ -50,19 +52,30 @@ impl CappedTableState {
 /// Bounded in-memory tracker that coalesces read-path `AccessTick` updates in RAM
 /// without issuing disk writes on `get_row()` / `SELECT`.
 ///
-/// Uses a two-level `BTreeMap<u16, HashMap<Vec<u8>, u64>>` so all read hits on existing
-/// hot keys, peeks (`peek_hot_tick`), lazy promotions (`take_hot_tick`), and overwrites/deletes
+/// Sharded across 16 cache-line-aligned (`#[repr(align(128))]`) maps indexed by `(table_id, pk)`,
+/// each holding a `BTreeMap<u16, HashMap<Vec<u8>, u64>>` so all read hits on existing hot keys,
+/// peeks (`peek_hot_tick`), lazy promotions (`take_hot_tick`), and overwrites/deletes
 /// (`remove_key`) probe by `&[u8]` (`Borrow<[u8]>`) with zero heap allocations.
 pub struct AccessTracker {
     next_tick: AtomicU64,
-    max_entries: usize,
-    /// Interior mutability so committed-view reads (`&self`) can record hits. The lock is held
-    /// only for in-memory map updates and never across I/O.
-    inner: Mutex<TrackerInner>,
+    max_entries_per_shard: usize,
+    /// Interior mutability so committed-view reads (`&self`) can record hits. Shard locks are
+    /// held only for in-memory map updates and never across I/O.
+    shards: Vec<TrackerShard>,
+}
+
+#[repr(align(128))]
+struct TrackerShard(Mutex<TrackerShardInner>);
+
+impl TrackerShard {
+    #[inline]
+    fn lock(&self) -> MutexGuard<'_, TrackerShardInner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Default)]
-struct TrackerInner {
+struct TrackerShardInner {
     /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys.
     hot_ticks: std::collections::BTreeMap<u16, HashMap<Vec<u8>, u64>>,
     total_entries: usize,
@@ -70,16 +83,28 @@ struct TrackerInner {
 
 impl AccessTracker {
     pub fn new(initial_tick: u64, max_entries: usize) -> Self {
+        let max_entries_per_shard = (max_entries.max(64) / TRACKER_SHARDS).max(1);
+        let mut shards = Vec::with_capacity(TRACKER_SHARDS);
+        for _ in 0..TRACKER_SHARDS {
+            shards.push(TrackerShard(Mutex::new(TrackerShardInner::default())));
+        }
         Self {
             next_tick: AtomicU64::new(initial_tick.max(1)),
-            max_entries: max_entries.max(64),
-            inner: Mutex::new(TrackerInner::default()),
+            max_entries_per_shard,
+            shards,
         }
     }
 
     #[inline]
-    fn lock(&self) -> std::sync::MutexGuard<'_, TrackerInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn shard_index(table_id: u16, pk: &[u8]) -> usize {
+        let mut h = crate::index::BloomFilter::hash64(pk);
+        h ^= (table_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        ((h ^ (h >> 32)) as usize) & (TRACKER_SHARDS - 1)
+    }
+
+    #[inline]
+    fn lock_shard(&self, table_id: u16, pk: &[u8]) -> MutexGuard<'_, TrackerShardInner> {
+        self.shards[Self::shard_index(table_id, pk)].lock()
     }
 
     /// Allocates the next monotonically increasing `AccessTick`.
@@ -112,36 +137,57 @@ impl AccessTracker {
 
     /// Records a read hit in RAM (`O(1)` hash map update, zero disk I/O).
     /// Updates existing hot keys in place with zero heap allocation.
-    /// Returns the newly assigned `AccessTick`.
+    /// Returns the effective `AccessTick` recorded for `(table_id, pk)`.
     pub fn record_read_hit(&self, table_id: u16, pk: &[u8]) -> u64 {
         let tick = self.next_tick();
-        let mut g = self.lock();
+        self.record_read_hit_with_tick(table_id, pk, tick)
+    }
+
+    fn record_read_hit_with_tick(&self, table_id: u16, pk: &[u8], tick: u64) -> u64 {
+        let mut g = self.lock_shard(table_id, pk);
         let inner = &mut *g;
         if let Some(table_map) = inner.hot_ticks.get_mut(&table_id) {
             if let Some(slot) = table_map.get_mut(pk) {
-                *slot = tick;
-                return tick;
+                // Keep the highest tick in case concurrent readers arrive out of order.
+                if tick > *slot {
+                    *slot = tick;
+                }
+                return *slot;
             }
         }
-        if inner.total_entries >= self.max_entries {
-            // Evict the oldest half of tracked in-memory ticks if bounded capacity is reached
+        if inner.total_entries >= self.max_entries_per_shard {
+            // Evict the oldest half of tracked entries in O(N) using quickselect; tie-break
+            // equal ticks deterministically so `u64::MAX` saturation cannot wipe the shard.
             let mut ticks: Vec<u64> = inner
                 .hot_ticks
                 .values()
                 .flat_map(|m| m.values().copied())
                 .collect();
             if !ticks.is_empty() {
-                ticks.sort_unstable();
-                let median = ticks[ticks.len() / 2];
+                let mid = ticks.len() / 2;
+                let (_, &mut median, _) = ticks.select_nth_unstable(mid);
+                let target_keep = self.max_entries_per_shard / 2;
+                let strictly_greater = ticks.iter().filter(|&&v| v > median).count();
+                let mut tie_budget = target_keep.saturating_sub(strictly_greater);
                 let mut kept = 0usize;
-                for m in inner.hot_ticks.values_mut() {
-                    m.retain(|_, &mut v| v > median);
+                inner.hot_ticks.retain(|_, m| {
+                    m.retain(|_, &mut v| {
+                        if v > median {
+                            true
+                        } else if v == median && tie_budget > 0 {
+                            tie_budget -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     kept += m.len();
-                }
+                    !m.is_empty()
+                });
                 inner.total_entries = kept;
             }
         }
-        let cap = self.max_entries.min(4096);
+        let cap = self.max_entries_per_shard.min(64);
         let table_map = inner
             .hot_ticks
             .entry(table_id)
@@ -155,7 +201,7 @@ impl AccessTracker {
     /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn take_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        let mut g = self.lock();
+        let mut g = self.lock_shard(table_id, pk);
         if g.total_entries == 0 {
             return None;
         }
@@ -169,7 +215,7 @@ impl AccessTracker {
     /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
-        let g = self.lock();
+        let g = self.lock_shard(table_id, pk);
         if g.total_entries == 0 {
             return None;
         }
@@ -180,7 +226,7 @@ impl AccessTracker {
     /// with zero allocation.
     #[inline]
     pub fn remove_key(&self, table_id: u16, pk: &[u8]) {
-        let mut g = self.lock();
+        let mut g = self.lock_shard(table_id, pk);
         if g.total_entries == 0 {
             return;
         }
@@ -191,8 +237,18 @@ impl AccessTracker {
         }
     }
 
+    /// Clears all pending read ticks for a committed `DROP TABLE`.
+    pub fn remove_table(&self, table_id: u16) {
+        for shard in &self.shards {
+            let mut g = shard.lock();
+            if let Some(removed) = g.hot_ticks.remove(&table_id) {
+                g.total_entries = g.total_entries.saturating_sub(removed.len());
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.lock().total_entries
+        self.shards.iter().map(|s| s.lock().total_entries).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -295,5 +351,52 @@ mod tests {
         tracker.observe_tick(u64::MAX);
         assert_eq!(tracker.next_tick(), u64::MAX);
         assert_eq!(tracker.next_tick(), u64::MAX);
+    }
+
+    #[test]
+    fn access_tracker_shards_are_cache_line_aligned() {
+        assert!(std::mem::align_of::<TrackerShard>() >= 128);
+    }
+
+    #[test]
+    fn access_tracker_never_regresses_tick_on_out_of_order_update() {
+        let tracker = AccessTracker::new(1, 64);
+        assert_eq!(tracker.record_read_hit_with_tick(1, b"hot", 200), 200);
+        assert_eq!(tracker.record_read_hit_with_tick(1, b"hot", 150), 200);
+        assert_eq!(tracker.peek_hot_tick(1, b"hot"), Some(200));
+    }
+
+    #[test]
+    fn access_tracker_u64_max_eviction_preserves_entries_without_wipeout() {
+        let tracker = AccessTracker::new(u64::MAX, 64);
+        for i in 0..128u32 {
+            let key = format!("sat_{i:04}");
+            let tick = tracker.record_read_hit((i % 4) as u16, key.as_bytes());
+            assert_eq!(tick, u64::MAX);
+        }
+        let len = tracker.len();
+        assert!(
+            (16..=64).contains(&len),
+            "expected saturated eviction to keep half without wipeout, got len={len}"
+        );
+    }
+
+    #[test]
+    fn access_tracker_remove_table_clears_only_target_table() {
+        let tracker = AccessTracker::new(1, 256);
+        for i in 0..30u32 {
+            let key = format!("row_{i:04}");
+            tracker.record_read_hit(1, key.as_bytes());
+            tracker.record_read_hit(2, key.as_bytes());
+        }
+        assert_eq!(tracker.len(), 60);
+
+        tracker.remove_table(1);
+        assert_eq!(tracker.len(), 30);
+        for i in 0..30u32 {
+            let key = format!("row_{i:04}");
+            assert_eq!(tracker.peek_hot_tick(1, key.as_bytes()), None);
+            assert!(tracker.peek_hot_tick(2, key.as_bytes()).is_some());
+        }
     }
 }

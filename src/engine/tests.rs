@@ -7418,3 +7418,29 @@ fn drop_table_inside_rolled_back_tx_preserves_lru_writer_policies_and_holders() 
     );
     assert_eq!(engine.get_row(tid, b"k1").unwrap(), Some(vec![0x5Au8; 200]));
 }
+
+#[test]
+fn drop_table_clears_access_tracker_on_commit_but_not_on_rollback() {
+    let tmp = TempTestDir::new("drop_table_access_tracker");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    engine.register_capped_table(1, 1024 * 1024).unwrap();
+    engine
+        .put_row(1, b"k1", b"v1", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), Some(b"v1".to_vec()));
+    assert!(engine.access_tracker.peek_hot_tick(1, b"k1").is_some());
+
+    engine.begin_transaction();
+    engine.drop_table(1, None).unwrap();
+    engine.rollback_transaction().unwrap();
+    assert!(
+        engine.access_tracker.peek_hot_tick(1, b"k1").is_some(),
+        "rolled back drop_table must keep AccessTracker entries intact"
+    );
+
+    engine.drop_table(1, None).unwrap();
+    assert!(engine.access_tracker.peek_hot_tick(1, b"k1").is_none());
+    assert!(engine.access_tracker.is_empty());
+}

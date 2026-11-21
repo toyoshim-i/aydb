@@ -836,6 +836,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
         let mut dropped_any_capped = false;
         for (tid, was_capped) in dropped_tables {
+            self.access_tracker.remove_table(tid);
             if let Some(mut old_w) = self.active_lru_writers.remove(&tid) {
                 // Left unpoisoned on purpose: every byte of this segment is dead from here on, so
                 // no committed state ever depends on it being durable.
