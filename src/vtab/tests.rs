@@ -3347,6 +3347,33 @@ fn i64_min_float_stays_real_on_coercion_and_matches_integer_in_lookups_and_uniqu
 }
 
 #[test]
+fn sqlite_wrappers_reject_a_truncated_statement_and_a_lossy_path() {
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t(v)").unwrap();
+    let error = conn
+        .query_all("INSERT INTO t VALUES (1)\0 RETURNING v", &[])
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(conn.query_all("SELECT v FROM t", &[]).unwrap().is_empty());
+
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    let tmp = TempTestDir::new("sqlite_path_encoding");
+    let path = tmp.path.join(invalid);
+    let error = SqliteConnection::open_file(&path).err().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(std::fs::read_dir(&tmp.path).unwrap().next().is_none());
+}
+
+#[test]
 fn collate_nocase_embedded_nul_matches_native_sqlite() {
     let tmp = TempTestDir::new("nocase_embedded_nul");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());

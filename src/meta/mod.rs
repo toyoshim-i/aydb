@@ -1015,7 +1015,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let referenced = self.state.referenced_file_names();
         let standby_mf = self.standby_manifest_id.map(format_manifest_file_name);
         let mut remaining = Vec::new();
-        let mut removed_any = false;
+        let mut unlinked = Vec::new();
         for file_name in self.state.pending_delete_files.drain(..) {
             if !is_managed_segment_or_manifest(&file_name)
                 || referenced.contains(&file_name)
@@ -1024,15 +1024,16 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 continue;
             }
             if self.fs.remove_file_unsynced(&file_name).is_ok() {
-                removed_any = true;
+                unlinked.push(file_name);
             } else {
                 remaining.push(file_name);
             }
         }
-        self.state.pending_delete_files = remaining;
-        if removed_any {
-            let _ = self.fs.sync_dir();
+        if !unlinked.is_empty() && self.fs.sync_dir().is_err() {
+            // A crash can restore these names until the directory flush succeeds.
+            remaining.append(&mut unlinked);
         }
+        self.state.pending_delete_files = remaining;
     }
 
     fn write_current_state_to_slot(&mut self, slot: SlotIndex) -> io::Result<()> {
@@ -1252,7 +1253,9 @@ impl<F: PlatformFs> BootMetaManager<F> {
 
         let slot_payload = &slot_buf[64..64 + payload_len];
         if crc32c(slot_payload) != expected_payload_crc {
-            return Err(SlotLoadError::Incompatible(io::Error::new(
+            // A partial overwrite can replace a header together with its own CRC while
+            // leaving the old payload and trailer. The payload CRC detects that mixture.
+            return Err(SlotLoadError::Corrupt(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload CRC32C mismatch in boot_meta slot",
             )));
@@ -3000,6 +3003,7 @@ mod tests {
             inner: OsFs,
             unsynced_deletes: AtomicUsize,
             sync_dir_calls: AtomicUsize,
+            fail_sync: std::sync::atomic::AtomicBool,
         }
 
         impl PlatformFs for BatchDeleteCountFs {
@@ -3026,6 +3030,9 @@ mod tests {
 
             fn sync_dir(&self) -> io::Result<()> {
                 self.sync_dir_calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail_sync.swap(false, Ordering::Relaxed) {
+                    return Err(io::Error::other("injected directory flush failure"));
+                }
                 self.inner.sync_dir()
             }
 
@@ -3043,6 +3050,7 @@ mod tests {
             inner: OsFs::open(&tmp.path, true).unwrap(),
             unsynced_deletes: AtomicUsize::new(0),
             sync_dir_calls: AtomicUsize::new(0),
+            fail_sync: std::sync::atomic::AtomicBool::new(false),
         });
         let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
 
@@ -3055,6 +3063,7 @@ mod tests {
 
         fs.unsynced_deletes.store(0, Ordering::Relaxed);
         fs.sync_dir_calls.store(0, Ordering::Relaxed);
+        fs.fail_sync.store(true, Ordering::Relaxed);
         mgr.commit_update(|s| {
             for name in &names {
                 s.queue_pending_delete(name.clone());
@@ -3064,6 +3073,9 @@ mod tests {
 
         assert_eq!(fs.unsynced_deletes.load(Ordering::Relaxed), 5);
         assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(mgr.state().pending_delete_files, names);
+        mgr.try_process_pending_deletes();
+        assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 2);
         assert!(mgr.state().pending_delete_files.is_empty());
         for name in &names {
             assert!(!tmp.path.join(name).exists());

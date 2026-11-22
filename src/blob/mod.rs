@@ -445,6 +445,14 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     /// durably written) and `Err` for genuine I/O errors, which must not be mistaken for an
     /// uncommitted record.
     pub fn validate_blob_ptr(&self, ptr: &BlobPtr) -> io::Result<bool> {
+        self.validate_blob_ptr_for_key(ptr, None)
+    }
+
+    pub(crate) fn validate_blob_ptr_for_key(
+        &self,
+        ptr: &BlobPtr,
+        expected_key: Option<&[u8]>,
+    ) -> io::Result<bool> {
         const STACK_BUF_LEN: usize = 16 * 1024;
         const STREAM_CHUNK_LEN: usize = 64 * 1024;
 
@@ -466,7 +474,8 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
 
         if total_len <= STACK_BUF_LEN {
             return Ok(
-                Self::verify_blob_record(&stack_buf[..total_len], ptr.crc32c, None).is_some(),
+                Self::verify_blob_record(&stack_buf[..total_len], ptr.crc32c, expected_key)
+                    .is_some(),
             );
         }
 
@@ -491,6 +500,19 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             return Ok(false);
         }
 
+        let mut remaining_key = match expected_key {
+            Some(key) => {
+                if key.len() != key_len {
+                    return Ok(false);
+                }
+                let n = key_len.min(first_len - BLOB_RECORD_HEADER_LEN);
+                if key[..n] != stack_buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + n] {
+                    return Ok(false);
+                }
+                &key[n..]
+            }
+            None => &[][..],
+        };
         let mut running_crc = crc32c(&stack_buf[8..first_len]);
         let mut file_pos = (ptr.offset as u64) + first_len as u64;
         let mut remaining = total_len - first_len;
@@ -515,6 +537,11 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
                 Err(e) => return Err(e),
             }
+            let n = remaining_key.len().min(to_read);
+            if remaining_key[..n] != chunk_buf[..n] {
+                return Ok(false);
+            }
+            remaining_key = &remaining_key[n..];
             running_crc = crc32c_append(running_crc, &chunk_buf[..to_read]);
             file_pos += to_read as u64;
             remaining -= to_read;
@@ -1024,6 +1051,8 @@ mod tests {
             *b = ((i * 131 + 17) & 0xFF) as u8;
         }
         let ptr = writer.append_blob(b"large-key", &payload).unwrap();
+        let mut long_key = vec![b'k'; 80 * 1024];
+        let long_ptr = writer.append_blob(&long_key, &payload).unwrap();
         writer.sync_durable().unwrap();
         drop(writer);
 
@@ -1048,6 +1077,17 @@ mod tests {
         assert!(reader.validate_blob_ptr(&ptr).unwrap());
         assert!(spy.max_read_len.load(Ordering::SeqCst) <= 64 * 1024);
         assert!(spy.read_calls.load(Ordering::SeqCst) >= 5);
+        assert!(
+            reader
+                .validate_blob_ptr_for_key(&long_ptr, Some(&long_key))
+                .unwrap()
+        );
+        *long_key.last_mut().unwrap() = b'x';
+        assert!(
+            !reader
+                .validate_blob_ptr_for_key(&long_ptr, Some(&long_key))
+                .unwrap()
+        );
 
         // Wrong pointer CRC must fail closed cleanly.
         let bad_crc = BlobPtr {
@@ -1072,7 +1112,7 @@ mod tests {
         spy.inject_mode.store(INJECT_NONE, Ordering::SeqCst);
 
         // Flipping a byte near the tail of the 256 KB payload must fail streaming CRC32C check.
-        let tail_off = file_len - 7;
+        let tail_off = u64::from(ptr.offset) + u64::from(ptr.len) - 7;
         let mut orig = [0u8; 1];
         rw_file.read_exact_at(&mut orig, tail_off).unwrap();
         rw_file.write_all_at(&[orig[0] ^ 0x80], tail_off).unwrap();

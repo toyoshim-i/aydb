@@ -180,7 +180,7 @@ pub(crate) fn walk_chain<V>(
     mut validate_blob: V,
 ) -> io::Result<Walk>
 where
-    V: FnMut(&BlobPtr) -> io::Result<bool>,
+    V: FnMut(&[u8], &BlobPtr) -> io::Result<bool>,
 {
     let mut last = checkpoint_lsn;
     for (i, found) in chain.iter().enumerate() {
@@ -228,11 +228,11 @@ where
 /// a real I/O failure and is propagated instead of being read as "blob absent".
 fn blobs_valid<V>(batch: &WalBatch, validate_blob: &mut V) -> io::Result<bool>
 where
-    V: FnMut(&BlobPtr) -> io::Result<bool>,
+    V: FnMut(&[u8], &BlobPtr) -> io::Result<bool>,
 {
     for rec in &batch.records {
-        if let WalRecord::PutBlobPtr { blob_ptr, .. } = rec {
-            if !validate_blob(blob_ptr)? {
+        if let WalRecord::PutBlobPtr { key, blob_ptr } = rec {
+            if !validate_blob(key, blob_ptr)? {
                 return Ok(false);
             }
         }
@@ -502,11 +502,35 @@ pub fn recover_two_streams_optional_with_mode<F, V>(
     buf_epoch: u64,
     checkpoint_lsn: u64,
     scan_mode: WalScanMode,
-    validate_blob: V,
+    mut validate_blob: V,
 ) -> io::Result<TwoStreamRecoveryResult>
 where
     F: PlatformFile,
     V: FnMut(&BlobPtr) -> io::Result<bool>,
+{
+    recover_two_streams_keyed(
+        sync_file,
+        sync_epoch,
+        buf_file,
+        buf_epoch,
+        checkpoint_lsn,
+        scan_mode,
+        |_, ptr| validate_blob(ptr),
+    )
+}
+
+pub(crate) fn recover_two_streams_keyed<F, V>(
+    sync_file: Option<&F>,
+    sync_epoch: u64,
+    buf_file: Option<&F>,
+    buf_epoch: u64,
+    checkpoint_lsn: u64,
+    scan_mode: WalScanMode,
+    validate_blob: V,
+) -> io::Result<TwoStreamRecoveryResult>
+where
+    F: PlatformFile,
+    V: FnMut(&[u8], &BlobPtr) -> io::Result<bool>,
 {
     let sync_rec = match sync_file {
         Some(f) => recover_single_wal_stream_with_mode(f, sync_epoch, scan_mode)?,
@@ -527,7 +551,7 @@ fn recover_ordered<V>(
     validate_blob: V,
 ) -> io::Result<TwoStreamRecoveryResult>
 where
-    V: FnMut(&BlobPtr) -> io::Result<bool>,
+    V: FnMut(&[u8], &BlobPtr) -> io::Result<bool>,
 {
     let flags = StopFlags {
         unsupported_format: sync_rec.unsupported_format.is_some()

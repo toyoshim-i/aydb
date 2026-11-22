@@ -13,6 +13,56 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
+#[test]
+fn recovery_rejects_an_intact_blob_bound_to_another_row() {
+    let tmp = TempTestDir::new("recovery_blob_wrong_key");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let cfg = EngineConfig::default();
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let first_key = encode_primary_row_key(1, b"first");
+    let ptr = engine
+        .append_to_blob_segment(BlobKind::Standard, 0, &first_key, b"value")
+        .unwrap();
+    engine.sync_active_std_writer().unwrap();
+    let sync = WriteDurability::SyncTransactional;
+    engine
+        .commit_wal_and_memtable(
+            vec![WalRecord::PutBlobPtr {
+                key: first_key,
+                blob_ptr: ptr,
+            }],
+            sync,
+        )
+        .unwrap();
+    engine
+        .commit_wal_and_memtable(
+            vec![WalRecord::PutBlobPtr {
+                key: encode_primary_row_key(1, b"wrong"),
+                blob_ptr: ptr,
+            }],
+            sync,
+        )
+        .unwrap();
+    engine.put_row(1, b"later", b"v", &[], sync).unwrap();
+    drop(engine);
+    let mut recovered = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(
+        recovered
+            .last_wal_recovery()
+            .damage
+            .as_ref()
+            .unwrap()
+            .reason,
+        crate::wal::WalDamageReason::UnverifiableBlob
+    );
+    assert_eq!(
+        recovered.get_row(1, b"first").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    assert!(!recovered.row_exists(1, b"wrong").unwrap());
+    assert!(!recovered.row_exists(1, b"later").unwrap());
+}
+
 /// `OsFs` with two additions: the next creation of a file whose name starts with `fail_prefix`
 /// creates it and then reports an error, and every file created that way is remembered as one
 /// whose directory entry is not durable (`volatile`) until it is removed.

@@ -38,7 +38,7 @@ mod tests;
 #[cfg(test)]
 mod wal_link_tests;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -66,7 +66,7 @@ use crate::pal::{OpenHint, PlatformFile, PlatformFs};
 use crate::wal::{
     BlobKind, BlobPtr, DEFAULT_BUF_WAL_SIZE, DEFAULT_SYNC_WAL_SIZE, WAL_BUF_FILE_NAME,
     WAL_SYNC_FILE_NAME, WalAppendOutcome, WalBatch, WalRecord, WalScanMode, WalStreamMode,
-    WalStreamWriter, recover_two_streams_optional_with_mode,
+    WalStreamWriter, recover_two_streams_keyed,
 };
 pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport};
 
@@ -160,12 +160,12 @@ pub enum WalDamagePolicy {
     Fail,
 }
 
-/// A queued automatic deletion of a row whose blob failed verification (`Evict` policy).
+/// A queued automatic deletion of a row with a corrupt blob or malformed metadata.
 struct PendingCorruptEviction {
-    /// Key of the record (`'r'` row or `'t'` row-meta) whose blob was corrupt.
+    /// Key of the corrupt record (`'r'` row or `'t'` row-meta).
     key: Vec<u8>,
-    /// The blob pointer observed as corrupt; deletion only proceeds if it is still current.
-    ptr: BlobPtr,
+    /// The record observed as corrupt. A subsequent overwrite cancels the deletion.
+    observed: IndexValue,
 }
 
 /// The outcome of resolving a virtual table name to a `table_id` without registering it.
@@ -469,6 +469,26 @@ fn record_post_catalog_span<K: Ord>(
     }
 }
 
+/// Make the recovered tail dirty again before syncing it. A failed writeback can leave the
+/// correct bytes readable in cache but clean, so a bare sync on reopen may do nothing.
+fn persist_recovered_blob_tail(
+    file: &impl PlatformFile,
+    mut offset: u64,
+    end: u64,
+) -> io::Result<()> {
+    if offset >= end {
+        return Ok(());
+    }
+    let mut buf = vec![0; (end - offset).min(64 * 1024) as usize];
+    while offset < end {
+        let n = (end - offset).min(buf.len() as u64) as usize;
+        file.read_exact_at(&mut buf[..n], offset)?;
+        file.write_all_at(&buf[..n], offset)?;
+        offset += n as u64;
+    }
+    file.sync_durable()
+}
+
 fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
     if spans.is_empty() {
         return 0;
@@ -585,14 +605,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut std_post_catalog_spans: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
         let mut cataloged_std_len: HashMap<u64, u64> =
             HashMap::with_capacity(state_snapshot.std_blob_segments.len());
-        let mut dirty_std_blobs: HashSet<u64> = HashSet::new();
         for bmeta in &state_snapshot.std_blob_segments {
             let fname = format_std_blob_file_name(bmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
-            if physical_len > bmeta.file_len {
-                dirty_std_blobs.insert(bmeta.seq_id);
-            }
             let file_len = physical_len.max(bmeta.file_len);
             // The catalog already accounts for every byte below its length, so only bytes beyond
             // it can be unaccounted garbage. A file shorter than the catalog (its tail never
@@ -614,14 +630,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut lru_post_catalog_spans: BTreeMap<(u16, u64), Vec<(u64, u64)>> = BTreeMap::new();
         let mut cataloged_lru_len: HashMap<(u16, u64), u64> =
             HashMap::with_capacity(state_snapshot.lru_blob_segments.len());
-        let mut dirty_lru_blobs: HashSet<(u16, u64)> = HashSet::new();
         for lmeta in &state_snapshot.lru_blob_segments {
             let fname = format_lru_blob_file_name(lmeta.table_id, lmeta.seq_id);
             let file = fs.open_file(&fname, false, true, OpenHint::ImmutableSequential)?;
             let physical_len = file.file_len()?;
-            if physical_len > lmeta.file_len {
-                dirty_lru_blobs.insert((lmeta.table_id, lmeta.seq_id));
-            }
             let file_len = physical_len.max(lmeta.file_len);
             // See the `blob_std` loop above.
             cataloged_lru_len.insert((lmeta.table_id, lmeta.seq_id), lmeta.file_len);
@@ -656,7 +668,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if !std_blobs.contains_key(&seq_id) {
                         if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                             let flen = file.file_len()?;
-                            dirty_std_blobs.insert(seq_id);
                             std_blobs.insert(
                                 seq_id,
                                 TrackedStdBlob {
@@ -680,7 +691,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         if !lru_blobs.contains_key(&(tbl_id, seq_id)) {
                             if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                                 let flen = file.file_len()?;
-                                dirty_lru_blobs.insert((tbl_id, seq_id));
                                 lru_blobs.insert(
                                     (tbl_id, seq_id),
                                     TrackedLruBlob {
@@ -790,20 +800,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             WalScanMode::StopAtEndOfLog
         };
-        let mut rec = recover_two_streams_optional_with_mode(
+        let mut rec = recover_two_streams_keyed(
             sync_wal_opt.as_ref().map(|w| &**w.file()),
             state_snapshot.sync_wal_epoch,
             buf_wal_opt.as_ref().map(|w| &**w.file()),
             state_snapshot.buf_wal_epoch,
             state_snapshot.checkpoint_lsn,
             scan_mode,
-            |ptr| match ptr.kind {
+            |key, ptr| match ptr.kind {
                 BlobKind::Standard => match std_blobs.get(&ptr.seg_id) {
-                    Some(b) => b.reader.validate_blob_ptr(ptr),
+                    Some(b) => b.reader.validate_blob_ptr_for_key(ptr, Some(key)),
                     None => Ok(false),
                 },
                 BlobKind::Lru => match lru_blobs.get(&(ptr.table_id, ptr.seg_id)) {
-                    Some(b) => b.reader.validate_blob_ptr(ptr),
+                    Some(b) => b.reader.validate_blob_ptr_for_key(ptr, Some(key)),
                     None => Ok(false),
                 },
             },
@@ -879,11 +889,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
                     match ptr.kind {
                         BlobKind::Standard => {
-                            let cataloged_len =
-                                cataloged_std_len.get(&ptr.seg_id).copied().unwrap_or(0);
-                            if end > cataloged_len {
-                                dirty_std_blobs.insert(ptr.seg_id);
-                            }
                             if let (Some(&cat_len), Some(b)) = (
                                 cataloged_std_len.get(&ptr.seg_id),
                                 std_blobs.get(&ptr.seg_id),
@@ -900,10 +905,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         BlobKind::Lru => {
                             let key = (ptr.table_id, ptr.seg_id);
-                            let cataloged_len = cataloged_lru_len.get(&key).copied().unwrap_or(0);
-                            if end > cataloged_len {
-                                dirty_lru_blobs.insert(key);
-                            }
                             if let (Some(&cat_len), Some(b)) =
                                 (cataloged_lru_len.get(&key), lru_blobs.get(&key))
                             {
@@ -1122,18 +1123,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             true
         });
 
-        // Sync every surviving dirty or replayed blob segment before cataloging lengths or
-        // flushing `idx` segments: after a process crash those tails may exist only in the OS
-        // page cache, and no active writer owns them during post-recovery checkpointing.
+        // Cataloged lengths are the durable prefix. Adopted segments start at zero.
+        // Finish writeback before publishing a longer length or checkpointing the WAL.
         for (seq_id, b) in &std_blobs {
-            if dirty_std_blobs.contains(seq_id) {
-                b.reader.file().sync_durable()?;
-            }
+            let start = cataloged_std_len.get(seq_id).copied().unwrap_or(0);
+            persist_recovered_blob_tail(&**b.reader.file(), start, b.file_len)?;
         }
         for (key, b) in &lru_blobs {
-            if dirty_lru_blobs.contains(key) {
-                b.reader.file().sync_durable()?;
-            }
+            let start = cataloged_lru_len.get(key).copied().unwrap_or(0);
+            persist_recovered_blob_tail(&**b.reader.file(), start, b.file_len)?;
         }
 
         // Catalog uncataloged blob segments that turned out to hold live records. Their SeqIDs are
@@ -1367,6 +1365,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
+    }
+
+    /// Every assigned LSN needs a representable successor, including the final commit chunk.
+    fn lsn_after_batches(&self, count: usize) -> io::Result<u64> {
+        self.next_lsn
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("WAL LSN space exhausted"))
     }
 
     /// Enables or disables background compaction mode at runtime (see
@@ -3133,17 +3138,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 ),
             )),
             CorruptPolicy::Evict => {
-                if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
-                    q.insert(
-                        (table_id, pk.to_vec()),
-                        PendingCorruptEviction {
-                            key: key.to_vec(),
-                            ptr: *ptr,
-                        },
-                    );
-                }
+                self.queue_corrupt_eviction(table_id, pk, key, IndexValue::Blob(*ptr));
                 Ok(())
             }
+        }
+    }
+
+    fn queue_corrupt_eviction(&self, table_id: u16, pk: &[u8], key: &[u8], observed: IndexValue) {
+        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
+            q.insert(
+                (table_id, pk.to_vec()),
+                PendingCorruptEviction {
+                    key: key.to_vec(),
+                    observed,
+                },
+            );
         }
     }
 
@@ -3170,7 +3179,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// transaction, where draining is deferred). Never called from read paths, so a
     /// connection that merely reads never writes. Does nothing while a transaction is active
     /// or the engine is poisoned (entries stay queued). Each entry is re-checked: the row is
-    /// only deleted if its record still points to the same corrupt `BlobPtr` (it may have been
+    /// only deleted if its record still has the observed bytes or blob pointer (it may have been
     /// overwritten or deleted since). Deletes use `BufferedFast` durability.
     pub(super) fn drain_corrupt_evictions(&mut self) -> io::Result<()> {
         if self.tx_depth > 0 || self.is_poisoned() || !self.has_pending_corrupt_evictions() {
@@ -3185,7 +3194,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut iter = pending.into_iter();
         while let Some(((table_id, pk), ev)) = iter.next() {
             let step = match self.lookup_raw_entry(&ev.key) {
-                Ok(Some((_, IndexValue::Blob(p)))) if p == ev.ptr => self
+                Ok(Some((_, current))) if current == ev.observed => self
                     .delete_row(table_id, &pk, WriteDurability::BufferedFast)
                     .map(|_| ()),
                 Ok(_) => Ok(()),
@@ -3913,6 +3922,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;
+        let successor = self.lsn_after_batches(1)?;
 
         if self.tx_depth > 0 {
             let batch_bytes: usize = records
@@ -3936,8 +3946,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     "transaction exceeds max_transaction_bytes budget",
                 ));
             }
+            let record_count = u32::try_from(records.len())
+                .ok()
+                .and_then(|n| self.pending_tx_record_count.checked_add(n))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many records in transaction",
+                    )
+                })?;
             self.pending_tx_bytes = next_tx_bytes;
-            self.next_lsn += 1;
+            self.next_lsn = successor;
             if durability == WriteDurability::SyncTransactional {
                 self.pending_tx_sync = true;
             }
@@ -3947,7 +3966,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
             }
             WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
-            self.pending_tx_record_count += records.len() as u32;
+            self.pending_tx_record_count = record_count;
             self.note_records_table_mutations(&records);
             let record_undo = !self.savepoints.is_empty();
             for rec in records {
@@ -3967,7 +3986,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         raw.clear();
         self.scratch_wal_encoded = raw;
         res?;
-        self.next_lsn = self.next_lsn.max(lsn + 1);
+        self.next_lsn = self.next_lsn.max(successor);
         if count_as_data_write && has_records {
             self.note_records_table_mutations(&batch.records);
         }
@@ -4169,6 +4188,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         match val {
             IndexValue::Inline(bytes) => Ok(match RowMetaRecord::from_bytes(&bytes) {
                 Ok(r) => MetaLookup::Found(r, None),
+                Err(e) if e.kind() != io::ErrorKind::InvalidData => return Err(e),
                 Err(_) => {
                     self.count_corrupt_detection();
                     MetaLookup::Corrupt(None)
@@ -4177,7 +4197,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             IndexValue::Blob(ptr) => match self.dereference_blob_lenient(&ptr, meta_key)? {
                 Some(bytes) => Ok(match RowMetaRecord::from_bytes(&bytes) {
                     Ok(r) => MetaLookup::Found(r, Some(ptr)),
-                    Err(_) => MetaLookup::Corrupt(Some(ptr)),
+                    Err(e) if e.kind() != io::ErrorKind::InvalidData => return Err(e),
+                    Err(_) => {
+                        self.count_corrupt_detection();
+                        MetaLookup::Corrupt(Some(ptr))
+                    }
                 }),
                 None => Ok(MetaLookup::Corrupt(Some(ptr))),
             },

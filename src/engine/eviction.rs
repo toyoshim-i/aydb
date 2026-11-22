@@ -236,10 +236,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
             let plan_res = (|| -> io::Result<()> {
                 for entry in candidates {
-                    let Some((old_tick, pk_slice)) = decode_lru_queue_key(table_id, &entry.key)
-                    else {
-                        continue;
-                    };
+                    let (old_tick, pk_slice) = decode_lru_queue_key(table_id, &entry.key)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid LRU queue key")
+                        })?;
                     last_scanned_tick = old_tick;
 
                     if matches!(entry.value, IndexValue::Tombstone) {
@@ -538,33 +538,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             )?;
             let mut meta_map: HashMap<Vec<u8>, (RowMetaRecord, Option<BlobPtr>)> =
                 HashMap::with_capacity(meta_entries.len());
-            // `'t'` records stored as blobs that failed verification (pk -> (meta key, ptr)).
-            // They must NOT be regenerated as empty metadata (that would orphan the row's
-            // secondary-index entries); instead the row is reported to the corruption policy.
-            let mut corrupt_meta: HashMap<Vec<u8>, (Vec<u8>, BlobPtr)> = HashMap::new();
+            // Preserve unreadable metadata so deletion can clean up indexes by primary key.
+            let mut corrupt_meta = HashMap::new();
             for entry in meta_entries {
                 if entry.key.len() >= 3 {
-                    let decoded = match entry.value {
-                        IndexValue::Inline(bytes) => {
-                            RowMetaRecord::from_bytes(&bytes).ok().map(|r| (r, None))
-                        }
-                        IndexValue::Blob(ptr) => {
-                            match self.dereference_blob_lenient(&ptr, &entry.key)? {
-                                Some(bytes) => RowMetaRecord::from_bytes(&bytes)
-                                    .ok()
-                                    .map(|r| (r, Some(ptr))),
-                                None => {
-                                    corrupt_meta
-                                        .insert(entry.key[3..].to_vec(), (entry.key.clone(), ptr));
-                                    None
-                                }
-                            }
-                        }
-                        IndexValue::Tombstone => None,
+                    let (decoded, ptr) = match &entry.value {
+                        IndexValue::Inline(bytes) => (Some(RowMetaRecord::from_bytes(bytes)), None),
+                        IndexValue::Blob(ptr) => (
+                            self.dereference_blob_raw(ptr, &entry.key)?
+                                .map(|bytes| RowMetaRecord::from_bytes(&bytes)),
+                            Some(*ptr),
+                        ),
+                        IndexValue::Tombstone => continue,
                     };
-                    if let Some((rec, m_ptr)) = decoded {
-                        self.access_tracker.observe_tick(rec.recorded_tick);
-                        meta_map.insert(entry.key[3..].to_vec(), (rec, m_ptr));
+                    let pk = entry.key[3..].to_vec();
+                    match decoded {
+                        Some(Ok(rec)) => {
+                            self.access_tracker.observe_tick(rec.recorded_tick);
+                            meta_map.insert(pk, (rec, ptr));
+                        }
+                        Some(Err(e)) if e.kind() != io::ErrorKind::InvalidData => return Err(e),
+                        _ => {
+                            corrupt_meta.insert(pk, (entry.key, entry.value));
+                        }
                     }
                 }
             }
@@ -629,14 +625,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         IndexValue::Tombstone => continue,
                     };
                     let logical_size = (pk.len() + val_len) as u32;
-                    if let Some((mkey, mptr)) = corrupt_meta.get(pk) {
+                    if let Some((mkey, observed)) = corrupt_meta.remove(pk) {
                         // Count the row at its estimated size; under `Evict` it is queued for
                         // deletion (which cleans 'i'/'l' entries by scanning), under `Error` it
                         // stays until the user deletes it. Never fail reconciliation/open.
                         total_bytes = total_bytes.saturating_add(logical_size as u64);
                         needs_repair = true;
                         if apply_repairs {
-                            let _ = self.note_corrupt_blob(mkey, mptr);
+                            self.count_corrupt_detection();
+                            if self.corrupt_policy(tid) == super::CorruptPolicy::Evict {
+                                self.queue_corrupt_eviction(tid, pk, &mkey, observed);
+                            }
                         }
                         continue;
                     }
@@ -734,7 +733,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             1,
             false,
             |key, _lsn, _value| {
-                newest_tick = decode_lru_queue_key(table_id, key).map(|(tick, _)| tick);
+                let (tick, _) = decode_lru_queue_key(table_id, key).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid LRU queue key")
+                })?;
+                newest_tick = Some(tick);
                 Ok(true)
             },
         )?;

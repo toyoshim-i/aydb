@@ -102,6 +102,8 @@ Each of the two slots (`Slot A` at offset `0`, `Slot B` at offset `4096`) is exa
 | `4092..4096` | 4 B | `trailer_crc32c` | `u32` | CRC32C checksum computed over the entire preceding 4092 bytes (`slot[0..4092]`). |
 
 #### Why Dual/Triple Checksums (`header_crc32c`, `payload_crc32c`, and `trailer_crc32c`)?
+
+A partial write can install a new header and its CRC while leaving the old payload and trailer in place. The header and trailer checks can both pass in this case. A payload CRC mismatch disqualifies that slot and allows recovery to use the other verified slot.
 While modern SSDs have 4 KB physical pages, some legacy disks, virtualized storage controllers, or network SMB transports fragment a 4 KB write into eight **512-byte sub-sectors**. If power fails after the first 512 bytes of a 4 KB slot are written (updating the header at `0..64`) but before the final 512-byte sub-sector (`3584..4096`) hits media, `header_crc32c` alone would pass while the tail of the slot still contained bytes from two generations ago!
 Placing `trailer_crc32c` at bytes `4092..4096` (the final 4 bytes of the 8th 512-byte sub-sector) guarantees that **both the head and the tail of the 4 KB page must arrive intact** for the slot to validate.
 

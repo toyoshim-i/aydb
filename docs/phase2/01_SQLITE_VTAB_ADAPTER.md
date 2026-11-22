@@ -59,8 +59,8 @@ While the primary key column is encoded using `src/index/key_codec.rs` (memcompa
   When a query runs `SELECT status FROM http_cache WHERE url = 'https://...'` on a row that also contains a `1 MB` `body BLOB` column, `xColumn` inspects `Col 1` directly at `Offset[1]` in $O(1)$ time without touching or copying the `1 MB` blob column!
 * **Zero-Copy Column Projection (`project_column_zero_copy`):**
   Rather than decoding a `ColValue` enum that allocates intermediate `String` or `Vec<u8>` buffers on the Rust heap during `xColumn`, `project_column_zero_copy` reads the 5-byte directory entry directly from the cursor's contiguous byte slab (`&[u8]`) and passes raw borrowed byte slices (`*const u8`) straight to `sqlite3_result_text` / `sqlite3_result_blob` (`SQLITE_TRANSIENT`), achieving **zero Rust heap allocations per projected column**.
-* **Direct FFI Serialization (`encode_sqlite_values_direct`):**
-  On `INSERT` and `UPDATE` (`xUpdate`), `encode_sqlite_values_direct` reads `sqlite3_value` pointers directly over FFI and serializes the 5-byte column directory and payloads in a single pass into a pre-sized `Vec<u8>`, bypassing any intermediate `Vec<ColValue>` allocation.
+* **Direct FFI Serialization (`try_encode_sqlite_values_direct`):**
+  On `INSERT` and `UPDATE` (`xUpdate`), `try_encode_sqlite_values_direct` reads `sqlite3_value` pointers directly over FFI and serializes the 5-byte column directory and payloads in a single pass into a pre-sized `Vec<u8>`, bypassing any intermediate `Vec<ColValue>` allocation. The encoder checks the 16-bit column count and 32-bit packed row length before allocating the output buffer. An oversized row returns `SQLITE_TOOBIG` from `xUpdate`.
 
 ---
 
@@ -110,7 +110,7 @@ SQLite routes `INSERT`, `UPDATE`, and `DELETE` statements on a virtual table to 
 | Operation | `argc` & `argv` Condition | `aydb` Execution Path |
 | :--- | :--- | :--- |
 | **`DELETE`** | `argc == 1` (`argv[0]` is old PK / rowid) | Extracts `old_pk` from `argv[0]` (via reversible 8-byte `i64` decoding or the persistent rowid index) and calls `engine.delete_row(table_id, &old_pk, durability)`. |
-| **`INSERT` / `REPLACE`** | `argc > 1` and `sqlite3_value_type(argv[0]) == SQLITE_NULL` | Extracts `new_pk` from `argv[2 + pk_col_idx]`, encodes all columns directly via `encode_sqlite_values_direct`, builds secondary index pairs `(index_id, col_bytes)` (plus one pair `(0x8000 | column, component)` for each non-`NULL` `UNIQUE` column, and the conflict check probes those entries), and calls `engine.put_row_owned(table_id, &new_pk, row_bytes, &sec_keys, durability)`. A duplicate primary key is first resolved against `ON CONFLICT` (`sqlite3_vtab_on_conflict`), failing with `SQLITE_CONSTRAINT` by default. `put_row_owned` overwrites existing keys and cleans up old blobs and LRU entries, so `INSERT OR REPLACE` works in a single pass. |
+| **`INSERT` / `REPLACE`** | `argc > 1` and `sqlite3_value_type(argv[0]) == SQLITE_NULL` | Extracts `new_pk` from `argv[2 + pk_col_idx]`, encodes all columns directly via `try_encode_sqlite_values_direct`, builds secondary index pairs `(index_id, col_bytes)` (plus one pair `(0x8000 | column, component)` for each non-`NULL` `UNIQUE` column, and the conflict check probes those entries), and calls `engine.put_row_owned(table_id, &new_pk, row_bytes, &sec_keys, durability)`. A duplicate primary key is first resolved against `ON CONFLICT` (`sqlite3_vtab_on_conflict`), failing with `SQLITE_CONSTRAINT` by default. `put_row_owned` overwrites existing keys and cleans up old blobs and LRU entries, so `INSERT OR REPLACE` works in a single pass. |
 | **`UPDATE`** | `argc > 1` and `sqlite3_value_type(argv[0]) != SQLITE_NULL` | Resolves `old_pk` from `argv[0]`. If `old_pk != new_pk`, deletes `old_pk` first, then upserts `new_pk` via `engine.put_row_owned(...)`. |
 
 ### 4.2 Lock-Free Reversible Integer `ROWID` Mapping

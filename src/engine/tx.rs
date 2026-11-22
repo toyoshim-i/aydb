@@ -1361,6 +1361,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         self.check_not_poisoned()?;
+        self.lsn_after_batches(1)?;
         let record_count = self.pending_tx_record_count;
         self.pending_tx_record_count = 0;
         let durability = if self.pending_tx_sync {
@@ -1488,6 +1489,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let mut required_sectors = 0usize;
+        // Refuse the entire transaction before the first chunk reaches either log.
+        self.lsn_after_batches(chunk_spans.len())?;
         let mut max_chunk_len = 0usize;
         for &(start, end, _) in &chunk_spans {
             let chunk_len = crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (end - start);

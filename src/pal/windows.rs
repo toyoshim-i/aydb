@@ -721,8 +721,7 @@ impl PlatformFs for WinPlatformFs {
     }
 
     fn sync_dir(&self) -> io::Result<()> {
-        let _ = self.sync_dir_if_unc();
-        Ok(())
+        self.sync_dir_if_unc()
     }
 
     fn list_files(&self) -> io::Result<Vec<String>> {

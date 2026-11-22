@@ -39,8 +39,15 @@ impl SqliteConnection {
     }
 
     /// Opens a file-backed SQLite database at `path`.
+    /// Returns `InvalidInput` if the path cannot be represented by SQLite's UTF-8 API.
     pub fn open_file(path: &Path) -> io::Result<Self> {
-        Self::open_path(&path.to_string_lossy())
+        let path = path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQLite path is not valid UTF-8",
+            )
+        })?;
+        Self::open_path(path)
     }
 
     fn open_path(path_str: &str) -> io::Result<Self> {
@@ -148,6 +155,12 @@ impl SqliteConnection {
 
     /// Prepares a parameterized SQL statement for repeated low-overhead execution.
     pub fn prepare(&self, sql: &str) -> io::Result<SqliteStatement<'_>> {
+        if sql.as_bytes().contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NUL byte in SQL",
+            ));
+        }
         if sql.len() > i32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

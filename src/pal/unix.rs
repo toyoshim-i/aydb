@@ -513,9 +513,9 @@ impl PlatformFile for UnixPlatformFile {
         match strategy {
             PreallocStrategy::LogicalExtendOnly => {
                 let _guard = self.mark_write_start();
-                let extend_len = target_len - current_len;
                 #[cfg(target_os = "linux")]
                 {
+                    let extend_len = target_len - current_len;
                     if let (Ok(off_i64), Ok(len_i64)) =
                         (i64::try_from(current_len), i64::try_from(extend_len))
                     {

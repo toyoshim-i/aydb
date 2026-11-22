@@ -2575,6 +2575,15 @@ fn crash_group_commit_seeds() {
     run_mode_test("crash-group-commit", mode, DEFAULT_MODE_SEEDS);
 }
 
+#[test]
+fn recovery_uses_the_other_slot_after_a_partial_boot_meta_write() {
+    let mode = Mode {
+        media: false,
+        group: true,
+    };
+    run_seed(1902, mode, &Coverage::default()).unwrap();
+}
+
 /// Group commit and media damage together.
 #[test]
 fn crash_group_commit_media_damage_seeds() {
@@ -4617,6 +4626,58 @@ fn process_crash_recovery_syncs_buffered_blobs_before_checkpoint() {
         e.get_row(3, b"lru_k").unwrap().as_deref(),
         Some(v_lru.as_slice())
     );
+}
+
+#[test]
+fn recovery_preserves_blob_tails_marked_clean_by_failed_writeback() {
+    let fs = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut cfg = repro_config();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 1 << 20;
+    let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    e.register_capped_table(3, 1 << 20).unwrap();
+    let prefix = vec![0x31; 512];
+    let tail = vec![0x76; 80 * 1024];
+    for tid in [2, 3] {
+        e.put_row(tid, b"prefix", &prefix, &[], SYNC).unwrap();
+    }
+    e.checkpoint().unwrap();
+    for tid in [2, 3] {
+        e.put_row(tid, b"tail", &tail, &[], BUF).unwrap();
+    }
+    drop(e);
+    {
+        let mut st = fs.st();
+        let ids: Vec<_> = st
+            .dir
+            .iter()
+            .filter(|(name, _)| name.starts_with("blob_"))
+            .map(|(_, &id)| id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let inode = &mut st.inodes[id];
+            assert!(!inode.pending.is_empty());
+            assert!(inode.cache.len() > inode.durable.len());
+            // The exact cache state produced by Effect::Lost on a failed file sync.
+            inode.pending.clear();
+        }
+    }
+    fs.crash(Crash::Process);
+    // Fail the second chunk of the standard tail on the first recovery attempt.
+    fs.arm(None, Some((FileKind::Blob, 1)));
+    assert!(StorageEngine::open(Arc::clone(&fs), cfg.clone()).is_err());
+    assert!(fs.fault_happened());
+    fs.crash(Crash::Process);
+    let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    reopened.checkpoint().unwrap();
+    drop(reopened);
+    fs.crash(Crash::Power { keep: 0, lose: 100 });
+    let mut reopened = StorageEngine::open(fs, cfg).unwrap();
+    for tid in [2, 3] {
+        assert!(row_is(&mut reopened, tid, b"prefix", &prefix));
+        assert!(row_is(&mut reopened, tid, b"tail", &tail));
+    }
 }
 
 /// `checkpoint` and `flush_memtable` must drain any pending group commit before draining

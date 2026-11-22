@@ -32,6 +32,8 @@ fn main() -> std::io::Result<()> {
 
 `OsFs::open(path, true)` permits directory creation; it does not reset an existing database. Open one engine for a store and share that instance when necessary. A database is a directory of managed files. Do not edit, remove, or independently open its files while it is in use. SMB storage follows the single-host exclusive access model in the [architecture](../ARCHITECTURE.md#21-single-host-exclusive-handle-model).
 
+On Unix, paths follow filesystem symlinks before resolving a subsequent `..`. Earlier versions removed `link/..` before consulting the filesystem. If an existing configuration uses that pattern, set its database root to the absolute path of the directory that contains the existing store before upgrading.
+
 ## Rows, ordering, and secondary keys
 
 * A native table is a `u16` namespace. Use nonzero IDs and keep an application-owned mapping of IDs to meanings; a normal native table needs no SQL DDL. Table `0` is reserved.

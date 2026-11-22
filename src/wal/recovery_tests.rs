@@ -29,7 +29,7 @@ fn found(lsn: u64, prev: u64, durable: u64) -> Found {
 }
 
 fn walk(chain: &[Found], checkpoint: u64) -> (usize, Option<(u64, CutKind)>) {
-    let w = walk_chain(chain, checkpoint, |_| Ok(true)).unwrap();
+    let w = walk_chain(chain, checkpoint, |_, _| Ok(true)).unwrap();
     (w.valid, w.cut.map(|c| (c.lsn, c.kind)))
 }
 
@@ -88,11 +88,11 @@ fn an_unverifiable_blob_is_the_cut_at_its_own_lsn() {
             crc32c: 0,
         },
     }];
-    let w = walk_chain(&chain, 4, |p| Ok(p.seg_id != 77)).unwrap();
+    let w = walk_chain(&chain, 4, |key, p| Ok(key != b"k" || p.seg_id != 77)).unwrap();
     assert_eq!((w.valid, w.cut.unwrap().lsn), (1, 9));
     assert_eq!(w.cut.unwrap().kind, CutKind::Blob);
     // A validator error is an I/O failure, not a missing blob.
-    let err = walk_chain(&chain, 4, |_| Err(io::Error::other("disk"))).unwrap_err();
+    let err = walk_chain(&chain, 4, |_, _| Err(io::Error::other("disk"))).unwrap_err();
     assert_eq!(err.to_string(), "disk");
 }
 

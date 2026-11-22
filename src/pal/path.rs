@@ -20,8 +20,11 @@ pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> 
     } else {
         std::env::current_dir()?.join(path)
     };
-    let clean_abs = clean_lexical_path(&abs_path);
-    let prefixed = ensure_extended_length_prefix(clean_abs);
+    #[cfg(windows)]
+    let prefixed = ensure_extended_length_prefix(clean_lexical_path(&abs_path));
+    // On Unix a symlink followed by ".." names the parent of the link target.
+    #[cfg(not(windows))]
+    let prefixed = abs_path;
     if create {
         std::fs::create_dir_all(&prefixed)?;
     }
@@ -29,6 +32,7 @@ pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> 
     Ok(ensure_extended_length_prefix(canonical))
 }
 
+#[cfg(windows)]
 fn clean_lexical_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -165,10 +169,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn database_root_resolves_parent_components_after_symlinks() {
+        let tmp = crate::util::test_util::TempTestDir::new("root_symlink_parent");
+        let target = tmp.path.join("target");
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        std::os::unix::fs::symlink(target.join("sub"), tmp.path.join("link")).unwrap();
+        let path = tmp.path.join("link/../database");
+        let resolved = normalize_db_root_path(&path, true).unwrap();
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(target.join("database")).unwrap()
+        );
+        assert_eq!(normalize_db_root_path(&path, false).unwrap(), resolved);
+        assert!(!tmp.path.join("database").exists());
+    }
+
+    #[test]
     fn normalize_db_root_path_creates_deep_long_paths_exceeding_max_path() {
         let pid = std::process::id();
         let base = std::env::temp_dir().join(format!("aydb_long_path_{pid}"));
-        let base_prefixed = ensure_extended_length_prefix(clean_lexical_path(&base));
+        let base_prefixed = ensure_extended_length_prefix(base.clone());
         let _ = std::fs::remove_dir_all(&base_prefixed);
 
         let mut deep = base.clone();

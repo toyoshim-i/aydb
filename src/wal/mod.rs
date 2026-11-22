@@ -17,6 +17,7 @@ pub use self::recovery::{
     WalRecoveryReport, recover_two_streams, recover_two_streams_optional_with_mode,
     recover_two_streams_with_mode,
 };
+pub(crate) use recovery::recover_two_streams_keyed;
 
 /// Fixed filename for the synchronous write-through WAL stream.
 pub const WAL_SYNC_FILE_NAME: &str = "wal_sync.db";

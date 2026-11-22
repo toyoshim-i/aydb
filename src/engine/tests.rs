@@ -6523,6 +6523,30 @@ fn backfill_engine(name: &str) -> (TempTestDir, Arc<OsFs>, EngineConfig, Storage
 const UNIQ: u16 = 0x8001;
 
 #[test]
+fn lsn_exhaustion_rejects_writes_and_preserves_the_last_commit() {
+    let (_tmp, fs, cfg, mut engine) = backfill_engine("lsn_exhaustion");
+    let sync = WriteDurability::SyncTransactional;
+    engine.next_lsn = u64::MAX - 1;
+    engine.begin_transaction();
+    engine
+        .put_row(1, b"rolled-back", b"value", &[], sync)
+        .unwrap();
+    assert!(engine.commit_transaction().is_err());
+    assert_eq!(engine.next_lsn(), u64::MAX - 1);
+    engine.put_row(1, b"last", b"value", &[], sync).unwrap();
+    assert!(engine.put_row(1, b"later", b"value", &[], sync).is_err());
+    drop(engine);
+    let mut reopened = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(reopened.next_lsn(), u64::MAX);
+    assert_eq!(
+        reopened.get_row(1, b"last").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+    assert!(reopened.get_row(1, b"rolled-back").unwrap().is_none());
+    assert!(reopened.get_row(1, b"later").unwrap().is_none());
+}
+
+#[test]
 fn backfill_adds_entries_and_meta_to_a_row_without_either() {
     let (_tmp, _fs, _cfg, mut engine) = backfill_engine("backfill_fresh");
     engine

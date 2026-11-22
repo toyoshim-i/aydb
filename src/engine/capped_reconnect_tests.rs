@@ -140,6 +140,95 @@ fn row_count(engine: &mut StorageEngine<CountFs>) -> usize {
 }
 
 #[test]
+fn reconciliation_preserves_unreadable_metadata_for_index_cleanup() {
+    for spilled in [false, true] {
+        for policy in [CorruptPolicy::Error, CorruptPolicy::Evict] {
+            let lab = Lab::new("capped_malformed_metadata");
+            let mut engine = lab.open();
+            let durability = WriteDurability::SyncTransactional;
+            engine.register_capped_table(TABLE, QUOTA).unwrap();
+            engine
+                .put_row(TABLE, b"k", b"v", &[(1, b"a".to_vec())], durability)
+                .unwrap();
+            let key = encode_row_meta_key(TABLE, b"k");
+            let record = if spilled {
+                let blob_ptr = engine
+                    .append_to_blob_segment(BlobKind::Standard, 0, &key, &[0])
+                    .unwrap();
+                engine.sync_active_std_writer().unwrap();
+                WalRecord::PutBlobPtr { key, blob_ptr }
+            } else {
+                WalRecord::PutInline {
+                    key,
+                    value: vec![0],
+                }
+            };
+            engine
+                .commit_wal_and_memtable(vec![record], durability)
+                .unwrap();
+            engine.set_table_corrupt_policy(TABLE, policy);
+            assert!(engine.reconcile_capped_tables_readonly().unwrap());
+            assert!(!engine.has_pending_corrupt_evictions());
+            engine.reconcile_single_capped_table(TABLE).unwrap();
+            assert_eq!(
+                engine.has_pending_corrupt_evictions(),
+                policy == CorruptPolicy::Evict
+            );
+            assert_eq!(
+                engine
+                    .capped_table_state(TABLE)
+                    .unwrap()
+                    .current_logical_bytes,
+                2
+            );
+            engine.drain_corrupt_evictions().unwrap();
+            assert_eq!(
+                engine.row_exists(TABLE, b"k").unwrap(),
+                policy == CorruptPolicy::Error
+            );
+            engine.delete_row(TABLE, b"k", durability).unwrap();
+            assert!(
+                engine
+                    .lookup_by_secondary_index(TABLE, 1, b"a")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                engine
+                    .capped_table_state(TABLE)
+                    .unwrap()
+                    .current_logical_bytes,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn eviction_reports_a_malformed_queue_key() {
+    let lab = Lab::new("capped_malformed_queue");
+    let mut engine = lab.open();
+    engine.register_capped_table(TABLE, QUOTA).unwrap();
+    let mut key = crate::lru::encode_namespace_prefix(TABLE, crate::lru::NS_LRU_QUEUE).to_vec();
+    key.push(1);
+    engine
+        .commit_wal_and_memtable(
+            vec![WalRecord::PutInline { key, value: vec![] }],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    engine
+        .capped_tables
+        .get_mut(&TABLE)
+        .unwrap()
+        .current_logical_bytes = QUOTA + 1;
+    let err = engine
+        .evict_until_within_quota(TABLE, WriteDurability::BufferedFast)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn an_unchanged_reconnect_commits_no_metadata() {
     let lab = Lab::seeded("capped_reconnect_same");
     let mut engine = lab.open();

@@ -93,7 +93,8 @@ pub use crate::vtab::row_codec::{
     encode_i64_tagged_key, encode_row, encode_sqlite_values_direct, extract_column_key_bytes,
     extract_column_key_bytes_with_collation, f64_to_exact_i64, format_sqlite_float_text,
     parse_sqlite_numeric_str, project_column_zero_copy, project_key_zero_copy,
-    sqlite_value_to_key_bytes, sqlite_value_to_key_bytes_with_schema,
+    sqlite_value_to_key_bytes, sqlite_value_to_key_bytes_with_schema, try_encode_row,
+    try_encode_sqlite_values_direct,
 };
 pub use crate::vtab::rowid_map::hash_pk_to_rowid;
 use crate::vtab::rowid_map::{extract_rowid_from_pk_bytes, extract_rowid_from_row};
@@ -2795,7 +2796,7 @@ unsafe extern "system" fn vtab_update(
             None
         };
 
-        let (new_pk, row_bytes, mut sec_keys) = encode_sqlite_values_direct(
+        let (new_pk, row_bytes, mut sec_keys) = match try_encode_sqlite_values_direct(
             argv.offset(2),
             num_cols,
             vtab.pk_col_idx,
@@ -2803,7 +2804,12 @@ unsafe extern "system" fn vtab_update(
             &vtab.col_affinities,
             &vtab.col_collations,
             &vtab.secondary_indexes,
-        );
+        ) {
+            Ok(row) => row,
+            Err(e) if e.kind() == io::ErrorKind::FileTooLarge => return ffi::SQLITE_TOOBIG,
+            Err(e) if e.kind() == io::ErrorKind::OutOfMemory => return ffi::SQLITE_NOMEM,
+            Err(e) => return io_err_to_sqlite_rc(&e),
+        };
 
         let coerced_int_pk = if vtab.pk_rowid_alias {
             decode_i64_tagged_key(&new_pk)

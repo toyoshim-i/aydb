@@ -509,26 +509,63 @@ pub fn decode_i64_tagged_key(key: &[u8]) -> Option<i64> {
 
 /// Encodes a slice of [`SqlValue`] columns into the compact binary row layout:
 /// `[col_count: u16 LE | flags: u16 LE | C * (type_tag: u8, offset: u32 LE) | payloads...]`.
+///
+/// # Panics
+/// Panics if the row exceeds the format limits or its output buffer cannot be allocated.
+/// Use [`try_encode_row`] to handle these errors.
 pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
+    try_encode_row(cols).expect("cannot encode row")
+}
+
+fn row_too_large() -> io::Error {
+    io::Error::new(
+        ErrorKind::FileTooLarge,
+        "row exceeds the binary row format limits",
+    )
+}
+
+fn row_header_len(count: usize) -> io::Result<u32> {
+    Ok(4 + 5 * u32::from(u16::try_from(count).map_err(|_| row_too_large())?))
+}
+
+fn add_cell_size(total: u32, prefix: u32, payload: usize) -> io::Result<u32> {
+    let payload = u32::try_from(payload).map_err(|_| row_too_large())?;
+    total
+        .checked_add(prefix)
+        .and_then(|n| n.checked_add(payload))
+        .ok_or_else(row_too_large)
+}
+
+fn allocate_row(size: u32) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size as usize)
+        .map_err(|_| io::Error::from(ErrorKind::OutOfMemory))?;
+    buf.resize(size as usize, 0);
+    Ok(buf)
+}
+
+/// Encodes a row, returning `FileTooLarge` when the column count or total length exceeds
+/// the on-disk representation. Performs the size checks before allocating the output.
+pub fn try_encode_row(cols: &[SqlValue]) -> io::Result<Vec<u8>> {
     let col_count = cols.len();
     let dir_start = 4;
-    let payload_start = dir_start + col_count * 5;
+    let payload_start = row_header_len(col_count)?;
 
-    let mut total_payload = 0usize;
+    let mut size = payload_start;
     for c in cols {
-        total_payload += match c {
-            SqlValue::Null => 0,
-            SqlValue::Integer(_) | SqlValue::Float(_) => 8,
-            SqlValue::Text(s) => 4 + s.len(),
-            SqlValue::Blob(b) => 4 + b.len(),
+        size = match c {
+            SqlValue::Null => size,
+            SqlValue::Integer(_) | SqlValue::Float(_) => add_cell_size(size, 0, 8)?,
+            SqlValue::Text(s) => add_cell_size(size, 4, s.len())?,
+            SqlValue::Blob(b) => add_cell_size(size, 4, b.len())?,
         };
     }
 
-    let mut buf = vec![0u8; payload_start + total_payload];
+    let mut buf = allocate_row(size)?;
     buf[0..2].copy_from_slice(&(col_count as u16).to_le_bytes());
     buf[2..4].copy_from_slice(&0u16.to_le_bytes());
 
-    let mut write_pos = payload_start;
+    let mut write_pos = payload_start as usize;
     for (idx, c) in cols.iter().enumerate() {
         let dir_pos = dir_start + idx * 5;
         let offset_u32 = write_pos as u32;
@@ -564,7 +601,7 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
         }
     }
 
-    buf
+    Ok(buf)
 }
 
 /// Encodes a slice of raw `sqlite3_value*` pointers (`argv[2 .. 2 + col_count]`) directly into
@@ -575,6 +612,9 @@ pub type DirectEncodedRow = (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>);
 
 /// If `pk_override` is `Some(auto_id)` (for `INTEGER PRIMARY KEY` when `SQLITE_NULL` is inserted),
 /// serializes `auto_id` as an `SQLITE_INTEGER` in the `pk_col_idx` slot.
+///
+/// # Panics
+/// Panics if the row cannot be encoded. Use [`try_encode_sqlite_values_direct`] for fallible encoding.
 ///
 /// # Safety
 /// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
@@ -587,6 +627,33 @@ pub unsafe fn encode_sqlite_values_direct(
     col_collations: &[ColCollation],
     secondary_indexes: &[(usize, u16)],
 ) -> DirectEncodedRow {
+    unsafe {
+        try_encode_sqlite_values_direct(
+            values,
+            col_count,
+            pk_col_idx,
+            pk_override,
+            col_affinities,
+            col_collations,
+            secondary_indexes,
+        )
+    }
+    .expect("cannot encode SQLite row")
+}
+
+/// Fallible counterpart to [`encode_sqlite_values_direct`].
+///
+/// # Safety
+/// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
+pub unsafe fn try_encode_sqlite_values_direct(
+    values: *mut *mut sqlite3_value,
+    col_count: usize,
+    pk_col_idx: usize,
+    pk_override: Option<i64>,
+    col_affinities: &[ColumnAffinity],
+    col_collations: &[ColCollation],
+    secondary_indexes: &[(usize, u16)],
+) -> io::Result<DirectEncodedRow> {
     enum CoercedSlot<'a> {
         Null,
         Int(i64),
@@ -598,16 +665,22 @@ pub unsafe fn encode_sqlite_values_direct(
 
     unsafe {
         let dir_start = 4;
-        let payload_start = dir_start + col_count * 5;
+        let payload_start = row_header_len(col_count)?;
+        if pk_col_idx >= col_count {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "primary key column outside row",
+            ));
+        }
 
         let mut slots: Vec<CoercedSlot<'_>> = Vec::with_capacity(col_count);
-        let mut total_payload = 0usize;
+        let mut size = payload_start;
 
         for i in 0..col_count {
             if i == pk_col_idx {
                 if let Some(auto_id) = pk_override {
                     slots.push(CoercedSlot::Int(auto_id));
-                    total_payload += 8;
+                    size = add_cell_size(size, 0, 8)?;
                     continue;
                 }
             }
@@ -678,20 +751,22 @@ pub unsafe fn encode_sqlite_values_direct(
                 }
                 _ => CoercedSlot::BlobSlice(sqlite_value_blob_bytes(vptr)),
             };
-            total_payload += match &slot {
-                CoercedSlot::Null => 0,
-                CoercedSlot::Int(_) | CoercedSlot::Float(_) => 8,
-                CoercedSlot::TextSlice(s) | CoercedSlot::BlobSlice(s) => 4 + s.len(),
-                CoercedSlot::TextOwned(s) => 4 + s.len(),
+            size = match &slot {
+                CoercedSlot::Null => size,
+                CoercedSlot::Int(_) | CoercedSlot::Float(_) => add_cell_size(size, 0, 8)?,
+                CoercedSlot::TextSlice(s) | CoercedSlot::BlobSlice(s) => {
+                    add_cell_size(size, 4, s.len())?
+                }
+                CoercedSlot::TextOwned(s) => add_cell_size(size, 4, s.len())?,
             };
             slots.push(slot);
         }
 
-        let mut buf = vec![0u8; payload_start + total_payload];
+        let mut buf = allocate_row(size)?;
         buf[0..2].copy_from_slice(&(col_count as u16).to_le_bytes());
         buf[2..4].copy_from_slice(&0u16.to_le_bytes());
 
-        let mut write_pos = payload_start;
+        let mut write_pos = payload_start as usize;
         for (i, slot) in slots.iter().enumerate() {
             let dir_pos = dir_start + i * 5;
             let offset_u32 = write_pos as u32;
@@ -785,7 +860,7 @@ pub unsafe fn encode_sqlite_values_direct(
             }
         }
 
-        (pk_bytes, buf, sec_keys)
+        Ok((pk_bytes, buf, sec_keys))
     }
 }
 
@@ -989,6 +1064,79 @@ pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> bo
     }
 }
 
+enum StoredColumn<'a> {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(&'a [u8]),
+    Blob(&'a [u8]),
+}
+
+fn stored_column_count(row: &[u8]) -> io::Result<usize> {
+    if row.len() < 4 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "truncated row header",
+        ));
+    }
+    let count = usize::from(u16::from_le_bytes([row[0], row[1]]));
+    if row.len() < 4 + count * 5 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "truncated column directory",
+        ));
+    }
+    Ok(count)
+}
+
+fn stored_column(row: &[u8], index: usize) -> io::Result<StoredColumn<'_>> {
+    let count = stored_column_count(row)?;
+    if index >= count {
+        return Ok(StoredColumn::Null);
+    }
+    let pos = 4 + index * 5;
+    let offset_at =
+        |pos: usize| u32::from_le_bytes(row[pos + 1..pos + 5].try_into().unwrap()) as usize;
+    let start = offset_at(pos);
+    let end = if index + 1 == count {
+        row.len()
+    } else {
+        offset_at(pos + 5)
+    };
+    let invalid = || {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid stored column extent or type",
+        )
+    };
+    let directory_end = 4 + count * 5;
+    if start < directory_end || (index == 0 && start != directory_end) {
+        return Err(invalid());
+    }
+    let cell = row.get(start..end).ok_or_else(invalid)?;
+    match row[pos] {
+        0 if cell.is_empty() => Ok(StoredColumn::Null),
+        1 => Ok(StoredColumn::Integer(i64::from_le_bytes(
+            cell.try_into().map_err(|_| invalid())?,
+        ))),
+        2 => Ok(StoredColumn::Float(f64::from_le_bytes(
+            cell.try_into().map_err(|_| invalid())?,
+        ))),
+        tag @ (3 | 4) => {
+            let (len, payload) = cell.split_first_chunk::<4>().ok_or_else(invalid)?;
+            if u32::from_le_bytes(*len) as usize != payload.len() {
+                return Err(invalid());
+            }
+            Ok(if tag == 3 {
+                StoredColumn::Text(payload)
+            } else {
+                StoredColumn::Blob(payload)
+            })
+        }
+        _ => Err(invalid()),
+    }
+}
+
 /// Projects column `col_idx` from `row_bytes` directly into `ctx` (`sqlite3_result_*`) with
 /// **zero Rust heap allocations** (`0` `String` / `Vec` allocations)!
 ///
@@ -1001,90 +1149,26 @@ pub unsafe fn project_column_zero_copy(
     ctx: *mut sqlite3_context,
 ) -> io::Result<()> {
     unsafe {
-        if row_bytes.len() < 4 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "row_bytes shorter than 4-byte header",
-            ));
-        }
-        let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
-        if col_idx >= col_count {
-            sqlite3_result_null(ctx);
-            return Ok(());
-        }
-
-        let dir_pos = 4 + col_idx * 5;
-        if dir_pos + 5 > row_bytes.len() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "truncated column directory",
-            ));
-        }
-        let type_tag = row_bytes[dir_pos];
-        let offset =
-            u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
-
-        match type_tag {
-            0 => sqlite3_result_null(ctx),
-            1 => {
-                if offset + 8 > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Integer"));
-                }
-                let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-                sqlite3_result_int64(ctx, v);
-            }
-            2 => {
-                if offset + 8 > row_bytes.len() {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "truncated Float"));
-                }
-                let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-                sqlite3_result_double(ctx, v);
-            }
-            3 | 4 => {
-                let is_text = type_tag == 3;
-                if offset + 4 > row_bytes.len() {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        if is_text {
-                            "truncated Text len"
-                        } else {
-                            "truncated Blob len"
-                        },
-                    ));
-                }
-                let len =
-                    u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                if offset + 4 + len > row_bytes.len() {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        if is_text {
-                            "truncated Text"
-                        } else {
-                            "truncated Blob"
-                        },
-                    ));
-                }
-                let payload = &row_bytes[offset + 4..offset + 4 + len];
-                if !result_bytes(ctx, payload, is_text) {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidInput,
-                        if is_text {
-                            "Text column exceeds i32::MAX bytes"
-                        } else {
-                            "Blob column exceeds i32::MAX bytes"
-                        },
-                    ));
-                }
-            }
-            other => {
+        match stored_column(row_bytes, col_idx)? {
+            StoredColumn::Null => sqlite3_result_null(ctx),
+            StoredColumn::Integer(v) => sqlite3_result_int64(ctx, v),
+            StoredColumn::Float(v) => sqlite3_result_double(ctx, v),
+            StoredColumn::Text(bytes) if !result_bytes(ctx, bytes, true) => {
                 return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("unknown column type_tag {other}"),
+                    ErrorKind::InvalidInput,
+                    "Text column exceeds i32::MAX bytes",
                 ));
             }
+            StoredColumn::Blob(bytes) if !result_bytes(ctx, bytes, false) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "Blob column exceeds i32::MAX bytes",
+                ));
+            }
+            StoredColumn::Text(_) | StoredColumn::Blob(_) => {}
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// Extracts the type-tagged memcomparable key bytes for column `col_idx` directly from `row_bytes`
@@ -1100,198 +1184,39 @@ pub fn extract_column_key_bytes_with_collation(
     col_idx: usize,
     collation: ColCollation,
 ) -> io::Result<Vec<u8>> {
-    if row_bytes.len() < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "row_bytes shorter than 4-byte header",
-        ));
-    }
-    let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
-    if col_idx >= col_count {
-        return Ok(vec![KEY_TAG_NULL]);
-    }
-    let dir_pos = 4 + col_idx * 5;
-    if dir_pos
-        .checked_add(5)
-        .is_none_or(|end| end > row_bytes.len())
-    {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated column directory in row_bytes",
-        ));
-    }
-    let type_tag = row_bytes[dir_pos];
-    let offset =
-        u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
-
-    match type_tag {
-        0 => Ok(vec![KEY_TAG_NULL]),
-        1 => {
-            let Some(end) = offset.checked_add(8).filter(|&end| end <= row_bytes.len()) else {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Integer column",
-                ));
-            };
-            let v = i64::from_le_bytes(row_bytes[offset..end].try_into().unwrap());
-            Ok(encode_i64_tagged_key(v).to_vec())
+    Ok(match stored_column(row_bytes, col_idx)? {
+        StoredColumn::Null => vec![KEY_TAG_NULL],
+        StoredColumn::Integer(v) => encode_i64_tagged_key(v).to_vec(),
+        StoredColumn::Float(v) => encode_f64_unified_key(v),
+        StoredColumn::Text(bytes) => {
+            let mut out = vec![KEY_TAG_TEXT];
+            collation.push_normalized_text(bytes, &mut out);
+            out
         }
-        2 => {
-            let Some(end) = offset.checked_add(8).filter(|&end| end <= row_bytes.len()) else {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Float column",
-                ));
-            };
-            let v = f64::from_le_bytes(row_bytes[offset..end].try_into().unwrap());
-            Ok(encode_f64_unified_key(v))
+        StoredColumn::Blob(bytes) => {
+            let mut out = Vec::with_capacity(1 + bytes.len());
+            out.push(KEY_TAG_BLOB);
+            out.extend_from_slice(bytes);
+            out
         }
-        3 | 4 => {
-            let is_text = type_tag == 3;
-            let Some(payload_start) = offset.checked_add(4).filter(|&s| s <= row_bytes.len())
-            else {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    if is_text {
-                        "truncated Text length"
-                    } else {
-                        "truncated Blob length"
-                    },
-                ));
-            };
-            let len =
-                u32::from_le_bytes(row_bytes[offset..payload_start].try_into().unwrap()) as usize;
-            let Some(payload_end) = payload_start
-                .checked_add(len)
-                .filter(|&end| end <= row_bytes.len())
-            else {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    if is_text {
-                        "truncated Text payload"
-                    } else {
-                        "truncated Blob payload"
-                    },
-                ));
-            };
-            let slice = &row_bytes[payload_start..payload_end];
-            let mut out = Vec::with_capacity(1 + len);
-            if is_text {
-                out.push(KEY_TAG_TEXT);
-                collation.push_normalized_text(slice, &mut out);
-            } else {
-                out.push(KEY_TAG_BLOB);
-                out.extend_from_slice(slice);
-            }
-            Ok(out)
-        }
-        other => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("unknown column type tag {other}"),
-        )),
-    }
+    })
 }
 
 /// Projects a single column `col_idx` from a packed row byte slice in $O(1)$ time without
 /// decoding any other columns in the row!
 pub fn decode_column_at(row_bytes: &[u8], col_idx: usize) -> io::Result<SqlValue> {
-    if row_bytes.len() < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "row_bytes shorter than 4-byte header",
-        ));
-    }
-    let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
-    if col_idx >= col_count {
-        return Ok(SqlValue::Null);
-    }
-
-    let dir_pos = 4 + col_idx * 5;
-    if dir_pos + 5 > row_bytes.len() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated column directory in row_bytes",
-        ));
-    }
-    let type_tag = row_bytes[dir_pos];
-    let offset =
-        u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
-
-    match type_tag {
-        0 => Ok(SqlValue::Null),
-        1 => {
-            if offset + 8 > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Integer column",
-                ));
-            }
-            let v = i64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-            Ok(SqlValue::Integer(v))
-        }
-        2 => {
-            if offset + 8 > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Float column",
-                ));
-            }
-            let v = f64::from_le_bytes(row_bytes[offset..offset + 8].try_into().unwrap());
-            Ok(SqlValue::Float(v))
-        }
-        3 => {
-            if offset + 4 > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Text length",
-                ));
-            }
-            let len =
-                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-            if offset + 4 + len > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Text payload",
-                ));
-            }
-            let s = String::from_utf8_lossy(&row_bytes[offset + 4..offset + 4 + len]).into_owned();
-            Ok(SqlValue::Text(s))
-        }
-        4 => {
-            if offset + 4 > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Blob length",
-                ));
-            }
-            let len =
-                u32::from_le_bytes(row_bytes[offset..offset + 4].try_into().unwrap()) as usize;
-            if offset + 4 + len > row_bytes.len() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "truncated Blob payload",
-                ));
-            }
-            Ok(SqlValue::Blob(
-                row_bytes[offset + 4..offset + 4 + len].to_vec(),
-            ))
-        }
-        other => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("unknown column type_tag {other}"),
-        )),
-    }
+    Ok(match stored_column(row_bytes, col_idx)? {
+        StoredColumn::Null => SqlValue::Null,
+        StoredColumn::Integer(v) => SqlValue::Integer(v),
+        StoredColumn::Float(v) => SqlValue::Float(v),
+        StoredColumn::Text(bytes) => SqlValue::Text(String::from_utf8_lossy(bytes).into_owned()),
+        StoredColumn::Blob(bytes) => SqlValue::Blob(bytes.to_vec()),
+    })
 }
 
 /// Decodes all columns from `row_bytes`.
 pub fn decode_all_columns(row_bytes: &[u8]) -> io::Result<Vec<SqlValue>> {
-    if row_bytes.len() < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "row_bytes shorter than 4-byte header",
-        ));
-    }
-    let col_count = u16::from_le_bytes([row_bytes[0], row_bytes[1]]) as usize;
+    let col_count = stored_column_count(row_bytes)?;
     let mut out = Vec::with_capacity(col_count);
     for i in 0..col_count {
         out.push(decode_column_at(row_bytes, i)?);
@@ -1302,6 +1227,23 @@ pub fn decode_all_columns(row_bytes: &[u8]) -> io::Result<Vec<SqlValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_checks_row_format_limits_before_narrowing() {
+        let mut columns = vec![SqlValue::Null; usize::from(u16::MAX)];
+        let row = try_encode_row(&columns).unwrap();
+        assert_eq!(decode_all_columns(&row).unwrap(), columns);
+        columns.push(SqlValue::Null);
+        assert_eq!(
+            try_encode_row(&columns).unwrap_err().kind(),
+            ErrorKind::FileTooLarge
+        );
+        assert_eq!(add_cell_size(u32::MAX - 5, 4, 1).unwrap(), u32::MAX);
+        assert_eq!(
+            add_cell_size(u32::MAX - 5, 4, 2).unwrap_err().kind(),
+            ErrorKind::FileTooLarge
+        );
+    }
 
     #[test]
     fn memcomparable_f64_preserves_order_and_normalizes_neg_zero() {
@@ -1646,6 +1588,20 @@ mod tests {
 
         // Valid NULL and out-of-range column index on a well-formed header remain Ok(KEY_TAG_NULL).
         let valid_row = encode_row(&[SqlValue::Null, SqlValue::Integer(42)]);
+        let mut overlapping = encode_row(&[SqlValue::Blob(vec![1, 2]), SqlValue::Integer(42)]);
+        overlapping[14..18].copy_from_slice(&3u32.to_le_bytes());
+        let mut inside_directory = valid_row.clone();
+        inside_directory[10..14].copy_from_slice(&4u32.to_le_bytes());
+        for (row, column) in [(&overlapping, 0), (&inside_directory, 1)] {
+            assert_eq!(
+                decode_column_at(row, column).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+            assert_eq!(
+                extract_column_key_bytes(row, column).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
         assert_eq!(
             extract_column_key_bytes(&valid_row, 0).unwrap(),
             vec![KEY_TAG_NULL]
