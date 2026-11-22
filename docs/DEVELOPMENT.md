@@ -66,6 +66,8 @@ Interpretations: an operation that logged nothing (a delete of a missing row, a 
 
 **Running**
 
+For a hosted run, open **Actions → Trybot → Run workflow**, choose the branch, and set the first seed and count. Each of the three hosted operating systems runs the full regression suite and then the selected range in all four crash modes. The default covers seeds 4000 through 4999. Each job publishes its test logs as a workflow artifact. To investigate a failure, select the same revision, enter the failing seed, and choose a count of one.
+
 The regular test runs 1,000 seeds (about 10 seconds in a debug build, on four threads). Environment variables:
 
 * `AYDB_CRASH_SEEDS=<n>`: number of seeds (for example 2000 or more for a long run).
