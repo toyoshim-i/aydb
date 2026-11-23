@@ -3347,6 +3347,181 @@ fn i64_min_float_stays_real_on_coercion_and_matches_integer_in_lookups_and_uniqu
 }
 
 #[test]
+fn integer_primary_key_column_and_rowid_lookups_match_native_sqlite_on_i64_min_float() {
+    let tmp = TempTestDir::new("ipk_vs_rowid_i64_min_float");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_ipk USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');
+         CREATE TABLE nat_ipk(id INTEGER PRIMARY KEY, v TEXT);
+         CREATE VIRTUAL TABLE ay_int USING aydb(table_id=2, columns='id INT PRIMARY KEY, v TEXT');
+         CREATE TABLE nat_int(id INT PRIMARY KEY, v TEXT);",
+    )
+    .unwrap();
+
+    let seed_rows = [
+        (i64::MIN, "min"),
+        (-9_223_372_036_854_774_784_i64, "adj"),
+        (1, "one"),
+        (i64::MAX, "max"),
+    ];
+    for tbl in ["ay_ipk", "nat_ipk", "ay_int", "nat_int"] {
+        let mut ins = conn
+            .prepare(&format!("INSERT INTO {tbl} VALUES (?1, ?2)"))
+            .unwrap();
+        for &(id, label) in &seed_rows {
+            ins.execute(&[SqlValue::Integer(id), SqlValue::Text(label.to_string())])
+                .unwrap();
+        }
+    }
+
+    let literals = [
+        "-9223372036854775808",
+        "-9223372036854775808.0",
+        "'-9223372036854775808'",
+        "'-9223372036854775808.0'",
+        "-9223372036854774784.0",
+        "1.0",
+        "'1.0'",
+        "9223372036854775808.0",
+    ];
+    for lit in literals {
+        for proj in ["id", "id, v"] {
+            let ay_id = conn
+                .query_all(&format!("SELECT {proj} FROM ay_ipk WHERE id = {lit}"), &[])
+                .unwrap();
+            let nat_id = conn
+                .query_all(&format!("SELECT {proj} FROM nat_ipk WHERE id = {lit}"), &[])
+                .unwrap();
+            let ay_rid = conn
+                .query_all(
+                    &format!("SELECT {proj} FROM ay_ipk WHERE rowid = {lit}"),
+                    &[],
+                )
+                .unwrap();
+            let nat_rid = conn
+                .query_all(
+                    &format!("SELECT {proj} FROM nat_ipk WHERE rowid = {lit}"),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(ay_id, nat_id, "ay_ipk vs nat_ipk mismatch for id = {lit}");
+            assert_eq!(
+                ay_rid, nat_rid,
+                "ay_ipk vs nat_ipk mismatch for rowid = {lit}"
+            );
+            assert_eq!(
+                ay_id, ay_rid,
+                "ay_ipk id vs rowid mismatch for {lit} ({proj})"
+            );
+        }
+    }
+
+    let bound_params = [
+        SqlValue::Integer(i64::MIN),
+        SqlValue::Float(-9_223_372_036_854_775_808.0),
+        SqlValue::Text("-9223372036854775808".into()),
+        SqlValue::Text("-9223372036854775808.0".into()),
+    ];
+    for param in &bound_params {
+        let ay_id = conn
+            .query_all(
+                "SELECT id, v FROM ay_ipk WHERE id = ?1",
+                std::slice::from_ref(param),
+            )
+            .unwrap();
+        let nat_id = conn
+            .query_all(
+                "SELECT id, v FROM nat_ipk WHERE id = ?1",
+                std::slice::from_ref(param),
+            )
+            .unwrap();
+        let ay_rid = conn
+            .query_all(
+                "SELECT id, v FROM ay_ipk WHERE rowid = ?1",
+                std::slice::from_ref(param),
+            )
+            .unwrap();
+        let nat_rid = conn
+            .query_all(
+                "SELECT id, v FROM nat_ipk WHERE rowid = ?1",
+                std::slice::from_ref(param),
+            )
+            .unwrap();
+        assert_eq!(ay_id, nat_id, "bound id mismatch for {param:?}");
+        assert_eq!(ay_rid, nat_rid, "bound rowid mismatch for {param:?}");
+        assert_eq!(ay_id, ay_rid, "bound id vs rowid mismatch for {param:?}");
+    }
+
+    for pred in [
+        "id IN (-9223372036854775808.0)",
+        "rowid IN (-9223372036854775808.0)",
+        "id BETWEEN -9223372036854775808.0 AND -9223372036854775808.0",
+        "rowid BETWEEN -9223372036854775808.0 AND -9223372036854775808.0",
+        "id >= -9223372036854775808.0 ORDER BY id",
+        "id <= -9223372036854775808.0",
+        "id < -9223372036854775808.0",
+        "id > -9223372036854775808.0 ORDER BY id",
+        "+id = -9223372036854775808.0",
+        "+rowid = -9223372036854775808.0",
+    ] {
+        let ay = conn
+            .query_all(&format!("SELECT id, v FROM ay_ipk WHERE {pred}"), &[])
+            .unwrap();
+        let nat = conn
+            .query_all(&format!("SELECT id, v FROM nat_ipk WHERE {pred}"), &[])
+            .unwrap();
+        assert_eq!(ay, nat, "predicate mismatch for `{pred}`");
+    }
+
+    for tbl in ["ay_ipk", "nat_ipk"] {
+        conn.execute_batch(&format!(
+            "UPDATE {tbl} SET v = 'changed' WHERE id = -9223372036854775808.0"
+        ))
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT changes()", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(0)]]
+        );
+        conn.execute_batch(&format!(
+            "DELETE FROM {tbl} WHERE id = -9223372036854775808.0"
+        ))
+        .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT changes()", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(0)]]
+        );
+        assert_eq!(
+            conn.query_all(
+                &format!("SELECT v FROM {tbl} WHERE id = -9223372036854775808"),
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("min".into())]]
+        );
+    }
+
+    // Non-alias `INT PRIMARY KEY` still uses index affinity equivalence on `-9223372036854775808.0`,
+    // matching native SQLite's B-tree index behavior.
+    for lit in ["-9223372036854775808.0", "'-9223372036854775808.0'"] {
+        let ay = conn
+            .query_all(&format!("SELECT id, v FROM ay_int WHERE id = {lit}"), &[])
+            .unwrap();
+        let nat = conn
+            .query_all(&format!("SELECT id, v FROM nat_int WHERE id = {lit}"), &[])
+            .unwrap();
+        assert_eq!(ay, nat, "ay_int vs nat_int mismatch for {lit}");
+        assert_eq!(ay.len(), 1);
+    }
+}
+
+#[test]
 fn sqlite_wrappers_reject_a_truncated_statement_and_a_lossy_path() {
     let conn = SqliteConnection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t(v)").unwrap();

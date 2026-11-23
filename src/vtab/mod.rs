@@ -1872,7 +1872,14 @@ unsafe fn execute_vtab_filter(
                     if found {
                         cursor.pks.push(pk_bytes);
                         cursor.lazy_blobs.push(None);
-                    } else if needs_numeric_alt_probe(&pk_bytes, vtab.pk_affinity) {
+                    // On an `INTEGER PRIMARY KEY` rowid alias (`pk_rowid_alias`), column equality
+                    // matches `rowid` (`SeekRowid`'s strict open interval `(-2^63, 2^63)`), so a
+                    // 17-byte `-9223372036854775808.0` search key must not probe the 9-byte
+                    // `i64::MIN` key; `INT PRIMARY KEY` (`!pk_rowid_alias`) and 9-byte `i64::MIN`
+                    // searches still probe both numeric representations.
+                    } else if !(vtab.pk_rowid_alias && pk_bytes.len() == 17)
+                        && needs_numeric_alt_probe(&pk_bytes, vtab.pk_affinity)
+                    {
                         if let Some(alt) = build_numeric_alt_key(&pk_bytes) {
                             match point_fetch(
                                 eng,
