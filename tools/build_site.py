@@ -15,7 +15,7 @@ Dependencies: Python 3 and the "markdown" package (pip install markdown).
 Expected layout of the artifacts directory (what actions/download-artifact
 produces when no artifact name is given, one sub-directory per artifact):
 
-    <artifacts>/test-<os>/{clippy,tests,reliability}.txt
+    <artifacts>/test-<os>/{fmt,clippy,tests,reliability}.txt
     <artifacts>/bench-<os>/bench/<name>.txt
     <artifacts>/bench-<os>/bench/status.txt   ("<name> exit=<n> seconds=<n>")
 
@@ -30,6 +30,7 @@ import re
 import shutil
 import sys
 import textwrap
+import urllib.parse
 from pathlib import Path
 
 import markdown
@@ -289,7 +290,7 @@ class LinkRewriter:
     ATTR = re.compile(r'\b(href|src)="([^"]*)"')
 
     def __init__(self, repo_root, repo_url, branch):
-        self.repo_root = repo_root
+        self.repo_root = Path(repo_root).resolve()
         self.repo_url = repo_url
         self.branch = branch
 
@@ -318,14 +319,22 @@ class LinkRewriter:
                 return match.group(0)
             path, sep, fragment_id = raw.partition("#")
             path = path.split("?")[0]
-            repo_path = posixpath.normpath(posixpath.join(source_dir, path))
-            if repo_path.startswith(".."):
+            if path.startswith("/"):
+                repo_path = posixpath.normpath(path.lstrip("/"))
+            else:
+                repo_path = posixpath.normpath(posixpath.join(source_dir, path))
+            if (repo_path in ("", ".", "..") or repo_path.startswith("../")
+                    or repo_path.startswith("/")):
                 return match.group(0)
             target = self.site_path(repo_path)
             if target is not None:
                 new = posixpath.relpath(target, page_dir or ".")
             else:
-                full = self.repo_root / repo_path
+                full = (self.repo_root / repo_path).resolve()
+                try:
+                    full.relative_to(self.repo_root)
+                except ValueError:
+                    return match.group(0)
                 kind = "tree" if full.is_dir() else "blob"
                 new = "{}/{}/{}/{}".format(
                     self.repo_url, kind, self.branch, repo_path)
@@ -432,6 +441,14 @@ def classify_tests(text):
     return "ok", detail
 
 
+def classify_fmt(text):
+    if text is None:
+        return "none", "no result"
+    if text.strip():
+        return "bad", "formatting differences or errors"
+    return "ok", "formatted"
+
+
 def classify_clippy(text):
     if text is None:
         return "none", "no result"
@@ -496,9 +513,20 @@ def parse_tables(text):
             header = split_row(line)
             rows = []
             j = i + 2
-            while j < len(lines) and "|" in lines[j]:
-                rows.append(split_row(lines[j]))
-                j += 1
+            while j < len(lines):
+                if "|" in lines[j]:
+                    rows.append(split_row(lines[j]))
+                    j += 1
+                elif (re.match(r"^-{10,}\s*$", lines[j])
+                      and j + 1 < len(lines)
+                      and "|" in lines[j + 1]
+                      and not (j + 2 < len(lines)
+                               and re.match(r"^-{10,}\s*$", lines[j + 2]))):
+                    # Preserve summary rows (such as TOTAL SPEEDTEST1 SUITE TIME) separated
+                    # by an internal dashed rule, without swallowing an adjacent table header.
+                    j += 1
+                else:
+                    break
             tables.append((section, header, rows))
             i = j
             continue
@@ -523,6 +551,7 @@ def collect(artifacts):
         entry = {
             "test_dir": test_dir.is_dir(),
             "bench_dir": bench_dir.is_dir(),
+            "fmt": read_text(test_dir / "fmt.txt"),
             "clippy": read_text(test_dir / "clippy.txt"),
             "tests": read_text(test_dir / "tests.txt"),
             "reliability": read_text(test_dir / "reliability.txt"),
@@ -538,6 +567,7 @@ def collect(artifacts):
 def os_summary_table(os_name, entry):
     rows = []
     for label, text, classify in (
+        ("cargo fmt --check", entry["fmt"], classify_fmt),
         ("Clippy (-D warnings)", entry["clippy"], classify_clippy),
         ("cargo test --all-targets", entry["tests"], classify_tests),
         ("Reliability benchmark", entry["reliability"], classify_reliability),
@@ -547,10 +577,13 @@ def os_summary_table(os_name, entry):
     for name in BENCHES:
         text = entry["bench"][name]
         status = entry["status"].get(name)
-        if text is None:
+        if text is None and status is None:
             rows.append((name, "none", "no result"))
         elif status is None:
-            rows.append((name, "ok", "output present, exit status not recorded"))
+            rows.append((name, "bad", "output present, exit status not recorded"))
+        elif status[0] == 0 and text is None:
+            rows.append((name, "bad",
+                         "exit status 0 after {} s, output missing".format(status[1])))
         elif status[0] == 0:
             rows.append((name, "ok", "completed in {} s".format(status[1])))
         else:
@@ -996,8 +1029,8 @@ def charts_section(data):
 
 def raw_outputs(data):
     out = []
-    sections = [("clippy", "Clippy"), ("tests", "cargo test"),
-                ("reliability", "Reliability benchmark")]
+    sections = [("fmt", "cargo fmt --check"), ("clippy", "Clippy"),
+                ("tests", "cargo test"), ("reliability", "Reliability benchmark")]
     items = [(key, label, lambda e, k=key: e[k]) for key, label in sections]
     items += [(name, name, lambda e, n=name: e["bench"][n]) for name in BENCHES]
     for _key, label, getter in items:
@@ -1014,14 +1047,28 @@ def raw_outputs(data):
     return "\n".join(out)
 
 
+def validate_http_url(url, label):
+    """Ensure a non-empty external link URL uses http or https with a host."""
+    if not url:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            "invalid {} URL {!r}: expected http:// or https:// URL".format(
+                label, url))
+    return url
+
+
 def build_results(artifacts, out, meta, repo_url):
+    repo_url = validate_http_url(repo_url, "repository")
+    run_url = validate_http_url(meta["run_url"], "workflow run")
     data = collect(artifacts)
     sha = meta["sha"]
     short = sha[:7] if sha else "unknown"
     commit = ('<a href="{}/commit/{}"><code>{}</code></a>'.format(
         esc(repo_url), esc(sha), esc(short)) if sha else "unknown")
-    run = ('<a href="{}">workflow run</a>'.format(esc(meta["run_url"]))
-           if meta["run_url"] else "unknown")
+    run = ('<a href="{}">workflow run</a>'.format(esc(run_url))
+           if run_url else "unknown")
     body = [
         "<h1>Latest test and benchmark results</h1>",
         '<p class="meta">Commit: {} &middot; Generated: {} &middot; {}</p>'.format(
@@ -1073,12 +1120,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     repo_root = args.repo.resolve()
+    artifacts = args.artifacts.resolve()
     out = args.out.resolve()
+    cwd = Path.cwd().resolve()
+    if (out == out.parent
+            or out == cwd
+            or out == repo_root
+            or out in repo_root.parents
+            or out == artifacts
+            or out in artifacts.parents):
+        raise SystemExit(
+            "refusing to remove protected or ancestor output directory: {}".format(
+                out))
+    repo_url = validate_http_url(args.repo_url.rstrip("/"), "--repo-url")
+    validate_http_url(args.run_url, "--run-url")
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    repo_url = args.repo_url.rstrip("/")
     build_markdown_pages(repo_root, out, repo_url, args.branch)
     meta = {"sha": args.sha, "run_url": args.run_url,
             "timestamp": args.timestamp}
