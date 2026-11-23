@@ -3071,12 +3071,12 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
     let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
     ));
-    let mut vtab = AydbVTab {
-        base: sqlite3_vtab {
+    let vtab = AydbVTab {
+        base: core::cell::UnsafeCell::new(sqlite3_vtab {
             pModule: &AYDB_VTAB_MODULE,
             nRef: 0,
             zErrMsg: core::ptr::null_mut(),
-        },
+        }),
         db: core::ptr::null_mut(),
         engine: Arc::clone(&engine),
         read_session: Arc::new(snapshot::ReadSession::new(engine)),
@@ -3121,7 +3121,7 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
             idxFlags: 0,
             colUsed: 1,
         };
-        let rc = unsafe { vtab_best_index(&mut vtab.base, &mut info) };
+        let rc = unsafe { vtab_best_index(vtab.base.get(), &mut info) };
         assert_eq!(rc, SQLITE_OK);
         assert_eq!(info.idxNum & 0xFF, PLAN_FULL_SCAN);
         assert_eq!(info.orderByConsumed, 0);

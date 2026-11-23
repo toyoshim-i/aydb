@@ -557,7 +557,7 @@ pub(super) struct ModuleAuxContext {
 
 #[repr(C)]
 pub(super) struct AydbVTab {
-    base: sqlite3_vtab,
+    base: core::cell::UnsafeCell<sqlite3_vtab>,
     db: *mut sqlite3,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
@@ -1028,6 +1028,9 @@ unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
 }
 
 /// Replaces `(*p_vtab).zErrMsg` with a SQLite-owned copy of `msg`.
+///
+/// # Safety
+/// `p_vtab` must be null or point to a valid `sqlite3_vtab` (such as `vtab.base.get()`).
 unsafe fn set_vtab_err_msg(p_vtab: *mut sqlite3_vtab, msg: &str) {
     unsafe {
         if !p_vtab.is_null() {
@@ -1225,11 +1228,11 @@ unsafe fn vtab_create_or_connect(
         } = connected;
 
         let vtab = Box::new(AydbVTab {
-            base: sqlite3_vtab {
+            base: core::cell::UnsafeCell::new(sqlite3_vtab {
                 pModule: &AYDB_VTAB_MODULE,
                 nRef: 0,
                 zErrMsg: core::ptr::null_mut(),
-            },
+            }),
             db,
             engine: aux.engine.clone(),
             read_session: Arc::clone(&aux.read_session),
@@ -1313,11 +1316,11 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
             // SQLite does not call `xBegin` for a rename, so inside a user transaction the
             // catalog change joins the engine transaction only if an earlier write opened one.
             if !eng.conn_has_open_transaction(conn_id) {
-                set_vtab_err_msg(p_vtab, RENAME_NEEDS_WRITE);
+                set_vtab_err_msg(vtab.base.get(), RENAME_NEEDS_WRITE);
                 return SQLITE_ERROR;
             }
             if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
                 return SQLITE_ERROR;
             }
             let old_effective = eng
@@ -1326,7 +1329,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
             if let Err(e) =
                 eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability)
             {
-                set_vtab_err_msg(p_vtab, &e.to_string());
+                set_vtab_err_msg(vtab.base.get(), &e.to_string());
                 return io_err_to_sqlite_rc(&e);
             }
             if let Ok(mut prev) = vtab.pre_tx_name.lock() {
@@ -1351,7 +1354,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
                 return SQLITE_ERROR;
             }
             if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
                 return SQLITE_ERROR;
             }
             match eng.begin_transaction_for_conn(conn_id) {
@@ -1362,7 +1365,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
                     }
                 }
                 Err(e) => {
-                    set_vtab_err_msg(p_vtab, &e.to_string());
+                    set_vtab_err_msg(vtab.base.get(), &e.to_string());
                     return io_err_to_sqlite_rc(&e);
                 }
             }
@@ -1375,7 +1378,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
         let prev_table_name = vtab.name();
         if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
             let _ = eng.rollback_transaction_for_conn(conn_id);
-            set_vtab_err_msg(p_vtab, &e.to_string());
+            set_vtab_err_msg(vtab.base.get(), &e.to_string());
             return io_err_to_sqlite_rc(&e);
         }
         if let Ok(mut prev) = vtab.pre_tx_name.lock() {
@@ -1430,7 +1433,7 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
                         return SQLITE_ERROR;
                     }
                     if !eng.is_vtab_token_active(vtab_ref.table_id, vtab_ref.reg_token, conn_id) {
-                        set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                        set_vtab_err_msg(vtab_ref.base.get(), STALE_VTAB_ERR);
                         return SQLITE_ERROR;
                     }
                     match eng.begin_transaction_for_conn(conn_id) {
@@ -1544,6 +1547,16 @@ fn sec_range_consumes_order_by(
     order_by.len() == 1 || (order_by[1].iColumn == pk_col_idx as i32 && order_by[1].desc == 0)
 }
 
+struct SelectedBestIndexPlan {
+    idx_num: c_int,
+    idx_flags: Option<c_int>,
+    order_by_consumed: bool,
+    estimated_cost: f64,
+    estimated_rows: i64,
+    used_constraints: [usize; 2],
+    num_used: usize,
+}
+
 unsafe extern "system" fn vtab_best_index(
     p_vtab: *mut sqlite3_vtab,
     p_info: *mut sqlite3_index_info,
@@ -1553,27 +1566,52 @@ unsafe extern "system" fn vtab_best_index(
             return SQLITE_ERROR;
         }
         let vtab = &*(p_vtab as *const AydbVTab);
-        let info = &mut *p_info;
-        let n = usize::try_from(info.nConstraint).unwrap_or(0);
-        let (constraints, usages): (
-            &[crate::vtab::ffi::sqlite3_index_constraint],
-            &mut [crate::vtab::ffi::sqlite3_index_constraint_usage],
-        ) = if n == 0 {
-            (&[], &mut [])
-        } else if info.aConstraint.is_null() || info.aConstraintUsage.is_null() {
+        // Read input fields via raw pointer without holding a live `&mut sqlite3_index_info`
+        // across FFI calls to `sqlite3_vtab_collation(p_info, ...)`, which inspects `p_info`
+        // and SQLite's trailing `HiddenIndexInfo`.
+        let n_constraint = (*p_info).nConstraint;
+        let a_constraint = (*p_info).aConstraint;
+        let a_constraint_usage = (*p_info).aConstraintUsage;
+        let n_order_by = (*p_info).nOrderBy;
+        let a_order_by = (*p_info).aOrderBy;
+        let col_used = (*p_info).colUsed;
+
+        let n = usize::try_from(n_constraint).unwrap_or(0);
+        let constraints: &[crate::vtab::ffi::sqlite3_index_constraint] = if n == 0 {
+            &[]
+        } else if a_constraint.is_null() || a_constraint_usage.is_null() {
             return SQLITE_ERROR;
         } else {
-            (
-                core::slice::from_raw_parts(info.aConstraint, n),
-                core::slice::from_raw_parts_mut(info.aConstraintUsage, n),
-            )
+            core::slice::from_raw_parts(a_constraint, n)
         };
-        let rc = select_best_index(vtab, p_info, info, constraints, usages);
-        #[cfg(test)]
-        if rc == SQLITE_OK {
-            record_best_index_plan(info, usages);
+        let order_by = order_by_slice(n_order_by, a_order_by);
+        let plan = select_best_index(vtab, p_info, constraints, order_by, col_used);
+
+        // No more calls into `sqlite3_vtab_collation`: safe to materialize unique references.
+        let info = &mut *p_info;
+        let usages: &mut [crate::vtab::ffi::sqlite3_index_constraint_usage] = if n == 0 {
+            &mut []
+        } else {
+            core::slice::from_raw_parts_mut(a_constraint_usage, n)
+        };
+        for slot in 0..plan.num_used {
+            let idx = plan.used_constraints[slot];
+            usages[idx].argvIndex = (slot + 1) as c_int;
+            usages[idx].omit = 0;
         }
-        rc
+        info.idxNum = plan.idx_num;
+        if let Some(flags) = plan.idx_flags {
+            info.idxFlags = flags;
+        }
+        if plan.order_by_consumed {
+            info.orderByConsumed = 1;
+        }
+        info.estimatedCost = plan.estimated_cost;
+        info.estimatedRows = plan.estimated_rows;
+
+        #[cfg(test)]
+        record_best_index_plan(info, usages);
+        SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
 }
@@ -1581,19 +1619,18 @@ unsafe extern "system" fn vtab_best_index(
 unsafe fn select_best_index(
     vtab: &AydbVTab,
     p_info: *mut sqlite3_index_info,
-    info: &mut sqlite3_index_info,
     constraints: &[crate::vtab::ffi::sqlite3_index_constraint],
-    usages: &mut [crate::vtab::ffi::sqlite3_index_constraint_usage],
-) -> c_int {
+    order_by: &[crate::vtab::ffi::sqlite3_index_orderby],
+    col_used: u64,
+) -> SelectedBestIndexPlan {
     unsafe {
         let n = constraints.len();
-        let order_by = order_by_slice(info.nOrderBy, info.aOrderBy);
 
         // Check if only `rowid` (`colUsed == 0`) or only a binary-collated PK column is projected
-        let can_use_keys_only = info.colUsed == 0
+        let can_use_keys_only = col_used == 0
             || (vtab.pk_collation == ColCollation::Binary
                 && vtab.pk_col_idx < 63
-                && info.colUsed == (1u64 << vtab.pk_col_idx));
+                && col_used == (1u64 << vtab.pk_col_idx));
 
         // 1. Check for usable equality constraint (`=`) on Primary Key (or ROWID `-1`)
         for i in 0..n {
@@ -1607,33 +1644,31 @@ unsafe fn select_best_index(
                 if col >= 0 && !constraint_matches_col_collation(p_info, i, vtab.pk_collation) {
                     continue;
                 }
-                usages[i].argvIndex = 1;
-                usages[i].omit = 0;
                 let mut pt_flags = if col == -1 { POINT_FLAG_BY_ROWID } else { 0 };
                 if can_use_keys_only {
                     pt_flags |= POINT_FLAG_KEYS_ONLY;
                 }
-                info.idxNum = PLAN_PK_POINT | (pt_flags << 8);
                 // Do not promise at most one row when a TEXT or BLOB PK may fall back to a
                 // cross-affinity full scan where `'1'`, `'01'`, and `'1.0'` all match `1`.
-                if col == -1
+                let unique_scan = col == -1
                     || matches!(
                         vtab.pk_affinity,
                         ColumnAffinity::Integer | ColumnAffinity::Numeric | ColumnAffinity::Real
-                    )
-                {
-                    info.idxFlags = SQLITE_INDEX_SCAN_UNIQUE;
-                }
-                if (info.idxFlags == SQLITE_INDEX_SCAN_UNIQUE && !order_by.is_empty())
+                    );
+                let idx_flags = unique_scan.then_some(SQLITE_INDEX_SCAN_UNIQUE);
+                let order_by_consumed = (unique_scan && !order_by.is_empty())
                     || order_by
                         .first()
-                        .is_some_and(|ob| ob.iColumn == vtab.pk_col_idx as i32 && ob.desc == 0)
-                {
-                    info.orderByConsumed = 1;
-                }
-                info.estimatedCost = 1.0;
-                info.estimatedRows = 1;
-                return SQLITE_OK;
+                        .is_some_and(|ob| ob.iColumn == vtab.pk_col_idx as i32 && ob.desc == 0);
+                return SelectedBestIndexPlan {
+                    idx_num: PLAN_PK_POINT | (pt_flags << 8),
+                    idx_flags,
+                    order_by_consumed,
+                    estimated_cost: 1.0,
+                    estimated_rows: 1,
+                    used_constraints: [i, 0],
+                    num_used: 1,
+                };
             }
         }
 
@@ -1669,25 +1704,23 @@ unsafe fn select_best_index(
                 }
             }
             if let Some((i, col_idx, ob_consumed)) = best_unique {
-                usages[i].argvIndex = 1;
                 // Keep `omit = 0` so digest collisions and cross-affinity fallbacks filter exact values.
-                usages[i].omit = 0;
                 let eq_flags = if can_use_keys_only {
                     RANGE_FLAG_KEYS_ONLY
                 } else {
                     0
                 };
-                info.idxNum = PLAN_UNIQUE_EQ
-                    | (((col_idx as c_int) & 0xFFFF) << 8)
-                    | ((eq_flags & 0x7F) << 24);
-                if ob_consumed {
-                    info.orderByConsumed = 1;
-                    info.estimatedCost = 1.8;
-                } else {
-                    info.estimatedCost = 2.0;
-                }
-                info.estimatedRows = 1;
-                return SQLITE_OK;
+                return SelectedBestIndexPlan {
+                    idx_num: PLAN_UNIQUE_EQ
+                        | (((col_idx as c_int) & 0xFFFF) << 8)
+                        | ((eq_flags & 0x7F) << 24),
+                    idx_flags: None,
+                    order_by_consumed: ob_consumed,
+                    estimated_cost: if ob_consumed { 1.8 } else { 2.0 },
+                    estimated_rows: 1,
+                    used_constraints: [i, 0],
+                    num_used: 1,
+                };
             }
         }
 
@@ -1722,26 +1755,24 @@ unsafe fn select_best_index(
             }
         }
         if let Some((i, _, index_id, ob_consumed)) = best_sec_eq {
-            usages[i].argvIndex = 1;
             // Do not set `omit = 1` on secondary index lookups so SQLite verifies the
             // exact column type and value (`NULL` vs `""` vs `X''`).
-            usages[i].omit = 0;
             let eq_flags = if can_use_keys_only {
                 RANGE_FLAG_KEYS_ONLY
             } else {
                 0
             };
-            info.idxNum = PLAN_SECONDARY_EQ
-                | (((index_id as c_int) & 0xFFFF) << 8)
-                | ((eq_flags & 0x7F) << 24);
-            if ob_consumed {
-                info.orderByConsumed = 1;
-                info.estimatedCost = 4.5;
-            } else {
-                info.estimatedCost = 5.0;
-            }
-            info.estimatedRows = 4;
-            return SQLITE_OK;
+            return SelectedBestIndexPlan {
+                idx_num: PLAN_SECONDARY_EQ
+                    | (((index_id as c_int) & 0xFFFF) << 8)
+                    | ((eq_flags & 0x7F) << 24),
+                idx_flags: None,
+                order_by_consumed: ob_consumed,
+                estimated_cost: if ob_consumed { 4.5 } else { 5.0 },
+                estimated_rows: 4,
+                used_constraints: [i, 0],
+                num_used: 1,
+            };
         }
 
         // 4. Compare usable range constraints (`>`, `>=`, `<`, `<=`) across PK and Secondary
@@ -1863,34 +1894,37 @@ unsafe fn select_best_index(
             } else {
                 0
             };
-            let mut next_arg = 1;
+            let mut used_constraints = [0usize; 2];
+            let mut num_used = 0usize;
             if let Some((i, fl)) = winner.lower {
-                usages[i].argvIndex = next_arg;
-                usages[i].omit = 0;
-                next_arg += 1;
+                used_constraints[num_used] = i;
+                num_used += 1;
                 flags |= fl;
             }
             if let Some((i, fl)) = winner.upper {
-                usages[i].argvIndex = next_arg;
-                usages[i].omit = 0;
+                used_constraints[num_used] = i;
+                num_used += 1;
                 flags |= fl;
             }
-            if winner.ob_consumed {
-                info.orderByConsumed = 1;
-                if winner.reverse {
-                    flags |= RANGE_FLAG_REVERSE;
-                }
+            if winner.ob_consumed && winner.reverse {
+                flags |= RANGE_FLAG_REVERSE;
             }
-            info.idxNum = if winner.is_pk {
+            let idx_num = if winner.is_pk {
                 PLAN_PK_RANGE | (flags << 8)
             } else {
                 PLAN_SECONDARY_RANGE
                     | (((winner.index_id as c_int) & 0xFFFF) << 8)
                     | ((flags & 0x7F) << 24)
             };
-            info.estimatedCost = winner.cost;
-            info.estimatedRows = winner.rows;
-            return SQLITE_OK;
+            return SelectedBestIndexPlan {
+                idx_num,
+                idx_flags: None,
+                order_by_consumed: winner.ob_consumed,
+                estimated_cost: winner.cost,
+                estimated_rows: winner.rows,
+                used_constraints,
+                num_used,
+            };
         }
 
         // 5. Fallback: Full Table Scan (let SQLite's VDBE enforce LIMIT/OFFSET after any
@@ -1901,15 +1935,19 @@ unsafe fn select_best_index(
             0
         };
         if let Some(reverse) = pk_ob {
-            info.orderByConsumed = 1;
             if reverse {
                 full_scan_flags |= RANGE_FLAG_REVERSE;
             }
         }
-        info.idxNum = PLAN_FULL_SCAN | (full_scan_flags << 8);
-        info.estimatedCost = 10_000.0;
-        info.estimatedRows = 1_000;
-        SQLITE_OK
+        SelectedBestIndexPlan {
+            idx_num: PLAN_FULL_SCAN | (full_scan_flags << 8),
+            idx_flags: None,
+            order_by_consumed: pk_ob.is_some(),
+            estimated_cost: 10_000.0,
+            estimated_rows: 1_000,
+            used_constraints: [0; 2],
+            num_used: 0,
+        }
     }
 }
 
@@ -2431,7 +2469,7 @@ unsafe extern "system" fn vtab_filter(
                 Err(_) => return SQLITE_ERROR,
             };
             if !guard.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-                set_vtab_err_msg(cursor.base.pVtab, STALE_VTAB_ERR);
+                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
                 return SQLITE_ERROR;
             }
             let snapshot = match vtab.read_session.for_cursor_locked(&guard, conn_id) {
@@ -2462,7 +2500,7 @@ unsafe extern "system" fn vtab_filter(
         };
         if snapshot.is_none() && !guard.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id)
         {
-            set_vtab_err_msg(cursor.base.pVtab, STALE_VTAB_ERR);
+            set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
             return SQLITE_ERROR;
         }
         let rc = match snapshot.as_ref() {
@@ -2878,7 +2916,7 @@ unsafe extern "system" fn vtab_update(
             return io_err_to_sqlite_rc(&e);
         }
         if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
-            set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+            set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
             return SQLITE_ERROR;
         }
 
@@ -2936,10 +2974,7 @@ unsafe extern "system" fn vtab_update(
             // SQLITE_CONSTRAINT would be resolved by the statement's conflict mode (OR IGNORE
             // would skip the row and report success, OR REPLACE would delete conflicting rows
             // first), so this is a plain error that every mode reports as such.
-            if !(*p_vtab).zErrMsg.is_null() {
-                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
-            }
-            (*p_vtab).zErrMsg = sqlite_error_message(reason);
+            set_vtab_err_msg(vtab.base.get(), reason);
             return SQLITE_ERROR;
         }
         let num_cols = vtab.col_names.len();
@@ -3446,7 +3481,7 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 Err(_) => return SQLITE_ERROR,
             };
             if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
-                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
                 return SQLITE_ERROR;
             }
         }
@@ -3460,7 +3495,7 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 Err(_) => return SQLITE_ERROR,
             };
             if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
-                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
                 return SQLITE_ERROR;
             }
             if let Some(snapshot) = vtab.read_session.current() {
@@ -3578,7 +3613,6 @@ fn complete_commit_step_for_engine(
 
 unsafe fn complete_commit_step(
     vtab: &AydbVTab,
-    p_vtab: *mut sqlite3_vtab,
     step: io::Result<CommitStep<OsFile>>,
     #[cfg(test)] fail_sync: Option<Arc<AtomicBool>>,
 ) -> c_int {
@@ -3590,7 +3624,7 @@ unsafe fn complete_commit_step(
     );
     if let Err(e) = committed {
         unsafe {
-            set_vtab_err_msg(p_vtab, &e.to_string());
+            set_vtab_err_msg(vtab.base.get(), &e.to_string());
         }
         return io_err_to_sqlite_rc(&e);
     }
@@ -3623,12 +3657,12 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             });
             for (id, stale_name) in stale {
                 if let Err(e) = eng.drop_stale_created_vtab(id, &stale_name) {
-                    set_vtab_err_msg(p_vtab, &e.to_string());
+                    set_vtab_err_msg(vtab.base.get(), &e.to_string());
                     return io_err_to_sqlite_rc(&e);
                 }
             }
             if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
-                set_vtab_err_msg(p_vtab, &e.to_string());
+                set_vtab_err_msg(vtab.base.get(), &e.to_string());
                 return io_err_to_sqlite_rc(&e);
             }
             #[cfg(test)]
@@ -3639,7 +3673,6 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         };
         complete_commit_step(
             vtab,
-            p_vtab,
             step,
             #[cfg(test)]
             fail_sync_flag,
@@ -3673,7 +3706,6 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
         };
         let rc = complete_commit_step(
             vtab,
-            p_vtab,
             step,
             #[cfg(test)]
             fail_sync_flag,
