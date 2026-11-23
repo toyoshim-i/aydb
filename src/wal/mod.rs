@@ -389,6 +389,13 @@ pub enum WalAppendOutcome {
     RingFull,
 }
 
+#[inline]
+fn sector_byte_offset(sector_idx: usize) -> io::Result<u64> {
+    (sector_idx as u64)
+        .checked_mul(WAL_SECTOR_SIZE as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "WAL sector offset overflow"))
+}
+
 /// Writer for a single fixed-size epoch-based WAL stream (`wal_sync.db` or `wal_buf.db`).
 pub struct WalStreamWriter<F: PlatformFile> {
     file: Arc<F>,
@@ -492,12 +499,21 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         let total_sectors = Self::validate_wal_target_size(target_size)?;
         let hint = Self::open_hint(mode);
         match fs.open_file(file_name, false, true, hint) {
-            Ok(file) => Ok(Some(Self::init_with_file(
-                file,
-                mode,
-                total_sectors,
-                active_epoch,
-            ))),
+            Ok(file) => {
+                let file_sectors = usize::try_from(file.file_len()? / WAL_SECTOR_SIZE as u64)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "WAL file sector count exceeds usize::MAX",
+                        )
+                    })?;
+                Ok(Some(Self::init_with_file(
+                    file,
+                    mode,
+                    total_sectors.max(file_sectors),
+                    active_epoch,
+                )))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -522,17 +538,24 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             }
             Err(e) => return Err(e),
         };
+        let file_sectors =
+            usize::try_from(file.file_len()? / WAL_SECTOR_SIZE as u64).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL file sector count exceeds usize::MAX",
+                )
+            })?;
         Ok(Self::init_with_file(
             file,
             mode,
-            total_sectors,
+            total_sectors.max(file_sectors),
             active_epoch,
         ))
     }
 
     /// Lengthens the file to the size the stream was opened with, if it is shorter.
     pub fn allocate_to_target(&mut self) -> io::Result<()> {
-        let target = (self.total_sectors * WAL_SECTOR_SIZE) as u64;
+        let target = sector_byte_offset(self.total_sectors)?;
         if self.file.file_len()? < target {
             let prealloc = match self.mode {
                 WalStreamMode::SyncSectorIsolated => PreallocStrategy::PhysicalZeroFill,
@@ -561,8 +584,10 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     }
 
     /// Positions the writer cursor right after the last valid sector recovered during startup.
+    /// If `next_sector_idx >= self.total_sectors`, appends will report `RingFull` until grown with
+    /// [`Self::ensure_min_size`] or rotated to a new epoch (never rewound onto live sectors).
     pub fn set_cursor_after_recovery(&mut self, next_sector_idx: usize) {
-        self.current_sector_idx = next_sector_idx.min(self.total_sectors);
+        self.current_sector_idx = next_sector_idx;
         self.current_valid_bytes = 0;
         self.dirty_in_user_space = false;
         self.clear_sector_buf();
@@ -612,8 +637,18 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// Grows the underlying WAL file if `target_size > current_size` to accommodate an oversized
     /// multi-chunk transaction in a single epoch.
     pub fn ensure_min_size(&mut self, target_size: u64) -> io::Result<()> {
-        let aligned = target_size.div_ceil(WAL_SECTOR_SIZE as u64) * WAL_SECTOR_SIZE as u64;
-        let new_sectors = (aligned / WAL_SECTOR_SIZE as u64) as usize;
+        let new_sectors_u64 = target_size.div_ceil(WAL_SECTOR_SIZE as u64);
+        let aligned = new_sectors_u64
+            .checked_mul(WAL_SECTOR_SIZE as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "WAL target size overflow")
+            })?;
+        let new_sectors = usize::try_from(new_sectors_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL sector count exceeds usize::MAX",
+            )
+        })?;
         if new_sectors > self.total_sectors {
             let prealloc = match self.mode {
                 WalStreamMode::SyncSectorIsolated => PreallocStrategy::PhysicalZeroFill,
@@ -752,7 +787,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                 WalStreamMode::SyncSectorIsolated => {
                     self.seal_current_sector_in_memory();
                     if staged_start_sector.is_none() && remaining.is_empty() {
-                        let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                        let offset = sector_byte_offset(self.current_sector_idx)?;
                         self.file.write_all_at(&self.sector_buf, offset)?;
                     } else {
                         if staged_start_sector.is_none() {
@@ -768,7 +803,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                     {
                         self.seal_current_sector_in_memory();
                         if staged_start_sector.is_none() && remaining.is_empty() {
-                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            let offset = sector_byte_offset(self.current_sector_idx)?;
                             self.file.write_all_at(&self.sector_buf, offset)?;
                         } else {
                             if staged_start_sector.is_none() {
@@ -784,7 +819,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                         if staged_start_sector.is_some() {
                             self.multi_sector_buf.extend_from_slice(&self.sector_buf);
                         } else {
-                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            let offset = sector_byte_offset(self.current_sector_idx)?;
                             self.file.write_all_at(&self.sector_buf, offset)?;
                         }
                     }
@@ -795,7 +830,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                     {
                         self.seal_current_sector_in_memory();
                         if staged_start_sector.is_none() && remaining.is_empty() {
-                            let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+                            let offset = sector_byte_offset(self.current_sector_idx)?;
                             self.file.write_all_at(&self.sector_buf, offset)?;
                         } else {
                             if staged_start_sector.is_none() {
@@ -812,7 +847,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         }
 
         if let Some(start_sec) = staged_start_sector {
-            let offset = (start_sec * WAL_SECTOR_SIZE) as u64;
+            let offset = sector_byte_offset(start_sec)?;
             self.file.write_all_at(&self.multi_sector_buf, offset)?;
             self.multi_sector_buf.clear();
         }
@@ -948,7 +983,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     fn seal_and_write_current_sector(&mut self) -> io::Result<()> {
         self.seal_current_sector_in_memory();
-        let offset = (self.current_sector_idx * WAL_SECTOR_SIZE) as u64;
+        let offset = sector_byte_offset(self.current_sector_idx)?;
         self.file.write_all_at(&self.sector_buf, offset)
     }
 
@@ -1146,7 +1181,12 @@ pub fn recover_single_wal_stream_with_mode<F: PlatformFile>(
     scan_mode: WalScanMode,
 ) -> io::Result<SingleStreamRecovery> {
     let file_len = file.file_len()?;
-    let total_sectors = (file_len / WAL_SECTOR_SIZE as u64) as usize;
+    let total_sectors = usize::try_from(file_len / WAL_SECTOR_SIZE as u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL file sector count exceeds usize::MAX",
+        )
+    })?;
 
     let mut rec = SingleStreamRecovery::default();
     if total_sectors == 0 {
@@ -1207,10 +1247,7 @@ pub fn recover_single_wal_stream_with_mode<F: PlatformFile>(
     'scan: while sec_idx < total_sectors {
         let count = (total_sectors - sec_idx).min(WINDOW_SECTORS);
         let byte_len = count * WAL_SECTOR_SIZE;
-        file.read_exact_at(
-            &mut window_buf[..byte_len],
-            (sec_idx * WAL_SECTOR_SIZE) as u64,
-        )?;
+        file.read_exact_at(&mut window_buf[..byte_len], sector_byte_offset(sec_idx)?)?;
 
         for i in 0..count {
             let sector = &window_buf[i * WAL_SECTOR_SIZE..(i + 1) * WAL_SECTOR_SIZE];
@@ -2411,5 +2448,55 @@ mod tests {
         assert_eq!(writer.active_epoch(), 5);
         writer.reset_for_new_epoch(6).unwrap();
         assert_eq!(writer.active_epoch(), 6);
+
+        let err = writer.ensure_min_size(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn set_cursor_after_recovery_preserves_grown_wal_position() {
+        let tmp = TempTestDir::new("wal_grown_cursor");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        {
+            let mut w = WalStreamWriter::open(
+                &fs,
+                WAL_SYNC_FILE_NAME,
+                8 * WAL_SECTOR_SIZE as u64,
+                1,
+                WalStreamMode::SyncSectorIsolated,
+            )
+            .unwrap();
+            w.ensure_min_size(16 * WAL_SECTOR_SIZE as u64).unwrap();
+            for lsn in 1..=12u64 {
+                w.append_batch(&put_batch(lsn, b"k", 10)).unwrap();
+            }
+            assert_eq!(w.current_sector_idx(), 12);
+        }
+
+        // Reopen with the original smaller target_size (8 sectors); recovery reaches sector 12.
+        let mut w = WalStreamWriter::open_existing_unallocated(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            8 * WAL_SECTOR_SIZE as u64,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap()
+        .expect("file exists");
+        let rec = recover_single_wal_stream(&**w.file(), 1).unwrap();
+        assert_eq!(rec.next_sector_idx, 12);
+        w.set_cursor_after_recovery(rec.next_sector_idx);
+        assert_eq!(w.current_sector_idx(), 12);
+        assert!(w.total_sectors() >= 16);
+
+        w.append_batch(&put_batch(13, b"k", 10)).unwrap();
+        drop(w);
+        let f = fs
+            .open_file(WAL_SYNC_FILE_NAME, false, false, OpenHint::MutableSyncLog)
+            .unwrap();
+        let rec = recover_single_wal_stream(&*f, 1).unwrap();
+        let lsns: Vec<u64> = rec.batches.iter().map(|b| b.lsn).collect();
+        assert_eq!(lsns, (1..=13).collect::<Vec<_>>());
     }
 }

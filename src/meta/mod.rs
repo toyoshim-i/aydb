@@ -106,6 +106,9 @@ fn is_managed_segment_or_manifest(file_name: &str) -> bool {
 /// Extracts the SeqID encoded in a managed segment or manifest file name
 /// (`idx_`, `blob_std_`, `blob_lru_<TblID>_` or `manifest_`).
 fn parse_managed_seq_id(file_name: &str) -> Option<u64> {
+    if !is_managed_segment_or_manifest(file_name) {
+        return None;
+    }
     let stem = file_name.strip_suffix(".db")?;
     let hex = if let Some(h) = stem.strip_prefix("idx_") {
         h
@@ -221,6 +224,25 @@ impl Default for BootMetaState {
 }
 
 impl BootMetaState {
+    fn check_header_bounds(&self) -> io::Result<()> {
+        if self.generation == 0
+            || self.generation == u64::MAX
+            || self.next_seq_id == 0
+            || self.next_seq_id == u64::MAX
+            || self.checkpoint_lsn == u64::MAX
+            || self.sync_wal_epoch == 0
+            || self.sync_wal_epoch == u64::MAX
+            || self.buf_wal_epoch == 0
+            || self.buf_wal_epoch == u64::MAX
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BootMetaState header counter or epoch out of valid bounds",
+            ));
+        }
+        Ok(())
+    }
+
     /// Allocates and returns a fresh, monotonically increasing `SeqID`.
     pub fn allocate_seq_id(&mut self) -> u64 {
         let id = self.next_seq_id;
@@ -522,8 +544,12 @@ impl BootMetaState {
         }
 
         // 5. Pending deletes
+        const MIN_MANAGED_FILE_NAME_LEN: usize = 23; // "idx_" + 16 hex + ".db"
         let num_deletes = r.read_u32_le()? as usize;
-        if num_deletes.checked_mul(2).is_none_or(|b| b > r.remaining()) {
+        if num_deletes
+            .checked_mul(2 + MIN_MANAGED_FILE_NAME_LEN)
+            .is_none_or(|b| b > r.remaining())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted pending_delete_files count",
@@ -538,6 +564,13 @@ impl BootMetaState {
                     "pending_delete_files allocation overflow",
                 )
             })?;
+        let mut seen_deletes = HashSet::new();
+        seen_deletes.try_reserve(num_deletes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pending_delete_files seen-set allocation overflow",
+            )
+        })?;
         for _ in 0..num_deletes {
             let name_len = r.read_u16_le()? as usize;
             let name_bytes = r.read_bytes(name_len)?;
@@ -551,6 +584,12 @@ impl BootMetaState {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "non-managed filename in pending_delete_files",
+                ));
+            }
+            if !seen_deletes.insert(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate filename in pending_delete_files",
                 ));
             }
             pending_delete_files.push(name.to_owned());
@@ -881,7 +920,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             .filter_map(|f| parse_managed_seq_id(f))
             .max();
         match max_seen {
-            Some(u64::MAX) => Err(io::Error::new(
+            Some(m) if m >= u64::MAX - 1 => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed segment SeqID overflow",
             )),
@@ -952,9 +991,15 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let prev_manifest_id = next_state.active_manifest_seq_id;
 
         mutate(&mut next_state);
-        next_state.generation = self.state.generation.checked_add(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "64-bit generation overflow")
-        })?;
+        next_state.generation = self
+            .state
+            .generation
+            .checked_add(1)
+            .filter(|&g| g < u64::MAX)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "64-bit generation overflow")
+            })?;
+        next_state.check_header_bounds()?;
 
         let target_slot = self.active_slot.opposite();
         let mut slot_write_attempted = false;
@@ -1056,6 +1101,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
         slot_write_attempted: &mut bool,
         orphan_manifest: &mut Option<String>,
     ) -> io::Result<()> {
+        state.check_header_bounds()?;
         let catalog_bytes = state.encode_catalog_payload()?;
 
         let (flags, slot_payload_bytes) = if catalog_bytes.len() <= MAX_INLINE_PAYLOAD_LEN {
@@ -1082,7 +1128,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
                     "external manifest exceeds MAX_EXTERNAL_MANIFEST_BYTES",
                 ));
             }
-            if state.next_seq_id == u64::MAX {
+            if state.next_seq_id >= u64::MAX - 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "64-bit SeqID overflow",
@@ -1126,6 +1172,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
             (FLAG_EXTERNAL_MANIFEST, ptr_buf)
         };
 
+        state.check_header_bounds()?;
         let payload_len = slot_payload_bytes.len() as u32;
         let payload_crc = crc32c(&slot_payload_bytes);
 
@@ -3080,5 +3127,110 @@ mod tests {
         for name in &names {
             assert!(!tmp.path.join(name).exists());
         }
+    }
+
+    #[test]
+    fn parse_managed_seq_id_rejects_non_canonical_names() {
+        assert_eq!(parse_managed_seq_id("idx_000000000000002a.db"), Some(0x2a));
+        assert_eq!(
+            parse_managed_seq_id("blob_lru_0007_fffffffffffffffe.db"),
+            Some(u64::MAX - 1)
+        );
+        for non_canonical in [
+            "idx_+ffffffffffffffff.db",
+            "idx_ffffffffffffffff.db".to_ascii_uppercase().as_str(),
+            "idx_1.db",
+            "blob_lru_backup_ffffffffffffffff.db",
+            "../idx_0000000000000001.db",
+        ] {
+            assert_eq!(
+                parse_managed_seq_id(non_canonical),
+                None,
+                "must reject {non_canonical}"
+            );
+        }
+
+        let tmp = TempTestDir::new("non_canon_seq");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+        std::fs::write(tmp.path.join("idx_+ffffffffffffffff.db"), b"alien").unwrap();
+        mgr.reserve_seq_ids_above_existing_files().unwrap();
+        assert!(tmp.path.join("idx_+ffffffffffffffff.db").exists());
+
+        // `u64::MAX - 1` would overflow `next_seq_id` to unreadable `u64::MAX` on +1.
+        std::fs::write(tmp.path.join(format_idx_file_name(u64::MAX - 1)), b"edge").unwrap();
+        let err = mgr.reserve_seq_ids_above_existing_files().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_rejects_unreadable_u64_max_or_zero_header_bounds() {
+        let tmp = TempTestDir::new("write_bounds");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
+
+        assert_eq!(
+            mgr.commit_update(|s| s.next_seq_id = u64::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            mgr.commit_update(|s| s.checkpoint_lsn = u64::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            mgr.commit_update(|s| s.sync_wal_epoch = 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            mgr.commit_update(|s| s.buf_wal_epoch = u64::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        // State near generation = u64::MAX - 1 must refuse advancing to u64::MAX.
+        mgr.state.generation = u64::MAX - 1;
+        assert_eq!(
+            mgr.commit_update(|_| {}).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn decode_rejects_inflated_and_duplicate_pending_deletes() {
+        let mut inflated = Vec::new();
+        inflated.extend_from_slice(&0u32.to_le_bytes());
+        inflated.extend_from_slice(&0u32.to_le_bytes());
+        inflated.extend_from_slice(&0u32.to_le_bytes());
+        inflated.extend_from_slice(&0u32.to_le_bytes());
+        inflated.extend_from_slice(&10u32.to_le_bytes());
+        let name = format_idx_file_name(1);
+        inflated.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        inflated.extend_from_slice(name.as_bytes());
+        let mut st = BootMetaState::default();
+        assert_eq!(
+            st.decode_catalog_payload(&inflated).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut dup = Vec::new();
+        dup.extend_from_slice(&0u32.to_le_bytes());
+        dup.extend_from_slice(&0u32.to_le_bytes());
+        dup.extend_from_slice(&0u32.to_le_bytes());
+        dup.extend_from_slice(&0u32.to_le_bytes());
+        dup.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            dup.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            dup.extend_from_slice(name.as_bytes());
+        }
+        assert_eq!(
+            st.decode_catalog_payload(&dup).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

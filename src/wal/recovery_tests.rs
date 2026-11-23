@@ -72,6 +72,11 @@ fn a_link_that_cannot_name_a_missing_batch_cuts_at_the_batch_itself() {
     assert_eq!(walk(&chain, 4), (2, Some((11, CutKind::Link))));
     let chain = [found(5, 4, 0), found(9, 12, 0)];
     assert_eq!(walk(&chain, 4), (1, Some((9, CutKind::Link))));
+    // Duplicate self-linked LSN must also cut at itself.
+    let chain = [found(11, 10, 0), found(11, 11, 0)];
+    assert_eq!(walk(&chain, 10), (1, Some((11, CutKind::Link))));
+    let chain = [found(10, 10, 0)];
+    assert_eq!(walk(&chain, 10), (0, Some((10, CutKind::Link))));
 }
 
 #[test]

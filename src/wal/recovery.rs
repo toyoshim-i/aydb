@@ -186,9 +186,9 @@ where
     for (i, found) in chain.iter().enumerate() {
         let b = &found.batch;
         let linked = if i == 0 {
-            b.prev_lsn <= checkpoint_lsn
+            b.lsn > checkpoint_lsn && b.prev_lsn <= checkpoint_lsn
         } else {
-            b.prev_lsn == last
+            b.lsn > last && b.prev_lsn == last
         };
         let cut = if !linked {
             let named = if b.prev_lsn > last && b.prev_lsn < b.lsn {

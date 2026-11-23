@@ -21,7 +21,7 @@ pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> 
         std::env::current_dir()?.join(path)
     };
     #[cfg(windows)]
-    let prefixed = ensure_extended_length_prefix(clean_lexical_path(&abs_path));
+    let prefixed = ensure_extended_length_prefix(clean_lexical_path(&abs_path)?);
     // On Unix a symlink followed by ".." names the parent of the link target.
     #[cfg(not(windows))]
     let prefixed = abs_path;
@@ -33,7 +33,18 @@ pub fn normalize_db_root_path(path: &Path, create: bool) -> io::Result<PathBuf> 
 }
 
 #[cfg(windows)]
-fn clean_lexical_path(path: &Path) -> PathBuf {
+fn clean_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::Prefix;
+
+    // Preserve verbatim `\\?\` / device `\\.\` paths exactly as supplied; strip trailing
+    // ASCII spaces and dots from regular components before `\\?\` disables Win32 normalization.
+    let is_verbatim = matches!(
+        path.components().next(),
+        Some(Component::Prefix(p))
+            if p.kind().is_verbatim() || matches!(p.kind(), Prefix::DeviceNS(_))
+    );
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -41,10 +52,27 @@ fn clean_lexical_path(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 out.pop();
             }
+            Component::Normal(s) if !is_verbatim => {
+                let mut wide: Vec<u16> = s.encode_wide().collect();
+                while wide
+                    .last()
+                    .copied()
+                    .is_some_and(|u| u == b' ' as u16 || u == b'.' as u16)
+                {
+                    wide.pop();
+                }
+                if wide.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows path component consists only of dots or spaces",
+                    ));
+                }
+                out.push(OsString::from_wide(&wide));
+            }
             other => out.push(other.as_os_str()),
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(windows)]
@@ -218,7 +246,7 @@ mod tests {
             ensure_extended_length_prefix(PathBuf::from(r"\\server/share/dir//sub")),
             PathBuf::from(r"\\?\UNC\server\share\dir\sub")
         );
-        let cleaned = clean_lexical_path(Path::new("//server/share/a/../b"));
+        let cleaned = clean_lexical_path(Path::new("//server/share/a/../b")).unwrap();
         assert_eq!(
             ensure_extended_length_prefix(cleaned),
             PathBuf::from(r"\\?\UNC\server\share\b")
@@ -239,5 +267,22 @@ mod tests {
             ensure_extended_length_prefix(PathBuf::from(r"\\.\C:/foo")),
             PathBuf::from(r"\\.\C:\foo")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn clean_lexical_path_strips_trailing_dots_and_spaces_before_verbatim_prefix() {
+        let tmp = crate::util::test_util::TempTestDir::new("win_trailing_dots");
+        let dirty = tmp.path.join("mydb. . ");
+        let resolved = normalize_db_root_path(&dirty, true).unwrap();
+        assert!(resolved.ends_with("mydb"));
+        assert!(tmp.path.join("mydb").exists());
+        assert_eq!(
+            normalize_db_root_path(&tmp.path.join("mydb."), false).unwrap(),
+            resolved
+        );
+
+        let err = clean_lexical_path(Path::new(r"C:\data\...")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
