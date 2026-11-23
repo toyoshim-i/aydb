@@ -1802,24 +1802,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Removes the tables that the active transaction created under `table_name` or with
-    /// `table_id` for which `is_stale(prev_db, prev_name)` holds, and returns them. SQLite only
-    /// runs `xCreate` for a name its schema does not have, so one of these is a creation that a
-    /// `ROLLBACK TO` undid in the schema but, because SQLite never announces such a savepoint to a
+    /// `table_id` for which `is_stale(prev_id, prev_db, prev_name)` holds, and returns them. SQLite
+    /// only runs `xCreate` for a name its schema does not have, so one of these is a creation that
+    /// a `ROLLBACK TO` undid in the schema but, because SQLite never announces such a savepoint to a
     /// table made inside it, not in the engine.
     pub(crate) fn take_vtabs_created_in_tx(
         &mut self,
         table_id: Option<u16>,
         table_name: &str,
-        mut is_stale: impl FnMut(&str, &str) -> bool,
+        mut is_stale: impl FnMut(u16, &str, &str) -> bool,
     ) -> Vec<(u16, String)> {
         let norm = normalize_vtab_ident(table_name);
         let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
             .into_iter()
             .partition(|(id, name, db)| {
-                (*name == norm || Some(*id) == table_id) && is_stale(db, name)
+                (*name == norm || Some(*id) == table_id) && is_stale(*id, db, name)
             });
         self.vtabs_created_in_tx = kept;
         stale.into_iter().map(|(id, name, _)| (id, name)).collect()
+    }
+
+    /// Returns a snapshot of `(table_id, table_name, db_name)` entries created in the active
+    /// transaction so callers can probe SQLite's schema without holding the engine lock.
+    pub(crate) fn vtabs_created_in_tx_snapshot(&self) -> Vec<(u16, String, String)> {
+        self.vtabs_created_in_tx.clone()
     }
 
     /// Removes any tables created in the active transaction for which `is_stale(db, name)` holds,

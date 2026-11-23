@@ -872,3 +872,58 @@ fn failed_create_inside_read_tx_preserves_read_snapshot_and_upgrade_check() {
     conn1.execute_batch("ROLLBACK;").unwrap();
     assert_eq!(ints(&conn1, "SELECT v FROM t1 WHERE k = 1"), [20]);
 }
+
+#[test]
+fn rolled_back_vtab_replaced_by_native_table_is_pruned_on_commit() {
+    let mut fixture = Fixture::new("rolled_back_vtab_replaced_native");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "BEGIN;
+         SAVEPOINT s;
+         CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO t VALUES (1, 10);
+         ROLLBACK TO s;
+         CREATE TABLE t(a INT);
+         INSERT INTO t VALUES (99);
+         COMMIT;",
+    )
+    .unwrap();
+    assert_eq!(ints(&conn, "SELECT a FROM t"), [99]);
+
+    // Dropping the native table and creating a fresh virtual table `t` must not inherit row 1.
+    conn.execute_batch(
+        "DROP TABLE t;
+         CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert!(ints(&conn, "SELECT v FROM t").is_empty());
+}
+
+#[test]
+fn rolled_back_vtab_does_not_block_in_tx_rename_to_same_name() {
+    let mut fixture = Fixture::new("rolled_back_vtab_rename_target");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "BEGIN;
+         CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO u VALUES (1, 42);
+         SAVEPOINT s;
+         CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO t VALUES (2, 99);
+         ROLLBACK TO s;
+         ALTER TABLE u RENAME TO t;
+         COMMIT;",
+    )
+    .unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [42]);
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [42]);
+}

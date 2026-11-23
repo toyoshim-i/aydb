@@ -280,18 +280,6 @@ unsafe extern "system" {
     pub fn sqlite3_step(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int;
     pub fn sqlite3_txn_state(db: *mut sqlite3, zSchema: *const c_char) -> c_int;
-    /// With a null `zColumnName` it only checks that the table exists in any attached database.
-    pub fn sqlite3_table_column_metadata(
-        db: *mut sqlite3,
-        zDbName: *const c_char,
-        zTableName: *const c_char,
-        zColumnName: *const c_char,
-        pzDataType: *mut *const c_char,
-        pzCollSeq: *mut *const c_char,
-        pNotNull: *mut c_int,
-        pPrimaryKey: *mut c_int,
-        pAutoinc: *mut c_int,
-    ) -> c_int;
     pub fn sqlite3_trace_v2(
         db: *mut sqlite3,
         mask: core::ffi::c_uint,

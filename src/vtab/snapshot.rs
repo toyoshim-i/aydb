@@ -15,6 +15,24 @@ use super::ffi::{sqlite3, sqlite3_get_autocommit};
 pub(super) const TRACE_STATEMENT: c_uint = 1;
 pub(super) const TRACE_PROFILE: c_uint = 2;
 
+thread_local! {
+    static IN_INTERNAL_SCHEMA_QUERY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Suspends `trace_reads` for internal read-only catalog queries executed while holding the
+/// engine lock (for example inside `xCreate`, `xRename`, `xSync`, or `ddl_commit_hook`).
+pub(super) struct InternalSchemaQueryGuard(bool);
+
+impl Drop for InternalSchemaQueryGuard {
+    fn drop(&mut self) {
+        IN_INTERNAL_SCHEMA_QUERY.with(|flag| flag.set(self.0));
+    }
+}
+
+pub(super) fn enter_internal_schema_query() -> InternalSchemaQueryGuard {
+    InternalSchemaQueryGuard(IN_INTERNAL_SCHEMA_QUERY.with(|flag| flag.replace(true)))
+}
+
 /// All virtual tables on a connection use one committed view of their shared engine.
 pub(super) struct ReadSession {
     #[cfg(test)]
@@ -137,6 +155,9 @@ pub(super) unsafe extern "system" fn trace_reads(
     _detail: *mut c_void,
 ) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        if IN_INTERNAL_SCHEMA_QUERY.with(Cell::get) {
+            return;
+        }
         let trace = &*(context as *const ReadTrace);
         let autocommit = sqlite3_get_autocommit(trace.database) != 0;
         let previously_autocommit = trace.autocommit.replace(autocommit);
@@ -164,7 +185,7 @@ pub(super) unsafe extern "system" fn trace_reads(
 pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let trace = &*(context as *const ReadTrace);
-        trace.pending_ddl.commit_pending(trace.database)
+        trace.pending_ddl.commit_pending()
     }))
     .unwrap_or(1)
 }
