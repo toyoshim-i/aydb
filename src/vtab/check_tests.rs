@@ -224,7 +224,8 @@ fn legacy_table_with(name: &str, column: &str) -> Fixture {
     conn.execute_batch(&format!(
         "PRAGMA writable_schema = ON;
          UPDATE sqlite_master SET sql = replace(sql, 'x INT CHECK(x > 0) UNIQUE', '{}') WHERE name = 't';",
-        column.replace("'", "''")
+        // Double quotes inside the stored `columns='...'` literal as well as for the UPDATE SQL string.
+        column.replace('\'', "''''")
     ))
     .unwrap();
     drop(conn);

@@ -71,7 +71,7 @@ pub(super) fn split_top_level_commas(input: &str) -> Vec<&str> {
     }
     if start <= input.len() {
         let tail = &input[start..];
-        if !tail.trim().is_empty() {
+        if !tail.trim().is_empty() || !parts.is_empty() {
             parts.push(tail);
         }
     }
@@ -199,14 +199,27 @@ fn column_tokens(input: &str) -> Result<Vec<&str>, c_int> {
 /// doubled quote character inside it. Identifier quotes inside the value are left alone.
 fn unwrap_option_value(raw: &str) -> String {
     let value = raw.trim();
-    for quote in ['\'', '"'] {
-        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
-            let inner = &value[1..value.len() - 1];
-            let doubled = format!("{quote}{quote}");
-            return inner
-                .replace(&doubled, &quote.to_string())
-                .trim()
-                .to_string();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') {
+        let quote = bytes[0];
+        let mut i = 1;
+        let mut unescaped = Vec::with_capacity(bytes.len() - 2);
+        while i < bytes.len() {
+            if bytes[i] == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                    unescaped.push(quote);
+                    i += 2;
+                } else if i + 1 == bytes.len() {
+                    let s = String::from_utf8(unescaped)
+                        .expect("stripping paired ASCII quotes preserves UTF-8");
+                    return s.trim().to_string();
+                } else {
+                    return value.to_string();
+                }
+            } else {
+                unescaped.push(bytes[i]);
+                i += 1;
+            }
         }
     }
     value.to_string()
@@ -380,7 +393,14 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
         let mut has_autoincrement = false;
         match keyword.as_str() {
             "CONSTRAINT" => {
-                if i + 1 >= tokens.len() {
+                if pending_name.is_some() || i + 1 >= tokens.len() {
+                    return Err(SQLITE_ERROR);
+                }
+                let name = tokens[i + 1];
+                if name.starts_with('(')
+                    || matches!(name, "+" | "-")
+                    || unquote_identifier(name).is_empty()
+                {
                     return Err(SQLITE_ERROR);
                 }
                 i += 2;
@@ -445,7 +465,14 @@ fn parse_column_def(tokens: &[&str]) -> Result<ColumnDef, c_int> {
                 let Some(name) = tokens.get(i + 1) else {
                     return Err(SQLITE_ERROR);
                 };
-                let Some(collation) = ColCollation::from_name(&unquote_identifier(name)) else {
+                if name.starts_with('(') {
+                    return Err(SQLITE_ERROR);
+                }
+                let unquoted = unquote_identifier(name);
+                if unquoted.is_empty() || unquoted != unquoted.trim() {
+                    return Err(SQLITE_ERROR);
+                }
+                let Some(collation) = ColCollation::from_name(&unquoted) else {
                     return Err(SQLITE_ERROR);
                 };
                 def.collation = collation;
@@ -637,7 +664,7 @@ pub(super) unsafe fn parse_vtab_ddl(
                 return Err(SQLITE_ERROR);
             }
             if raw_tokens.is_empty() {
-                continue;
+                return Err(SQLITE_ERROR);
             }
             if is_table_constraint(&raw_tokens) {
                 return Err(SQLITE_ERROR);
@@ -676,25 +703,27 @@ pub(super) unsafe fn parse_vtab_ddl(
         // Parse secondary index column names
         let mut secondary_indexes = Vec::new();
         let mut next_idx_id = 1u16;
-        for idx_col in split_top_level_commas(&indexes_spec) {
-            if idx_col.trim().is_empty() {
-                continue;
+        if !indexes_spec.trim().is_empty() {
+            for idx_col in split_top_level_commas(&indexes_spec) {
+                if idx_col.trim().is_empty() {
+                    return Err(SQLITE_ERROR);
+                }
+                if next_idx_id >= 0x8000 {
+                    return Err(SQLITE_ERROR);
+                }
+                let target = unquote_identifier(idx_col.trim());
+                let Some(pos) = col_names
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&target))
+                else {
+                    return Err(SQLITE_ERROR);
+                };
+                if secondary_indexes.iter().any(|&(p, _)| p == pos) {
+                    return Err(SQLITE_ERROR);
+                }
+                secondary_indexes.push((pos, next_idx_id));
+                next_idx_id += 1;
             }
-            if next_idx_id >= 0x8000 {
-                return Err(SQLITE_ERROR);
-            }
-            let target = unquote_identifier(idx_col.trim());
-            let Some(pos) = col_names
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(&target))
-            else {
-                return Err(SQLITE_ERROR);
-            };
-            if secondary_indexes.iter().any(|&(p, _)| p == pos) {
-                return Err(SQLITE_ERROR);
-            }
-            secondary_indexes.push((pos, next_idx_id));
-            next_idx_id += 1;
         }
 
         Ok(ParsedVtabDdl {
@@ -1200,5 +1229,85 @@ mod tests {
             parse(&[&format!("columns='{many_cols}'")]).err(),
             Some(SQLITE_ERROR)
         );
+    }
+
+    #[test]
+    fn option_unwrapping_constraints_collations_and_commas_harden_edge_cases() {
+        // Unquoted columns option whose first and last identifiers happen to be quoted must keep
+        // all outer quotes intact.
+        let d = parse(&[r#"columns="k" INTEGER PRIMARY KEY, "v""#]).unwrap();
+        assert_eq!(d.col_names, vec!["k", "v"]);
+        assert!(d.pk_rowid_alias);
+
+        // Quoted value with escaped inner quotes still unwraps cleanly.
+        let d = parse(&["columns='\"k\" INTEGER PRIMARY KEY, ''v'' TEXT'"]).unwrap();
+        assert_eq!(d.col_names, vec!["k", "v"]);
+
+        // Quoted identifiers around a block comment must NOT be unwrapped to hide the comment.
+        assert_eq!(
+            parse(&["columns='k' /* comment */ 'v'"]).err(),
+            Some(SQLITE_ERROR)
+        );
+
+        // Consecutive, empty-name, and punctuation-named CONSTRAINT clauses are rejected.
+        for bad_constraint in [
+            "k TEXT PRIMARY KEY, v INT CONSTRAINT a CONSTRAINT b UNIQUE",
+            "k TEXT PRIMARY KEY, v INT CONSTRAINT ( UNIQUE",
+            "k TEXT PRIMARY KEY, v INT CONSTRAINT \"\" UNIQUE",
+            "k TEXT PRIMARY KEY, v INT CONSTRAINT + UNIQUE",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{bad_constraint}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{bad_constraint}"
+            );
+        }
+
+        // COLLATE allows properly quoted standard names without internal whitespace padding.
+        let d = cols("k TEXT PRIMARY KEY, a TEXT COLLATE \"NOCASE\", b TEXT COLLATE [RTRIM]");
+        assert_eq!(
+            d.col_collations,
+            vec![
+                ColCollation::Binary,
+                ColCollation::NoCase,
+                ColCollation::RTrim
+            ]
+        );
+        for bad_collate in [
+            "k TEXT PRIMARY KEY, a TEXT COLLATE \" NOCASE \"",
+            "k TEXT PRIMARY KEY, a TEXT COLLATE (NOCASE)",
+            "k TEXT PRIMARY KEY, a TEXT COLLATE \"\"",
+        ] {
+            assert_eq!(
+                parse(&[&format!("columns='{bad_collate}'")]).err(),
+                Some(SQLITE_ERROR),
+                "{bad_collate}"
+            );
+        }
+
+        // Empty comma slots in columns and non-empty indexes are rejected, while indexes='' works.
+        assert_eq!(
+            parse(&["columns='k INT PRIMARY KEY, v TEXT'", "indexes=''"])
+                .unwrap()
+                .secondary_indexes,
+            Vec::new()
+        );
+        for bad_commas in [
+            vec!["columns='k INT PRIMARY KEY,'"],
+            vec!["columns=', k INT PRIMARY KEY'"],
+            vec!["columns='k INT PRIMARY KEY, , v TEXT'"],
+            vec!["columns='k INT PRIMARY KEY, v TEXT'", "indexes='v,'"],
+            vec!["columns='k INT PRIMARY KEY, v TEXT'", "indexes=', v'"],
+            vec![
+                "columns='k INT PRIMARY KEY, v TEXT, w INT'",
+                "indexes='v,,w'",
+            ],
+        ] {
+            assert_eq!(
+                parse(&bad_commas).err(),
+                Some(SQLITE_ERROR),
+                "{bad_commas:?}"
+            );
+        }
     }
 }
