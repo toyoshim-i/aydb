@@ -72,10 +72,10 @@ const ERROR_IO_PENDING: DWORD = 997;
 /// or queued completion, avoiding extra kernel dispatcher work on every cached read/write.
 const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x02;
 
-// FILE_INFO_BY_HANDLE_CLASS discriminants
+// FILE_INFO_BY_HANDLE_CLASS discriminants (`minwinbase.h`)
 const FILE_ALLOCATION_INFO_CLASS: i32 = 5;
 const FILE_END_OF_FILE_INFO_CLASS: i32 = 6;
-const FILE_IO_PRIORITY_HINT_INFO_CLASS: i32 = 13;
+const FILE_IO_PRIORITY_HINT_INFO_CLASS: i32 = 12;
 
 // IO_PRIORITY_HINT discriminant for background bulk I/O
 const IO_PRIORITY_HINT_LOW: i32 = 1;
@@ -197,18 +197,40 @@ thread_local! {
 }
 
 #[inline]
+fn validate_io_offset(offset: u64) -> io::Result<()> {
+    if i64::try_from(offset).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file offset exceeds i64::MAX",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
 fn with_tls_event<F, R>(f: F) -> io::Result<R>
 where
     F: FnOnce(HANDLE) -> io::Result<R>,
 {
-    TLS_EVENT.with(|cell| {
+    let mut f = Some(f);
+    match TLS_EVENT.try_with(|cell| {
         let mut guard = cell.borrow_mut();
         let h_event = guard.get_or_create()?;
         // Setting the low bit (`| 1`) instructs the Windows kernel not to queue an IOCP
         // packet if the handle is ever associated with an I/O Completion Port.
         let tagged_event = ((h_event as usize) | 1) as HANDLE;
-        f(tagged_event)
-    })
+        (f.take().unwrap())(tagged_event)
+    }) {
+        Ok(res) => res,
+        Err(_) => {
+            // During thread teardown after `TLS_EVENT` has already been destroyed, allocate a
+            // one-shot manual-reset event so destructor flushes never panic.
+            let mut one_shot = ThreadLocalEvent(ptr::null_mut());
+            let h_event = one_shot.get_or_create()?;
+            let tagged_event = ((h_event as usize) | 1) as HANDLE;
+            (f.take().unwrap())(tagged_event)
+        }
+    }
 }
 
 /// Windows implementation of [`PlatformFile`].
@@ -382,6 +404,7 @@ impl Drop for WinPlatformFile {
 
 impl PlatformFile for WinPlatformFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        validate_io_offset(offset)?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -448,6 +471,7 @@ impl PlatformFile for WinPlatformFile {
     }
 
     fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        validate_io_offset(offset)?;
         while !buf.is_empty() {
             let n = self.read_at(buf, offset)?;
             if n == 0 {
@@ -457,7 +481,12 @@ impl PlatformFile for WinPlatformFile {
                 ));
             }
             buf = &mut buf[n..];
-            offset += n as u64;
+            offset = offset.checked_add(n as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
+            })?;
+            if !buf.is_empty() {
+                validate_io_offset(offset)?;
+            }
         }
         Ok(())
     }
@@ -467,7 +496,9 @@ impl PlatformFile for WinPlatformFile {
     }
 
     fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        validate_io_offset(offset)?;
         while !buf.is_empty() {
+            validate_io_offset(offset)?;
             let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;
             let written = with_tls_event(|h_event| {
                 let mut overlapped = Overlapped {
@@ -521,7 +552,9 @@ impl PlatformFile for WinPlatformFile {
                 ));
             }
             buf = &buf[written..];
-            offset += written as u64;
+            offset = offset.checked_add(written as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
+            })?;
         }
         Ok(())
     }
@@ -828,5 +861,96 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(file.file_len().unwrap(), 64 * 1024);
+    }
+
+    #[test]
+    fn background_io_priority_hint_and_offset_bounds_and_tls_teardown() {
+        let dir = crate::util::test_util::TempTestDir::new("win_prio_bounds_tls");
+        let fs = Arc::new(WinPlatformFs::open(&dir.path, true).unwrap());
+        let file = fs
+            .open_file("bulk.dat", true, true, OpenHint::BackgroundBulk)
+            .unwrap();
+
+        // `FileIoPriorityHintInfo` is class 12 in Windows SDK `minwinbase.h`.
+        let prio = FileIoPriorityHintInfo {
+            priority_hint: IO_PRIORITY_HINT_LOW,
+        };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.handle,
+                FILE_IO_PRIORITY_HINT_INFO_CLASS,
+                (&prio as *const FileIoPriorityHintInfo).cast(),
+                core::mem::size_of::<FileIoPriorityHintInfo>() as DWORD,
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "SetFileInformationByHandle(FileIoPriorityHintInfo) failed: {}",
+            io::Error::last_os_error()
+        );
+
+        // Offsets above `i64::MAX` (especially `u64::MAX` / FILE_WRITE_TO_END_OF_FILE) must fail.
+        for bad_off in [i64::MAX as u64 + 1, u64::MAX] {
+            let mut rbuf = [0u8; 8];
+            assert_eq!(
+                file.read_at(&mut rbuf, bad_off).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                file.read_exact_at(&mut rbuf, bad_off).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                file.write_all_at(b"abc", bad_off).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(file.file_len().unwrap(), 0);
+
+        // Overlapped I/O executed from a TLS destructor during thread teardown must not panic
+        // regardless of whether `TLS_EVENT` was destroyed before or after the caller's TLS slot.
+        struct FlushOnExit {
+            file: Option<Arc<WinPlatformFile>>,
+            offset: u64,
+        }
+        impl Drop for FlushOnExit {
+            fn drop(&mut self) {
+                if let Some(f) = self.file.take() {
+                    f.write_all_at(b"teardown", self.offset).unwrap();
+                }
+            }
+        }
+        thread_local! {
+            static EXIT_FLUSH: RefCell<Option<FlushOnExit>> = const { RefCell::new(None) };
+        }
+
+        for (idx, touch_tls_event_first) in [false, true].into_iter().enumerate() {
+            let f = Arc::clone(&file);
+            let off = (idx as u64) * 16;
+            std::thread::spawn(move || {
+                if touch_tls_event_first {
+                    let mut tmp = [0u8; 1];
+                    let _ = f.read_at(&mut tmp, 0);
+                }
+                EXIT_FLUSH.with(|slot| {
+                    *slot.borrow_mut() = Some(FlushOnExit {
+                        file: Some(Arc::clone(&f)),
+                        offset: off,
+                    });
+                });
+                if !touch_tls_event_first {
+                    let mut tmp = [0u8; 1];
+                    let _ = f.read_at(&mut tmp, 0);
+                }
+            })
+            .join()
+            .unwrap();
+        }
+        let mut check = [0u8; 8];
+        file.read_exact_at(&mut check, 0).unwrap();
+        assert_eq!(&check, b"teardown");
+        file.read_exact_at(&mut check, 16).unwrap();
+        assert_eq!(&check, b"teardown");
     }
 }
