@@ -6,7 +6,7 @@ This page defines the intended application-facing entry points and separates the
 
 | Interface | Current entry points | Responsibility |
 | :--- | :--- | :--- |
-| Native storage | `aydb::engine::{StorageEngine, EngineConfig, WriteDurability, CorruptPolicy}` | Opaque byte rows, secondary keys, scans, transactions, quotas, maintenance, and diagnostics |
+| Native storage | `aydb::engine::{StorageEngine, EngineConfig, WriteDurability, CorruptPolicy, WalDamagePolicy, WalRecoveryReport, WalDamage, WalDamageReason, StreamCounts, SalvagedTx, SalvagedOp, LruReadTrackingMode}` | Opaque byte rows, secondary keys, scans, transactions, quotas, WAL damage recovery/salvage, maintenance, and diagnostics |
 | Filesystem setup | `aydb::pal::OsFs` | Open the directory used by a native engine |
 | SQLite integration | `aydb::vtab::connection::{SqliteConnection, SqliteStatement}` | Register the adapter, execute SQL, bind parameters, and read results |
 | SQL values | `aydb::vtab::row_codec::SqlValue` | Parameter and result values for the SQLite Rust wrappers |
@@ -25,7 +25,7 @@ Rust `pub` visibility currently exposes more than the intended application subse
 
 | Surface | Intended audience |
 | :--- | :--- |
-| `*_for_conn`, connection read views, `register_or_resolve_vtab*` | SQLite adapter and other engine integrations that manage connection ownership/catalog lifecycles |
+| `*_for_conn`, `EngineReader`, `ReadView`, `LazyBlob`, connection read views, `register_or_resolve_vtab*` | SQLite adapter and other engine integrations that manage connection ownership/catalog lifecycles |
 | `put_row_owned_with_hint`, compaction hooks, shared-reader retry protocols | Integrations that can uphold the relevant engine-lock and visibility invariants |
 | `CompactionJob`, `CompactionOutput`, `prepare_compaction`, `install_compaction` | Custom maintenance schedulers; consume the documented prepare/run/install protocol |
 | `PlatformFs`, `PlatformFile` | Custom filesystem backends and fault-injection implementations |

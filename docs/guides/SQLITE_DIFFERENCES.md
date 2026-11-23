@@ -2,7 +2,7 @@
 
 This page lists where an `aydb` virtual table behaves differently from an ordinary SQLite table. For each difference it gives what the SQL standard says, what a native SQLite table does, what `aydb` does, whether the difference could be removed, and the test that pins the `aydb` behaviour. Anything not listed is meant to behave like a native table; report a difference that is missing here as a bug.
 
-Checked against the code at commit `cbdda30`. "Not verified" marks a cell taken from the SQLite documentation or from reading the code, not from a test that runs it. The SQL standard column refers to ISO/IEC 9075 (SQL:2023) and was written without checking the text of the standard, so every entry in it is "Not verified". "—" in that column means the standard has no such feature.
+Checked against the current codebase. "Not verified" marks a cell taken from the SQLite documentation or from reading the code, not from a test that runs it. The SQL standard column refers to ISO/IEC 9075 (SQL:2023) and was written without checking the text of the standard, so every entry in it is "Not verified". "—" in that column means the standard has no such feature.
 
 The [SQLite guide](SQLITE.md) covers setup and adapter options.
 
@@ -36,19 +36,17 @@ The "Avoidable?" column is a judgement from the design, not a plan:
 
 | Feature | SQL standard | Native SQLite | `aydb` | Avoidable? | Pinned by |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `AUTOINCREMENT` | Identity columns (`GENERATED ... AS IDENTITY`, SQL:2003) and sequence generators: values only move forward and are not reused after a delete, unless `CYCLE` is given; gaps are allowed | Keys are never reused, even after the largest one is deleted (`sqlite_sequence`) | **Differs.** Accepted but ignored: the next automatic key is `max + 1`, so the largest key can be handed out again after it is deleted. Not verified. | **Format change.** The largest key ever used would have to be stored per table. | — |
+| `AUTOINCREMENT` | Identity columns (`GENERATED ... AS IDENTITY`, SQL:2003) and sequence generators: values only move forward and are not reused after a delete, unless `CYCLE` is given; gaps are allowed | Keys are never reused, even after the largest one is deleted (`sqlite_sequence`) | **Refused.** `CREATE VIRTUAL TABLE` fails with "AUTOINCREMENT is not supported by aydb tables" for `INTEGER PRIMARY KEY AUTOINCREMENT` (and rejects `AUTOINCREMENT` on non-alias keys with `SQLITE_ERROR`). A table that already has `AUTOINCREMENT` connects, and `SELECT`, `DELETE`, `ALTER TABLE ... RENAME` and `DROP TABLE` work, but every `INSERT` and `UPDATE` fails. | **Format change.** The largest key ever used would have to be stored per table. | `ddl.rs` (unit tests), `check_tests.rs` |
 | NULL inserted into a primary key other than `INTEGER PRIMARY KEY` | A primary key is never NULL | Stored as NULL (a historical SQLite quirk), unless the column is `NOT NULL` | **Refused.** `INT PRIMARY KEY` and `BIGINT PRIMARY KEY` get no automatic key either, as in SQLite. | **Hard (aydb).** The primary key is the storage key and must be unique, so two NULL keys would collide. | `key_null_tests.rs` |
-| `rowid` of a `TEXT` (or other non-integer) key | — | Assigned in sequence (1, 2, 3, …) | **Differs.** A stable value derived from a hash of the key, kept in a persistent mapping. Do not rely on its order or size. | **Yes.** The persistent mapping could hand out `max + 1` instead of a hash. | `rowid_tests.rs` |
-| `rowid` of an `INT` / `BIGINT` key | — | Separate from the key | **Differs.** The rowid is the key value. | **Hard (aydb).** Integer keys are used as their own rowid, without a mapping. A separate rowid would need a mapping on every read path. | `rowid_write_tests.rs` |
-| Writing a `rowid` that differs from an `INT` / `BIGINT` key | — | Sets the rowid | **Refused** with `SQLITE_MISMATCH` | **Hard (aydb),** as in the row above | `rowid_write_tests.rs` |
-| `UPDATE` that changes an `INT` / `BIGINT` key | — | The row keeps its rowid | **Differs.** The rowid changes with the key. | **Hard (aydb),** as in the row above | `pk_update_tests.rs` |
+| Non-integer value inserted into `INTEGER PRIMARY KEY` | Integer values only for integer columns | **Refused** with `SQLITE_MISMATCH` (`datatype mismatch`) | **Differs.** Accepts non-integer values in an `INTEGER PRIMARY KEY` column and assigns each such row a persistent synthetic rowid. | **Yes.** `xUpdate` could check the key storage class when `pk_rowid_alias` is set. | `rowid_tests.rs` |
+| Automatically assigned `rowid` of any key other than `INTEGER PRIMARY KEY` | — | Assigned in sequence (1, 2, 3, …) | **Differs.** A stable value derived from a hash of the key, kept in a persistent mapping (while explicit and updated rowids are stored and enforced like native SQLite). Do not rely on automatically assigned rowid order or size. | **Yes.** The persistent mapping could hand out `max + 1` instead of a hash. | `rowid_tests.rs`, `rowid_write_tests.rs` |
 
 ## Conflict handling
 
 | Feature | SQL standard | Native SQLite | `aydb` | Avoidable? | Pinned by |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `changes()` after a multi-row `UPDATE OR REPLACE` | No `OR REPLACE` (`MERGE` is the nearest statement); the row count is read with `GET DIAGNOSTICS ... ROW_COUNT` | Counts the rows updated | **Differs.** Can be one higher. SQLite still passes `aydb` a row that an earlier `REPLACE` in the same statement deleted, and counts the call. | **Hard (SQLite).** SQLite counts every update call it makes, and the adapter cannot cancel one. | `pk_update_tests.rs` |
-| `UPDATE OR REPLACE` that moves an integer-key row onto a rowid the statement has not reached yet | No `OR REPLACE` and no rowid | Each row gets its own new values | **Differs.** The moved row gets the values SQLite computed for the row it replaced. | **Hard (aydb and SQLite).** SQLite queues the rowids before it updates, and an integer key is its own rowid. | `pk_update_tests.rs` |
+| `UPDATE OR REPLACE` that moves an `INTEGER PRIMARY KEY` row onto a rowid the statement has not reached yet | No `OR REPLACE` and no rowid | Each row gets its own new values | **Differs.** The moved row gets the values SQLite computed for the row it replaced. | **Hard (aydb and SQLite).** SQLite queues the rowids before it updates, and an `INTEGER PRIMARY KEY` is its own rowid. | `pk_update_tests.rs` |
 
 ## Schema statements
 

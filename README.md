@@ -19,7 +19,7 @@ Built with **zero external runtime crate dependencies**, `aydb` is engineered sp
 ```mermaid
 flowchart TB
     subgraph SQL["SQL & API Layer"]
-        VTAB["SQLite Virtual Table Adapter (src/vtab/)<br/>Zero-Copy FFI Column Projection + Constraint/LIMIT Pushdown"]
+        VTAB["SQLite Virtual Table Adapter (src/vtab/)<br/>Zero-Copy FFI Column Projection + Constraint/ORDER BY Pushdown"]
         KVAPI["Native Ordered KV & Table API (src/engine/)<br/>get_row / put_row / scan_table / lookup_by_secondary_index"]
     end
 
@@ -60,7 +60,7 @@ flowchart TB
 
 The charts below are regenerated from the CI results on every push to `main`: one run per operating system on shared GitHub-hosted runners, so they are noisy. Exact values, test status, and raw logs are published at <https://toyoshim-i.github.io/aydb/results.html>.
 
-All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same machine with **equivalent durability guarantees** (`WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` 2PC transactions):
+All benchmarks compare `aydb` (exercised through its SQLite `sqlite3_module` Virtual Table adapter over identical SQL queries) against native Vanilla SQLite (`PRAGMA journal_mode = WAL`) on the same machine with **equivalent durability guarantees** (`WalStreamMode::BufferedImmediateOsCache` writing every commit to the OS page cache vs. SQLite `PRAGMA synchronous = NORMAL`, and `WriteDurability::SyncTransactional` on `wal_sync.db` vs. SQLite `PRAGMA synchronous = FULL`) after passing a **pre-benchmark differential SQL result/state verification suite** (`verify_differential_sql_equivalence` in `examples/standard_sql_bench.rs` covering mixed numeric types, column affinities, `COLLATE NOCASE`/`RTRIM`, failed `UNIQUE` constraint statements, `SAVEPOINT`/`ROLLBACK TO`, cross-connection snapshot isolation, and mixed native-SQLite + `aydb` transactions (coordinated via `xSync`)):
 
 <p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/speedtest.svg" alt="Speedtest1-style workload, aydb relative to SQLite" width="100%"/></a></p>
 <p align="center"><a href="https://toyoshim-i.github.io/aydb/results.html"><img src="https://toyoshim-i.github.io/aydb/charts/tpcb.svg" alt="TPC-B-style workload, aydb relative to SQLite" width="100%"/></a></p>
@@ -108,7 +108,7 @@ This repository is structured as a **"Build-to-Learn" Living Textbook**. Every s
 
 ### Phase 2: SQLite Virtual Table Adapter & Comparative Benchmarks (`docs/phase2/`)
 * **[Chapter 2.0: Phase 2 Overview](docs/phase2/00_OVERVIEW.md)** — Bridging SQLite's VDBE bytecode engine to `aydb` via `sqlite3_module` and zero-dependency `winsqlite3.dll` / `libsqlite3` FFI.
-* **[Chapter 2.1: SQLite Virtual Table Adapter, Row Codec, & Constraint Pushdown](docs/phase2/01_SQLITE_VTAB_ADAPTER.md)** — $O(1)$ offset-indexed binary `RowCodec`, zero-copy FFI column projection (`project_column_zero_copy`), `xBestIndex` constraint/`LIMIT`/`ORDER BY` pushdown, reusable contiguous cursor byte slabs (`AydbCursor::slab`), lock-free reversible 8-byte `ROWID` encoding, and `xBegin`/`xCommit`/`xRollback` transaction coalescing.
+* **[Chapter 2.1: SQLite Virtual Table Adapter, Row Codec, & Constraint Pushdown](docs/phase2/01_SQLITE_VTAB_ADAPTER.md)** — $O(1)$ offset-indexed binary `RowCodec`, zero-copy FFI column projection (`project_column_zero_copy`), `xBestIndex` constraint/`ORDER BY` pushdown, reusable contiguous cursor byte slabs (`AydbCursor::slab`), persistent hash-derived `ROWID` mapping (`rowid_map.rs`), and `xBegin`/`xCommit`/`xRollback` transaction coalescing.
 * **[Chapter 2.2: Hybrid Workload Benchmarks vs. Vanilla SQLite](docs/phase2/02_SQLITE_VS_AYDB_BENCHMARKS.md)** — Deep-dive evaluation of synchronous configuration updates, `MAX_BYTES`-bounded 16 KB blob caching, and read-heavy LRU access tracking.
 * **[Chapter 2.3: Selected Standard SQL Benchmark Workloads (`Speedtest1`-Style, `YCSB`-Style, `TPC-B`-Style)](docs/phase2/03_STANDARD_SQL_BENCHMARKS.md)** — Pre-benchmark differential SQL equivalence verification, methodology, results, and architectural root-cause analysis across `Speedtest1`-style, `YCSB`-style (`Workloads A–F`), and `TPC-B`-style workloads.
 
@@ -122,8 +122,10 @@ aydb/
 ├── README.md
 ├── docs/
 │   ├── ARCHITECTURE.md                       # Master architecture specification
+│   ├── guides/                               # Application guides (Native, SQLite, SQLite Differences)
 │   ├── phase1/                               # Phase 1: Storage Engine textbook (Chapters 1.0 - 1.5)
-│   └── phase2/                               # Phase 2: SQLite VTab & Benchmarks (Chapters 2.0 - 2.3)
+│   ├── phase2/                               # Phase 2: SQLite VTab & Benchmarks (Chapters 2.0 - 2.3)
+│   └── reference/                            # API boundaries & method/config reference
 ├── tools/build_site.py                       # GitHub Pages Site & Chart Generator
 ├── src/
 │   ├── lib.rs                                # Crate root & module exports
@@ -135,7 +137,9 @@ aydb/
 │   │   └── test_util.rs
 │   ├── pal/                                  # Platform Abstraction Layer (Win32 OVERLAPPED / Unix pread)
 │   ├── meta/mod.rs                           # 8 KB Ping-Pong boot_meta.db & Deferred GC
-│   ├── wal/mod.rs                            # Dual-Stream Fixed-Size Epoch WAL & Recovery
+│   ├── wal/                                  # Dual-Stream Fixed-Size Epoch WAL & Ordered Crash Recovery
+│   │   ├── mod.rs
+│   │   └── recovery.rs
 │   ├── blob/mod.rs                           # Append-only Standard & Per-Table LRU Blob Segments
 │   ├── index/                                # 4 KB Block SSTables, Key Codec, Sparse Fence Pointers & Bloom Filter
 │   │   ├── mod.rs
@@ -143,23 +147,33 @@ aydb/
 │   │   └── key_codec.rs
 │   ├── memtable/mod.rs                       # Bounded In-Memory B-Tree MemTable
 │   ├── lru/mod.rs                            # Zero-I/O AccessTracker & Capped Table Metadata
-│   ├── engine/                               # StorageEngine Coordinator, Transactions, Scans, Compaction & Eviction
+│   ├── engine/                               # StorageEngine Coordinator, Transactions, Scans, Compaction, Eviction & Salvage
 │   │   ├── mod.rs
-│   │   ├── tx.rs
-│   │   ├── reader.rs
-│   │   ├── scan.rs
 │   │   ├── compaction.rs
+│   │   ├── crash_tests/
 │   │   ├── eviction.rs
-│   │   └── tests.rs
+│   │   ├── reader.rs
+│   │   ├── rowid.rs
+│   │   ├── salvage.rs
+│   │   ├── scan.rs
+│   │   ├── snapshot.rs
+│   │   ├── tests.rs
+│   │   ├── tx.rs
+│   │   ├── unique_index.rs
+│   │   └── wal_links.rs
 │   └── vtab/                                 # SQLite Virtual Table Adapter
 │       ├── mod.rs
-│       ├── ddl.rs
 │       ├── compaction_worker.rs
-│       ├── rowid_map.rs
 │       ├── connection.rs
-│       ├── row_codec.rs
+│       ├── constraints.rs
+│       ├── ddl.rs
 │       ├── ffi.rs
-│       └── tests.rs
+│       ├── row_codec.rs
+│       ├── rowid_map.rs
+│       ├── snapshot.rs
+│       ├── tests.rs
+│       ├── unique_key.rs
+│       └── unique_migration.rs
 └── examples/
     ├── pal_bench.rs                          # Step 1-1: OS Cache & Positional I/O microbenchmarks
     ├── meta_wal_bench.rs                     # Step 1-2/1-3: Ping-Pong Meta & Dual-Stream WAL benchmarks

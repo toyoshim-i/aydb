@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# Exclude Cargo.lock for library crates (tracked only by binary applications)
+/Cargo.lock
 **/*.rs.bk
 
 # Local AI agent customization & memory files
