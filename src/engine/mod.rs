@@ -896,11 +896,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         sync_wal.set_cursor_after_recovery(rec.next_sync_sector_idx);
         buf_wal.set_cursor_after_recovery(rec.next_buf_sector_idx);
 
-        // Recovery that found no valid sector in either stream and replayed no batch leaves the
-        // persisted capped-table byte totals authoritative.
+        // Recovery that found no valid sector, no batch, no damage, and no torn tail sectors in
+        // either stream leaves the persisted capped-table byte totals authoritative. Sector-0
+        // damage or torn tails can drop acknowledged writes and still require reconciliation.
         let replayed_wal = !rec.merged_batches.is_empty()
             || rec.next_sync_sector_idx > 0
-            || rec.next_buf_sector_idx > 0;
+            || rec.next_buf_sector_idx > 0
+            || wal_report.damage.is_some()
+            || wal_report.torn_tail_sectors.sync > 0
+            || wal_report.torn_tail_sectors.buffered > 0;
 
         let mut memtable = MemTable::new(config.memtable_capacity_bytes);
         for batch in rec.merged_batches {
@@ -1290,18 +1294,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !engine.memtable.is_empty() {
             engine.flush_memtable()?;
         } else {
-            engine.rotate_wal_epochs_only()?;
-            if replayed_wal && !engine.capped_tables.is_empty() {
-                let mut quota_metas = engine.build_quota_metas();
-                quota_metas.sort_by_key(|q| q.table_id);
-                let mut stored = engine.meta_mgr.state().table_quotas.clone();
-                stored.sort_by_key(|q| q.table_id);
-                if stored != quota_metas {
-                    engine.meta_mgr.commit_update(|st| {
-                        st.table_quotas = quota_metas;
-                    })?;
-                }
-            }
+            engine.rotate_wal_epochs_only_with_quotas(
+                replayed_wal && !engine.capped_tables.is_empty(),
+            )?;
         }
 
         // Reconciliation records land in the fresh epoch and are replayed by the next recovery.

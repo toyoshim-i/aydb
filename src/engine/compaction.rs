@@ -346,6 +346,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn rotate_wal_epochs_only(&mut self) -> io::Result<()> {
+        self.rotate_wal_epochs_only_with_quotas(false)
+    }
+
+    pub(super) fn rotate_wal_epochs_only_with_quotas(
+        &mut self,
+        persist_quotas: bool,
+    ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.buf_wal.flush_buffered_to_os()?;
         self.sync_active_blob_writers()?;
@@ -353,10 +360,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let new_buf_epoch = self.buf_wal.active_epoch() + 1;
         let new_checkpoint_lsn = self.next_lsn.saturating_sub(1);
         let settled = self.prepare_settled_blob_checkpoint();
+        let quota_metas = persist_quotas.then(|| self.settled_quota_metas());
         let lingering = self.unlink_after_wal_rotation.clone();
         self.meta_mgr.commit_update(|st| {
             st.std_blob_segments = settled.std_metas;
             st.lru_blob_segments = settled.lru_metas;
+            if let Some(quotas) = quota_metas {
+                st.table_quotas = quotas;
+            }
             st.checkpoint_lsn = new_checkpoint_lsn;
             st.sync_wal_epoch = new_sync_epoch;
             st.buf_wal_epoch = new_buf_epoch;

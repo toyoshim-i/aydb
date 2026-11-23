@@ -309,3 +309,159 @@ fn a_lost_quota_change_converges_on_the_next_connect() {
         QUOTA * 3
     );
 }
+
+#[test]
+fn sector_0_wal_damage_reconciles_capped_table_quotas() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let lab = Lab::new("capped_sector0_damage");
+    let baseline_bytes = {
+        let mut engine = lab.open();
+        engine.register_capped_table(TABLE, QUOTA).unwrap();
+        engine
+            .put_row(
+                TABLE,
+                b"k1",
+                &[b'a'; 100],
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        let base = engine
+            .capped_table_state(TABLE)
+            .unwrap()
+            .current_logical_bytes;
+
+        engine
+            .put_row(
+                TABLE,
+                b"k2",
+                &[b'b'; 500],
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        engine.register_capped_table(TABLE, QUOTA * 2).unwrap();
+        assert!(
+            engine
+                .capped_table_state(TABLE)
+                .unwrap()
+                .current_logical_bytes
+                > base
+        );
+        base
+    };
+
+    let wal_sync_path = lab._dir.path.join(crate::wal::WAL_SYNC_FILE_NAME);
+    {
+        use std::io::Read;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_sync_path)
+            .unwrap();
+        let mut payload_bytes = [0u8; 4];
+        f.seek(SeekFrom::Start(20)).unwrap();
+        f.read_exact(&mut payload_bytes).unwrap();
+        for b in &mut payload_bytes {
+            *b ^= 0xFF;
+        }
+        // Corrupt sector-0 payload bytes while preserving the sector header epoch so recovery
+        // rejects sector 0 on CRC32C mismatch (`torn_tail_sectors.sync == 1`).
+        f.seek(SeekFrom::Start(20)).unwrap();
+        f.write_all(&payload_bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let reopened = lab.open();
+    assert_eq!(reopened.last_wal_recovery().torn_tail_sectors.sync, 1);
+    assert_eq!(
+        reopened
+            .capped_table_state(TABLE)
+            .unwrap()
+            .current_logical_bytes,
+        baseline_bytes
+    );
+    assert_eq!(
+        reopened.meta_mgr.state().table_quotas[0].current_logical_bytes,
+        baseline_bytes
+    );
+}
+
+#[test]
+fn empty_memtable_wal_recovery_commits_quota_and_epochs_atomically() {
+    let lab = Lab::seeded("capped_atomic_recovery");
+    let (expected_bytes, gen_before) = {
+        let mut engine = lab.open();
+        let expected = engine
+            .capped_table_state(TABLE)
+            .unwrap()
+            .current_logical_bytes;
+        engine
+            .commit_wal_and_memtable(
+                vec![WalRecord::TxBegin, WalRecord::TxCommit],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        assert!(engine.memtable.is_empty());
+        engine
+            .meta_mgr
+            .commit_update(|st| {
+                st.table_quotas[0].current_logical_bytes = expected + 999;
+            })
+            .unwrap();
+        (expected, engine.meta_mgr.state().generation)
+    };
+
+    let reopened = lab.open();
+    assert_eq!(
+        reopened
+            .capped_table_state(TABLE)
+            .unwrap()
+            .current_logical_bytes,
+        expected_bytes
+    );
+    assert_eq!(
+        reopened.meta_mgr.state().table_quotas[0].current_logical_bytes,
+        expected_bytes
+    );
+    assert_eq!(
+        reopened.meta_mgr.state().generation,
+        gen_before + 1,
+        "epoch rotation and reconciled table_quotas must commit in a single boot_meta generation"
+    );
+}
+
+#[test]
+fn deferred_flush_or_compact_on_empty_memtable_persists_table_quotas() {
+    let lab = Lab::new("capped_empty_deferred_quota");
+    {
+        let mut engine = lab.open();
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine.register_capped_table(9, 10_000).unwrap();
+        engine.flush_memtable().unwrap();
+        assert!(engine.memtable.is_empty());
+        engine.commit_transaction_for_conn(1).unwrap();
+    }
+    {
+        let mut engine = lab.open();
+        assert_eq!(engine.capped_table_state(9).unwrap().max_bytes, 10_000);
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine.register_capped_table(9, 25_000).unwrap();
+        engine.compact().unwrap();
+        assert!(engine.memtable.is_empty());
+        engine.commit_transaction_for_conn(1).unwrap();
+    }
+    {
+        let mut engine = lab.open();
+        assert_eq!(engine.capped_table_state(9).unwrap().max_bytes, 25_000);
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine.drop_table(9, None).unwrap();
+        engine.flush_memtable().unwrap();
+        assert!(engine.memtable.is_empty());
+        engine.commit_transaction_for_conn(1).unwrap();
+    }
+    let reopened = lab.open();
+    assert!(reopened.capped_table_state(9).is_none());
+}

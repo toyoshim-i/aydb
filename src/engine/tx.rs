@@ -1021,26 +1021,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
         let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
-        let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
-        if (dropped_any_capped || quotas_modified) && !will_flush_or_compact && !self.is_poisoned()
-        {
-            // Sync any buffered WAL entries before committing `table_quotas`, matching
-            // `register_capped_table`, so a power cut cannot leave unverified byte totals.
-            let sync_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                self.make_buf_wal_durable(true)
-            } else {
-                Ok(())
-            };
-            let quota_metas = self.build_quota_metas();
-            if let Err(e) = sync_res.and_then(|()| {
-                self.meta_mgr.commit_update(|st| {
-                    st.table_quotas = quota_metas;
-                })
-            }) {
-                self.record_maintenance_failure(&e);
-            }
-        }
-
         let maintenance = if do_compact {
             self.auto_compaction_due = false;
             self.compact()
@@ -1051,6 +1031,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         };
         if let Err(e) = maintenance {
             self.record_maintenance_failure(&e);
+        }
+        if (dropped_any_capped || quotas_modified) && !self.is_poisoned() {
+            let mut quota_metas = self.build_quota_metas();
+            quota_metas.sort_by_key(|q| q.table_id);
+            let mut stored = self.meta_mgr.state().table_quotas.clone();
+            stored.sort_by_key(|q| q.table_id);
+            if stored != quota_metas {
+                // Persist quota additions/drops/changes even when deferred flush/compact ran on
+                // an empty MemTable (where `flush_memtable` and `compact` return early). Sync any
+                // buffered WAL entries first, matching `register_capped_table`, so a power cut
+                // cannot leave unverified byte totals.
+                let sync_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                    self.make_buf_wal_durable(true)
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = sync_res.and_then(|()| {
+                    self.meta_mgr.commit_update(|st| {
+                        st.table_quotas = quota_metas;
+                    })
+                }) {
+                    self.record_maintenance_failure(&e);
+                }
+            }
         }
         // Safe point: the commit's batch is appended and `next_lsn` has advanced.
         self.run_due_auto_compaction();
