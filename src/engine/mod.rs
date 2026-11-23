@@ -4139,6 +4139,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// failure leaves the durability outcome unknown and poisons the engine; a failed buffer
     /// write stays retryable.
     pub(super) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.sync_active_blob_writers()?;
         self.buf_wal
             .make_durable_and_seal(durable)

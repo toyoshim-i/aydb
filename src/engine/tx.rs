@@ -977,9 +977,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !tid_recapped {
                 self.access_tracker.remove_table(tid);
                 if let Some(mut old_w) = self.active_lru_writers.remove(&tid) {
-                    // Left unpoisoned on purpose: every byte of this segment is dead from here on,
-                    // so no committed state ever depends on it being durable.
-                    let _ = old_w.sync_durable();
+                    if let Err(e) = old_w.sync_durable() {
+                        self.active_lru_writers.insert(tid, old_w);
+                        let e = self.poison(e);
+                        self.record_maintenance_failure(&e);
+                        continue;
+                    }
                     if let Some(b) = self.lru_blobs.get_mut(&(tid, old_w.seq_id())) {
                         b.file_len = old_w.current_len();
                         b.dead_bytes = b.file_len;
@@ -1001,7 +1004,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
         let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
         let will_flush_or_compact = do_compact || do_flush || self.memtable.should_flush();
-        if (dropped_any_capped || quotas_modified) && !will_flush_or_compact {
+        if (dropped_any_capped || quotas_modified) && !will_flush_or_compact && !self.is_poisoned()
+        {
             // Sync any buffered WAL entries before committing `table_quotas`, matching
             // `register_capped_table`, so a power cut cannot leave unverified byte totals.
             let sync_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {

@@ -8668,3 +8668,45 @@ fn mem_only_secondary_scan_clamps_seek_below_prefix_like_merged_scan() {
     assert_eq!(mem_only.1, vec![b"r1".to_vec(), b"r2".to_vec()]);
     assert_eq!(mem_only.2, vec![b"pk2".to_vec()]);
 }
+
+#[test]
+fn dropped_capped_table_lru_sync_failure_poisons_before_advancing_wal_durable_lsn() {
+    let fs = Arc::new(PowerLossFs::new());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 256;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+
+    engine.register_capped_table(1, 1024 * 1024).unwrap();
+    let payload = vec![0xABu8; 2048];
+    engine
+        .put_row(1, b"k1", &payload, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let durable_before = engine.wal_links.stamp().1;
+    assert!(engine.last_buf_append_lsn > engine.last_buf_synced_lsn);
+
+    // Next sync on any `blob_*` file fails once (fsyncgate), dropping dirty pages from cache.
+    fs.arm_blob_sync_failure();
+    let _ = engine.drop_table_with_durability(1, None, WriteDurability::BufferedFast);
+
+    assert!(
+        engine.is_poisoned(),
+        "failed LRU blob sync on dropped table must poison the engine"
+    );
+    assert!(
+        engine.maintenance_failures() >= 1,
+        "failed LRU blob sync must be counted as a maintenance failure"
+    );
+    assert_eq!(
+        engine.wal_links.stamp().1,
+        durable_before,
+        "durable watermark must not advance over a pre-drop WAL batch whose LRU blob failed to sync"
+    );
+
+    // Subsequent synchronous writes on an unrelated table must be refused rather than acknowledged
+    // above an unrecoverable pre-drop `PutBlobPtr`.
+    assert!(
+        engine
+            .put_row(2, b"k2", b"val", &[], WriteDurability::SyncTransactional)
+            .is_err()
+    );
+}
