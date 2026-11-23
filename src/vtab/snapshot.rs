@@ -88,6 +88,7 @@ pub(super) struct ReadTrace {
     sessions: RefCell<Vec<Weak<ReadSession>>>,
     statements: RefCell<HashSet<usize>>,
     autocommit: Cell<bool>,
+    pending_ddl: Arc<super::PendingDdlSlot>,
 }
 
 impl ReadTrace {
@@ -97,11 +98,24 @@ impl ReadTrace {
             sessions: RefCell::new(Vec::new()),
             statements: RefCell::new(HashSet::new()),
             autocommit: Cell::new(true),
+            pending_ddl: Arc::new(super::PendingDdlSlot::new()),
         }
     }
 
     pub(super) fn add_session(&self, session: &Arc<ReadSession>) {
         self.sessions.borrow_mut().push(Arc::downgrade(session));
+    }
+
+    pub(super) fn pending_ddl(&self) -> Arc<super::PendingDdlSlot> {
+        Arc::clone(&self.pending_ddl)
+    }
+
+    pub(super) fn abort_pending_ddl(&self) {
+        self.pending_ddl.rollback_pending();
+    }
+
+    pub(super) fn take_ddl_error(&self) -> Option<String> {
+        self.pending_ddl.take_error()
     }
 
     pub(super) fn clear(&self) {
@@ -130,6 +144,9 @@ pub(super) unsafe extern "system" fn trace_reads(
         let idle = {
             let mut statements = trace.statements.borrow_mut();
             if event == TRACE_STATEMENT {
+                if statements.is_empty() {
+                    trace.pending_ddl.clear_error();
+                }
                 statements.insert(statement as usize);
             } else if event == TRACE_PROFILE {
                 statements.remove(&(statement as usize));
@@ -137,10 +154,26 @@ pub(super) unsafe extern "system" fn trace_reads(
             statements.is_empty()
         };
         if transaction_ended || (autocommit && idle) {
+            trace.abort_pending_ddl();
             trace.clear();
         }
     }));
     0
+}
+
+pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let trace = &*(context as *const ReadTrace);
+        trace.pending_ddl.commit_pending()
+    }))
+    .unwrap_or(1)
+}
+
+pub(super) unsafe extern "system" fn ddl_rollback_hook(context: *mut c_void) {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let trace = &*(context as *const ReadTrace);
+        trace.pending_ddl.rollback_pending();
+    }));
 }
 
 #[cfg(test)]

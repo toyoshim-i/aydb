@@ -488,3 +488,172 @@ fn nested_savepoints_with_create_rename_and_writes_match_expected_state() {
         assert!(ints(&conn, &format!("SELECT v FROM {rolled_back_name}")).is_empty());
     }
 }
+
+#[test]
+fn failed_rename_under_read_lock_preserves_name_and_rows() {
+    for with_view in [false, true] {
+        let mut fixture = Fixture::new(&format!("rename_read_lock_view_{with_view}"));
+        let conn1 = fixture.open();
+        conn1
+            .execute_batch("CREATE TABLE n(a INT); INSERT INTO n VALUES (1);")
+            .unwrap();
+        conn1.execute_batch(TABLE).unwrap();
+        conn1
+            .execute_batch("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20)")
+            .unwrap();
+        if with_view {
+            conn1
+                .execute_batch("CREATE VIEW vt AS SELECT k, v FROM t;")
+                .unwrap();
+        }
+
+        let conn2 = fixture.open();
+        assert_eq!(ints(&conn2, "SELECT v FROM t ORDER BY k"), [10, 20]);
+
+        conn2.execute_batch("BEGIN; SELECT * FROM n;").unwrap();
+        let err = conn1
+            .execute_batch("ALTER TABLE t RENAME TO u")
+            .expect_err("ALTER TABLE RENAME must fail under read lock")
+            .to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("locked"),
+            "with_view={with_view}: expected locked error, got: {err}"
+        );
+        conn2.execute_batch("COMMIT").unwrap();
+
+        // Reopen both connections and check SQLite schema still has `t` with original rows.
+        drop(conn1);
+        drop(conn2);
+        let conn = fixture.open();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+        assert!(conn.query_all("SELECT v FROM u", &[]).is_err());
+
+        // Creating a fresh table named `u` must NOT inherit `t`'s catalog entry or rows!
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+        )
+        .unwrap();
+        assert!(ints(&conn, "SELECT v FROM u").is_empty());
+        conn.execute_batch("DROP TABLE u").unwrap();
+
+        // Restarting the engine confirms `t` and its rows survived durably under `t`.
+        drop(conn);
+        fixture.restart();
+        let conn = fixture.open();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+        if with_view {
+            assert_eq!(ints(&conn, "SELECT v FROM vt ORDER BY k"), [10, 20]);
+        }
+
+        // Now unlocked rename succeeds cleanly.
+        conn.execute_batch("ALTER TABLE t RENAME TO u").unwrap();
+        assert_eq!(ints(&conn, "SELECT v FROM u ORDER BY k"), [10, 20]);
+        assert!(conn.query_all("SELECT v FROM t", &[]).is_err());
+    }
+}
+
+#[test]
+fn failed_rename_with_broken_view_preserves_name_and_rows() {
+    let mut fixture = Fixture::new("rename_broken_view");
+    let conn = fixture.open();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE helper(x INT);
+         CREATE VIEW broken_v AS SELECT k FROM t, helper;
+         DROP TABLE helper;",
+    )
+    .unwrap();
+
+    assert!(conn.execute_batch("ALTER TABLE t RENAME TO u").is_err());
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [10]);
+    assert!(conn.query_all("SELECT v FROM u", &[]).is_err());
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t"), [10]);
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+    )
+    .unwrap();
+    assert!(ints(&conn, "SELECT v FROM u").is_empty());
+}
+
+#[test]
+fn rename_wal_failure_rolls_back_sqlite_schema() {
+    // (a) WAL append failure: SQLite schema keeps `t` and both reader and restart keep `t`.
+    {
+        let mut fixture = Fixture::new("rename_wal_append_fail");
+        let conn = fixture.open();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+             INSERT INTO t VALUES (1, 'a', 10);",
+        )
+        .unwrap();
+        let reader = fixture.open();
+        assert_eq!(ints(&reader, "SELECT v FROM t"), [10]);
+
+        fixture
+            .engine()
+            .write()
+            .unwrap()
+            .debug_fail_next_wal_append();
+        let err = conn
+            .execute_batch("ALTER TABLE t RENAME TO u")
+            .expect_err("RENAME must report WAL append failure")
+            .to_string();
+        assert!(!err.is_empty());
+        assert!(fixture.engine().read().unwrap().is_poisoned());
+        assert_eq!(
+            conn.query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("t".into())]]
+        );
+        assert_eq!(ints(&reader, "SELECT v FROM t"), [10]);
+
+        drop(reader);
+        drop(conn);
+        fixture.restart();
+        let conn = fixture.open();
+        assert_eq!(ints(&conn, "SELECT v FROM t"), [10]);
+        assert!(conn.query_all("SELECT v FROM u", &[]).is_err());
+    }
+
+    // (b) WAL sync failure: commit hook rejects commit so SQLite schema and live reader keep `t`.
+    {
+        let fixture = Fixture::new("rename_wal_sync_fail");
+        let conn = fixture.open();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+             INSERT INTO t VALUES (1, 'a', 10);",
+        )
+        .unwrap();
+        let reader = fixture.open();
+        assert_eq!(ints(&reader, "SELECT v FROM t"), [10]);
+
+        fixture.engine().read().unwrap().debug_fail_next_wal_sync();
+        let err = conn
+            .execute_batch("ALTER TABLE t RENAME TO u")
+            .expect_err("RENAME must report WAL sync failure")
+            .to_string();
+        assert!(
+            err.contains("injected WAL sync failure"),
+            "unexpected error: {err}"
+        );
+        assert!(fixture.engine().read().unwrap().is_poisoned());
+        assert_eq!(
+            conn.query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("t".into())]]
+        );
+        assert_eq!(ints(&reader, "SELECT v FROM t"), [10]);
+    }
+}

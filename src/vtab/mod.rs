@@ -381,9 +381,176 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xIntegrity: None,
 };
 
+pub(super) enum PendingDdl {
+    Drop {
+        engine: Arc<RwLock<StorageEngine<OsFs>>>,
+        conn_id: usize,
+        durability: WriteDurability,
+        destroyed_token: (u16, u64),
+    },
+    Rename {
+        engine: Arc<RwLock<StorageEngine<OsFs>>>,
+        conn_id: usize,
+        durability: WriteDurability,
+        table_name: Arc<std::sync::Mutex<String>>,
+        old_name: String,
+    },
+}
+
+pub(super) struct PendingDdlSlot {
+    pending: std::sync::Mutex<Option<PendingDdl>>,
+    last_error: std::sync::Mutex<Option<String>>,
+}
+
+impl PendingDdlSlot {
+    pub(super) fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn set(&self, ddl: PendingDdl) -> bool {
+        self.clear_error();
+        let Ok(mut slot) = self.pending.lock() else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(ddl);
+        true
+    }
+
+    fn take(&self) -> Option<PendingDdl> {
+        self.pending.lock().ok().and_then(|mut s| s.take())
+    }
+
+    fn is_occupied(&self) -> bool {
+        self.pending.lock().map_or(true, |s| s.is_some())
+    }
+
+    pub(super) fn clear_error(&self) {
+        if let Ok(mut err) = self.last_error.lock() {
+            *err = None;
+        }
+    }
+
+    fn set_error(&self, msg: String) {
+        if let Ok(mut err) = self.last_error.lock() {
+            *err = Some(msg);
+        }
+    }
+
+    pub(super) fn take_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|mut err| err.take())
+    }
+
+    fn cleanup_aborted(ddl: PendingDdl, rollback: bool) {
+        match ddl {
+            PendingDdl::Drop {
+                engine,
+                conn_id,
+                destroyed_token: (tid, tok),
+                ..
+            } => {
+                if let Ok(mut eng) = engine.write() {
+                    if rollback && eng.conn_has_open_transaction(conn_id) {
+                        let _ = eng.rollback_transaction_for_conn(conn_id);
+                    }
+                    eng.unregister_vtab_token(tid, tok);
+                }
+            }
+            PendingDdl::Rename {
+                engine,
+                conn_id,
+                table_name,
+                old_name,
+                ..
+            } => {
+                if rollback {
+                    if let Ok(mut eng) = engine.write() {
+                        if eng.conn_has_open_transaction(conn_id) {
+                            let _ = eng.rollback_transaction_for_conn(conn_id);
+                        }
+                    }
+                }
+                if let Ok(mut name) = table_name.lock() {
+                    *name = old_name;
+                }
+            }
+        }
+    }
+
+    pub(super) fn commit_pending(&self) -> c_int {
+        let Some(ddl) = self.take() else {
+            return 0;
+        };
+        self.clear_error();
+        let (engine, conn_id, durability) = match &ddl {
+            PendingDdl::Drop {
+                engine,
+                conn_id,
+                durability,
+                ..
+            }
+            | PendingDdl::Rename {
+                engine,
+                conn_id,
+                durability,
+                ..
+            } => (Arc::clone(engine), *conn_id, *durability),
+        };
+        #[cfg(test)]
+        let fail_sync: Option<Arc<AtomicBool>>;
+        let step = {
+            let mut eng = match engine.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    Self::cleanup_aborted(ddl, false);
+                    self.set_error("engine lock poisoned".to_string());
+                    return 1;
+                }
+            };
+            if !eng.conn_has_open_transaction(conn_id) {
+                return 0;
+            }
+            if let Err(e) = eng.prepare_commit_transaction(durability) {
+                drop(eng);
+                Self::cleanup_aborted(ddl, true);
+                self.set_error(e.to_string());
+                return 1;
+            }
+            #[cfg(test)]
+            {
+                fail_sync = Some(eng.debug_fail_wal_sync_flag());
+            }
+            eng.begin_commit_for_conn(conn_id)
+        };
+        if let Err(e) = complete_commit_step_for_engine(
+            &engine,
+            step,
+            #[cfg(test)]
+            fail_sync,
+        ) {
+            Self::cleanup_aborted(ddl, true);
+            self.set_error(e.to_string());
+            return 1;
+        }
+        0
+    }
+
+    pub(super) fn rollback_pending(&self) {
+        if let Some(ddl) = self.take() {
+            Self::cleanup_aborted(ddl, true);
+        }
+    }
+}
+
 pub(super) struct ModuleAuxContext {
     pub(super) engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
+    pub(super) pending_ddl: Arc<PendingDdlSlot>,
     /// Background compaction worker; joined when the module (and thus this context) is dropped.
     pub(super) _compaction_worker: Option<compaction_worker::CompactionWorker>,
 }
@@ -394,11 +561,12 @@ pub(super) struct AydbVTab {
     db: *mut sqlite3,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
+    pending_ddl: Arc<PendingDdlSlot>,
     table_id: u16,
     reg_token: u64,
     db_name: String,
     /// Normalised at use. Changes when the table is renamed.
-    table_name: std::sync::Mutex<String>,
+    table_name: Arc<std::sync::Mutex<String>>,
     /// Name before an uncommitted rename inside the current transaction, used to clean up live
     /// registration if the rename is rolled back without SQLite invoking `xRollback` on this vtab.
     pre_tx_name: std::sync::Mutex<Option<String>>,
@@ -1065,10 +1233,11 @@ unsafe fn vtab_create_or_connect(
             db,
             engine: aux.engine.clone(),
             read_session: Arc::clone(&aux.read_session),
+            pending_ddl: Arc::clone(&aux.pending_ddl),
             table_id,
             reg_token,
             db_name: ddl.db_name,
-            table_name: std::sync::Mutex::new(ddl.table_name),
+            table_name: Arc::new(std::sync::Mutex::new(ddl.table_name)),
             pre_tx_name: std::sync::Mutex::new(None),
             durability: ddl.durability,
             unique_def: unique_key::UniqueDef::from_columns(
@@ -1115,12 +1284,14 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
     .unwrap_or(SQLITE_ERROR)
 }
 
-/// `ALTER TABLE ... RENAME TO`: moves the catalog entry to the new name. Without this SQLite
-/// only rewrites the stored definition, and the table (looked up by name) could no longer be found.
+/// `ALTER TABLE ... RENAME TO`: moves the catalog entry to the new name.
 ///
-/// Note on SQLite's `xRename` lifecycle: SQLite invokes `xRename` before rewriting `sqlite_schema`
-/// and does not call `xBegin`/`xCommit`/`xRollback` for an autocommit rename, so an autocommit
-/// `xRename` commits immediately while transactional renames join the active engine transaction.
+/// Transactional renames join an active engine transaction (if an earlier write already opened one)
+/// and commit or roll back through `xSync`/`xCommit`/`xRollback`. Autocommit renames open a
+/// short engine transaction and hold the final commit until SQLite invokes the connection's
+/// `sqlite3_commit_hook` (returning `0` on success, or rolling back SQLite's schema update if WAL
+/// commit fails), rolling back cleanly in `sqlite3_rollback_hook` if SQLite aborts before commit
+/// (for instance due to `SQLITE_BUSY` / lock contention or broken views).
 unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c_char) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         if p_vtab.is_null() || z_new.is_null() {
@@ -1128,45 +1299,103 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
         }
         let vtab = &*(p_vtab as *const AydbVTab);
         let new_name = CStr::from_ptr(z_new).to_string_lossy().into_owned();
-        let mut eng = match vtab.engine.write() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
-        };
-        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
-            return io_err_to_sqlite_rc(&e);
-        }
-        if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
-            set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
-            return SQLITE_ERROR;
-        }
-        // SQLite does not call `xBegin` for a rename, so inside a user transaction the catalog
-        // change joins the engine transaction only if an earlier write opened one. Otherwise it
-        // would be committed at once, and a ROLLBACK of the SQL transaction (which restores the
-        // old name in the schema) would leave the catalog under the new name, so the table
-        // would appear empty. Refuse that case instead.
-        if sqlite3_get_autocommit(vtab.db) == 0 && !eng.conn_has_open_transaction(vtab.db as usize)
-        {
-            if !(*p_vtab).zErrMsg.is_null() {
-                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
+        let conn_id = vtab.db as usize;
+        let autocommit = sqlite3_get_autocommit(vtab.db) != 0;
+
+        if !autocommit {
+            let mut eng = match vtab.engine.write() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if let Err(e) = eng.check_write_allowed_for_conn(conn_id) {
+                return io_err_to_sqlite_rc(&e);
             }
-            (*p_vtab).zErrMsg = sqlite_error_message(RENAME_NEEDS_WRITE);
-            return SQLITE_ERROR;
-        }
-        let old_effective = eng
-            .active_vtab_name(vtab.table_id)
-            .unwrap_or_else(|| vtab.name());
-        if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
-            return io_err_to_sqlite_rc(&e);
-        }
-        if eng.in_active_transaction() {
+            // SQLite does not call `xBegin` for a rename, so inside a user transaction the
+            // catalog change joins the engine transaction only if an earlier write opened one.
+            if !eng.conn_has_open_transaction(conn_id) {
+                set_vtab_err_msg(p_vtab, RENAME_NEEDS_WRITE);
+                return SQLITE_ERROR;
+            }
+            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
+                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                return SQLITE_ERROR;
+            }
+            let old_effective = eng
+                .active_vtab_name(vtab.table_id)
+                .unwrap_or_else(|| vtab.name());
+            if let Err(e) =
+                eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability)
+            {
+                set_vtab_err_msg(p_vtab, &e.to_string());
+                return io_err_to_sqlite_rc(&e);
+            }
             if let Ok(mut prev) = vtab.pre_tx_name.lock() {
                 prev.get_or_insert(old_effective);
             }
-        } else if let Ok(mut prev) = vtab.pre_tx_name.lock() {
+            if let Ok(mut name) = vtab.table_name.lock() {
+                *name = new_name;
+            }
+            return SQLITE_OK;
+        }
+
+        if vtab.pending_ddl.is_occupied() {
+            return SQLITE_ERROR;
+        }
+        let mut deadline = None;
+        let mut eng = loop {
+            let mut eng = match vtab.engine.write() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if eng.conn_has_open_transaction(conn_id) {
+                return SQLITE_ERROR;
+            }
+            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
+                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                return SQLITE_ERROR;
+            }
+            match eng.begin_transaction_for_conn(conn_id) {
+                Ok(()) => break eng,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !wait_for_other_transaction(eng, &mut deadline) {
+                        return SQLITE_BUSY;
+                    }
+                }
+                Err(e) => {
+                    set_vtab_err_msg(p_vtab, &e.to_string());
+                    return io_err_to_sqlite_rc(&e);
+                }
+            }
+        };
+
+        vtab.read_session.clear();
+        let old_effective = eng
+            .active_vtab_name(vtab.table_id)
+            .unwrap_or_else(|| vtab.name());
+        let prev_table_name = vtab.name();
+        if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
+            let _ = eng.rollback_transaction_for_conn(conn_id);
+            set_vtab_err_msg(p_vtab, &e.to_string());
+            return io_err_to_sqlite_rc(&e);
+        }
+        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
             *prev = None;
         }
         if let Ok(mut name) = vtab.table_name.lock() {
             *name = new_name;
+        }
+        if !vtab.pending_ddl.set(PendingDdl::Rename {
+            engine: Arc::clone(&vtab.engine),
+            conn_id,
+            durability: vtab.durability,
+            table_name: Arc::clone(&vtab.table_name),
+            old_name: prev_table_name.clone(),
+        }) {
+            let _ = eng.rollback_transaction_for_conn(conn_id);
+            if let Ok(mut name) = vtab.table_name.lock() {
+                *name = prev_table_name;
+            }
+            return SQLITE_ERROR;
         }
         SQLITE_OK
     }))
@@ -1179,34 +1408,58 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab_ref = &*(p_vtab as *const AydbVTab);
                 // SQLite does not call `xBegin` for a DROP, and once `xDestroy` has freed the
-                // table it no longer calls `xCommit` or `xRollback` for it. The drop therefore
-                // cannot join a user transaction: it would be committed at once (or, after an
-                // earlier write to this table, leave an engine transaction that nothing ends),
-                // while a ROLLBACK restores the table in SQLite's schema. Refuse instead. SQLite
-                // does not report an `xDestroy` error message, so the caller sees only the code.
+                // table it no longer calls `xCommit` or `xRollback` for it. Inside a user
+                // transaction we therefore keep refusing `DROP TABLE`. In autocommit mode, we
+                // stage `drop_table_with_durability` in an engine transaction and commit it only
+                // in `sqlite3_commit_hook` once SQLite commits the schema change (or roll back in
+                // `sqlite3_rollback_hook` if SQLite aborts due to locks or errors).
                 if sqlite3_get_autocommit(vtab_ref.db) == 0 {
                     return SQLITE_ERROR;
                 }
-                {
+                if vtab_ref.pending_ddl.is_occupied() {
+                    return SQLITE_ERROR;
+                }
+                let conn_id = vtab_ref.db as usize;
+                let mut deadline = None;
+                let mut eng = loop {
                     let mut eng = match vtab_ref.engine.write() {
                         Ok(g) => g,
                         Err(_) => return SQLITE_ERROR,
                     };
-                    if let Err(e) = eng.check_write_allowed_for_conn(vtab_ref.db as usize) {
-                        return io_err_to_sqlite_rc(&e);
+                    if eng.conn_has_open_transaction(conn_id) {
+                        return SQLITE_ERROR;
                     }
-                    if !eng.is_vtab_token_active(
-                        vtab_ref.table_id,
-                        vtab_ref.reg_token,
-                        vtab_ref.db as usize,
-                    ) {
+                    if !eng.is_vtab_token_active(vtab_ref.table_id, vtab_ref.reg_token, conn_id) {
                         set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
                         return SQLITE_ERROR;
                     }
-                    if let Err(e) = eng.drop_table(vtab_ref.table_id, None) {
-                        return io_err_to_sqlite_rc(&e);
+                    match eng.begin_transaction_for_conn(conn_id) {
+                        Ok(()) => break eng,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            if !wait_for_other_transaction(eng, &mut deadline) {
+                                return SQLITE_BUSY;
+                            }
+                        }
+                        Err(e) => return io_err_to_sqlite_rc(&e),
                     }
+                };
+                vtab_ref.read_session.clear();
+                if let Err(e) =
+                    eng.drop_table_with_durability(vtab_ref.table_id, None, vtab_ref.durability)
+                {
+                    let _ = eng.rollback_transaction_for_conn(conn_id);
+                    return io_err_to_sqlite_rc(&e);
                 }
+                if !vtab_ref.pending_ddl.set(PendingDdl::Drop {
+                    engine: Arc::clone(&vtab_ref.engine),
+                    conn_id,
+                    durability: vtab_ref.durability,
+                    destroyed_token: (vtab_ref.table_id, vtab_ref.reg_token),
+                }) {
+                    let _ = eng.rollback_transaction_for_conn(conn_id);
+                    return SQLITE_ERROR;
+                }
+                drop(eng);
                 drop(Box::from_raw(p_vtab as *mut AydbVTab));
             }
         }

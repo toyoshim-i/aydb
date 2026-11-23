@@ -17,12 +17,15 @@ use crate::vtab::ffi::{
     sqlite_column_blob_bytes, sqlite_column_text_bytes, sqlite_transient, sqlite3,
     sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
     sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_count,
-    sqlite3_column_double, sqlite3_column_int64, sqlite3_column_type, sqlite3_create_module_v2,
-    sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open, sqlite3_prepare_v2,
-    sqlite3_reset, sqlite3_step, sqlite3_stmt,
+    sqlite3_column_double, sqlite3_column_int64, sqlite3_column_type, sqlite3_commit_hook,
+    sqlite3_create_module_v2, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open,
+    sqlite3_prepare_v2, sqlite3_reset, sqlite3_rollback_hook, sqlite3_step, sqlite3_stmt,
 };
 use crate::vtab::row_codec::SqlValue;
-use crate::vtab::snapshot::{ReadSession, ReadTrace, TRACE_PROFILE, TRACE_STATEMENT, trace_reads};
+use crate::vtab::snapshot::{
+    ReadSession, ReadTrace, TRACE_PROFILE, TRACE_STATEMENT, ddl_commit_hook, ddl_rollback_hook,
+    trace_reads,
+};
 use crate::vtab::{AYDB_VTAB_MODULE, ModuleAuxContext, destroy_aux_context};
 
 /// Safe, ergonomic wrapper around a native `sqlite3*` database connection with `aydb`
@@ -83,6 +86,10 @@ impl SqliteConnection {
                 "could not register SQLite read lifecycle trace",
             ));
         }
+        unsafe {
+            sqlite3_commit_hook(db, Some(ddl_commit_hook), read_trace.cast());
+            sqlite3_rollback_hook(db, Some(ddl_rollback_hook), read_trace.cast());
+        }
         Ok(Self { db, read_trace })
     }
 
@@ -111,12 +118,14 @@ impl SqliteConnection {
             None
         };
         let read_session = Arc::new(ReadSession::new(Arc::clone(&engine)));
-        unsafe {
+        let pending_ddl = unsafe {
             (*self.read_trace).add_session(&read_session);
-        }
+            (*self.read_trace).pending_ddl()
+        };
         let aux = Box::new(ModuleAuxContext {
             engine,
             read_session,
+            pending_ddl,
             _compaction_worker: worker,
         });
         let rc = unsafe {
@@ -190,6 +199,11 @@ impl SqliteConnection {
     }
 
     pub(super) fn last_error(&self, context: &str) -> io::Error {
+        let ddl_err = if !self.read_trace.is_null() {
+            unsafe { (*self.read_trace).take_ddl_error() }
+        } else {
+            None
+        };
         let msg = unsafe {
             let ptr = sqlite3_errmsg(self.db);
             if ptr.is_null() {
@@ -198,7 +212,10 @@ impl SqliteConnection {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        io::Error::other(format!("{context}: {msg}"))
+        match ddl_err {
+            Some(err) => io::Error::other(format!("{context}: {msg} ({err})")),
+            None => io::Error::other(format!("{context}: {msg}")),
+        }
     }
 }
 
@@ -207,7 +224,10 @@ impl Drop for SqliteConnection {
         if !self.db.is_null() {
             unsafe {
                 crate::vtab::ffi::sqlite3_trace_v2(self.db, 0, None, core::ptr::null_mut());
+                sqlite3_commit_hook(self.db, None, core::ptr::null_mut());
+                sqlite3_rollback_hook(self.db, None, core::ptr::null_mut());
                 if !self.read_trace.is_null() {
+                    (*self.read_trace).abort_pending_ddl();
                     (*self.read_trace).clear();
                 }
                 sqlite3_close(self.db);

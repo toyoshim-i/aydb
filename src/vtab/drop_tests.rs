@@ -257,6 +257,141 @@ fn cross_connection_drop_after_rename_and_recreate_does_not_delete_new_table_cat
 }
 
 #[test]
+fn failed_drop_under_read_lock_preserves_rows_and_catalog() {
+    let cases = [
+        ("integer_pk_unique", VARIANTS[0].create, true),
+        ("text_pk_capped", VARIANTS[1].create, false),
+        (
+            "sync_integer_pk",
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT')",
+            true,
+        ),
+    ];
+    for (label, create_sql, int_key) in cases {
+        let variant = Variant {
+            name: label,
+            create: create_sql,
+            int_key,
+        };
+        let mut fixture = Fixture::new(&format!("drop_read_lock_{label}"));
+        let conn1 = fixture.open();
+        conn1
+            .execute_batch("CREATE TABLE n(a INT); INSERT INTO n VALUES (1);")
+            .unwrap();
+        conn1.execute_batch(variant.create).unwrap();
+        conn1.execute_batch(&variant.insert("t", 1)).unwrap();
+        conn1.execute_batch(&variant.insert("t", 2)).unwrap();
+
+        let conn2 = fixture.open();
+        variant.assert_intact(&conn2, &[1, 2], "before locked DROP");
+
+        // Hold a shared SQLite file read lock on `conn2` while `conn1` tries to DROP `t`.
+        conn2.execute_batch("BEGIN; SELECT * FROM n;").unwrap();
+        let err = conn1
+            .execute_batch("DROP TABLE t")
+            .expect_err("DROP TABLE must fail with database is locked")
+            .to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("locked"),
+            "{label}: expected locked error, got: {err}"
+        );
+        conn2.execute_batch("COMMIT").unwrap();
+
+        // After releasing the lock, SQLite still has `t` and every row/index must remain intact.
+        variant.assert_intact(&conn1, &[1, 2], "conn1 after failed DROP");
+        variant.assert_intact(&conn2, &[1, 2], "conn2 after failed DROP");
+
+        drop(conn1);
+        drop(conn2);
+        fixture.restart();
+        let conn = fixture.open();
+        variant.assert_intact(&conn, &[1, 2], "after restart");
+
+        // Unlocked DROP TABLE succeeds cleanly and recreates empty.
+        conn.execute_batch("DROP TABLE t").unwrap();
+        assert!(conn.query_all("SELECT v FROM t", &[]).is_err());
+        conn.execute_batch(variant.create).unwrap();
+        assert!(ints(&conn, "SELECT v FROM t").is_empty());
+    }
+}
+
+#[test]
+fn drop_table_wal_failure_rolls_back_sqlite_schema() {
+    // (a) WAL append failure: both live reader and restarted engine retain `t` and all rows.
+    {
+        let mut fixture = Fixture::new("drop_wal_append_fail");
+        let conn = fixture.open();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+             INSERT INTO t VALUES (1, 'u1', 10), (2, 'u2', 20);",
+        )
+        .unwrap();
+        let reader = fixture.open();
+        assert_eq!(ints(&reader, "SELECT v FROM t ORDER BY k"), [10, 20]);
+
+        fixture
+            .engine()
+            .write()
+            .unwrap()
+            .debug_fail_next_wal_append();
+        let err = conn
+            .execute_batch("DROP TABLE t")
+            .expect_err("DROP TABLE must report WAL append failure")
+            .to_string();
+        assert!(!err.is_empty());
+        assert!(fixture.engine().read().unwrap().is_poisoned());
+        assert_eq!(
+            conn.query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("t".into())]]
+        );
+        assert_eq!(ints(&reader, "SELECT v FROM t ORDER BY k"), [10, 20]);
+
+        drop(reader);
+        drop(conn);
+        fixture.restart();
+        let conn = fixture.open();
+        assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+    }
+
+    // (b) WAL sync failure: commit hook rejects commit so SQLite schema and live reader retain `t`.
+    {
+        let fixture = Fixture::new("drop_wal_sync_fail");
+        let conn = fixture.open();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+             INSERT INTO t VALUES (1, 'u1', 10), (2, 'u2', 20);",
+        )
+        .unwrap();
+        let reader = fixture.open();
+        assert_eq!(ints(&reader, "SELECT v FROM t ORDER BY k"), [10, 20]);
+
+        fixture.engine().read().unwrap().debug_fail_next_wal_sync();
+        let err = conn
+            .execute_batch("DROP TABLE t")
+            .expect_err("DROP TABLE must report WAL sync failure")
+            .to_string();
+        assert!(
+            err.contains("injected WAL sync failure"),
+            "unexpected error: {err}"
+        );
+        assert!(fixture.engine().read().unwrap().is_poisoned());
+        assert_eq!(
+            conn.query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[]
+            )
+            .unwrap(),
+            vec![vec![SqlValue::Text("t".into())]]
+        );
+        assert_eq!(ints(&reader, "SELECT v FROM t ORDER BY k"), [10, 20]);
+    }
+}
+
+#[test]
 fn reused_table_id_invalidates_stale_connection_handles() {
     // Case 1: Two independent :memory: SQLite schemas sharing one StorageEngine with explicit table_id=7.
     {

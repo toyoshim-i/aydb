@@ -299,6 +299,16 @@ unsafe extern "system" {
         >,
         context: *mut c_void,
     ) -> c_int;
+    pub fn sqlite3_commit_hook(
+        db: *mut sqlite3,
+        callback: Option<unsafe extern "system" fn(*mut c_void) -> c_int>,
+        arg: *mut c_void,
+    ) -> *mut c_void;
+    pub fn sqlite3_rollback_hook(
+        db: *mut sqlite3,
+        callback: Option<unsafe extern "system" fn(*mut c_void)>,
+        arg: *mut c_void,
+    ) -> *mut c_void;
     pub fn sqlite3_reset(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_clear_bindings(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_finalize(pStmt: *mut sqlite3_stmt) -> c_int;

@@ -35,13 +35,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.drain_group_for_autocommit()?;
         let prev_has_row_meta = self.table_has_row_meta.get(&table_id).copied();
         self.table_has_row_meta.insert(table_id, true);
-        let was_present = self.capped_tables.contains_key(&table_id);
+        let prev_max = self.capped_tables.get(&table_id).map(|ct| ct.max_bytes);
         let entry = self
             .capped_tables
             .entry(table_id)
             .or_insert_with(|| CappedTableState::new(table_id, max_bytes));
         entry.max_bytes = max_bytes;
-        if !was_present {
+        if prev_max.is_none() {
             if let Err(e) = self.reconcile_single_capped_table(table_id) {
                 self.capped_tables.remove(&table_id);
                 match prev_has_row_meta {
@@ -94,7 +94,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     st.table_quotas = quota_metas;
                 })?;
             }
-        } else {
+        } else if prev_max != Some(max_bytes) {
             self.quotas_modified_in_tx = true;
         }
         Ok(())
