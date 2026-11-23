@@ -501,6 +501,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    fn flush_reconcile_repairs(
+        &mut self,
+        missing_records: &mut Vec<WalRecord>,
+        new_meta_ptrs: &mut Vec<BlobPtr>,
+        dead_meta_ptrs: &mut Vec<BlobPtr>,
+    ) -> io::Result<()> {
+        if missing_records.is_empty() {
+            return Ok(());
+        }
+        let records = core::mem::take(missing_records);
+        if let Err(e) = self.commit_wal_and_memtable(records, WriteDurability::BufferedFast) {
+            if self.tx_depth == 0 {
+                self.in_flight_autocommit_blob_starts.clear();
+            }
+            for p in new_meta_ptrs.drain(..) {
+                self.record_dead_blob_bytes(&p);
+            }
+            return Err(e);
+        }
+        new_meta_ptrs.clear();
+        for m_ptr in dead_meta_ptrs.drain(..) {
+            self.record_dead_blob_bytes(&m_ptr);
+        }
+        Ok(())
+    }
+
     pub(super) fn reconcile_single_capped_table(&mut self, tid: u16) -> io::Result<()> {
         self.reconcile_single_capped_table_inner(tid, true)
             .map(|_| ())
@@ -512,6 +538,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         apply_repairs: bool,
     ) -> io::Result<bool> {
         const RECONCILE_BATCH_SIZE: usize = 512;
+        let wal_bytes = (self.buf_wal.total_sectors() as u64)
+            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
+        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
         let meta_prefix = encode_namespace_prefix(tid, NS_ROW_META);
         let user_prefix = encode_namespace_prefix(tid, NS_PRIMARY_ROW);
 
@@ -582,6 +611,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut missing_records = Vec::new();
             let mut new_meta_ptrs = Vec::new();
             let mut dead_meta_ptrs = Vec::new();
+            let mut batch_est_bytes = 0usize;
 
             for entry in row_entries {
                 let Some(pk) = decode_primary_row_key(tid, &entry.key) else {
@@ -593,10 +623,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         needs_repair = true;
                         if apply_repairs {
                             let tick = self.access_tracker.next_tick();
-                            missing_records.push(WalRecord::PutInline {
+                            let lru_rec = WalRecord::PutInline {
                                 key: encode_lru_queue_key(tid, tick, pk),
                                 value: Vec::new(),
-                            });
+                            };
                             let meta_key = encode_row_meta_key(tid, pk);
                             let meta_bytes = match RowMetaRecord::encode_slice(
                                 tick,
@@ -605,12 +635,36 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             ) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
+                                    if self.tx_depth == 0 {
+                                        self.in_flight_autocommit_blob_starts.clear();
+                                    }
                                     for p in &new_meta_ptrs {
                                         self.record_dead_blob_bytes(p);
                                     }
                                     return Err(e);
                                 }
                             };
+                            let meta_est = if IndexEntry::inline_fits_in_block(
+                                meta_key.len(),
+                                meta_bytes.len(),
+                            ) {
+                                9 + meta_key.len() + meta_bytes.len()
+                            } else {
+                                28 + meta_key.len()
+                            };
+                            let row_est = est_wal_record_bytes(&lru_rec).saturating_add(meta_est);
+                            if !missing_records.is_empty()
+                                && batch_est_bytes.saturating_add(row_est) > max_batch_wal_bytes
+                            {
+                                self.flush_reconcile_repairs(
+                                    &mut missing_records,
+                                    &mut new_meta_ptrs,
+                                    &mut dead_meta_ptrs,
+                                )?;
+                                batch_est_bytes = 0;
+                            }
+                            let rec_start = missing_records.len();
+                            missing_records.push(lru_rec);
                             match self.append_std_meta_record(
                                 meta_key,
                                 meta_bytes,
@@ -620,11 +674,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 Ok(Some(ptr)) => new_meta_ptrs.push(ptr),
                                 Ok(None) => {}
                                 Err(e) => {
+                                    if self.tx_depth == 0 {
+                                        self.in_flight_autocommit_blob_starts.clear();
+                                    }
                                     for p in &new_meta_ptrs {
                                         self.record_dead_blob_bytes(p);
                                     }
                                     return Err(e);
                                 }
+                            }
+                            for r in &missing_records[rec_start..] {
+                                batch_est_bytes =
+                                    batch_est_bytes.saturating_add(est_wal_record_bytes(r));
                             }
                             if let Some(m_ptr) = *old_m_ptr {
                                 dead_meta_ptrs.push(m_ptr);
@@ -661,36 +722,48 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             match RowMetaRecord::encode_slice(tick, logical_size, &[]) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
+                                    if self.tx_depth == 0 {
+                                        self.in_flight_autocommit_blob_starts.clear();
+                                    }
                                     for p in &new_meta_ptrs {
                                         self.record_dead_blob_bytes(p);
                                     }
                                     return Err(e);
                                 }
                             };
-                        missing_records.push(WalRecord::PutInline {
+                        let lru_rec = WalRecord::PutInline {
                             key: encode_lru_queue_key(tid, tick, pk),
                             value: Vec::new(),
-                        });
-                        missing_records.push(WalRecord::PutInline {
+                        };
+                        let meta_rec = WalRecord::PutInline {
                             key: encode_row_meta_key(tid, pk),
                             value: encoded_meta,
-                        });
+                        };
+                        let row_est = est_wal_record_bytes(&lru_rec)
+                            .saturating_add(est_wal_record_bytes(&meta_rec));
+                        if !missing_records.is_empty()
+                            && batch_est_bytes.saturating_add(row_est) > max_batch_wal_bytes
+                        {
+                            self.flush_reconcile_repairs(
+                                &mut missing_records,
+                                &mut new_meta_ptrs,
+                                &mut dead_meta_ptrs,
+                            )?;
+                            batch_est_bytes = 0;
+                        }
+                        missing_records.push(lru_rec);
+                        missing_records.push(meta_rec);
+                        batch_est_bytes = batch_est_bytes.saturating_add(row_est);
                     }
                 }
             }
 
-            if apply_repairs && !missing_records.is_empty() {
-                if let Err(e) =
-                    self.commit_wal_and_memtable(missing_records, WriteDurability::BufferedFast)
-                {
-                    for p in &new_meta_ptrs {
-                        self.record_dead_blob_bytes(p);
-                    }
-                    return Err(e);
-                }
-                for m_ptr in dead_meta_ptrs {
-                    self.record_dead_blob_bytes(&m_ptr);
-                }
+            if apply_repairs {
+                self.flush_reconcile_repairs(
+                    &mut missing_records,
+                    &mut new_meta_ptrs,
+                    &mut dead_meta_ptrs,
+                )?;
             }
         }
 

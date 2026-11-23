@@ -355,6 +355,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Re-entrancy guard preventing `relocate_fragmented_std_blobs` from triggering another
     /// relocation pass if its internal MemTable flush invokes auto-compaction.
     pub(super) relocating_std_blobs: bool,
+    /// Sealed `blob_std` segment IDs containing an unreadable corrupt blob under lenient
+    /// relocation, skipped on subsequent relocation passes until reclaimed by compaction/drop.
+    pub(super) unrelocatable_std_blobs: std::collections::HashSet<u64>,
     /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
     /// compaction pending in background mode.
     pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1231,6 +1234,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             deferred_compact_on_commit: false,
             auto_compaction_due: false,
             relocating_std_blobs: false,
+            unrelocatable_std_blobs: std::collections::HashSet::new(),
             compaction_hook: None,
             compaction_hook_id: 0,
             tx_prepared: false,
@@ -1381,9 +1385,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
     }
 
-    /// Fails if a prior WAL or metadata I/O failure left the on-disk state uncertain.
+    /// Fails if a prior WAL, metadata, or group-commit leader failure left the on-disk state uncertain.
     pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
         self.meta_mgr.check_healthy()?;
+        if self.commit_gate.is_failed() {
+            return Err(io::Error::other(
+                "engine is poisoned after a group-commit leader failure and must be reopened",
+            ));
+        }
         match &self.poisoned {
             None => Ok(()),
             Some(msg) => Err(io::Error::other(format!(
@@ -3742,13 +3751,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     })
                     .unwrap_or(true);
                 if roll {
-                    if let Some(mut old_w) = self.active_std_writer.take() {
-                        // Poisons on any error: the writer is already out of the engine, so its
-                        // buffer cannot be retried.
-                        old_w.sync_durable().map_err(|e| self.poison(e))?;
-                        if let Some(b) = self.std_blobs.get_mut(&old_w.seq_id()) {
-                            b.file_len = old_w.current_len();
-                        }
+                    if self.active_std_writer.is_some() {
+                        self.sync_active_std_writer()?;
+                        self.active_std_writer = None;
                     }
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
@@ -3822,11 +3827,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     })
                     .unwrap_or(true);
                 if roll {
-                    if let Some(mut old_w) = self.active_lru_writers.remove(&table_id) {
-                        old_w.sync_durable().map_err(|e| self.poison(e))?;
-                        if let Some(b) = self.lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
-                            b.file_len = old_w.current_len();
-                        }
+                    if self.active_lru_writers.contains_key(&table_id) {
+                        self.sync_active_lru_writer(table_id)?;
+                        self.active_lru_writers.remove(&table_id);
                     }
                     let seq_id = self.meta_mgr.reserve_seq_id();
                     let writer =

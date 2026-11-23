@@ -141,6 +141,18 @@ pub(super) fn salvage<F: PlatformFile>(
             None => Ok(None),
         }
     };
+    let validate_blob = |ptr: &BlobPtr, key: &[u8]| -> io::Result<bool> {
+        let reader = match ptr.kind {
+            BlobKind::Standard => std_blobs.get(&ptr.seg_id).map(|b| &b.reader),
+            BlobKind::Lru => lru_blobs
+                .get(&(ptr.table_id, ptr.seg_id))
+                .map(|b| &b.reader),
+        };
+        match reader {
+            Some(r) => r.validate_blob_ptr_for_key(ptr, Some(key)),
+            None => Ok(false),
+        }
+    };
 
     for tx in discarded {
         let mut ops = Vec::new();
@@ -183,15 +195,26 @@ pub(super) fn salvage<F: PlatformFile>(
             let value = match put {
                 None => None,
                 Some(Ok(value)) => Some(value),
-                Some(Err(ptr)) => match read_blob(&ptr, &key)? {
-                    Some(value) => Some(value),
-                    None => {
-                        out.unsalvageable += 1;
-                        bad = true;
-                        ops.clear();
+                Some(Err(ptr)) => {
+                    if keep_values && !bad {
+                        match read_blob(&ptr, &key)? {
+                            Some(value) => Some(value),
+                            None => {
+                                out.unsalvageable += 1;
+                                bad = true;
+                                ops.clear();
+                                continue;
+                            }
+                        }
+                    } else {
+                        if !validate_blob(&ptr, &key)? {
+                            out.unsalvageable += 1;
+                            bad = true;
+                            ops.clear();
+                        }
                         continue;
                     }
-                },
+                }
             };
             if keep_values && !bad {
                 let key = key[3..].to_vec();

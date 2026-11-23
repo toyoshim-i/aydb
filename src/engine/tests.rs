@@ -9063,3 +9063,108 @@ fn table_has_synthetic_rowids_snapshot_and_restore_across_tx_and_savepoint() {
         None
     );
 }
+
+#[test]
+fn empty_sealed_blob_segments_are_reclaimed_and_corrupt_std_blobs_not_rescanned() {
+    let tmp = TempTestDir::new("empty_and_unreloc_blobs");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4096;
+    cfg.buf_wal_size_bytes = 8 * 4096;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    // Register an empty sealed `blob_std` segment directly in state + meta, then reclaim.
+    let seq_empty = engine.meta_mgr.reserve_seq_id();
+    let empty_writer = BlobSegmentWriter::open(&*fs, BlobKind::Standard, 0, seq_empty).unwrap();
+    let empty_reader = empty_writer.reader();
+    drop(empty_writer);
+    engine.std_blobs.insert(
+        seq_empty,
+        TrackedStdBlob {
+            reader: empty_reader,
+            file_len: 0,
+            dead_bytes: 0,
+        },
+    );
+    engine.reclaim_fully_dead_blob_segments().unwrap();
+    assert!(!engine.std_blobs.contains_key(&seq_empty));
+
+    // Create a fragmented std segment whose remaining live blob is corrupt under `Evict`.
+    engine.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+    let payload = vec![0x6B; 512];
+    for i in 0..4u32 {
+        engine
+            .put_row(
+                1,
+                format!("k{i:02}").as_bytes(),
+                &payload,
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    engine.sync_active_std_writer().unwrap();
+    engine.active_std_writer = None;
+    for i in 0..3u32 {
+        engine
+            .delete_row(
+                1,
+                format!("k{i:02}").as_bytes(),
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    assert!(engine.has_fragmented_std_blobs(0.5));
+    let seg_id = *engine.std_blobs.keys().next().unwrap();
+    let seg_name = crate::meta::format_std_blob_file_name(seg_id);
+    engine.flush_memtable().unwrap();
+    drop(engine);
+
+    // Corrupt the surviving last blob record while the engine handle is closed.
+    let f = fs
+        .open_file(
+            &seg_name,
+            false,
+            true,
+            crate::pal::OpenHint::ImmutableRandom,
+        )
+        .unwrap();
+    let flen = f.file_len().unwrap();
+    f.write_all_at(&[0xFF; 16], flen - 32).unwrap();
+    f.sync_durable().unwrap();
+    drop(f);
+
+    let mut cfg2 = EngineConfig::default();
+    cfg2.inline_threshold_bytes = 64;
+    cfg2.max_blob_segment_bytes = 4096;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg2).unwrap();
+    engine.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+    assert!(engine.has_fragmented_std_blobs(0.5));
+
+    assert_eq!(engine.relocate_fragmented_std_blobs(0.5).unwrap(), 0);
+    assert!(
+        !engine.has_fragmented_std_blobs(0.5),
+        "unrelocatable corrupt blob segment must not trigger endless re-scans"
+    );
+}
+
+#[test]
+fn poison_guards_block_zero_record_prepared_tx_savepoints_and_dropped_leader() {
+    let tmp = TempTestDir::new("poison_guards_tx_gate");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    // Zero-record prepared tx and savepoints must reject after commit leader guard drops.
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    {
+        let _guard = engine.commit_gate.leader_guard();
+        // Dropped without `disarm()`.
+    }
+    assert!(engine.commit_transaction().is_err());
+    assert!(engine.savepoint_for_conn(1, 1).is_err());
+    assert!(engine.statement_savepoint_for_conn(1, 1).is_err());
+}

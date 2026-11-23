@@ -49,6 +49,9 @@ struct GateState {
 pub(crate) struct CommitGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    /// Latch set immediately inside `fail` / `abandon_flush` so `check_not_poisoned()` detects
+    /// a dropped/unwound flush leader before entering engine writes.
+    failed_flag: std::sync::atomic::AtomicBool,
 }
 
 /// What a commit waiting for durability has to do next.
@@ -85,11 +88,18 @@ impl CommitGate {
     }
 
     pub(super) fn fail(&self, error: &io::Error) {
+        self.failed_flag
+            .store(true, std::sync::atomic::Ordering::Release);
         let mut state = self.lock();
         state.failed = Some(error.to_string());
         state.leader_active = false;
         drop(state);
         self.changed.notify_all();
+    }
+
+    #[inline]
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed_flag.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Count of ended transactions. Read it under the engine lock before waiting, so that a
@@ -683,6 +693,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// persistence, compaction, flush) fails; such failures are counted in
     /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
+        if self.tx_depth == 1 {
+            self.check_not_poisoned()?;
+        }
         if self.tx_depth == 1 && !self.tx_prepared {
             let durability = if self.pending_tx_sync {
                 WriteDurability::SyncTransactional
@@ -1207,6 +1220,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         conn_id: usize,
         table_id: u16,
     ) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.check_write_allowed_for_conn(conn_id)?;
         self.tx_prepared = false;
         self.tx_synced_vtabs.clear();
@@ -1253,6 +1267,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Opens a transaction savepoint for SQLite connection `conn_id`.
     pub fn savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.check_write_allowed_for_conn(conn_id)?;
         let was_zero = self.tx_depth == 0;
         self.savepoint(sp_id);
@@ -1495,10 +1510,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn flush_pending_tx_records(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.pending_tx_record_count == 0 {
             return Ok(());
         }
-        self.check_not_poisoned()?;
         self.lsn_after_batches(1)?;
         let record_count = self.pending_tx_record_count;
         self.pending_tx_record_count = 0;

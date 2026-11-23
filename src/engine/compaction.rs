@@ -11,7 +11,7 @@ use crate::meta::{
     format_lru_blob_file_name, format_std_blob_file_name,
 };
 use crate::pal::PlatformFs;
-use crate::wal::{BlobKind, WalRecord};
+use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
 use super::{StorageEngine, WriteDurability};
 
@@ -395,6 +395,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
         self.std_blobs.iter().filter_map(move |(&seq, b)| {
             (Some(seq) != active_std_seq
+                && !self.unrelocatable_std_blobs.contains(&seq)
                 && b.file_len > 0
                 && b.dead_bytes < b.file_len
                 && (b.dead_bytes as f64) / (b.file_len as f64) >= dead_ratio_threshold)
@@ -430,6 +431,41 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         res
     }
 
+    fn abort_relocation_batch(&mut self, new_ptrs: Vec<BlobPtr>) {
+        self.in_flight_autocommit_blob_starts.clear();
+        for p in new_ptrs {
+            self.record_dead_blob_bytes(&p);
+        }
+    }
+
+    fn flush_relocation_batch(
+        &mut self,
+        wal_records: &mut Vec<WalRecord>,
+        new_ptrs: &mut Vec<BlobPtr>,
+        dead_ptrs: &mut Vec<BlobPtr>,
+    ) -> io::Result<()> {
+        if wal_records.is_empty() {
+            return Ok(());
+        }
+        let recs = core::mem::take(wal_records);
+        if let Err(e) =
+            self.commit_wal_and_memtable_core(recs, WriteDurability::BufferedFast, false, false)
+        {
+            self.abort_relocation_batch(core::mem::take(new_ptrs));
+            return Err(e);
+        }
+        new_ptrs.clear();
+        for old_ptr in dead_ptrs.drain(..) {
+            self.record_dead_blob_bytes(&old_ptr);
+        }
+        if self.memtable.should_flush() {
+            if let Err(e) = self.flush_memtable_no_auto_compact() {
+                self.record_maintenance_failure(&e);
+            }
+        }
+        Ok(())
+    }
+
     fn relocate_fragmented_std_blobs_inner(
         &mut self,
         dead_ratio_threshold: f64,
@@ -443,6 +479,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         const RELOCATE_BATCH_SIZE: usize = 512;
+        let wal_bytes = (self.buf_wal.total_sectors() as u64)
+            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
+        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
         let mut seek_key: Vec<u8> = Vec::new();
         let mut lower_inclusive = true;
         let mut relocated = 0usize;
@@ -465,61 +504,61 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut batch_wal_records = Vec::new();
             let mut batch_dead_ptrs = Vec::new();
             let mut batch_new_ptrs = Vec::new();
+            let mut batch_est_bytes = 0usize;
             for entry in entries {
                 if let IndexValue::Blob(old_ptr) = entry.value {
                     if old_ptr.kind == BlobKind::Standard
                         && fragmented_seqs.contains(&old_ptr.seg_id)
                     {
-                        if let Some(payload) =
-                            self.dereference_blob_lenient(&old_ptr, &entry.key)?
-                        {
-                            let new_ptr = match self.append_to_blob_segment(
-                                BlobKind::Standard,
-                                0,
-                                &entry.key,
-                                &payload,
-                            ) {
-                                Ok(ptr) => ptr,
-                                Err(e) => {
-                                    self.in_flight_autocommit_blob_starts.clear();
-                                    for p in batch_new_ptrs {
-                                        self.record_dead_blob_bytes(&p);
-                                    }
-                                    return Err(e);
-                                }
-                            };
-                            batch_dead_ptrs.push(old_ptr);
-                            batch_new_ptrs.push(new_ptr);
-                            batch_wal_records.push(WalRecord::PutBlobPtr {
-                                key: entry.key,
-                                blob_ptr: new_ptr,
-                            });
-                            relocated += 1;
+                        let payload = match self.dereference_blob_lenient(&old_ptr, &entry.key) {
+                            Ok(Some(payload)) => payload,
+                            Ok(None) => {
+                                self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
+                                continue;
+                            }
+                            Err(e) => {
+                                self.abort_relocation_batch(batch_new_ptrs);
+                                return Err(e);
+                            }
+                        };
+                        let new_ptr = match self.append_to_blob_segment(
+                            BlobKind::Standard,
+                            0,
+                            &entry.key,
+                            &payload,
+                        ) {
+                            Ok(ptr) => ptr,
+                            Err(e) => {
+                                self.abort_relocation_batch(batch_new_ptrs);
+                                return Err(e);
+                            }
+                        };
+                        let rec = WalRecord::PutBlobPtr {
+                            key: entry.key,
+                            blob_ptr: new_ptr,
+                        };
+                        let rec_est = super::eviction::est_wal_record_bytes(&rec);
+                        batch_dead_ptrs.push(old_ptr);
+                        batch_new_ptrs.push(new_ptr);
+                        batch_wal_records.push(rec);
+                        batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
+                        relocated += 1;
+                        if batch_est_bytes >= max_batch_wal_bytes {
+                            self.flush_relocation_batch(
+                                &mut batch_wal_records,
+                                &mut batch_new_ptrs,
+                                &mut batch_dead_ptrs,
+                            )?;
+                            batch_est_bytes = 0;
                         }
                     }
                 }
             }
-            if !batch_wal_records.is_empty() {
-                if let Err(e) = self.commit_wal_and_memtable_core(
-                    batch_wal_records,
-                    WriteDurability::BufferedFast,
-                    false,
-                    false,
-                ) {
-                    for p in batch_new_ptrs {
-                        self.record_dead_blob_bytes(&p);
-                    }
-                    return Err(e);
-                }
-                for old_ptr in batch_dead_ptrs {
-                    self.record_dead_blob_bytes(&old_ptr);
-                }
-                if self.memtable.should_flush() {
-                    if let Err(e) = self.flush_memtable_no_auto_compact() {
-                        self.record_maintenance_failure(&e);
-                    }
-                }
-            }
+            self.flush_relocation_batch(
+                &mut batch_wal_records,
+                &mut batch_new_ptrs,
+                &mut batch_dead_ptrs,
+            )?;
         }
         Ok(relocated)
     }
@@ -835,6 +874,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for seq in dead_std_seqs {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.unrelocatable_std_blobs.remove(&seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
@@ -989,6 +1029,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for seq in dead_std_seqs {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.unrelocatable_std_blobs.remove(&seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru_keys {
@@ -1011,7 +1052,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .iter()
             .filter(|&(&seq, b)| {
                 Some(seq) != active_std_seq
-                    && b.file_len > 0
                     && self.settled_std_dead_bytes(seq, b.dead_bytes) >= b.file_len
             })
             .map(|(&seq, _)| seq)
@@ -1028,7 +1068,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .filter(|&(&(tid, seq), b)| {
                 let active_seq = self.active_lru_writers.get(&tid).map(|w| w.seq_id());
                 Some(seq) != active_seq
-                    && b.file_len > 0
                     && self.settled_lru_dead_bytes((tid, seq), b.dead_bytes) >= b.file_len
             })
             .map(|(&k, _)| k)
@@ -1053,7 +1092,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .filter(|&(&(tid, seq), b)| {
                 tid == table_id
                     && Some(seq) != active_seq
-                    && b.file_len > 0
                     && self.settled_lru_dead_bytes((tid, seq), b.dead_bytes) >= b.file_len
             })
             .map(|(&k, _)| k)
