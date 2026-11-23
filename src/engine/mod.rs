@@ -2112,6 +2112,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for ptr in dead_ptrs {
             self.record_dead_blob_bytes(&ptr);
         }
+        // Mark pre-drop `blob_lru` bytes dead now (rather than waiting until commit) so if this
+        // `table_id` is reused later in the same transaction, only bytes from the dropped
+        // incarnation are marked dead and live blobs written by the replacement table stay intact.
+        for (&(t, _), b) in &mut self.lru_blobs {
+            if t == table_id {
+                b.dead_bytes = b.file_len;
+            }
+        }
 
         self.vtabs_created_in_tx
             .retain(|(id, _, _)| *id != table_id);

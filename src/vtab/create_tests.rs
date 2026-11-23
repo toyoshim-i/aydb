@@ -687,3 +687,44 @@ fn whitespace_padded_table_names_are_distinct() {
     assert_eq!(ints(&conn, "SELECT v FROM \"x \""), [400]);
     assert_eq!(ints(&conn, "SELECT v FROM \" \""), [500]);
 }
+
+#[test]
+fn in_tx_drop_and_reused_table_id_preserves_live_capped_lru_blobs_on_commit() {
+    for explicit_id in [false, true] {
+        for on_corrupt in ["error", "evict"] {
+            let mut fixture = Fixture::new(&format!("reuse_capped_lru_{explicit_id}_{on_corrupt}"));
+            let id_opt = if explicit_id { "table_id=5, " } else { "" };
+            let ddl = format!(
+                "CREATE VIRTUAL TABLE t1 USING aydb({id_opt}max_bytes=1048576, on_corrupt='{on_corrupt}', columns='k INT PRIMARY KEY, v BLOB')"
+            );
+            {
+                let conn = fixture.open();
+                conn.execute_batch(&format!(
+                    "BEGIN;
+                     SAVEPOINT s1;
+                     {ddl};
+                     INSERT INTO t1 VALUES (1, zeroblob(4096));
+                     ROLLBACK TO s1;
+                     {ddl};
+                     INSERT INTO t1 VALUES (2, zeroblob(4096));
+                     COMMIT;"
+                ))
+                .unwrap();
+
+                // Recreated table's row 2 blob must remain intact right after commit (not reclaimed).
+                assert_eq!(
+                    conn.query_all("SELECT k, length(v) FROM t1 ORDER BY k", &[])
+                        .unwrap(),
+                    vec![vec![SqlValue::Integer(2), SqlValue::Integer(4096)]]
+                );
+            }
+            fixture.restart();
+            let conn = fixture.open();
+            assert_eq!(
+                conn.query_all("SELECT k, length(v) FROM t1 ORDER BY k", &[])
+                    .unwrap(),
+                vec![vec![SqlValue::Integer(2), SqlValue::Integer(4096)]]
+            );
+        }
+    }
+}
