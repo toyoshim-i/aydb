@@ -95,15 +95,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.rowid_for_pk_src(ReadSource::from_view(view), table_id, pk)
     }
 
+    #[inline]
+    fn table_definitely_has_no_synthetic_rowids(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        table_id: u16,
+    ) -> bool {
+        match src {
+            ReadSource::Snapshot(_) => false,
+            ReadSource::Committed if self.tx_start_meta.active => {
+                self.tx_start_meta.table_has_synthetic_rowids.get(&table_id) == Some(&false)
+            }
+            ReadSource::Committed | ReadSource::Owner => {
+                self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
+            }
+        }
+    }
+
     pub(super) fn rowid_for_pk_src(
         &self,
         src: ReadSource<'_, FS::File>,
         table_id: u16,
         pk: &[u8],
     ) -> io::Result<Option<i64>> {
-        if !matches!(src, ReadSource::Snapshot(_))
-            && self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
-        {
+        if self.table_definitely_has_no_synthetic_rowids(src, table_id) {
             return Ok(None);
         }
         let key = rowid_key(table_id, NS_ROWID_BY_PK, pk);
@@ -161,9 +176,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         rowid: i64,
     ) -> io::Result<Option<Vec<u8>>> {
-        if !matches!(src, ReadSource::Snapshot(_))
-            && self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
-        {
+        if self.table_definitely_has_no_synthetic_rowids(src, table_id) {
             return Ok(None);
         }
         let key = rowid_key(table_id, NS_PK_BY_ROWID, &rowid.to_le_bytes());

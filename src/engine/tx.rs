@@ -200,6 +200,7 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) active_vtab_holders: HashMap<u16, Vec<u64>>,
     pub(super) corrupt_policies: HashMap<u16, super::CorruptPolicy>,
     pub(super) table_inline_thresholds: BTreeMap<u16, usize>,
+    pub(super) table_has_synthetic_rowids: BTreeMap<u16, bool>,
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
@@ -227,6 +228,7 @@ pub(crate) struct StatementMetaSnapshot {
     pub(super) next_lsn: u64,
     pub(super) table_id: u16,
     pub(super) capped_table: Option<CappedTableState>,
+    pub(super) table_has_synthetic_rowids: Option<bool>,
     pub(super) table_has_row_meta: Option<bool>,
     pub(super) blob_undo_len: usize,
 }
@@ -1191,6 +1193,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             next_lsn: self.next_lsn,
             table_id,
             capped_table: self.capped_tables.get(&table_id).cloned(),
+            table_has_synthetic_rowids: self.table_has_synthetic_rowids.get(&table_id).copied(),
             table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
             blob_undo_len: self.statement_blob_undo.len(),
         };
@@ -1368,6 +1371,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(ct) = &st.capped_table {
             self.capped_tables.insert(st.table_id, ct.clone());
         }
+        match st.table_has_synthetic_rowids {
+            Some(v) => {
+                self.table_has_synthetic_rowids.insert(st.table_id, v);
+            }
+            None => {
+                self.table_has_synthetic_rowids.remove(&st.table_id);
+            }
+        }
         match st.table_has_row_meta {
             Some(v) => {
                 self.table_has_row_meta.insert(st.table_id, v);
@@ -1403,6 +1414,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_vtab_holders: self.active_vtab_holders.clone(),
             corrupt_policies: self.corrupt_policies.clone(),
             table_inline_thresholds: self.table_inline_thresholds.clone(),
+            table_has_synthetic_rowids: self.table_has_synthetic_rowids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
             vtabs_created_in_tx: self.vtabs_created_in_tx.clone(),
@@ -1430,6 +1442,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.active_vtab_holders = snap.active_vtab_holders.clone();
         self.corrupt_policies = snap.corrupt_policies.clone();
         self.table_inline_thresholds = snap.table_inline_thresholds.clone();
+        self.table_has_synthetic_rowids = snap.table_has_synthetic_rowids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
         self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();

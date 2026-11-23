@@ -8919,3 +8919,118 @@ fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
         }
     }
 }
+
+#[test]
+fn table_has_synthetic_rowids_snapshot_and_restore_across_tx_and_savepoint() {
+    let tmp = TempTestDir::new("synthetic_rowid_tx_snap");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let sync = WriteDurability::SyncTransactional;
+
+    // Seed table 1 with a synthetic rowid mapping and populate `table_has_synthetic_rowids`.
+    engine.put_row(1, b"pk1", b"val1", &[], sync).unwrap();
+    let rid = engine
+        .assign_rowid(1, b"pk1", 10, sync, |_, _| Ok(false))
+        .unwrap();
+    assert!(engine.may_have_synthetic_rowids(1).unwrap());
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), Some(true));
+
+    // Seed table 2 with no synthetic rowids and cache `false`.
+    assert!(!engine.may_have_synthetic_rowids(2).unwrap());
+    assert_eq!(engine.test_table_has_synthetic_rowids(2), Some(false));
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine.savepoint_for_conn(1, 10).unwrap();
+
+    // Dropping table 1 in-tx clears the owner cache, and probing or reusing `table_id = 1` sets
+    // the owner cache to `false`; concurrent `ReadView::Committed` must keep seeing committed
+    // synthetic rowids.
+    engine.drop_table(1, None).unwrap();
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), None);
+    assert!(!engine.may_have_synthetic_rowids(1).unwrap());
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), Some(false));
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Owner, 1, b"pk1")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        engine.pk_for_rowid_view(ReadView::Owner, 1, rid).unwrap(),
+        None
+    );
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Committed, 1, b"pk1")
+            .unwrap(),
+        Some(rid)
+    );
+    assert_eq!(
+        engine
+            .pk_for_rowid_view(ReadView::Committed, 1, rid)
+            .unwrap(),
+        Some(b"pk1".to_vec())
+    );
+
+    // Rolling back to the savepoint restores the `true` cache flag.
+    engine.rollback_to_savepoint_for_conn(1, 10).unwrap();
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), Some(true));
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Owner, 1, b"pk1")
+            .unwrap(),
+        Some(rid)
+    );
+
+    // Drop table 1 again (re-caching `Some(false)` in owner state) and also add a synthetic rowid
+    // on table 2 in-tx.
+    engine.drop_table(1, None).unwrap();
+    assert!(!engine.may_have_synthetic_rowids(1).unwrap());
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), Some(false));
+    engine.put_row(2, b"p2", b"v2", &[], sync).unwrap();
+    let rid2 = engine
+        .assign_rowid(2, b"p2", 1, sync, |_, _| Ok(false))
+        .unwrap();
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Committed, 2, b"p2")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        engine.rowid_for_pk_view(ReadView::Owner, 2, b"p2").unwrap(),
+        Some(rid2)
+    );
+
+    // Full rollback restores both tables' synthetic-rowid cache flags.
+    engine.rollback_transaction_for_conn(1).unwrap();
+    assert_eq!(engine.test_table_has_synthetic_rowids(1), Some(true));
+    assert_eq!(engine.test_table_has_synthetic_rowids(2), Some(false));
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Owner, 1, b"pk1")
+            .unwrap(),
+        Some(rid)
+    );
+    assert_eq!(
+        engine
+            .pk_for_rowid_view(ReadView::Committed, 1, rid)
+            .unwrap(),
+        Some(b"pk1".to_vec())
+    );
+
+    // Deleting the restored row removes its synthetic `'u'`/`'v'` entries instead of skipping them.
+    assert!(engine.delete_row(1, b"pk1", sync).unwrap());
+    assert_eq!(
+        engine
+            .rowid_for_pk_view(ReadView::Committed, 1, b"pk1")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        engine
+            .pk_for_rowid_view(ReadView::Committed, 1, rid)
+            .unwrap(),
+        None
+    );
+}
