@@ -380,6 +380,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
     /// `(table_id, normalised name, normalised sqlite schema name)`.
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
+    /// Virtual-table pointers (`p_vtab as usize`) that joined the active SQLite transaction via
+    /// `xBegin` and have not yet reached `xSync`.
+    pub(super) tx_pending_sync_vtabs: Vec<usize>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
@@ -439,6 +442,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Rows awaiting automatic deletion under [`CorruptPolicy::Evict`]. Filled from `&self` read
     /// paths (hence the `Mutex`); drained only by [`Self::drain_corrupt_evictions`].
     pending_corrupt_evictions: Mutex<HashMap<(u16, Vec<u8>), PendingCorruptEviction>>,
+    /// Test seam: makes the next `append_raw_wal_batch_with_rotation` fail and poison the engine.
+    #[cfg(test)]
+    pub(super) debug_fail_next_wal_append: bool,
+    /// Test seam: makes the next vtab commit `sync_barrier` fail as a device flush failure would.
+    #[cfg(test)]
+    pub(super) debug_fail_next_wal_sync: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Opens a blob segment found by directory listing but absent from the catalog. A file that
@@ -1214,6 +1223,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             statement_blob_undo: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
             vtabs_created_in_tx: Vec::new(),
+            tx_pending_sync_vtabs: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
             next_vtab_token: 1,
@@ -1241,6 +1251,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             blob_cache,
             corrupt_blob_detections: AtomicU64::new(0),
             pending_corrupt_evictions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            debug_fail_next_wal_append: false,
+            #[cfg(test)]
+            debug_fail_next_wal_sync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
 
@@ -1304,6 +1318,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     #[cfg(test)]
     pub(crate) fn debug_poison(&mut self, reason: &str) {
         let _ = self.poison(io::Error::other(reason.to_string()));
+    }
+
+    /// Test seam: causes the next WAL batch append to fail and poison the engine.
+    #[cfg(test)]
+    pub(crate) fn debug_fail_next_wal_append(&mut self) {
+        self.debug_fail_next_wal_append = true;
+    }
+
+    /// Test seam: causes the next vtab commit `sync_barrier` to fail as a device flush error.
+    #[cfg(test)]
+    pub(crate) fn debug_fail_next_wal_sync(&self) {
+        self.debug_fail_next_wal_sync.store(true, Ordering::SeqCst);
+    }
+
+    /// Test seam: returns the shared sync-failure injection flag.
+    #[cfg(test)]
+    pub(crate) fn debug_fail_wal_sync_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.debug_fail_next_wal_sync)
     }
 
     /// Returns how many post-commit maintenance steps have failed. The writes that triggered them
@@ -4051,6 +4083,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
+        #[cfg(test)]
+        if core::mem::replace(&mut self.debug_fail_next_wal_append, false) {
+            return Err(self.poison(io::Error::other("injected WAL append failure")));
+        }
         let batch_lsn = if encoded.len() >= 8 {
             u64::from_le_bytes(encoded[0..8].try_into().unwrap())
         } else {

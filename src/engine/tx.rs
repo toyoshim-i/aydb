@@ -414,6 +414,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();
+            self.tx_pending_sync_vtabs.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = None;
@@ -442,6 +443,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();
+            self.tx_pending_sync_vtabs.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = Some(conn_id);
@@ -453,6 +455,48 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.tx_depth += 1;
         Ok(())
+    }
+
+    /// Begins (or joins) the engine transaction for SQLite connection `conn_id` on behalf of
+    /// virtual table `vtab_id`, keeping `tx_depth == 1` across multiple tables in one transaction
+    /// and tracking `vtab_id` until its `xSync` arrives.
+    pub(crate) fn begin_vtab_transaction(
+        &mut self,
+        conn_id: usize,
+        vtab_id: usize,
+    ) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        self.check_write_allowed_for_conn(conn_id)?;
+        if self.tx_depth == 0 {
+            self.begin_transaction_for_conn(conn_id)?;
+        } else {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        }
+        if !self.tx_pending_sync_vtabs.contains(&vtab_id) {
+            self.tx_pending_sync_vtabs.push(vtab_id);
+        }
+        Ok(())
+    }
+
+    /// Removes `vtab_id` from the active transaction's pending-sync list on disconnect.
+    pub(crate) fn detach_vtab_from_tx(&mut self, conn_id: usize, vtab_id: usize) {
+        if self.conn_has_open_transaction(conn_id) {
+            self.tx_pending_sync_vtabs.retain(|&id| id != vtab_id);
+        }
+    }
+
+    /// Records that `vtab_id` has reached `xSync` with `durability` and returns `true` when it is
+    /// the last participating virtual table (so this call should commit the engine transaction).
+    pub(crate) fn mark_vtab_synced_ready_to_commit(
+        &mut self,
+        vtab_id: usize,
+        durability: WriteDurability,
+    ) -> bool {
+        if durability == WriteDurability::SyncTransactional {
+            self.pending_tx_sync = true;
+        }
+        self.tx_pending_sync_vtabs.retain(|&id| id != vtab_id);
+        self.tx_pending_sync_vtabs.is_empty()
     }
 
     /// Whether `conn_id` has a transaction open in the engine (it has written since `BEGIN`).
@@ -525,6 +569,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth == 0 {
             return Ok(());
         }
+        self.check_not_poisoned()?;
         if durability == WriteDurability::SyncTransactional {
             self.pending_tx_sync = true;
         }
@@ -880,6 +925,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
         self.vtabs_created_in_tx.clear();
+        self.tx_pending_sync_vtabs.clear();
         self.tx_start_meta = TxMetaSnapshot::default();
         self.commit_gate.tx_ended();
     }
@@ -1006,6 +1052,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.bump_table_epochs_from_overlay_map();
         self.tx_depth = 0;
         self.vtabs_created_in_tx.clear();
+        self.tx_pending_sync_vtabs.clear();
         self.tx_owner_conn = None;
         self.deferred_flush_on_commit = false;
         self.deferred_compact_on_commit = false;

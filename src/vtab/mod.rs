@@ -858,6 +858,18 @@ unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
     }
 }
 
+/// Replaces `(*p_vtab).zErrMsg` with a SQLite-owned copy of `msg`.
+unsafe fn set_vtab_err_msg(p_vtab: *mut sqlite3_vtab, msg: &str) {
+    unsafe {
+        if !p_vtab.is_null() {
+            if !(*p_vtab).zErrMsg.is_null() {
+                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
+            }
+            (*p_vtab).zErrMsg = sqlite_error_message(msg);
+        }
+    }
+}
+
 /// Waits, bounded like `xBegin`, for another connection's transaction to end: the same thread
 /// may hold that connection open and could never end it. Returns false once the wait ran out.
 fn wait_for_other_transaction(
@@ -1092,6 +1104,7 @@ unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
             unsafe {
                 let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
                 if let Ok(mut eng) = vtab.engine.write() {
+                    eng.detach_vtab_from_tx(vtab.db as usize, p_vtab as usize);
                     eng.unregister_vtab_token(vtab.table_id, vtab.reg_token);
                 }
             }
@@ -3155,7 +3168,7 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                     return io_err_to_sqlite_rc(&error);
                 }
             }
-            match eng.begin_transaction_for_conn(vtab.db as usize) {
+            match eng.begin_vtab_transaction(vtab.db as usize, p_vtab as usize) {
                 Ok(()) => {
                     vtab.read_session.clear();
                     break;
@@ -3204,32 +3217,133 @@ unsafe fn schema_has_table(db: *mut sqlite3, db_name: &str, name: &str) -> bool 
     rc != SQLITE_ERROR
 }
 
+fn run_commit_sync_barrier(
+    file: &OsFile,
+    #[cfg(test)] fail_sync: Option<&Arc<AtomicBool>>,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if fail_sync.is_some_and(|flag| flag.swap(false, Ordering::SeqCst)) {
+        return Err(io::Error::other("injected WAL sync failure"));
+    }
+    file.sync_barrier()
+}
+
+fn complete_commit_step_for_engine(
+    engine: &Arc<RwLock<StorageEngine<OsFs>>>,
+    step: io::Result<CommitStep<OsFile>>,
+    #[cfg(test)] fail_sync: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    // The device flush runs without the engine lock so that readers are not held up by it.
+    step.and_then(|step| match step {
+        CommitStep::Done => Ok(()),
+        CommitStep::AwaitingSync(file) => {
+            let flushed = run_commit_sync_barrier(
+                &file,
+                #[cfg(test)]
+                fail_sync.as_ref(),
+            );
+            match engine.write() {
+                Ok(mut eng) => eng.finish_commit_for_conn(flushed),
+                Err(_) => Err(io::Error::other("engine lock poisoned")),
+            }
+        }
+        CommitStep::AwaitingGroup { lsn, file, gate } => loop {
+            match gate.join_group(lsn)? {
+                GroupRole::Durable => break Ok(()),
+                GroupRole::Lead(target) => {
+                    let mut leader_guard = gate.leader_guard();
+                    let flushed = run_commit_sync_barrier(
+                        &file,
+                        #[cfg(test)]
+                        fail_sync.as_ref(),
+                    );
+                    match engine.write() {
+                        Ok(mut eng) => {
+                            let res = eng.finish_group_flush(target, flushed);
+                            leader_guard.disarm();
+                            res?;
+                        }
+                        Err(_) => {
+                            let e = io::Error::other("engine lock poisoned");
+                            gate.abandon_flush(&e);
+                            leader_guard.disarm();
+                            break Err(e);
+                        }
+                    }
+                }
+            }
+        },
+    })
+}
+
+unsafe fn complete_commit_step(
+    vtab: &AydbVTab,
+    p_vtab: *mut sqlite3_vtab,
+    step: io::Result<CommitStep<OsFile>>,
+    #[cfg(test)] fail_sync: Option<Arc<AtomicBool>>,
+) -> c_int {
+    let committed = complete_commit_step_for_engine(
+        &vtab.engine,
+        step,
+        #[cfg(test)]
+        fail_sync,
+    );
+    if let Err(e) = committed {
+        unsafe {
+            set_vtab_err_msg(p_vtab, &e.to_string());
+        }
+        return io_err_to_sqlite_rc(&e);
+    }
+    SQLITE_OK
+}
+
 unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        let mut eng = match vtab.engine.write() {
-            Ok(g) => g,
-            Err(_) => return SQLITE_ERROR,
-        };
-        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
-            return io_err_to_sqlite_rc(&e);
-        }
-        // Tables this transaction created (even if later renamed) whose creation a `ROLLBACK TO`
-        // has since undone in SQLite's schema must not be committed.
-        if eng.conn_has_open_transaction(vtab.db as usize) {
+        // Run prepare, WAL append, and device flush in `xSync` rather than `xCommit`: SQLite
+        // discards `xCommit`'s return code, whereas returning an error from `xSync` aborts
+        // `COMMIT` and rolls back any native SQLite tables updated in the same transaction.
+        #[cfg(test)]
+        let fail_sync_flag: Option<Arc<AtomicBool>>;
+        let step = {
+            let mut eng = match vtab.engine.write() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if !eng.conn_has_open_transaction(vtab.db as usize) {
+                return SQLITE_OK;
+            }
+            if !eng.mark_vtab_synced_ready_to_commit(p_vtab as usize, vtab.durability) {
+                return SQLITE_OK;
+            }
+            // Tables this transaction created (even if later renamed) whose creation a `ROLLBACK TO`
+            // has since undone in SQLite's schema must not be committed.
             let stale = eng.take_stale_vtabs_created_in_tx(|prev_db, prev_name| {
                 !schema_has_table(vtab.db, prev_db, prev_name)
             });
             for (id, stale_name) in stale {
                 if let Err(e) = eng.drop_stale_created_vtab(id, &stale_name) {
+                    set_vtab_err_msg(p_vtab, &e.to_string());
                     return io_err_to_sqlite_rc(&e);
                 }
             }
-        }
-        if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
-            return io_err_to_sqlite_rc(&e);
-        }
-        SQLITE_OK
+            if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
+                set_vtab_err_msg(p_vtab, &e.to_string());
+                return io_err_to_sqlite_rc(&e);
+            }
+            #[cfg(test)]
+            {
+                fail_sync_flag = Some(eng.debug_fail_wal_sync_flag());
+            }
+            eng.begin_commit_for_conn(vtab.db as usize)
+        };
+        complete_commit_step(
+            vtab,
+            p_vtab,
+            step,
+            #[cfg(test)]
+            fail_sync_flag,
+        )
     }))
     .unwrap_or(SQLITE_ERROR)
 }
@@ -3237,55 +3351,35 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        // SQLite invokes `xCommit` once per virtual table in `aVTrans`. Once an earlier table's
-        // commit ends the engine transaction and notifies `commit_gate`, another connection may
-        // immediately start a new transaction before SQLite calls `xCommit` on the remaining
-        // tables; skip `begin_commit_for_conn` when this connection no longer owns a tx.
+        // SQLite invokes `xCommit` once per virtual table in `aVTrans`. Normal transactions
+        // already appended, flushed, and published in `xSync` (whose return code SQLite checks),
+        // so `conn_has_open_transaction` is false here; keep `begin_commit_for_conn` as a
+        // fallback only if an active engine transaction remains.
+        #[cfg(test)]
+        let mut fail_sync_flag: Option<Arc<AtomicBool>> = None;
         let step = match vtab.engine.write() {
             Ok(mut eng) => {
                 if !eng.conn_has_open_transaction(vtab.db as usize) {
                     Ok(CommitStep::Done)
                 } else {
+                    #[cfg(test)]
+                    {
+                        fail_sync_flag = Some(eng.debug_fail_wal_sync_flag());
+                    }
                     eng.begin_commit_for_conn(vtab.db as usize)
                 }
             }
             Err(_) => return SQLITE_ERROR,
         };
-        // The device flush runs without the engine lock so that readers are not held up by it.
-        let committed = step.and_then(|step| match step {
-            CommitStep::Done => Ok(()),
-            CommitStep::AwaitingSync(file) => {
-                let flushed = file.sync_barrier();
-                match vtab.engine.write() {
-                    Ok(mut eng) => eng.finish_commit_for_conn(flushed),
-                    Err(_) => Err(io::Error::other("engine lock poisoned")),
-                }
-            }
-            CommitStep::AwaitingGroup { lsn, file, gate } => loop {
-                match gate.join_group(lsn)? {
-                    GroupRole::Durable => break Ok(()),
-                    GroupRole::Lead(target) => {
-                        let mut leader_guard = gate.leader_guard();
-                        let flushed = file.sync_barrier();
-                        match vtab.engine.write() {
-                            Ok(mut eng) => {
-                                let res = eng.finish_group_flush(target, flushed);
-                                leader_guard.disarm();
-                                res?;
-                            }
-                            Err(_) => {
-                                let e = io::Error::other("engine lock poisoned");
-                                gate.abandon_flush(&e);
-                                leader_guard.disarm();
-                                break Err(e);
-                            }
-                        }
-                    }
-                }
-            },
-        });
-        if let Err(e) = committed {
-            return io_err_to_sqlite_rc(&e);
+        let rc = complete_commit_step(
+            vtab,
+            p_vtab,
+            step,
+            #[cfg(test)]
+            fail_sync_flag,
+        );
+        if rc != SQLITE_OK {
+            return rc;
         }
         if let Ok(mut prev) = vtab.pre_tx_name.lock() {
             *prev = None;

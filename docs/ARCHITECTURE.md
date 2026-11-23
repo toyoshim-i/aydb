@@ -148,7 +148,7 @@ After a process restart, a verified blob can still be readable from a clean cach
 
 ### 4.5 Commit Path and Group Commit
 
-A synchronous SQL commit (`xCommit`) has three steps, and only the first and last hold the engine lock:
+A synchronous SQL commit (`xSync`) has three steps, and only the first and last hold the engine lock (WAL append and device flush run in `xSync` rather than `xCommit` because SQLite discards `xCommit`'s return code, whereas returning an error from `xSync` aborts `COMMIT`):
 
 1. Under the lock, the WAL batch is written to `wal_sync.db` without a device flush.
 2. Without the lock, the commit waits for a device flush that covers its batch.
