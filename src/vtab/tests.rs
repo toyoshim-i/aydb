@@ -4281,3 +4281,53 @@ fn integer_pk_table_tracks_synthetic_rowid_flag_and_cleans_mixed_keys() {
     assert_eq!(v_keys.len(), 1);
     assert_eq!(v_keys[0].len(), 3);
 }
+
+#[test]
+fn statement_execute_reports_commit_failure_on_insert_returning() {
+    let tmp = TempTestDir::new("stmt_execute_returning_busy");
+    let db_path = tmp.path.join("ret.sqlite");
+    let conn1 = SqliteConnection::open_file(&db_path).unwrap();
+    let conn2 = SqliteConnection::open_file(&db_path).unwrap();
+
+    conn1
+        .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // Hold a shared read lock on conn2 so autocommit COMMIT on conn1 fails with SQLITE_BUSY.
+    conn2.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        conn2.query_all("SELECT count(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(0)]]
+    );
+
+    let mut insert = conn1
+        .prepare("INSERT INTO t(v) VALUES (?1) RETURNING id")
+        .unwrap();
+    assert!(
+        insert.execute(&[SqlValue::Text("a".into())]).is_err(),
+        "execute must report commit failure after RETURNING yields a row"
+    );
+
+    conn2.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        conn1.query_all("SELECT count(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(0)]]
+    );
+
+    // Once the read lock is released, re-executing the prepared statement commits cleanly.
+    insert.execute(&[SqlValue::Text("a".into())]).unwrap();
+    assert_eq!(
+        conn1.query_all("SELECT count(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(1)]]
+    );
+
+    // Multi-row RETURNING drains every row and commits all inserted rows.
+    let mut multi = conn1
+        .prepare("INSERT INTO t(v) VALUES ('b'), ('c') RETURNING id")
+        .unwrap();
+    multi.execute(&[]).unwrap();
+    assert_eq!(
+        conn1.query_all("SELECT count(*) FROM t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(3)]]
+    );
+}

@@ -229,15 +229,27 @@ pub struct SqliteStatement<'a> {
 }
 
 impl<'a> SqliteStatement<'a> {
-    /// Binds parameters, steps once (for `INSERT`/`UPDATE`/`DELETE`), and resets the statement.
+    /// Binds parameters, steps the statement to completion (draining any returned rows, such as
+    /// from `RETURNING`), and resets the statement.
     pub fn execute(&mut self, params: &[SqlValue]) -> io::Result<()> {
         self.bind_all(params)?;
-        let rc = unsafe { sqlite3_step(self.stmt) };
-        unsafe {
-            sqlite3_reset(self.stmt);
+        loop {
+            let rc = unsafe { sqlite3_step(self.stmt) };
+            if rc == SQLITE_ROW {
+                continue;
+            }
+            if rc == SQLITE_DONE {
+                break;
+            }
+            let err = self.conn.last_error("sqlite3_step(execute)");
+            unsafe {
+                sqlite3_reset(self.stmt);
+            }
+            return Err(err);
         }
-        if rc != SQLITE_DONE && rc != SQLITE_ROW {
-            return Err(self.conn.last_error("sqlite3_step(execute)"));
+        let reset_rc = unsafe { sqlite3_reset(self.stmt) };
+        if reset_rc != SQLITE_OK {
+            return Err(self.conn.last_error("sqlite3_reset(execute)"));
         }
         Ok(())
     }
@@ -258,14 +270,16 @@ impl<'a> SqliteStatement<'a> {
             } else if rc == SQLITE_DONE {
                 break;
             } else {
+                let err = self.conn.last_error("sqlite3_step(query)");
                 unsafe {
                     sqlite3_reset(self.stmt);
                 }
-                return Err(self.conn.last_error("sqlite3_step(query)"));
+                return Err(err);
             }
         }
-        unsafe {
-            sqlite3_reset(self.stmt);
+        let reset_rc = unsafe { sqlite3_reset(self.stmt) };
+        if reset_rc != SQLITE_OK {
+            return Err(self.conn.last_error("sqlite3_reset(query)"));
         }
         Ok(rows)
     }
