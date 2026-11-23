@@ -9,7 +9,9 @@ use crate::engine::WriteDurability;
 use crate::pal::PlatformFs;
 use crate::util::crc32c::crc32c_append;
 use crate::vtab::AydbVTab;
-use crate::vtab::row_codec::{decode_i64_tagged_key, extract_column_key_bytes_with_collation};
+use crate::vtab::row_codec::{
+    decode_i64_tagged_key, extract_column_key_bytes_with_collation, read_stored_i64_column,
+};
 use crate::wal::WalRecord;
 
 pub(super) fn plan_synthetic_rowid<FS: PlatformFs>(
@@ -66,14 +68,9 @@ pub(super) fn extract_rowid_from_row(
     vtab: &AydbVTab,
     snapshot: Option<&crate::engine::ReadSnapshotToken>,
 ) -> io::Result<i64> {
-    let dir_pos = 4 + vtab.pk_col_idx * 5;
-    if vtab.pk_rowid_alias && dir_pos + 5 <= row_bytes.len() && row_bytes[dir_pos] == 1 {
-        let offset =
-            u32::from_le_bytes(row_bytes[dir_pos + 1..dir_pos + 5].try_into().unwrap()) as usize;
-        if offset + 8 <= row_bytes.len() {
-            return Ok(i64::from_le_bytes(
-                row_bytes[offset..offset + 8].try_into().unwrap(),
-            ));
+    if vtab.pk_rowid_alias {
+        if let Some(id) = read_stored_i64_column(row_bytes, vtab.pk_col_idx)? {
+            return Ok(id);
         }
     }
     let pk =

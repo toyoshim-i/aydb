@@ -78,7 +78,7 @@ use crate::vtab::ffi::{
     SQLITE_FULL, SQLITE_INDEX_CONSTRAINT_EQ, SQLITE_INDEX_CONSTRAINT_GE,
     SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT,
     SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL,
-    SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, SQLITE_TXN_WRITE,
+    SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, SQLITE_TOOBIG, SQLITE_TXN_WRITE,
     SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite_column_text_bytes, sqlite_transient,
     sqlite_value_text_bytes, sqlite3, sqlite3_bind_text, sqlite3_context, sqlite3_declare_vtab,
     sqlite3_finalize, sqlite3_get_autocommit, sqlite3_index_info, sqlite3_int64, sqlite3_malloc,
@@ -89,6 +89,7 @@ use crate::vtab::ffi::{
 };
 
 const CREATE_SAVEPOINT: i32 = STATEMENT_SAVEPOINT + 1;
+use crate::vtab::row_codec::is_canonical_float_zero_key;
 pub use crate::vtab::row_codec::{
     ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
     KEY_TAG_FLOAT_LT_I64_MIN, KEY_TAG_INTEGER, KEY_TAG_NULL, KEY_TAG_TEXT, SqlValue,
@@ -288,6 +289,7 @@ fn io_err_to_sqlite_rc(err: &io::Error) -> c_int {
     match err.kind() {
         io::ErrorKind::WouldBlock => SQLITE_BUSY,
         io::ErrorKind::InvalidData => SQLITE_CORRUPT,
+        io::ErrorKind::FileTooLarge => SQLITE_TOOBIG,
         io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists => SQLITE_ERROR,
         _ => SQLITE_IOERR,
     }
@@ -1063,8 +1065,15 @@ const STALE_VTAB_ERR: &str = "virtual table handle is stale: table was dropped";
 /// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
 /// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
 unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
+    let Some(alloc_len) = msg
+        .len()
+        .checked_add(1)
+        .and_then(|n| c_int::try_from(n).ok())
+    else {
+        return core::ptr::null_mut();
+    };
     unsafe {
-        let buf = sqlite3_malloc((msg.len() + 1) as c_int) as *mut c_char;
+        let buf = sqlite3_malloc(alloc_len) as *mut c_char;
         if !buf.is_null() {
             core::ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, buf, msg.len());
             *buf.add(msg.len()) = 0;
@@ -2897,9 +2906,16 @@ unsafe extern "system" fn vtab_column(
             }
             let pk_bytes = &cursor.pks[cursor.pos];
             if i_col as usize == vtab.pk_col_idx {
-                if project_key_zero_copy(pk_bytes, p_ctx) {
-                    return SQLITE_OK;
-                }
+                return match project_key_zero_copy(pk_bytes, p_ctx) {
+                    Ok(()) => SQLITE_OK,
+                    Err(e) => {
+                        let rc = io_err_to_sqlite_rc(&e);
+                        if rc != SQLITE_TOOBIG {
+                            sqlite3_result_error_code(p_ctx, rc);
+                        }
+                        rc
+                    }
+                };
             }
             return SQLITE_ERROR;
         }
@@ -2920,8 +2936,19 @@ unsafe extern "system" fn vtab_column(
         // Fast path 2: Primary Key column projection with Binary collation directly from cursor.pks
         if i_col as usize == vtab.pk_col_idx && vtab.pk_collation == ColCollation::Binary {
             if let Some(pk_bytes) = cursor.pks.get(cursor.pos) {
-                if project_key_zero_copy(pk_bytes, p_ctx) {
-                    return SQLITE_OK;
+                if !is_canonical_float_zero_key(pk_bytes) {
+                    match project_key_zero_copy(pk_bytes, p_ctx) {
+                        Ok(()) => return SQLITE_OK,
+                        Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
+                            return SQLITE_TOOBIG;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                            let rc = io_err_to_sqlite_rc(&e);
+                            sqlite3_result_error_code(p_ctx, rc);
+                            return rc;
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -3016,7 +3043,13 @@ unsafe extern "system" fn vtab_column(
 
         match project_column_zero_copy(row_bytes, i_col as usize, p_ctx) {
             Ok(()) => SQLITE_OK,
-            Err(_) => SQLITE_ERROR,
+            Err(e) => {
+                let rc = io_err_to_sqlite_rc(&e);
+                if rc != SQLITE_TOOBIG {
+                    sqlite3_result_error_code(p_ctx, rc);
+                }
+                rc
+            }
         }
     }))
     .unwrap_or(SQLITE_ERROR)

@@ -4545,3 +4545,72 @@ fn flushed_reverse_scan_below_min_key_and_empty_full_compaction_reopen_do_not_pa
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     engine.compact().unwrap();
 }
+
+#[test]
+fn real_pk_negative_zero_preserves_sign_and_corrupt_rowid_fails_without_panic() {
+    let tmp = TempTestDir::new("neg_zero_and_corrupt_rowid");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k REAL PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    let mut ins = conn.prepare("INSERT INTO t VALUES (?1, ?2)").unwrap();
+    ins.execute(&[SqlValue::Float(-0.0), SqlValue::Integer(1)])
+        .unwrap();
+    drop(ins);
+
+    let rows = conn.query_all("SELECT k, v FROM t", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    match rows[0][0] {
+        SqlValue::Float(f) => {
+            assert_eq!(
+                f.to_bits(),
+                (-0.0f64).to_bits(),
+                "Fast Path 2 must fall back to row_bytes so -0.0 retains negative sign"
+            );
+        }
+        ref other => panic!("expected Float(-0.0), got {other:?}"),
+    }
+    let lookup_rows = conn
+        .query_all("SELECT k, v FROM t WHERE k = 0.0", &[])
+        .unwrap();
+    assert_eq!(lookup_rows.len(), 1);
+    match lookup_rows[0][0] {
+        SqlValue::Float(f) => assert_eq!(f.to_bits(), (-0.0f64).to_bits()),
+        ref other => panic!("expected Float(-0.0) on k = 0.0 lookup, got {other:?}"),
+    }
+
+    // Corrupt 2-column row bytes must fail `project_column_zero_copy` cleanly (SQLITE_CORRUPT)
+    // instead of slicing out of bounds or masking corruption as SQLITE_ERROR.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(table_id=2, columns='k INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+    {
+        let mut eng = engine.write().unwrap();
+        let corrupt_row = vec![2u8, 0, 0, 0, 1, 14, 0, 0, 0, 3, 22, 0, 0, 0];
+        eng.put_row(
+            2,
+            &encode_i64_tagged_key(1),
+            &corrupt_row,
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    }
+    let err = conn
+        .query_all("SELECT k, v FROM u", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.to_ascii_lowercase().contains("malformed")
+            || err.to_ascii_lowercase().contains("corrupt"),
+        "expected SQLITE_CORRUPT / malformed error, got: {err}"
+    );
+}

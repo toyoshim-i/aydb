@@ -228,40 +228,47 @@ pub fn format_sqlite_float_text(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
     }
-    let abs = f.abs();
-    if abs >= 1e15 || abs < 1e-4 {
-        let s = format!("{f:.14e}");
-        if let Some((mant, exp_str)) = s.split_once('e') {
-            let trimmed_mant = mant.trim_end_matches('0');
-            let mant_norm = if trimmed_mant.ends_with('.') {
-                format!("{trimmed_mant}0")
-            } else if !trimmed_mant.contains('.') {
-                format!("{trimmed_mant}.0")
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    // Round to 15 significant digits before choosing fixed vs scientific notation, matching
+    // SQLite's `%.15g` threshold (`-4 <= exp < 15` uses fixed point) on rounding boundaries.
+    let sci = format!("{:.14e}", f.abs());
+    let Some((mant_raw, exp_raw)) = sci.split_once('e') else {
+        return format!("{f}");
+    };
+    let exp: i32 = exp_raw.parse().unwrap_or(0);
+    let mut digits = String::with_capacity(16);
+    for b in mant_raw.bytes() {
+        if b != b'.' {
+            digits.push(b as char);
+        }
+    }
+    let sig = digits.trim_end_matches('0');
+    let sig = if sig.is_empty() { "0" } else { sig };
+    if (-4..15).contains(&exp) {
+        if exp < 0 {
+            let zeros = (-exp - 1) as usize;
+            format!("{sign}0.{}{sig}", "0".repeat(zeros))
+        } else {
+            let int_digits = (exp + 1) as usize;
+            if sig.len() <= int_digits {
+                format!("{sign}{sig}{}.0", "0".repeat(int_digits - sig.len()))
             } else {
-                trimmed_mant.to_string()
-            };
-            let exp: i32 = exp_str.parse().unwrap_or(0);
-            let sign = if exp >= 0 { '+' } else { '-' };
-            let abs_exp = exp.unsigned_abs();
-            if abs_exp < 100 {
-                return format!("{mant_norm}e{sign}{abs_exp:02}");
-            } else {
-                return format!("{mant_norm}e{sign}{abs_exp}");
+                format!("{sign}{}.{}", &sig[..int_digits], &sig[int_digits..])
             }
         }
-        return s;
-    }
-    if f.fract() == 0.0 {
-        return format!("{f:.1}");
-    }
-    let log10 = abs.log10().floor() as i32;
-    let frac_digits = (14 - log10).clamp(1, 18) as usize;
-    let formatted = format!("{f:.frac_digits$}");
-    let trimmed = formatted.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        format!("{trimmed}0")
     } else {
-        trimmed.to_string()
+        let mant = if sig.len() == 1 {
+            format!("{sig}.0")
+        } else {
+            format!("{}.{}", &sig[..1], &sig[1..])
+        };
+        let exp_sign = if exp >= 0 { '+' } else { '-' };
+        let abs_exp = exp.unsigned_abs();
+        if abs_exp < 100 {
+            format!("{sign}{mant}e{exp_sign}{abs_exp:02}")
+        } else {
+            format!("{sign}{mant}e{exp_sign}{abs_exp}")
+        }
     }
 }
 
@@ -312,14 +319,26 @@ pub fn encode_canonical_numeric_key_from_f64(v: f64) -> Vec<u8> {
     }
 }
 
+/// True when `key` is the canonical 17-byte float zero (`[KEY_TAG_INTEGER, +0, 0]`), which
+/// collapses `-0.0` and `+0.0` so callers needing `-0.0`'s sign must read from `row_bytes`.
+#[inline]
+pub(super) fn is_canonical_float_zero_key(key: &[u8]) -> bool {
+    key.len() == 17
+        && key[0] == KEY_TAG_INTEGER
+        && key[1..9] == encode_i64_memcomparable(0)
+        && key[9..17] == [0u8; 8]
+}
+
 /// Encodes an IEEE-754 `f64` into an 8-byte order-preserving big-endian representation:
-/// - Normalizes `-0.0` to `+0.0`.
+/// - Normalizes `-0.0` to `+0.0` and any `NaN` bit pattern (including `-NaN`) to canonical `f64::NAN`.
 /// - Positive/zero floats (`sign bit == 0`) flip the sign bit (`bits ^ (1 << 63)`).
 /// - Negative floats (`sign bit == 1`) flip all 64 bits (`!bits`).
 #[inline]
 pub fn encode_f64_memcomparable(v: f64) -> [u8; 8] {
     let bits = if v == 0.0 {
         0.0f64.to_bits()
+    } else if v.is_nan() {
+        f64::NAN.to_bits()
     } else {
         v.to_bits()
     };
@@ -1015,25 +1034,28 @@ unsafe fn result_bytes(ctx: *mut sqlite3_context, payload: &[u8], is_text: bool)
 /// Projects a type-tagged primary key slice directly into `ctx` (`sqlite3_result_*`) with
 /// zero heap allocation and exact byte preservation (including invalid UTF-8 `TEXT` keys).
 ///
-/// Returns `false` if `key` is malformed or has an unknown tag.
+/// Returns `Err(ErrorKind::InvalidData)` if `key` is malformed or has an unknown tag, or
+/// `Err(ErrorKind::FileTooLarge)` (after invoking `sqlite3_result_error_toobig`) if a `TEXT` or
+/// `BLOB` key exceeds `i32::MAX` bytes.
 ///
 /// # Safety
 /// `ctx` must be a valid non-null `*mut sqlite3_context`.
 #[inline]
-pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> bool {
+pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> io::Result<()> {
+    let invalid = || io::Error::new(ErrorKind::InvalidData, "malformed primary key bytes");
     let Some((&tag, payload)) = key.split_first() else {
-        return false;
+        return Err(invalid());
     };
     unsafe {
         match tag {
             KEY_TAG_NULL if payload.is_empty() => {
                 sqlite3_result_null(ctx);
-                true
+                Ok(())
             }
             KEY_TAG_INTEGER if payload.len() == 8 => {
                 let arr: [u8; 8] = payload.try_into().unwrap();
                 sqlite3_result_int64(ctx, decode_i64_memcomparable(arr));
-                true
+                Ok(())
             }
             KEY_TAG_INTEGER if payload.len() == 16 => {
                 let q_arr: [u8; 8] = payload[0..8].try_into().unwrap();
@@ -1044,22 +1066,32 @@ pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> bo
                     decode_f64_memcomparable(r_arr)
                 };
                 sqlite3_result_double(ctx, f);
-                true
+                Ok(())
             }
             KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 if payload.len() == 8 => {
                 let arr: [u8; 8] = payload.try_into().unwrap();
                 sqlite3_result_double(ctx, decode_f64_memcomparable(arr));
-                true
+                Ok(())
             }
             KEY_TAG_TEXT => {
-                let _ = result_bytes(ctx, payload, true);
-                true
+                if !result_bytes(ctx, payload, true) {
+                    return Err(io::Error::new(
+                        ErrorKind::FileTooLarge,
+                        "Text key exceeds i32::MAX bytes",
+                    ));
+                }
+                Ok(())
             }
             KEY_TAG_BLOB => {
-                let _ = result_bytes(ctx, payload, false);
-                true
+                if !result_bytes(ctx, payload, false) {
+                    return Err(io::Error::new(
+                        ErrorKind::FileTooLarge,
+                        "Blob key exceeds i32::MAX bytes",
+                    ));
+                }
+                Ok(())
             }
-            _ => false,
+            _ => Err(invalid()),
         }
     }
 }
@@ -1137,6 +1169,15 @@ fn stored_column(row: &[u8], index: usize) -> io::Result<StoredColumn<'_>> {
     }
 }
 
+/// Reads column `col_idx` from `row` when stored as an 8-byte `INTEGER`, validating the row
+/// header, directory, and column payload bounds first.
+pub(super) fn read_stored_i64_column(row: &[u8], col_idx: usize) -> io::Result<Option<i64>> {
+    match stored_column(row, col_idx)? {
+        StoredColumn::Integer(v) => Ok(Some(v)),
+        _ => Ok(None),
+    }
+}
+
 /// Projects column `col_idx` from `row_bytes` directly into `ctx` (`sqlite3_result_*`) with
 /// **zero Rust heap allocations** (`0` `String` / `Vec` allocations)!
 ///
@@ -1155,13 +1196,13 @@ pub unsafe fn project_column_zero_copy(
             StoredColumn::Float(v) => sqlite3_result_double(ctx, v),
             StoredColumn::Text(bytes) if !result_bytes(ctx, bytes, true) => {
                 return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
+                    ErrorKind::FileTooLarge,
                     "Text column exceeds i32::MAX bytes",
                 ));
             }
             StoredColumn::Blob(bytes) if !result_bytes(ctx, bytes, false) => {
                 return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
+                    ErrorKind::FileTooLarge,
                     "Blob column exceeds i32::MAX bytes",
                 ));
             }
@@ -1477,11 +1518,38 @@ mod tests {
             );
         }
 
+        // Positive and negative NaN patterns normalize identically and sort strictly after +Inf.
+        assert_eq!(
+            encode_f64_memcomparable(-f64::NAN),
+            encode_f64_memcomparable(f64::NAN)
+        );
+        assert!(encode_f64_memcomparable(f64::INFINITY) < encode_f64_memcomparable(-f64::NAN));
+        assert_eq!(
+            SqlValue::Float(-f64::NAN).to_key_bytes(),
+            SqlValue::Float(f64::NAN).to_key_bytes()
+        );
+        assert!(
+            SqlValue::Float(f64::INFINITY).to_key_bytes()
+                < SqlValue::Float(-f64::NAN).to_key_bytes()
+        );
+
         // format_sqlite_float_text matches SQLite's %.15g / %!.15g formatting
         assert_eq!(format_sqlite_float_text(0.0), "0.0");
         assert_eq!(format_sqlite_float_text(-0.0), "0.0");
         assert_eq!(format_sqlite_float_text(42.0), "42.0");
         assert_eq!(format_sqlite_float_text(-1.5), "-1.5");
+        assert_eq!(
+            format_sqlite_float_text(123_456_789_012_345.5),
+            "123456789012346.0"
+        );
+        assert_eq!(
+            format_sqlite_float_text(100_000_000_000_000.5),
+            "100000000000000.0"
+        );
+        assert_eq!(format_sqlite_float_text(999_999_999_999_999.9), "1.0e+15");
+        assert_eq!(format_sqlite_float_text(-999_999_999_999_999.9), "-1.0e+15");
+        assert_eq!(format_sqlite_float_text(9.999_999_999_999_999e-5), "0.0001");
+        assert_eq!(format_sqlite_float_text(1e-5), "1.0e-05");
         assert_eq!(format_sqlite_float_text(1e20), "1.0e+20");
         assert_eq!(format_sqlite_float_text(1.25e20), "1.25e+20");
         assert_eq!(format_sqlite_float_text(-1e-20), "-1.0e-20");
@@ -1676,5 +1744,20 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidData
         );
+
+        // `read_stored_i64_column` rejects truncated/overflowed integer directories safely.
+        assert_eq!(
+            read_stored_i64_column(&make_row(1, 9, &[1, 2, 3]), 0)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_stored_i64_column(&make_row(1, u32::MAX - 2, &[]), 0)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(read_stored_i64_column(&valid_row, 0).unwrap(), None);
     }
 }
