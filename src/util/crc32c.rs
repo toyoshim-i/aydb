@@ -407,7 +407,7 @@ unsafe fn crc32c_sse42(crc: u32, mut data: &[u8]) -> u32 {
         c = c64 as u32;
     }
 
-    if data.len() >= 4 {
+    while data.len() >= 4 {
         let word = unsafe { (data.as_ptr() as *const u32).read_unaligned().to_le() };
         c = _mm_crc32_u32(c, word);
         data = &data[4..];
@@ -651,6 +651,21 @@ mod tests {
                 let combined = crc32c_append(part1, &slice[split..]);
                 assert_eq!(combined, hw, "incremental mismatch at len={len}");
             }
+        }
+    }
+
+    #[test]
+    fn sub_stripe_and_sector_lengths_match_software_crc32c() {
+        let buf: Vec<u8> = (0..4096usize)
+            .map(|i| (i.wrapping_mul(29).wrapping_add(7) & 0xFF) as u8)
+            .collect();
+        for len in (0..=512).chain([4092, 4096]) {
+            let slice = &buf[..len];
+            assert_eq!(
+                crc32c(slice),
+                crc32c_software(0, slice),
+                "CRC32C mismatch at len={len}"
+            );
         }
     }
 }
