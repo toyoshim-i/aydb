@@ -9168,3 +9168,66 @@ fn poison_guards_block_zero_record_prepared_tx_savepoints_and_dropped_leader() {
     assert!(engine.savepoint_for_conn(1, 1).is_err());
     assert!(engine.statement_savepoint_for_conn(1, 1).is_err());
 }
+
+#[test]
+fn empty_pk_resume_key_and_mem_only_prepopulated_limit_behave_consistently() {
+    let tmp = TempTestDir::new("scan_empty_pk_and_limit");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    for (pk, val) in [
+        (b"" as &[u8], b"v_empty" as &[u8]),
+        (b"\x00", b"v_zero"),
+        (b"a", b"v_a"),
+    ] {
+        engine
+            .put_row(1, pk, val, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+
+    // Check both Mem-only path and segment-merged path.
+    for flushed in [false, true] {
+        if flushed {
+            engine.flush_memtable().unwrap();
+        }
+        let mut pks = Vec::new();
+        let mut slab = Vec::new();
+        let mut spans = Vec::new();
+        engine
+            .scan_range_into_slab(
+                1, None, None, false, 1, false, &mut pks, &mut slab, &mut spans, None,
+            )
+            .unwrap();
+        assert_eq!(spans.len(), 1, "flushed={flushed}");
+        assert_eq!(&slab[spans[0].0..spans[0].1], b"v_empty");
+        assert_eq!(
+            pks,
+            vec![Vec::<u8>::new()],
+            "empty-PK resume key must be preserved (flushed={flushed})"
+        );
+
+        // Resume exclusively past empty PK and append into pre-populated slab/spans/pks.
+        let last_pk = pks.pop().unwrap();
+        engine
+            .scan_range_into_slab(
+                1,
+                Some((&last_pk, false)),
+                None,
+                false,
+                1,
+                false,
+                &mut pks,
+                &mut slab,
+                &mut spans,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            spans.len(),
+            2,
+            "limit=1 on pre-populated output must append 1 new row (flushed={flushed})"
+        );
+        assert_eq!(&slab[spans[1].0..spans[1].1], b"v_zero");
+        assert_eq!(pks, vec![b"\x00".to_vec()]);
+    }
+}

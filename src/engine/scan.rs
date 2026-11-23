@@ -320,6 +320,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Lazy dereference cannot skip a row once the cursor has emitted it, so tables whose
         // corrupt rows must vanish (`CorruptPolicy::Evict`) verify blobs eagerly during the scan.
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
+        let start_pks = pks_out.len();
+        let start_spans = spans_out.len();
 
         if self.idx_segments_for(cx.src).is_empty() && !reverse {
             let Some(range) =
@@ -328,6 +330,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Ok(());
             };
             let mut last_pk_buf: Vec<u8> = Vec::new();
+            let mut have_last_pk = false;
             for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
                 if !range.in_upper_and_prefix(k) {
                     break;
@@ -335,7 +338,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if keys_only {
                     if !matches!(entry.value, IndexValue::Tombstone) {
                         pks_out.push(k[3..].to_vec());
-                        if pks_out.len() >= limit {
+                        if pks_out.len() - start_pks >= limit {
                             break;
                         }
                     }
@@ -352,8 +355,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         } else {
                             last_pk_buf.clear();
                             last_pk_buf.extend_from_slice(&k[3..]);
+                            have_last_pk = true;
                         }
-                        if spans_out.len() >= limit {
+                        if spans_out.len() - start_spans >= limit {
                             break;
                         }
                     }
@@ -362,7 +366,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             spans_out.push((0, 0));
                             lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, ptr)));
                             pks_out.push(k[3..].to_vec());
-                            if spans_out.len() >= limit {
+                            if spans_out.len() - start_spans >= limit {
                                 break;
                             }
                         } else {
@@ -375,8 +379,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 } else {
                                     last_pk_buf.clear();
                                     last_pk_buf.extend_from_slice(&k[3..]);
+                                    have_last_pk = true;
                                 }
-                                if spans_out.len() >= limit {
+                                if spans_out.len() - start_spans >= limit {
                                     break;
                                 }
                             }
@@ -385,13 +390,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     IndexValue::Tombstone => {}
                 }
             }
-            if !keys_only && lazy_blobs_out.is_none() && !last_pk_buf.is_empty() {
+            if !keys_only && lazy_blobs_out.is_none() && have_last_pk {
                 pks_out.push(last_pk_buf);
             }
             return Ok(());
         }
 
         let mut last_pk_buf: Vec<u8> = Vec::new();
+        let mut have_last_pk = false;
         let mut emit_entry = |key: &[u8], _lsn: u64, val: MergedValueRef<'_>| -> io::Result<bool> {
             if key.len() < 3 || !key.starts_with(&prefix) {
                 return Ok(false);
@@ -411,6 +417,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     } else {
                         last_pk_buf.clear();
                         last_pk_buf.extend_from_slice(&key[3..]);
+                        have_last_pk = true;
                     }
                     Ok(true)
                 }
@@ -430,6 +437,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             } else {
                                 last_pk_buf.clear();
                                 last_pk_buf.extend_from_slice(&key[3..]);
+                                have_last_pk = true;
                             }
                             Ok(true)
                         } else {
@@ -464,7 +472,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             )?;
         }
 
-        if !keys_only && lazy_blobs_out.is_none() && !last_pk_buf.is_empty() {
+        if !keys_only && lazy_blobs_out.is_none() && have_last_pk {
             pks_out.push(last_pk_buf);
         }
         Ok(())
@@ -733,6 +741,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         else {
             return;
         };
+        let mut emitted = 0usize;
         for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
             if !range.in_upper_and_prefix(k) {
                 break;
@@ -744,7 +753,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 pks_out.push(pk.to_vec());
                 last_sec_key_buf.clear();
                 last_sec_key_buf.extend_from_slice(k);
-                if pks_out.len() >= limit {
+                emitted += 1;
+                if emitted >= limit {
                     break;
                 }
             }
@@ -782,6 +792,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.ensure_all_flushed_cx(cx)?;
         }
 
+        let start_pks = pks_out.len();
+        let start_spans = spans_out.len();
         let mut last_sec_key_buf: Vec<u8> = Vec::new();
 
         if keys_only {
@@ -819,7 +831,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     },
                 )?;
             }
-            if pks_out.len() >= limit && !last_sec_key_buf.is_empty() {
+            if pks_out.len() - start_pks >= limit && !last_sec_key_buf.is_empty() {
                 return Ok(Some(last_sec_key_buf));
             }
             return Ok(None);
@@ -828,8 +840,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut cur_seek_owned: Option<Vec<u8>> = None;
         let mut batch_pks: Vec<Vec<u8>> = Vec::with_capacity(limit.min(256));
 
-        while spans_out.len() < limit {
-            let batch_need = limit - spans_out.len();
+        while spans_out.len() - start_spans < limit {
+            let batch_need = limit - (spans_out.len() - start_spans);
             batch_pks.clear();
             let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
 
@@ -886,7 +898,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if scanned_count < batch_need {
                 return Ok(None);
             }
-            if spans_out.len() >= limit {
+            if spans_out.len() - start_spans >= limit {
                 return Ok(Some(last_sec_key_buf));
             }
             cur_seek_owned = Some(last_sec_key_buf.clone());
