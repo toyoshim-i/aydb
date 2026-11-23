@@ -1403,6 +1403,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .unwrap_or(true)
     }
 
+    pub(super) fn has_pending_corrupt_evictions_for_table(&self, table_id: u16) -> bool {
+        self.pending_corrupt_evictions
+            .lock()
+            .map(|pending| pending.keys().any(|&(tid, _)| tid == table_id))
+            .unwrap_or(true)
+    }
+
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
     }

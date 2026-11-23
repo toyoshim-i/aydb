@@ -966,12 +966,15 @@ fn connect_table(
         Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
         None => eng.reset_table_inline_threshold(table_id),
     }
-    let unique_ready = unique_def.is_empty()
-        || eng
-            .unique_marker_view(crate::engine::ReadView::Committed, table_id)
-            .ok()
-            .flatten()
-            .is_some_and(|found| found == unique_def.marker_value());
+    let existing_marker = eng
+        .unique_marker_view(crate::engine::ReadView::Committed, table_id)
+        .ok()
+        .flatten();
+    let unique_ready = if unique_def.is_empty() {
+        existing_marker.is_none()
+    } else {
+        existing_marker.is_some_and(|found| found == unique_def.marker_value())
+    };
     Ok(Some(Connected {
         table_id,
         reg_token,
@@ -2919,6 +2922,27 @@ unsafe extern "system" fn vtab_update(
             set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
             return SQLITE_ERROR;
         }
+        // When `xBegin` skipped migration (for example because the connection held a read snapshot
+        // before upgrading to write), remove any stale UNIQUE completion marker transactionally now
+        // so removing all UNIQUE constraints cannot leave an obsolete marker behind.
+        if vtab.unique_def.is_empty() && !vtab.unique_ready.load(Ordering::Acquire) {
+            match eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id) {
+                Ok(Some(_)) => {
+                    if let Err(e) = eng.remove_unique_marker(vtab.table_id, vtab.durability) {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                    if !eng.in_active_transaction() {
+                        vtab.unique_ready.store(true, Ordering::Release);
+                    }
+                }
+                Ok(None) => {
+                    if !eng.in_active_transaction() {
+                        vtab.unique_ready.store(true, Ordering::Release);
+                    }
+                }
+                Err(e) => return io_err_to_sqlite_rc(&e),
+            }
+        }
 
         let needs_synthetic_delete_check =
             |pk: &[u8]| -> bool { !(vtab.pk_rowid_alias && decode_i64_tagged_key(pk).is_some()) };
@@ -3449,6 +3473,7 @@ fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
     };
     let params = unique_migration::Params {
         table_id: vtab.table_id,
+        vtab_token: Some((vtab.reg_token, vtab.db as usize)),
         durability: vtab.durability,
         def: &vtab.unique_def,
         chunk_rows: unique_migration::CHUNK_ROWS,

@@ -3279,6 +3279,7 @@ fn power_cut_during_unique_index_migration_resumes_to_an_exact_index() {
         fs.arm(cut.map(|c| start + c), None);
         let params = Params {
             table_id: 1,
+            vtab_token: None,
             durability: sync,
             def: &def,
             chunk_rows: 4,

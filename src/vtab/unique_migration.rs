@@ -33,6 +33,9 @@ pub(crate) const ROWS_PER_BEGIN: usize = 8 * CHUNK_ROWS;
 
 pub(crate) struct Params<'a> {
     pub table_id: u16,
+    /// Optional live holder check `(reg_token, conn_id)`; stops migration if the vtab was dropped
+    /// or replaced between chunk locks.
+    pub vtab_token: Option<(u64, usize)>,
     /// Durability of the completion marker. Chunks are always buffered.
     pub durability: WriteDurability,
     pub def: &'a UniqueDef,
@@ -59,7 +62,8 @@ pub(crate) fn migrate<FS: PlatformFs>(
     p: &Params<'_>,
     cursor: &mut Option<Vec<u8>>,
 ) -> Outcome {
-    let want = p.def.marker_value();
+    let empty_def = p.def.is_empty();
+    let want = (!empty_def).then(|| p.def.marker_value());
     let mut done = 0usize;
     loop {
         let Ok(mut eng) = engine.write() else {
@@ -70,11 +74,27 @@ pub(crate) fn migrate<FS: PlatformFs>(
         if eng.in_active_transaction() {
             return Outcome::Skipped;
         }
+        if let Some((reg_token, conn_id)) = p.vtab_token {
+            if !eng.is_vtab_token_active(p.table_id, reg_token, conn_id) {
+                return Outcome::Skipped;
+            }
+        }
         if let Err(e) = eng.drain_group_for_autocommit() {
             return Outcome::Failed(e);
         }
+        if empty_def {
+            return match eng.unique_marker_view(ReadView::Committed, p.table_id) {
+                Ok(None) => Outcome::Complete,
+                Ok(Some(_)) => match eng.remove_unique_marker(p.table_id, p.durability) {
+                    Ok(()) => Outcome::Complete,
+                    Err(e) => Outcome::Failed(e),
+                },
+                Err(e) => Outcome::Failed(e),
+            };
+        }
+        let want = want.as_ref().expect("non-empty unique def has a marker");
         match eng.unique_marker_view(ReadView::Committed, p.table_id) {
-            Ok(Some(found)) if found == want => return Outcome::Complete,
+            Ok(Some(found)) if found == *want => return Outcome::Complete,
             Ok(Some(_)) => {
                 // Built for another definition: stop trusting it before touching the entries.
                 if let Err(e) = eng.remove_unique_marker(p.table_id, WriteDurability::BufferedFast)
@@ -88,6 +108,9 @@ pub(crate) fn migrate<FS: PlatformFs>(
         }
         if done >= p.budget_rows {
             return Outcome::Incomplete;
+        }
+        if let Err(e) = eng.drain_corrupt_evictions() {
+            return Outcome::Failed(e);
         }
         let batch = eng.scan_table_batch(
             p.table_id,
@@ -121,7 +144,7 @@ pub(crate) fn migrate<FS: PlatformFs>(
                     return Outcome::Failed(e);
                 }
                 return match eng.unique_marker_view(ReadView::Committed, p.table_id) {
-                    Ok(Some(found)) if found == want => Outcome::Complete,
+                    Ok(Some(found)) if found == *want => Outcome::Complete,
                     Ok(_) => Outcome::Failed(io::Error::other("UNIQUE index marker not visible")),
                     Err(e) => Outcome::Failed(e),
                 };

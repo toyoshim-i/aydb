@@ -141,6 +141,7 @@ fn a_synchronous_migration_syncs_once_regardless_of_row_count() {
         let before = counter.load(Ordering::SeqCst);
         let params = Params {
             table_id: 1,
+            vtab_token: None,
             durability,
             def: &def,
             chunk_rows: 8,
@@ -497,6 +498,7 @@ fn writers_between_chunks_keep_the_index_exact() {
         let def = UniqueDef::new(vec![(1, ColCollation::Binary, ColumnAffinity::Text)]);
         let params = Params {
             table_id: 2,
+            vtab_token: None,
             durability: WriteDurability::BufferedFast,
             def: &def,
             chunk_rows: 4,
@@ -553,6 +555,7 @@ fn another_connections_transaction_makes_the_migration_stand_aside() {
     let def = std_def();
     let params = Params {
         table_id: 1,
+        vtab_token: None,
         durability: WriteDurability::BufferedFast,
         def: &def,
         chunk_rows: 5,
@@ -672,6 +675,7 @@ fn migrate_after_pending_group_commit_preserves_new_unique_entry() {
 
     let params = Params {
         table_id: 1,
+        vtab_token: None,
         durability: WriteDurability::SyncTransactional,
         def: &def,
         chunk_rows: 16,
@@ -860,6 +864,7 @@ fn unique_migration_chunk_commits_in_single_wal_batch_and_recovers() {
         let lsn_before = engine.read().unwrap().next_lsn();
         let params = Params {
             table_id: 1,
+            vtab_token: None,
             durability: WriteDurability::SyncTransactional,
             def: &def,
             chunk_rows: 512,
@@ -939,5 +944,242 @@ fn reconcile_unique_keys_batch_splits_sub_batches_cleanly_on_small_wal_ring() {
     assert!(
         (2..10).contains(&batches),
         "expected a few bounded sub-batches on 32 KB WAL ring, got {batches}"
+    );
+}
+
+#[test]
+fn stale_vtab_token_skips_migration_without_touching_replacement_table() {
+    let fx = legacy_fixture("unique_mig_stale_token", "");
+    legacy_table(&fx, 10);
+
+    let (old_token, _conn_id) = {
+        let mut eng = fx.engine.write().unwrap();
+        let plan = eng.plan_vtab_registration("t_old", Some(2)).unwrap();
+        let (tid, tok) = eng
+            .register_vtab_plan(plan, WriteDurability::BufferedFast, None)
+            .unwrap();
+        assert_eq!(tid, 2);
+        for i in 0..8 {
+            let pk = SqlValue::Text(format!("p{i:02}")).to_key_bytes();
+            let row = encode_row(&[
+                SqlValue::Text(format!("p{i:02}")),
+                SqlValue::Text(format!("a{i:02}")),
+                SqlValue::Integer(i as i64),
+                SqlValue::Text(format!("N{i:02}")),
+                SqlValue::Text("c".into()),
+            ]);
+            eng.put_row(2, &pk, &row, &[], WriteDurability::BufferedFast)
+                .unwrap();
+        }
+        (tok, 0usize)
+    };
+
+    let def = std_def();
+    // Invalid/unregistered token must skip cleanly.
+    let stale_params = Params {
+        table_id: 2,
+        vtab_token: Some((old_token.wrapping_add(999), 0xDEADusize)),
+        durability: WriteDurability::BufferedFast,
+        def: &def,
+        chunk_rows: 3,
+        budget_rows: 3,
+    };
+    let mut cursor = None;
+    assert!(matches!(
+        unique_migration::migrate(&fx.engine, &stale_params, &mut cursor),
+        Outcome::Skipped
+    ));
+    assert!(marker_of(&fx.engine, 2).is_none());
+    assert!(
+        fx.engine
+            .read()
+            .unwrap()
+            .test_live_entry_keys(2)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Dropping and recreating `table_id = 2` between chunks invalidates `old_token`, so
+    // `migrate` returns `Outcome::Skipped` without mutating the replacement table's index.
+    let active_params = Params {
+        table_id: 2,
+        vtab_token: Some((old_token, 0xCAFEusize)),
+        durability: WriteDurability::BufferedFast,
+        def: &def,
+        chunk_rows: 3,
+        budget_rows: 3,
+    };
+    let mut cursor = None;
+    assert!(matches!(
+        unique_migration::migrate(&fx.engine, &active_params, &mut cursor),
+        Outcome::Incomplete
+    ));
+    {
+        let mut eng = fx.engine.write().unwrap();
+        eng.drop_table(2, Some("t_old")).unwrap();
+        let plan = eng.plan_vtab_registration("t_new", Some(2)).unwrap();
+        eng.register_vtab_plan(plan, WriteDurability::BufferedFast, None)
+            .unwrap();
+        let pk = SqlValue::Text("r0".into()).to_key_bytes();
+        let row = encode_row(&[
+            SqlValue::Text("r0".into()),
+            SqlValue::Text("ra0".into()),
+            SqlValue::Integer(0),
+            SqlValue::Text("RN0".into()),
+            SqlValue::Text("c".into()),
+        ]);
+        eng.put_row(2, &pk, &row, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    assert!(matches!(
+        unique_migration::migrate(&fx.engine, &active_params, &mut cursor),
+        Outcome::Skipped
+    ));
+    assert!(marker_of(&fx.engine, 2).is_none());
+    assert!(
+        fx.engine
+            .read()
+            .unwrap()
+            .test_live_entry_keys(2)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn removing_all_unique_columns_clears_marker_across_autocommit_and_snapshot_upgrade() {
+    for snapshot_upgrade in [false, true] {
+        let dir = TempTestDir::new(&format!("unique_mig_clear_marker_{snapshot_upgrade}"));
+        let engine = open_engine(&dir);
+        let connect_cols = |columns: &str| {
+            let conn = SqliteConnection::open_in_memory().unwrap();
+            conn.register_aydb_module_with_options(engine.clone(), false)
+                .unwrap();
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE u USING aydb(table_id=2, columns='{columns}')"
+            ))
+            .unwrap();
+            conn
+        };
+
+        let first = connect_cols("k TEXT PRIMARY KEY, a TEXT UNIQUE");
+        first
+            .execute_batch("INSERT INTO u VALUES('k1','dup')")
+            .unwrap();
+        assert!(marker_of(&engine, 2).is_some());
+        drop(first);
+
+        let no_unique = connect_cols("k TEXT PRIMARY KEY, a TEXT");
+        if snapshot_upgrade {
+            // Snapshot write-upgrade skips `migrate_unique_index_before_begin`, so `vtab_update`
+            // removes the marker transactionally; rolling back must keep the stale marker intact.
+            no_unique
+                .execute_batch(
+                    "BEGIN; SELECT * FROM u; INSERT INTO u VALUES('k_rb','dup'); ROLLBACK;",
+                )
+                .unwrap();
+            assert!(
+                marker_of(&engine, 2).is_some(),
+                "rolled-back snapshot write must not drop marker prematurely"
+            );
+            no_unique
+                .execute_batch("BEGIN; SELECT * FROM u; INSERT INTO u VALUES('k2','dup'); COMMIT;")
+                .unwrap();
+        } else {
+            no_unique
+                .execute_batch("INSERT INTO u VALUES('k2','dup')")
+                .unwrap();
+        }
+        assert!(
+            marker_of(&engine, 2).is_none(),
+            "stale UNIQUE marker must be removed once UNIQUE columns are removed"
+        );
+        drop(no_unique);
+
+        // Reconnecting with UNIQUE again must rebuild and enforce UNIQUE instead of trusting an
+        // obsolete marker.
+        let re_unique = connect_cols("k TEXT PRIMARY KEY, a TEXT UNIQUE");
+        assert!(
+            re_unique
+                .execute_batch("INSERT INTO u VALUES('k3','dup')")
+                .is_err(),
+            "UNIQUE violation must still be caught after marker cleanup and rebuild"
+        );
+        assert!(marker_of(&engine, 2).is_some());
+    }
+}
+
+#[test]
+fn reconcile_unique_keys_batch_skips_queued_corrupt_eviction_on_capped_table() {
+    use crate::engine::CorruptPolicy;
+
+    let dir = TempTestDir::new("unique_mig_capped_corrupt_evict");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    let mut eng = StorageEngine::open(fs, cfg.clone()).unwrap();
+    eng.register_capped_table(7, 1 << 20).unwrap();
+    eng.set_table_corrupt_policy(7, CorruptPolicy::Evict);
+
+    let pk1 = SqlValue::Text("k1".into()).to_key_bytes();
+    let pk2 = SqlValue::Text("k2".into()).to_key_bytes();
+    let val1 = vec![0xAAu8; 200];
+    let val2 = b"ok".to_vec();
+    eng.put_row(7, &pk1, &val1, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    eng.put_row(7, &pk2, &val2, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    eng.flush_memtable().unwrap();
+    let k2_only_bytes = (pk2.len() + val2.len()) as u64;
+    drop(eng);
+
+    // Corrupt `blob_lru` so reading `k1` under `CorruptPolicy::Evict` queues its eviction without
+    // deleting it yet.
+    let lru_blob = std::fs::read_dir(&dir.path)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("blob_lru_"))
+        })
+        .unwrap();
+    let mut bytes = std::fs::read(&lru_blob).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&lru_blob, bytes).unwrap();
+
+    let fs2 = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let mut eng = StorageEngine::open(fs2, cfg).unwrap();
+    eng.set_table_corrupt_policy(7, CorruptPolicy::Evict);
+    assert_eq!(eng.get_row(7, &pk1).unwrap(), None);
+    assert!(eng.has_pending_corrupt_evictions());
+
+    // Even if `batch_rows` already captured `(pk1, val1.len(), ...)`, `reconcile_unique_keys_batch`
+    // drains `k1` first and must cleanly skip it without failing capped-table metadata lookup or
+    // writing zombie UNIQUE entries.
+    let batch_rows = vec![
+        (pk1.clone(), val1.len(), vec![(0x8001u16, b"u1".to_vec())]),
+        (pk2.clone(), val2.len(), vec![(0x8001u16, b"u2".to_vec())]),
+    ];
+    let updated = eng
+        .reconcile_unique_keys_batch(7, &batch_rows, WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(updated, 1);
+    assert!(!eng.has_pending_corrupt_evictions());
+    assert!(
+        eng.lookup_by_secondary_index(7, 0x8001, b"u1")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(eng.test_row_meta(7, &pk1).unwrap().is_none());
+    assert_eq!(
+        eng.lookup_by_secondary_index(7, 0x8001, b"u2").unwrap(),
+        vec![pk2.clone()]
+    );
+    assert!(eng.test_row_meta(7, &pk2).unwrap().is_some());
+    assert_eq!(
+        eng.capped_table_state(7).unwrap().current_logical_bytes,
+        k2_only_bytes
     );
 }

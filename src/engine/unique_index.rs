@@ -336,6 +336,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<usize> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
+        let drained_for_table =
+            self.tx_depth == 0 && self.has_pending_corrupt_evictions_for_table(table_id);
         self.drain_corrupt_evictions()?;
         if rows.is_empty() {
             return Ok(0);
@@ -368,7 +370,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     desired,
                     may_have_meta,
                     is_capped,
-                    Some(*row_value_len),
+                    (!drained_for_table).then_some(*row_value_len),
                 )?
                 else {
                     continue;
