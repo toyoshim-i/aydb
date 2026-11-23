@@ -385,9 +385,13 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// `RingFull` WAL rotation checkpoint never catalogs uncommitted blob lengths ahead of the
     /// batch.
     pub(super) in_flight_autocommit_blob_starts: Vec<(BlobKind, u16, u64, u64)>,
-    /// Virtual-table pointers (`p_vtab as usize`) that joined the active SQLite transaction via
-    /// `xBegin` and have not yet reached `xSync`.
-    pub(super) tx_pending_sync_vtabs: Vec<usize>,
+    /// Virtual-table pointers (`p_vtab as usize`) participating in the active SQLite transaction
+    /// (`xBegin` or `xCreate`). Kept for the duration of the transaction so a `SQLITE_BUSY` retry
+    /// on `COMMIT` waits for all participating tables to reach `xSync` again.
+    pub(super) tx_vtabs: Vec<usize>,
+    /// Subset of [`Self::tx_vtabs`] that have already reached `xSync` during the current commit
+    /// attempt; cleared when all participating tables have synced or on new in-tx writes.
+    pub(super) tx_synced_vtabs: Vec<usize>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
@@ -1240,7 +1244,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             dropped_tables_in_tx: Vec::new(),
             vtabs_created_in_tx: Vec::new(),
             in_flight_autocommit_blob_starts: Vec::new(),
-            tx_pending_sync_vtabs: Vec::new(),
+            tx_vtabs: Vec::new(),
+            tx_synced_vtabs: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
             next_vtab_token: 1,
@@ -4135,6 +4140,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         "too many records in transaction",
                     )
                 })?;
+            if !self.tx_preparing {
+                self.tx_prepared = false;
+                self.tx_synced_vtabs.clear();
+            }
             self.pending_tx_bytes = next_tx_bytes;
             self.next_lsn = successor;
             if durability == WriteDurability::SyncTransactional {

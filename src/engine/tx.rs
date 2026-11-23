@@ -422,7 +422,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();
-            self.tx_pending_sync_vtabs.clear();
+            self.tx_vtabs.clear();
+            self.tx_synced_vtabs.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = None;
@@ -452,7 +453,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();
-            self.tx_pending_sync_vtabs.clear();
+            self.tx_vtabs.clear();
+            self.tx_synced_vtabs.clear();
             self.quotas_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = Some(conn_id);
@@ -468,7 +470,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Begins (or joins) the engine transaction for SQLite connection `conn_id` on behalf of
     /// virtual table `vtab_id`, keeping `tx_depth == 1` across multiple tables in one transaction
-    /// and tracking `vtab_id` until its `xSync` arrives.
+    /// and tracking `vtab_id` for `xSync`.
     pub(crate) fn begin_vtab_transaction(
         &mut self,
         conn_id: usize,
@@ -481,21 +483,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         }
-        if !self.tx_pending_sync_vtabs.contains(&vtab_id) {
-            self.tx_pending_sync_vtabs.push(vtab_id);
+        if !self.tx_vtabs.contains(&vtab_id) {
+            self.tx_vtabs.push(vtab_id);
+            self.tx_synced_vtabs.clear();
         }
         Ok(())
     }
 
-    /// Removes `vtab_id` from the active transaction's pending-sync list on disconnect.
-    pub(crate) fn detach_vtab_from_tx(&mut self, conn_id: usize, vtab_id: usize) {
-        if self.conn_has_open_transaction(conn_id) {
-            self.tx_pending_sync_vtabs.retain(|&id| id != vtab_id);
+    /// Registers an already-created `vtab_id` (`p_vtab as usize`) with the active transaction
+    /// owned by `conn_id` (used when `xCreate` adds a table without SQLite invoking `xBegin`).
+    pub(crate) fn attach_vtab_to_tx(&mut self, conn_id: usize, vtab_id: usize) {
+        if self.conn_has_open_transaction(conn_id) && !self.tx_vtabs.contains(&vtab_id) {
+            self.tx_vtabs.push(vtab_id);
+            self.tx_synced_vtabs.clear();
         }
     }
 
-    /// Records that `vtab_id` has reached `xSync` with `durability` and returns `true` when it is
-    /// the last participating virtual table (so this call should commit the engine transaction).
+    /// Removes `vtab_id` from the active transaction's participating tables on disconnect.
+    pub(crate) fn detach_vtab_from_tx(&mut self, conn_id: usize, vtab_id: usize) {
+        if self.conn_has_open_transaction(conn_id) {
+            self.tx_vtabs.retain(|&id| id != vtab_id);
+            self.tx_synced_vtabs.retain(|&id| id != vtab_id);
+        }
+    }
+
+    /// Records that `vtab_id` has reached `xSync` with `durability` and returns `true` when all
+    /// participating virtual tables have synced (clearing per-attempt sync progress so a
+    /// `SQLITE_BUSY` retry of `COMMIT` re-syncs every participating table).
     pub(crate) fn mark_vtab_synced_ready_to_commit(
         &mut self,
         vtab_id: usize,
@@ -504,8 +518,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if durability == WriteDurability::SyncTransactional {
             self.pending_tx_sync = true;
         }
-        self.tx_pending_sync_vtabs.retain(|&id| id != vtab_id);
-        self.tx_pending_sync_vtabs.is_empty()
+        if !self.tx_synced_vtabs.contains(&vtab_id) {
+            self.tx_synced_vtabs.push(vtab_id);
+        }
+        let all_synced = self
+            .tx_vtabs
+            .iter()
+            .all(|id| self.tx_synced_vtabs.contains(id));
+        if all_synced {
+            self.tx_synced_vtabs.clear();
+        }
+        all_synced
     }
 
     /// Whether `conn_id` has a transaction open in the engine (it has written since `BEGIN`).
@@ -579,6 +602,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         self.check_not_poisoned()?;
+        let need_sync_upgrade =
+            durability == WriteDurability::SyncTransactional && !self.pending_tx_sync;
+        if self.tx_prepared && !need_sync_upgrade {
+            return Ok(());
+        }
         if durability == WriteDurability::SyncTransactional {
             self.pending_tx_sync = true;
         }
@@ -945,7 +973,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
         self.vtabs_created_in_tx.clear();
-        self.tx_pending_sync_vtabs.clear();
+        self.tx_vtabs.clear();
+        self.tx_synced_vtabs.clear();
         self.tx_start_meta = TxMetaSnapshot::default();
         self.commit_gate.tx_ended();
     }
@@ -1087,7 +1116,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.bump_table_epochs_from_overlay_map();
         self.tx_depth = 0;
         self.vtabs_created_in_tx.clear();
-        self.tx_pending_sync_vtabs.clear();
+        self.tx_vtabs.clear();
+        self.tx_synced_vtabs.clear();
         self.tx_owner_conn = None;
         self.deferred_flush_on_commit = false;
         self.deferred_compact_on_commit = false;
@@ -1133,6 +1163,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// transaction's start (see [`Self::rollback_to_savepoint`]).
     pub fn savepoint(&mut self, sp_id: i32) {
         self.tx_prepared = false;
+        self.tx_synced_vtabs.clear();
         let mut implicit_tx = false;
         if self.tx_depth == 0 {
             self.begin_transaction();
@@ -1171,6 +1202,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.check_write_allowed_for_conn(conn_id)?;
         self.tx_prepared = false;
+        self.tx_synced_vtabs.clear();
         let mut implicit_tx = false;
         if self.tx_depth == 0 {
             self.begin_transaction();
@@ -1265,6 +1297,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.tx_prepared = false;
+        self.tx_synced_vtabs.clear();
         let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
             if self.savepoints.iter().any(|s| s.sp_id < sp_id) {
                 return Err(io::Error::new(

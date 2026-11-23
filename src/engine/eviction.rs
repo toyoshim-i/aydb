@@ -96,6 +96,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         } else if prev_max != Some(max_bytes) {
             self.quotas_modified_in_tx = true;
+            self.tx_prepared = false;
+            self.tx_synced_vtabs.clear();
         }
         Ok(())
     }

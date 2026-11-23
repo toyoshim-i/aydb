@@ -728,3 +728,147 @@ fn in_tx_drop_and_reused_table_id_preserves_live_capped_lru_blobs_on_commit() {
         }
     }
 }
+
+#[test]
+fn autocommit_create_under_read_lock_and_wal_sync_failure_rolls_back_atomically() {
+    let create_sql = "CREATE VIRTUAL TABLE t USING aydb(table_id=7, max_bytes=4096, durability='sync', columns='k INTEGER PRIMARY KEY, v BLOB')";
+
+    // (a) SHARED read lock (SQLITE_BUSY) must roll back both SQLite schema and aydb catalog/quota.
+    {
+        let mut fixture = Fixture::new("autocommit_create_lock");
+        let conn1 = fixture.open();
+        conn1
+            .execute_batch("CREATE TABLE n(a INT); INSERT INTO n VALUES (1);")
+            .unwrap();
+        let conn2 = fixture.open();
+        conn2.execute_batch("BEGIN; SELECT * FROM n;").unwrap();
+
+        let err = conn1
+            .execute_batch(create_sql)
+            .expect_err("autocommit CREATE under SHARED lock must fail with SQLITE_BUSY")
+            .to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("locked"),
+            "expected locked error, got: {err}"
+        );
+        conn2.execute_batch("COMMIT").unwrap();
+
+        assert!(
+            conn1
+                .query_all(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't'",
+                    &[],
+                )
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let engine_arc = fixture.engine();
+            let eng = engine_arc.read().unwrap();
+            assert!(
+                eng.capped_table_state_view(crate::engine::ReadView::Committed, 7)
+                    .is_none()
+            );
+            assert!(eng.active_vtab_name(7).is_none());
+        }
+
+        // Retrying the same CREATE after releasing the lock succeeds cleanly and persists.
+        conn1.execute_batch(create_sql).unwrap();
+        conn1
+            .execute_batch("INSERT INTO t VALUES (1, zeroblob(64))")
+            .unwrap();
+        drop(conn1);
+        drop(conn2);
+        fixture.restart();
+        let conn = fixture.open();
+        assert_eq!(
+            conn.query_all("SELECT k, length(v) FROM t", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(1), SqlValue::Integer(64)]]
+        );
+    }
+
+    // (b) WAL sync failure must poison the engine and roll back SQLite schema and aydb catalog/quota.
+    {
+        let mut fixture = Fixture::new("autocommit_create_wal_sync_fail");
+        let conn = fixture.open();
+        fixture.engine().read().unwrap().debug_fail_next_wal_sync();
+        let err = conn
+            .execute_batch(create_sql)
+            .expect_err("autocommit CREATE must report WAL sync failure")
+            .to_string();
+        assert!(
+            err.contains("injected WAL sync failure"),
+            "unexpected error: {err}"
+        );
+        assert!(fixture.engine().read().unwrap().is_poisoned());
+        assert!(tables(&conn).is_empty());
+
+        drop(conn);
+        fixture.restart();
+        assert!(
+            fixture
+                .engine()
+                .read()
+                .unwrap()
+                .capped_table_state_view(crate::engine::ReadView::Committed, 7)
+                .is_none()
+        );
+        let conn = fixture.open();
+        conn.execute_batch(create_sql).unwrap();
+        conn.execute_batch("INSERT INTO t VALUES (2, zeroblob(32))")
+            .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT k, length(v) FROM t", &[]).unwrap(),
+            vec![vec![SqlValue::Integer(2), SqlValue::Integer(32)]]
+        );
+    }
+}
+
+#[test]
+fn failed_create_inside_read_tx_preserves_read_snapshot_and_upgrade_check() {
+    let tmp = crate::util::test_util::TempTestDir::new("failed_create_read_snapshot");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, crate::engine::EngineConfig::default()).unwrap(),
+    ));
+    let conn1 = SqliteConnection::open_in_memory().unwrap();
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    let ddl =
+        "CREATE VIRTUAL TABLE t1 USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, v INT')";
+    for conn in [&conn1, &conn2] {
+        conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+        conn.execute_batch(ddl).unwrap();
+    }
+    conn1
+        .execute_batch("INSERT INTO t1 VALUES (1, 10)")
+        .unwrap();
+
+    conn1.execute_batch("BEGIN;").unwrap();
+    assert_eq!(ints(&conn1, "SELECT v FROM t1 WHERE k = 1"), [10]);
+
+    assert!(
+        conn1
+            .execute_batch(
+                "CREATE VIRTUAL TABLE bad USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, v INT')",
+            )
+            .is_err(),
+        "creating a second table bound to occupied table_id=1 must fail"
+    );
+
+    conn2
+        .execute_batch("UPDATE t1 SET v = 20 WHERE k = 1")
+        .unwrap();
+
+    // Failed CREATE must not discard conn1's active read snapshot or bypass stale write checks.
+    assert_eq!(ints(&conn1, "SELECT v FROM t1 WHERE k = 1"), [10]);
+    assert!(
+        conn1
+            .execute_batch("INSERT INTO t1 VALUES (2, 200)")
+            .is_err(),
+        "stale read snapshot must reject write upgrade after failed CREATE"
+    );
+
+    conn1.execute_batch("ROLLBACK;").unwrap();
+    assert_eq!(ints(&conn1, "SELECT v FROM t1 WHERE k = 1"), [20]);
+}

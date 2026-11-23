@@ -164,7 +164,7 @@ pub(super) unsafe extern "system" fn trace_reads(
 pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let trace = &*(context as *const ReadTrace);
-        trace.pending_ddl.commit_pending()
+        trace.pending_ddl.commit_pending(trace.database)
     }))
     .unwrap_or(1)
 }

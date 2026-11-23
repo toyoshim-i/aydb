@@ -456,3 +456,128 @@ fn multi_table_mixed_durability_tx_commits_once_in_xsync_and_reports_errors() {
         vec![vec![SqlValue::Integer(10)]]
     );
 }
+
+#[test]
+fn mixed_tx_commit_busy_preserves_open_tx_for_rollback_and_retry() {
+    let dir = TempTestDir::new("vtab_mixed_commit_busy");
+    let db_path = dir.path.join("mixed.sqlite");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = open_mixed_file_conn(&db_path, &engine);
+    let blocker = SqliteConnection::open_file(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE native_t(id INTEGER PRIMARY KEY, v TEXT);
+         CREATE VIRTUAL TABLE aydb_t USING aydb(table_id=1, durability='sync', columns='id INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+
+    // 1. SQLITE_BUSY on mixed COMMIT keeps both SQLite and aydb transactions open so further
+    //    writes still belong to the transaction and ROLLBACK aborts everything cleanly.
+    blocker
+        .execute_batch("BEGIN; SELECT * FROM native_t;")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO native_t VALUES (1, 'n1');
+         INSERT INTO aydb_t VALUES (1, 'a1');",
+    )
+    .unwrap();
+    let err = conn
+        .execute_batch("COMMIT")
+        .expect_err("mixed COMMIT under SHARED lock must fail with SQLITE_BUSY")
+        .to_string();
+    assert!(
+        err.to_ascii_lowercase().contains("locked"),
+        "expected locked error, got: {err}"
+    );
+    conn.execute_batch("INSERT INTO aydb_t VALUES (2, 'a2')")
+        .unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+    blocker.execute_batch("COMMIT").unwrap();
+    assert_mixed_tx_rolled_back(&conn, &blocker);
+
+    // 2. SQLITE_BUSY on mixed multi-aydb-table COMMIT followed by unlock + retry commits atomically.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE aydb_t2 USING aydb(table_id=2, durability='buffered', columns='id INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+    blocker
+        .execute_batch("BEGIN; SELECT * FROM native_t;")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO native_t VALUES (10, 'n10');
+         INSERT INTO aydb_t VALUES (10, 'a10');
+         INSERT INTO aydb_t2 VALUES (10, 'b10');",
+    )
+    .unwrap();
+    let err = conn
+        .execute_batch("COMMIT")
+        .expect_err("mixed multi-table COMMIT under SHARED lock must fail with SQLITE_BUSY")
+        .to_string();
+    assert!(
+        err.to_ascii_lowercase().contains("locked"),
+        "expected locked error, got: {err}"
+    );
+    blocker.execute_batch("COMMIT").unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM native_t ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(10), SqlValue::Text("n10".into())]]
+    );
+    assert_eq!(
+        blocker
+            .query_all("SELECT id, v FROM native_t ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(10), SqlValue::Text("n10".into())]]
+    );
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM aydb_t ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(10), SqlValue::Text("a10".into())]]
+    );
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM aydb_t2 ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(10), SqlValue::Text("b10".into())]]
+    );
+
+    // 3. BEGIN; CREATE VIRTUAL TABLE aydb_t3 ...; INSERT ...; COMMIT under SHARED lock -> ROLLBACK
+    //    leaves no table, quota, or live registration in SQLite or aydb.
+    blocker
+        .execute_batch("BEGIN; SELECT * FROM native_t;")
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN;
+         CREATE VIRTUAL TABLE aydb_t3 USING aydb(table_id=3, max_bytes=4096, durability='sync', columns='id INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO aydb_t3 VALUES (1, 'c1');",
+    )
+    .unwrap();
+    let err = conn
+        .execute_batch("COMMIT")
+        .expect_err("mixed CREATE+INSERT COMMIT under SHARED lock must fail with SQLITE_BUSY")
+        .to_string();
+    assert!(
+        err.to_ascii_lowercase().contains("locked"),
+        "expected locked error, got: {err}"
+    );
+    conn.execute_batch("ROLLBACK").unwrap();
+    blocker.execute_batch("COMMIT").unwrap();
+    assert!(
+        conn.query_all(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'aydb_t3'",
+            &[],
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let eng = engine.read().unwrap();
+    assert!(
+        eng.capped_table_state_view(crate::engine::ReadView::Committed, 3)
+            .is_none()
+    );
+    assert!(eng.active_vtab_name(3).is_none());
+}

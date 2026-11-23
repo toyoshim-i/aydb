@@ -71,6 +71,11 @@ pub const SQLITE_INDEX_SCAN_UNIQUE: c_int = 1;
 /// `sqlite3_vtab_config` option: `xUpdate` returns `SQLITE_CONSTRAINT` before it changes anything.
 pub const SQLITE_VTAB_CONSTRAINT_SUPPORT: c_int = 1;
 
+// Transaction states returned by `sqlite3_txn_state`
+pub const SQLITE_TXN_NONE: c_int = 0;
+pub const SQLITE_TXN_READ: c_int = 1;
+pub const SQLITE_TXN_WRITE: c_int = 2;
+
 /// `SQLITE_TRANSIENT` instructs SQLite to make its own private copy of a string/blob immediately.
 pub const fn sqlite_transient() -> Option<unsafe extern "system" fn(*mut c_void)> {
     unsafe { core::mem::transmute::<isize, Option<unsafe extern "system" fn(*mut c_void)>>(-1) }
@@ -274,6 +279,7 @@ unsafe extern "system" {
     ) -> c_int;
     pub fn sqlite3_step(pStmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int;
+    pub fn sqlite3_txn_state(db: *mut sqlite3, zSchema: *const c_char) -> c_int;
     /// With a null `zColumnName` it only checks that the table exists in any attached database.
     pub fn sqlite3_table_column_metadata(
         db: *mut sqlite3,
