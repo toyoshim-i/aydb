@@ -4401,7 +4401,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     return Some(e);
                 }
             }
-            if self.tx_depth > 0 && !self.pending_group.is_empty() {
+            if self.tx_depth > 0 && !self.pending_group.is_empty() && !self.is_poisoned() {
                 for (_, entries) in self.pending_group.iter().rev() {
                     if let Some(e) = entries.get(key) {
                         return Some(e);

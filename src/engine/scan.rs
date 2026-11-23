@@ -1594,16 +1594,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else {
             self.tx_overlay.map.range::<[u8], _>((lo, hi))
         };
-        let pending_ranges =
-            if src.is_owner() && self.tx_depth > 0 && !self.pending_group.is_empty() {
-                let mut ranges = Vec::with_capacity(self.pending_group.len());
-                for (_, entries) in self.pending_group.iter().rev() {
-                    ranges.push(entries.range::<[u8], _>((lo, hi)));
-                }
-                ranges
-            } else {
-                Vec::new()
-            };
+        let pending_ranges = if src.is_owner()
+            && self.tx_depth > 0
+            && !self.pending_group.is_empty()
+            && !self.is_poisoned()
+        {
+            let mut ranges = Vec::with_capacity(self.pending_group.len());
+            for (_, entries) in self.pending_group.iter().rev() {
+                ranges.push(entries.range::<[u8], _>((lo, hi)));
+            }
+            ranges
+        } else {
+            Vec::new()
+        };
         MemView::new(
             self.memtable_for(src).iter_range(lo, hi),
             ov_range,

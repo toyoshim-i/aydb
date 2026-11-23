@@ -74,7 +74,7 @@ impl CommitGate {
         state.appended = state.appended.max(lsn);
     }
 
-    fn mark_durable(&self, lsn: u64, ends_leadership: bool) {
+    pub(super) fn mark_durable(&self, lsn: u64, ends_leadership: bool) {
         let mut state = self.lock();
         state.durable_end = state.durable_end.max(lsn + 1);
         if ends_leadership {
@@ -84,7 +84,7 @@ impl CommitGate {
         self.changed.notify_all();
     }
 
-    fn fail(&self, error: &io::Error) {
+    pub(super) fn fail(&self, error: &io::Error) {
         let mut state = self.lock();
         state.failed = Some(error.to_string());
         state.leader_active = false;
@@ -106,15 +106,20 @@ impl CommitGate {
             .wait_timeout_while(guard, timeout.min(COMMIT_GATE_WAIT), |s| s.tx_ends == seen);
     }
 
+    /// Returns `true` if `lsn` has already been marked durable by a completed flush or barrier.
+    pub(crate) fn is_durable_through(&self, lsn: u64) -> bool {
+        self.lock().durable_end > lsn
+    }
+
     /// Waits until the batch at `lsn` is durable or this caller has to run the device flush.
     pub(crate) fn join_group(&self, lsn: u64) -> io::Result<GroupRole> {
         let mut state = self.lock();
         loop {
-            if let Some(message) = &state.failed {
-                return Err(group_flush_error(message));
-            }
             if state.durable_end > lsn {
                 return Ok(GroupRole::Durable);
+            }
+            if let Some(message) = &state.failed {
+                return Err(group_flush_error(message));
             }
             if !state.leader_active {
                 state.leader_active = true;
@@ -784,6 +789,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         target: u64,
         flushed: io::Result<()>,
     ) -> io::Result<()> {
+        if self.commit_gate.is_durable_through(target) {
+            self.commit_gate.mark_durable(target, true);
+            if let Err(e) = flushed {
+                if !self.is_poisoned() {
+                    let _ = self.poison(e);
+                }
+            } else if !self.is_poisoned() {
+                self.run_due_auto_compaction();
+            }
+            return Ok(());
+        }
         if let Err(e) = self.check_not_poisoned() {
             self.commit_gate.fail(&e);
             return Err(e);

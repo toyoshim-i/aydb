@@ -8710,3 +8710,95 @@ fn dropped_capped_table_lru_sync_failure_poisons_before_advancing_wal_durable_ls
             .is_err()
     );
 }
+
+#[test]
+fn commit_gate_join_group_returns_durable_before_later_failure() {
+    let gate = tx::CommitGate::default();
+    gate.mark_durable(5, true);
+    gate.fail(&io::Error::other("later failure"));
+
+    assert!(matches!(gate.join_group(5).unwrap(), GroupRole::Durable));
+    assert!(gate.join_group(6).is_err());
+}
+
+#[test]
+fn finish_group_flush_handles_already_durable_drain_race_and_late_failure() {
+    let tmp1 = TempTestDir::new("group_drain_race_ok");
+    let mut engine1 = open_group_engine(&tmp1);
+    let ticket1 = commit_into_group(&mut engine1, 1, b"a", b"1");
+    let GroupRole::Lead(target1) = ticket1.2.join_group(ticket1.0).unwrap() else {
+        panic!("expected leader role");
+    };
+    engine1.drain_pending_durable().unwrap();
+    assert_eq!(row_visible_to(&engine1, 9, b"a"), Some(b"1".to_vec()));
+    engine1.finish_group_flush(target1, Ok(())).unwrap();
+    assert!(!engine1.is_poisoned());
+    assert!(matches!(
+        ticket1.2.join_group(ticket1.0 + 1).unwrap(),
+        GroupRole::Lead(_)
+    ));
+
+    let tmp2 = TempTestDir::new("group_drain_race_err");
+    let mut engine2 = open_group_engine(&tmp2);
+    let ticket2 = commit_into_group(&mut engine2, 1, b"a", b"1");
+    let GroupRole::Lead(target2) = ticket2.2.join_group(ticket2.0).unwrap() else {
+        panic!("expected leader role");
+    };
+    engine2.drain_pending_durable().unwrap();
+    assert_eq!(row_visible_to(&engine2, 9, b"a"), Some(b"1".to_vec()));
+    // The batch at `target2` was already synced & absorbed; late leader failure still completes
+    // `target2`, releases leadership, and poisons the engine for subsequent writes.
+    engine2
+        .finish_group_flush(target2, Err(io::Error::other("late sync err")))
+        .unwrap();
+    assert!(engine2.is_poisoned());
+    assert!(ticket2.2.is_durable_through(target2));
+    assert!(matches!(
+        ticket2.2.join_group(target2).unwrap(),
+        GroupRole::Durable
+    ));
+    assert!(matches!(
+        ticket2.2.join_group(target2 + 1).unwrap(),
+        GroupRole::Lead(_)
+    ));
+}
+
+#[test]
+fn poisoned_engine_hides_pending_group_from_open_writer_reads() {
+    let tmp1 = TempTestDir::new("poisoned_pending_writer_err");
+    let mut engine1 = open_group_engine(&tmp1);
+    let ticket = commit_into_group(&mut engine1, 1, b"k1", b"v1");
+    engine1.begin_transaction_for_conn(2).unwrap();
+    assert_eq!(engine1.get_row(1, b"k1").unwrap(), Some(b"v1".to_vec()));
+    let GroupRole::Lead(target) = ticket.2.join_group(ticket.0).unwrap() else {
+        panic!("expected leader role");
+    };
+    assert!(
+        engine1
+            .finish_group_flush(target, Err(io::Error::other("flush failed")))
+            .is_err()
+    );
+    assert!(!engine1.pending_group.is_empty());
+    assert_eq!(engine1.get_row(1, b"k1").unwrap(), None);
+    assert!(
+        engine1
+            .scan_table_range(1, None, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+
+    let tmp2 = TempTestDir::new("poisoned_pending_writer_prepoison");
+    let mut engine2 = open_group_engine(&tmp2);
+    let _ticket2 = commit_into_group(&mut engine2, 1, b"k1", b"v1");
+    engine2.begin_transaction_for_conn(2).unwrap();
+    assert_eq!(engine2.get_row(1, b"k1").unwrap(), Some(b"v1".to_vec()));
+    let _ = engine2.poison(io::Error::other("prior failure"));
+    assert!(!engine2.pending_group.is_empty());
+    assert_eq!(engine2.get_row(1, b"k1").unwrap(), None);
+    assert!(
+        engine2
+            .scan_table_range(1, None, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
