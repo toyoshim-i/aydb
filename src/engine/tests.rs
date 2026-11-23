@@ -8802,3 +8802,120 @@ fn poisoned_engine_hides_pending_group_from_open_writer_reads() {
             .is_empty()
     );
 }
+
+#[test]
+fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
+    for is_capped in [false, true] {
+        let fs = Arc::new(PowerLossFs::new());
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 64;
+        cfg.buf_wal_size_bytes = 3 * 4096;
+        cfg.sync_wal_size_bytes = 4 * 4096;
+        let fast = WriteDurability::BufferedFast;
+        let sync = WriteDurability::SyncTransactional;
+
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let tid = if is_capped {
+            engine.register_capped_table(7, 1 << 20).unwrap();
+            7
+        } else {
+            1
+        };
+
+        // Create and flush a baseline segment holding `b"k1"`.
+        engine
+            .put_row(tid, b"k1", &[0x11u8; 300], &[], fast)
+            .unwrap();
+        engine.flush_memtable().unwrap();
+        let (seg_id, len_after_k1) = if is_capped {
+            let m = &engine.meta_mgr.state().lru_blob_segments[0];
+            (m.seq_id, m.file_len)
+        } else {
+            let m = &engine.meta_mgr.state().std_blob_segments[0];
+            (m.seq_id, m.file_len)
+        };
+        assert!(len_after_k1 > 0);
+
+        // Fill sectors 0..=1 of the 3-sector buffered WAL with inline rows so we sit inside sector
+        // 2 (final sector) without appending to any blob segment.
+        let mut i = 0usize;
+        while engine.buf_wal.current_sector_idx() < 2 {
+            let k = format!("pad_{i:04}");
+            engine
+                .put_row(tid, k.as_bytes(), &[0x33u8; 32], &[], fast)
+                .unwrap();
+            i += 1;
+        }
+        let epoch_before = engine.buf_wal.active_epoch();
+
+        // Append an out-of-line blob whose WAL record (~9 KB) cannot fit in the partially used
+        // final sector (<4 KB remaining) yet fits in the fresh 3-sector WAL after `RingFull`
+        // rotation (unsynced).
+        let big_pk = vec![b'z'; 2000];
+        let sec = (1u16, vec![b'y'; 1500]);
+        engine
+            .put_row(tid, &big_pk, &[0x22u8; 300], &[sec], fast)
+            .unwrap();
+        assert_eq!(engine.buf_wal.active_epoch(), epoch_before + 1);
+        assert!(engine.in_flight_autocommit_blob_starts.is_empty());
+
+        let cataloged_at_ring_full = if is_capped {
+            engine
+                .meta_mgr
+                .state()
+                .lru_blob_segments
+                .iter()
+                .find(|m| m.table_id == tid && m.seq_id == seg_id)
+                .unwrap()
+                .file_len
+        } else {
+            engine
+                .meta_mgr
+                .state()
+                .std_blob_segments
+                .iter()
+                .find(|m| m.seq_id == seg_id)
+                .unwrap()
+                .file_len
+        };
+        assert_eq!(
+            cataloged_at_ring_full, len_after_k1,
+            "RingFull rotation checkpoint must not catalog uncommitted blob bytes"
+        );
+        let blob2_tail = if is_capped {
+            engine.lru_blobs.get(&(tid, seg_id)).unwrap().file_len - len_after_k1
+        } else {
+            engine.std_blobs.get(&seg_id).unwrap().file_len - len_after_k1
+        };
+        assert!(blob2_tail > 0);
+
+        // Power loss drops the retried buffered WAL batch while keeping the synced blob file and
+        // the `boot_meta.db` checkpoint written by the `RingFull` rotation.
+        drop(engine);
+        fs.power_loss();
+
+        let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+        assert_eq!(reopened.get_row(tid, &big_pk).unwrap(), None);
+        assert_eq!(
+            reopened.get_row(tid, b"k1").unwrap(),
+            Some(vec![0x11u8; 300])
+        );
+
+        if is_capped {
+            let b = reopened.lru_blobs.get(&(tid, seg_id)).unwrap();
+            assert_eq!(b.dead_bytes, blob2_tail);
+        } else {
+            let b = reopened.std_blobs.get(&seg_id).unwrap();
+            assert_eq!(b.dead_bytes, blob2_tail);
+        }
+
+        // Deleting `k1` must now make the entire segment dead and reclaim it cleanly.
+        reopened.delete_row(tid, b"k1", sync).unwrap();
+        reopened.flush_memtable().unwrap();
+        if is_capped {
+            assert!(!reopened.lru_blobs.contains_key(&(tid, seg_id)));
+        } else {
+            assert!(!reopened.std_blobs.contains_key(&seg_id));
+        }
+    }
+}

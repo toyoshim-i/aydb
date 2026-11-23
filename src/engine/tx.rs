@@ -416,6 +416,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn begin_transaction(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         if self.tx_depth == 0 {
+            self.in_flight_autocommit_blob_starts.clear();
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();
@@ -445,6 +446,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             ));
         }
         if self.tx_depth == 0 {
+            self.in_flight_autocommit_blob_starts.clear();
             self.tx_overlay.clear();
             self.dropped_tables_in_tx.clear();
             self.vtabs_created_in_tx.clear();

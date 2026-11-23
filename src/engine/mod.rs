@@ -380,6 +380,11 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
     /// `(table_id, normalised name, normalised sqlite schema name)`.
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
+    /// Initial `(kind, tid_key, seq_id, prev_file_len)` recorded for autocommit (`tx_depth == 0`)
+    /// blob appends not yet appended to the WAL (`tid_key = 0` for `BlobKind::Standard`), so a
+    /// `RingFull` WAL rotation checkpoint never catalogs uncommitted blob lengths ahead of the
+    /// batch.
+    pub(super) in_flight_autocommit_blob_starts: Vec<(BlobKind, u16, u64, u64)>,
     /// Virtual-table pointers (`p_vtab as usize`) that joined the active SQLite transaction via
     /// `xBegin` and have not yet reached `xSync`.
     pub(super) tx_pending_sync_vtabs: Vec<usize>,
@@ -1230,6 +1235,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             statement_blob_undo: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
             vtabs_created_in_tx: Vec::new(),
+            in_flight_autocommit_blob_starts: Vec::new(),
             tx_pending_sync_vtabs: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
@@ -2349,6 +2355,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     BlobKind::Lru => self.sync_active_lru_writer(table_id),
                 };
                 if let Err(e) = sync_res {
+                    self.in_flight_autocommit_blob_starts.clear();
                     if let Some(ref p) = new_row_blob_ptr {
                         self.record_dead_blob_bytes(p);
                     }
@@ -2394,6 +2401,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 match RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys) {
                     Ok(bytes) => bytes,
                     Err(e) => {
+                        if self.tx_depth == 0 {
+                            self.in_flight_autocommit_blob_starts.clear();
+                        }
                         if let Some(ref p) = new_row_blob_ptr {
                             self.record_dead_blob_bytes(p);
                         }
@@ -2404,6 +2414,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 match self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records) {
                     Ok(ptr_opt) => ptr_opt,
                     Err(e) => {
+                        if self.tx_depth == 0 {
+                            self.in_flight_autocommit_blob_starts.clear();
+                        }
                         if let Some(ref p) = new_row_blob_ptr {
                             self.record_dead_blob_bytes(p);
                         }
@@ -2588,6 +2601,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
             if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
                 if let Err(e) = self.sync_active_std_writer() {
+                    self.in_flight_autocommit_blob_starts.clear();
                     self.record_dead_blob_bytes(&ptr);
                     return Err(e);
                 }
@@ -3656,6 +3670,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    #[inline]
+    fn note_in_flight_autocommit_blob(
+        &mut self,
+        kind: BlobKind,
+        tid_key: u16,
+        seg_id: u64,
+        prev_len: u64,
+    ) {
+        if self.tx_depth == 0
+            && !self
+                .in_flight_autocommit_blob_starts
+                .iter()
+                .any(|&(k, t, s, _)| k == kind && t == tid_key && s == seg_id)
+        {
+            self.in_flight_autocommit_blob_starts
+                .push((kind, tid_key, seg_id, prev_len));
+        }
+    }
+
     pub(super) fn append_to_blob_segment(
         &mut self,
         kind: BlobKind,
@@ -3715,17 +3748,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     self.active_std_writer = Some(writer);
                 }
                 let writer = self.active_std_writer.as_mut().unwrap();
+                let seg_id = writer.seq_id();
                 let ptr = writer.append_blob(key, value)?;
-                if let Some(b) = self.std_blobs.get_mut(&writer.seq_id()) {
-                    let prev_len = b.file_len;
-                    b.file_len = writer.current_len();
+                let new_len = writer.current_len();
+                if let Some(prev_len) = self.std_blobs.get_mut(&seg_id).map(|b| {
+                    let prev = b.file_len;
+                    b.file_len = new_len;
+                    prev
+                }) {
+                    if self.tx_depth == 0 {
+                        self.note_in_flight_autocommit_blob(
+                            BlobKind::Standard,
+                            0,
+                            seg_id,
+                            prev_len,
+                        );
+                    }
                     if self.statement_savepoint_active {
-                        let delta = b.file_len.saturating_sub(prev_len);
+                        let delta = new_len.saturating_sub(prev_len);
                         if delta > 0 {
                             self.statement_blob_undo.push(tx::BlobUndo::Appended {
                                 kind: BlobKind::Standard,
                                 table_id: 0,
-                                seg_id: writer.seq_id(),
+                                seg_id,
                                 len: delta,
                             });
                         }
@@ -3786,17 +3831,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     self.active_lru_writers.insert(table_id, writer);
                 }
                 let writer = self.active_lru_writers.get_mut(&table_id).unwrap();
+                let seg_id = writer.seq_id();
                 let ptr = writer.append_blob(key, value)?;
-                if let Some(b) = self.lru_blobs.get_mut(&(table_id, writer.seq_id())) {
-                    let prev_len = b.file_len;
-                    b.file_len = writer.current_len();
+                let new_len = writer.current_len();
+                if let Some(prev_len) = self.lru_blobs.get_mut(&(table_id, seg_id)).map(|b| {
+                    let prev = b.file_len;
+                    b.file_len = new_len;
+                    prev
+                }) {
+                    if self.tx_depth == 0 {
+                        self.note_in_flight_autocommit_blob(
+                            BlobKind::Lru,
+                            table_id,
+                            seg_id,
+                            prev_len,
+                        );
+                    }
                     if self.statement_savepoint_active {
-                        let delta = b.file_len.saturating_sub(prev_len);
+                        let delta = new_len.saturating_sub(prev_len);
                         if delta > 0 {
                             self.statement_blob_undo.push(tx::BlobUndo::Appended {
                                 kind: BlobKind::Lru,
                                 table_id,
-                                seg_id: writer.seq_id(),
+                                seg_id,
                                 len: delta,
                             });
                         }
@@ -4097,16 +4154,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let has_records = !records.is_empty();
-        self.drain_pending_durable()?;
-        let mut batch = WalBatch::new(lsn, records);
-        self.flush_active_blob_buffers()?;
-        (batch.prev_lsn, batch.durable_lsn) = self.wal_links_for_append(durability)?;
-        let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
-        batch.encode_into(&mut raw);
-        let res = self.append_raw_wal_batch_with_rotation(&raw, durability);
-        raw.clear();
-        self.scratch_wal_encoded = raw;
-        res?;
+        let batch = match (|| -> io::Result<WalBatch> {
+            self.drain_pending_durable()?;
+            let mut batch = WalBatch::new(lsn, records);
+            self.flush_active_blob_buffers()?;
+            (batch.prev_lsn, batch.durable_lsn) = self.wal_links_for_append(durability)?;
+            let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
+            batch.encode_into(&mut raw);
+            let res = self.append_raw_wal_batch_with_rotation(&raw, durability);
+            raw.clear();
+            self.scratch_wal_encoded = raw;
+            res?;
+            Ok(batch)
+        })() {
+            Ok(batch) => {
+                self.in_flight_autocommit_blob_starts.clear();
+                batch
+            }
+            Err(e) => {
+                self.in_flight_autocommit_blob_starts.clear();
+                return Err(e);
+            }
+        };
         self.next_lsn = self.next_lsn.max(successor);
         if count_as_data_write && has_records {
             self.note_records_table_mutations(&batch.records);

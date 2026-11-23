@@ -439,6 +439,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         })();
 
         if let Err(e) = res {
+            if self.tx_depth == 0 {
+                self.in_flight_autocommit_blob_starts.clear();
+            }
             for p in state.new_meta_ptrs.drain(..) {
                 self.record_dead_blob_bytes(&p);
             }

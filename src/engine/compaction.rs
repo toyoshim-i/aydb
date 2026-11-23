@@ -453,6 +453,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
             let mut batch_wal_records = Vec::new();
             let mut batch_dead_ptrs = Vec::new();
+            let mut batch_new_ptrs = Vec::new();
             for entry in entries {
                 if let IndexValue::Blob(old_ptr) = entry.value {
                     if old_ptr.kind == BlobKind::Standard
@@ -461,13 +462,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         if let Some(payload) =
                             self.dereference_blob_lenient(&old_ptr, &entry.key)?
                         {
-                            let new_ptr = self.append_to_blob_segment(
+                            let new_ptr = match self.append_to_blob_segment(
                                 BlobKind::Standard,
                                 0,
                                 &entry.key,
                                 &payload,
-                            )?;
+                            ) {
+                                Ok(ptr) => ptr,
+                                Err(e) => {
+                                    self.in_flight_autocommit_blob_starts.clear();
+                                    for p in batch_new_ptrs {
+                                        self.record_dead_blob_bytes(&p);
+                                    }
+                                    return Err(e);
+                                }
+                            };
                             batch_dead_ptrs.push(old_ptr);
+                            batch_new_ptrs.push(new_ptr);
                             batch_wal_records.push(WalRecord::PutBlobPtr {
                                 key: entry.key,
                                 blob_ptr: new_ptr,
@@ -478,12 +489,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
             if !batch_wal_records.is_empty() {
-                self.commit_wal_and_memtable_core(
+                if let Err(e) = self.commit_wal_and_memtable_core(
                     batch_wal_records,
                     WriteDurability::BufferedFast,
                     false,
                     false,
-                )?;
+                ) {
+                    for p in batch_new_ptrs {
+                        self.record_dead_blob_bytes(&p);
+                    }
+                    return Err(e);
+                }
                 for old_ptr in batch_dead_ptrs {
                     self.record_dead_blob_bytes(&old_ptr);
                 }
@@ -881,11 +897,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Transaction-start counterpart for `blob_std` segment lengths so uncommitted appends inside an
-    /// active transaction are not cataloged ahead of commit/checkpoint.
+    /// active transaction or in-flight autocommit op are not cataloged ahead of commit/checkpoint.
     pub(super) fn settled_std_file_len(&self, seq: u64, file_len: u64) -> u64 {
         if self.tx_start_meta.active {
             let at_start = self.tx_start_meta.std_blobs.get(&seq).map_or(0, |s| s.0);
             at_start.min(file_len)
+        } else if let Some(&(_, _, _, prev_len)) = self
+            .in_flight_autocommit_blob_starts
+            .iter()
+            .find(|&&(k, t, s, _)| k == BlobKind::Standard && t == 0 && s == seq)
+        {
+            prev_len.min(file_len)
         } else {
             file_len
         }
@@ -896,6 +918,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_start_meta.active {
             let at_start = self.tx_start_meta.lru_blobs.get(&key).map_or(0, |s| s.0);
             at_start.min(file_len)
+        } else if let Some(&(_, _, _, prev_len)) = self
+            .in_flight_autocommit_blob_starts
+            .iter()
+            .find(|&&(k, t, s, _)| k == BlobKind::Lru && (t, s) == key)
+        {
+            prev_len.min(file_len)
         } else {
             file_len
         }

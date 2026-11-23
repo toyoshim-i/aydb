@@ -419,6 +419,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             })();
 
             if let Err(e) = plan_res {
+                if self.tx_depth == 0 {
+                    self.in_flight_autocommit_blob_starts.clear();
+                }
                 for p in &new_meta_ptrs {
                     self.record_dead_blob_bytes(p);
                 }
@@ -434,6 +437,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     && self.tx_depth == 0
                 {
                     if let Err(e) = self.sync_active_std_writer() {
+                        self.in_flight_autocommit_blob_starts.clear();
                         for p in &new_meta_ptrs {
                             self.record_dead_blob_bytes(p);
                         }

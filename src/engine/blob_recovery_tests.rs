@@ -531,3 +531,70 @@ fn blob_rollover_during_uncommitted_tx_does_not_leak_segment_after_rollback_and_
         "reclaimed uncommitted segment must not remain in boot_meta catalog"
     );
 }
+
+#[test]
+fn autocommit_ring_full_write_zero_preserves_settled_len_and_dead_bytes() {
+    let tmp = TempTestDir::new("ring_full_write_zero_blob");
+    let mut config = EngineConfig::default();
+    config.inline_threshold_bytes = 64;
+    config.buf_wal_size_bytes = 2 * 4096;
+    config.sync_wal_size_bytes = 2 * 4096;
+    let fast = WriteDurability::BufferedFast;
+
+    let mut engine = open_plain(&tmp.path, &config);
+    // Commit one live row into the first standard blob segment and flush so it is cataloged.
+    engine
+        .put_row(1, b"live", &[0x11u8; 300], &[], fast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+
+    let (seg_id, cataloged_len) = {
+        let m = &engine.meta_mgr.state().std_blob_segments[0];
+        (m.seq_id, m.file_len)
+    };
+    assert!(cataloged_len > 0);
+
+    // Leave a committed row in the MemTable so the `RingFull` path takes
+    // `flush_memtable_no_auto_compact()`.
+    engine.put_row(1, b"small", b"ok", &[], fast).unwrap();
+
+    // Trigger an autocommit blob write whose WAL batch exceeds the 2-sector WAL even after
+    // RingFull rotation (`WriteZero`), proving the rotation does not catalog the uncommitted tail
+    // and the failure path does not double-count `dead_bytes`.
+    let big_pk = vec![b'p'; 2000];
+    let sec1 = (1u16, vec![b'a'; 1500]);
+    let sec2 = (2u16, vec![b'b'; 1500]);
+    let sec3 = (3u16, vec![b'c'; 1500]);
+    let err = engine
+        .put_row(1, &big_pk, &[0x22u8; 300], &[sec1, sec2, sec3], fast)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    assert!(engine.in_flight_autocommit_blob_starts.is_empty());
+
+    let cataloged_after = engine
+        .meta_mgr
+        .state()
+        .std_blob_segments
+        .iter()
+        .find(|m| m.seq_id == seg_id)
+        .unwrap();
+    assert_eq!(
+        cataloged_after.file_len, cataloged_len,
+        "RingFull rotation must not catalog uncommitted blob bytes"
+    );
+
+    let tracked = engine.std_blobs.get(&seg_id).unwrap();
+    let expected_aborted = tracked.file_len - cataloged_len;
+    assert_eq!(
+        tracked.dead_bytes, expected_aborted,
+        "failed WriteZero batch must count aborted blob bytes once, without double-counting"
+    );
+
+    // Reopening seals `seg_id`; deleting the remaining live row must make the segment 100% dead
+    // and reclaim it cleanly.
+    drop(engine);
+    let mut reopened = open_plain(&tmp.path, &config);
+    reopened.delete_row(1, b"live", fast).unwrap();
+    reopened.flush_memtable().unwrap();
+    assert!(!reopened.std_blobs.contains_key(&seg_id));
+}
