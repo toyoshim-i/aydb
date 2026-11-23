@@ -1748,7 +1748,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             _ => None,
         };
         if mapped == Some(table_id) {
-            self.drop_table(table_id, Some(&norm))?;
+            self.drop_table_with_durability(table_id, Some(&norm), WriteDurability::BufferedFast)?;
         }
         Ok(())
     }
@@ -1977,8 +1977,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Drops a table (`xDestroy` / `DROP TABLE`), deleting all primary rows (`'r'`), secondary
     /// index entries (`'i'`), row metadata (`'t'`), LRU queue entries (`'l'`), capped table
-    /// quota registrations, and system catalog entries.
+    /// quota registrations, and system catalog entries synchronously
+    /// ([`WriteDurability::SyncTransactional`]).
     pub fn drop_table(&mut self, table_id: u16, table_name: Option<&str>) -> io::Result<()> {
+        self.drop_table_with_durability(table_id, table_name, WriteDurability::SyncTransactional)
+    }
+
+    /// Drops a table using the specified [`WriteDurability`] for its WAL tombstones and catalog
+    /// deletion records.
+    pub fn drop_table_with_durability(
+        &mut self,
+        table_id: u16,
+        table_name: Option<&str>,
+        durability: WriteDurability,
+    ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         let mut records = Vec::new();
@@ -2030,15 +2042,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // Without an enclosing transaction the deletes run in an internal one: its chunked
         // TxBegin/TxCommit framing and WAL growth let a table larger than the WAL be dropped
-        // atomically. The internal transaction is exempt from `max_transaction_bytes`. It begins
-        // before any engine state is changed so a rollback restores that state.
+        // atomically. Dropping a table is exempt from `max_transaction_bytes` both standalone and
+        // inside a staged DDL transaction.
         let internal_tx = self.tx_depth == 0;
         if internal_tx {
             self.begin_transaction();
         }
         if !records.is_empty() {
-            let was_preparing = core::mem::replace(&mut self.tx_preparing, internal_tx);
-            let res = self.commit_wal_and_memtable(records, WriteDurability::BufferedFast);
+            let was_preparing = core::mem::replace(&mut self.tx_preparing, true);
+            let res = self.commit_wal_and_memtable(records, durability);
             self.tx_preparing = was_preparing;
             if let Err(e) = res {
                 if internal_tx {

@@ -4310,6 +4310,7 @@ fn drop_table_with_tombstones_larger_than_wal_is_atomic_and_durable() {
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut cfg = EngineConfig::default();
     cfg.buf_wal_size_bytes = 64 * 1024;
+    cfg.sync_wal_size_bytes = 64 * 1024;
     let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
     for i in 0..20000u32 {
         engine

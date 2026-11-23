@@ -4893,3 +4893,89 @@ fn lazy_lru_promotion_with_out_of_line_meta_syncs_blob_std_before_sync_wal() {
         Some(vec![0x33u8; 1500])
     );
 }
+
+/// Dropping a non-capped `SyncTransactional` table after checkpointing must persist the deletion
+/// durably so losing all unsynced buffered writes on a power cut never resurrects the catalog or
+/// its rows; a power cut at any I/O step must never lose an acknowledged drop or leave catalog and
+/// rows out of sync.
+#[test]
+fn power_cut_after_drop_table_does_not_resurrect_sync_table_or_rows() {
+    let cfg = repro_config();
+
+    // Part 1: Direct audit reproduction — register sync table, write sync row, checkpoint,
+    // drop_table, then simulate a power cut that drops 100% of unsynced buffered writes.
+    {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, 9));
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let tid = e
+            .register_or_resolve_vtab_with_durability("t", None, SYNC)
+            .unwrap();
+        e.put_row(tid, b"k1", b"v1", &[], SYNC).unwrap();
+        e.checkpoint().unwrap();
+
+        e.drop_table(tid, Some("t")).unwrap();
+        assert_eq!(e.get_row(tid, b"k1").unwrap(), None);
+        assert!(
+            !e.plan_vtab_registration("t", None).unwrap().persisted,
+            "catalog must be removed right after drop_table"
+        );
+
+        fs.cut_now();
+        drop(e);
+        fs.crash(Crash::Power { keep: 0, lose: 100 });
+
+        let mut reopened = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        assert!(
+            !reopened
+                .plan_vtab_registration("t", Some(tid))
+                .unwrap()
+                .persisted,
+            "table catalog resurrected after power cut following drop_table"
+        );
+        assert_eq!(
+            reopened.get_row(tid, b"k1").unwrap(),
+            None,
+            "row resurrected after power cut following drop_table"
+        );
+    }
+
+    // Part 2: Exhaustive cut sweep across every I/O step issued inside `drop_table`.
+    let scenario = |seed: u64, cut: Option<u64>, keep: u64, lose: u64| -> u64 {
+        let fs = Arc::new(CrashFs::new(DirMode::Unix, seed));
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let tid = e
+            .register_or_resolve_vtab_with_durability("t", Some(1), SYNC)
+            .unwrap();
+        e.put_row(tid, b"k1", b"v1", &[], SYNC).unwrap();
+        e.checkpoint().unwrap();
+
+        let start = fs.op_stats().0;
+        fs.arm(cut.map(|c| start + c), None);
+        let acknowledged = e.drop_table(tid, Some("t")).is_ok();
+        let span = fs.op_stats().0 - start;
+        fs.cut_now();
+        drop(e);
+        fs.crash(Crash::Power { keep, lose });
+
+        let mut e = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        let persisted = e.plan_vtab_registration("t", Some(1)).unwrap().persisted;
+        let row_present = e.get_row(1, b"k1").unwrap().is_some();
+        assert!(
+            !acknowledged || (!persisted && !row_present),
+            "acknowledged drop_table resurrected (seed {seed}, cut {cut:?}, persisted={persisted}, row_present={row_present})"
+        );
+        assert_eq!(
+            persisted, row_present,
+            "catalog and rows disagree after crash during drop_table (seed {seed}, cut {cut:?})"
+        );
+        span
+    };
+
+    for (seed, keep, lose) in [(1, 0, 100), (2, 50, 50), (4, 20, 40)] {
+        let span = scenario(seed, None, keep, lose);
+        assert!(span > 0);
+        for cut in 0..=span {
+            scenario(seed, Some(cut), keep, lose);
+        }
+    }
+}
