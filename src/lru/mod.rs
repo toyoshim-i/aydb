@@ -79,6 +79,8 @@ struct TrackerShardInner {
     /// Maps `table_id -> (pk_bytes -> latest_access_tick)` for recently read keys.
     hot_ticks: std::collections::BTreeMap<u16, HashMap<Vec<u8>, u64>>,
     total_entries: usize,
+    /// Rotates equal-median tie-breaking across tables on shard capacity trim.
+    evict_round: usize,
 }
 
 impl AccessTracker {
@@ -157,7 +159,8 @@ impl AccessTracker {
         }
         if inner.total_entries >= self.max_entries_per_shard {
             // Evict the oldest half of tracked entries in O(N) using quickselect; tie-break
-            // equal ticks deterministically so `u64::MAX` saturation cannot wipe the shard.
+            // equal ticks fairly across tables so `u64::MAX` saturation or equal medians do not
+            // starve lower `table_id`s.
             let mut ticks: Vec<u64> = inner
                 .hot_ticks
                 .values()
@@ -170,20 +173,33 @@ impl AccessTracker {
                 let strictly_greater = ticks.iter().filter(|&&v| v > median).count();
                 let mut tie_budget = target_keep.saturating_sub(strictly_greater);
                 let mut kept = 0usize;
-                inner.hot_ticks.retain(|_, m| {
-                    m.retain(|_, &mut v| {
-                        if v > median {
-                            true
-                        } else if v == median && tie_budget > 0 {
-                            tie_budget -= 1;
-                            true
+                let mut tids: Vec<u16> = inner.hot_ticks.keys().copied().collect();
+                if !tids.is_empty() {
+                    let rot = inner.evict_round % tids.len();
+                    inner.evict_round = inner.evict_round.wrapping_add(1);
+                    tids.rotate_left(rot);
+                    for tid in tids {
+                        let empty = if let Some(m) = inner.hot_ticks.get_mut(&tid) {
+                            m.retain(|_, &mut v| {
+                                if v > median {
+                                    true
+                                } else if v == median && tie_budget > 0 {
+                                    tie_budget -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            kept += m.len();
+                            m.is_empty()
                         } else {
                             false
+                        };
+                        if empty {
+                            inner.hot_ticks.remove(&tid);
                         }
-                    });
-                    kept += m.len();
-                    !m.is_empty()
-                });
+                    }
+                }
                 inner.total_entries = kept;
             }
         }
@@ -205,7 +221,13 @@ impl AccessTracker {
         if g.total_entries == 0 {
             return None;
         }
-        let removed = g.hot_ticks.get_mut(&table_id)?.remove(pk);
+        let (removed, became_empty) = {
+            let table_map = g.hot_ticks.get_mut(&table_id)?;
+            (table_map.remove(pk), table_map.is_empty())
+        };
+        if became_empty {
+            g.hot_ticks.remove(&table_id);
+        }
         if removed.is_some() {
             g.total_entries = g.total_entries.saturating_sub(1);
         }
@@ -222,6 +244,32 @@ impl AccessTracker {
         g.hot_ticks.get(&table_id)?.get(pk).copied()
     }
 
+    /// Clears the pending read tick for `(table_id, pk)` only if its stored tick `<= max_tick`,
+    /// preserving newer reads recorded concurrently or after the snapshot. Prunes empty table maps.
+    #[inline]
+    pub fn clear_if_tick_le(&self, table_id: u16, pk: &[u8], max_tick: u64) {
+        let mut g = self.lock_shard(table_id, pk);
+        if g.total_entries == 0 {
+            return;
+        }
+        let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
+            if table_map.get(pk).copied().is_some_and(|t| t <= max_tick) {
+                let did_remove = table_map.remove(pk).is_some();
+                (did_remove, table_map.is_empty())
+            } else {
+                (false, false)
+            }
+        } else {
+            return;
+        };
+        if became_empty {
+            g.hot_ticks.remove(&table_id);
+        }
+        if removed {
+            g.total_entries = g.total_entries.saturating_sub(1);
+        }
+    }
+
     /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete)
     /// with zero allocation.
     #[inline]
@@ -230,10 +278,16 @@ impl AccessTracker {
         if g.total_entries == 0 {
             return;
         }
-        if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
-            if table_map.remove(pk).is_some() {
-                g.total_entries = g.total_entries.saturating_sub(1);
-            }
+        let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
+            (table_map.remove(pk).is_some(), table_map.is_empty())
+        } else {
+            return;
+        };
+        if became_empty {
+            g.hot_ticks.remove(&table_id);
+        }
+        if removed {
+            g.total_entries = g.total_entries.saturating_sub(1);
         }
     }
 
@@ -398,5 +452,54 @@ mod tests {
             assert_eq!(tracker.peek_hot_tick(1, key.as_bytes()), None);
             assert!(tracker.peek_hot_tick(2, key.as_bytes()).is_some());
         }
+    }
+
+    #[test]
+    fn access_tracker_prunes_empty_table_maps_and_tie_breaks_fairly() {
+        let tracker = AccessTracker::new(1, 64);
+        assert_eq!(tracker.record_read_hit_with_tick(42, b"k1", 10), 10);
+        tracker.clear_if_tick_le(42, b"k1", 5);
+        assert_eq!(tracker.peek_hot_tick(42, b"k1"), Some(10));
+        tracker.clear_if_tick_le(42, b"k1", 10);
+        assert_eq!(tracker.peek_hot_tick(42, b"k1"), None);
+        for shard in &tracker.shards {
+            assert!(!shard.lock().hot_ticks.contains_key(&42));
+        }
+
+        // All equal saturated ticks across tables 1 and 2 on a single shard must not starve
+        // table 2 forever across repeated capacity trims.
+        let saturated = AccessTracker::new(u64::MAX, 64);
+        let shard_idx = AccessTracker::shard_index(1, b"x");
+        assert_eq!(saturated.max_entries_per_shard, 4);
+        for i in 0..4u8 {
+            saturated.record_read_hit_with_tick(1, &[b'a' + i], u64::MAX);
+        }
+        // Push from table 2 with the same shard until capacity trim fires multiple rounds.
+        let mut t2_keys = Vec::new();
+        for i in 0..200u16 {
+            let k = i.to_le_bytes();
+            if AccessTracker::shard_index(2, &k) == shard_idx {
+                t2_keys.push(k);
+                if t2_keys.len() == 6 {
+                    break;
+                }
+            }
+        }
+        let mut t1_keys = Vec::new();
+        for i in 0..200u16 {
+            let k = (i + 500).to_le_bytes();
+            if AccessTracker::shard_index(1, &k) == shard_idx {
+                t1_keys.push(k);
+                if t1_keys.len() == 6 {
+                    break;
+                }
+            }
+        }
+        for round in 0..6 {
+            saturated.record_read_hit_with_tick(1, &t1_keys[round], u64::MAX);
+            saturated.record_read_hit_with_tick(2, &t2_keys[round], u64::MAX);
+        }
+        let g = saturated.shards[shard_idx].lock();
+        assert!(g.total_entries <= saturated.max_entries_per_shard);
     }
 }

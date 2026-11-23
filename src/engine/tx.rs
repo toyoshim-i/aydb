@@ -203,6 +203,7 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) table_has_synthetic_rowids: BTreeMap<u16, bool>,
     pub(super) table_has_row_meta: BTreeMap<u16, bool>,
     pub(super) dropped_tables_len: usize,
+    pub(super) lru_clears_len: usize,
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
     pub(super) quotas_modified_in_tx: bool,
 }
@@ -231,6 +232,7 @@ pub(crate) struct StatementMetaSnapshot {
     pub(super) table_has_synthetic_rowids: Option<bool>,
     pub(super) table_has_row_meta: Option<bool>,
     pub(super) blob_undo_len: usize,
+    pub(super) lru_clears_len: usize,
 }
 
 #[derive(Clone)]
@@ -972,6 +974,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
+        self.pending_tx_lru_clears.clear();
         self.vtabs_created_in_tx.clear();
         self.tx_vtabs.clear();
         self.tx_synced_vtabs.clear();
@@ -1004,6 +1007,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.invalidate_snapshot_memtable();
         self.memtable.absorb(overlay);
+        for (tid, pk, max_tick) in core::mem::take(&mut self.pending_tx_lru_clears) {
+            self.access_tracker.clear_if_tick_le(tid, &pk, max_tick);
+        }
         self.finalize_tx_state();
 
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
@@ -1126,6 +1132,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
+        self.pending_tx_lru_clears.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
@@ -1228,6 +1235,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_has_synthetic_rowids: self.table_has_synthetic_rowids.get(&table_id).copied(),
             table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
             blob_undo_len: self.statement_blob_undo.len(),
+            lru_clears_len: self.pending_tx_lru_clears.len(),
         };
         self.savepoints.push(SavepointMarker {
             sp_id: STATEMENT_SAVEPOINT,
@@ -1341,6 +1349,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
+        self.pending_tx_lru_clears.clear();
         self.pending_tx_record_count = 0;
         self.pending_tx_bytes = 0;
         self.pending_tx_buf.clear();
@@ -1356,6 +1365,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.bump_table_epochs_from_undo_suffix(undo_target_len);
         self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = st.next_lsn;
+        self.pending_tx_lru_clears.truncate(st.lru_clears_len);
         while self.statement_blob_undo.len() > st.blob_undo_len {
             let entry = self.statement_blob_undo.pop().unwrap();
             match entry {
@@ -1450,6 +1460,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_has_synthetic_rowids: self.table_has_synthetic_rowids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
             dropped_tables_len: self.dropped_tables_in_tx.len(),
+            lru_clears_len: self.pending_tx_lru_clears.len(),
             vtabs_created_in_tx: self.vtabs_created_in_tx.clone(),
             quotas_modified_in_tx: self.quotas_modified_in_tx,
         }
@@ -1478,6 +1489,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_has_synthetic_rowids = snap.table_has_synthetic_rowids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
         self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
+        self.pending_tx_lru_clears.truncate(snap.lru_clears_len);
         self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();
         self.quotas_modified_in_tx = snap.quotas_modified_in_tx;
     }

@@ -321,6 +321,9 @@ impl IdxBlockBuilder {
         val_bytes: &[u8],
     ) -> io::Result<()> {
         let (klen, vlen) = Self::validate_raw_entry_params(key.len(), val_type, val_bytes.len())?;
+        if val_type == 2 {
+            BlobKind::from_u8(val_bytes[0])?;
+        }
         if !self.can_fit_raw(key.len(), val_type, val_bytes.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -583,15 +586,21 @@ impl<'a> IdxBlockReader<'a> {
     }
 
     #[inline]
-    fn entry_offset(&self, index: usize) -> usize {
+    fn entry_offset(&self, index: usize) -> io::Result<usize> {
+        if index >= self.num_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "entry index out of bounds in 4 KB index block",
+            ));
+        }
         let pos = self.dir_start + (index * 2);
-        u16::from_le_bytes([self.buf[pos], self.buf[pos + 1]]) as usize
+        Ok(u16::from_le_bytes([self.buf[pos], self.buf[pos + 1]]) as usize)
     }
 
     /// Returns the raw key slice of the entry at `index` without allocating or decoding the value.
     #[inline]
     fn key_at(&self, index: usize) -> io::Result<&'a [u8]> {
-        let off = self.entry_offset(index);
+        let off = self.entry_offset(index)?;
         if off + 11 > self.dir_start {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -612,7 +621,7 @@ impl<'a> IdxBlockReader<'a> {
     /// Parses the byte ranges of the entry at `index` inside `self.buf` with zero heap allocations.
     #[inline]
     fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
-        let off = self.entry_offset(index);
+        let off = self.entry_offset(index)?;
         if off + 11 > self.dir_start {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -749,6 +758,7 @@ pub struct IdxSegmentBuilder<F: PlatformFile> {
     seq_id: u64,
     level: u16,
     bloom_bits_per_key: usize,
+    cap_bloom_to_meta_budget: bool,
     block_builder: IdxBlockBuilder,
     fence_pointers: Vec<FencePointer>,
     bloom_hashes: Vec<u64>,
@@ -774,6 +784,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             seq_id,
             level,
             bloom_bits_per_key,
+            cap_bloom_to_meta_budget: false,
             block_builder: IdxBlockBuilder::new(),
             fence_pointers: Vec::new(),
             bloom_hashes: Vec::new(),
@@ -784,6 +795,12 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             buf_start_offset: 0,
             write_buf: Vec::with_capacity(IDX_WRITE_BUFFER_CAPACITY),
         })
+    }
+
+    /// Configures whether [`Self::finish`] caps the Bloom bitset to the remaining
+    /// `MAX_INDEX_META_BYTES` budget rather than failing if `bloom_bits_per_key` would overflow it.
+    pub fn set_cap_bloom_to_meta_budget(&mut self, cap: bool) {
+        self.cap_bloom_to_meta_budget = cap;
     }
 
     /// Adds a sorted [`IndexEntry`] to the segment, flushing a 4 KB data block whenever full.
@@ -913,36 +930,78 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         self.flush_current_data_block()?;
         self.flush_write_buf()?;
 
-        // Build BloomFilter from precomputed 64-bit hashes and drop the hash vector immediately
-        let bloom_hashes = core::mem::take(&mut self.bloom_hashes);
-        let bloom = BloomFilter::from_hashes64(&bloom_hashes, self.bloom_bits_per_key);
-        drop(bloom_hashes);
-
-        // Encode Filter + Sparse Fence Pointers + max_key metadata section
-        let meta_offset = self.write_offset;
-        let mut meta_buf = Vec::with_capacity(256);
-        bloom.encode(&mut meta_buf);
         let fp_count_u32 = u32::try_from(self.fence_pointers.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "idx fence pointer count exceeds u32::MAX",
             )
         })?;
-        meta_buf.extend_from_slice(&fp_count_u32.to_le_bytes());
+        let mut fence_and_last_bytes = 4usize;
         for fp in &self.fence_pointers {
-            let klen_u16 = u16::try_from(fp.first_key.len()).map_err(|_| {
+            let _ = u16::try_from(fp.first_key.len()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "idx fence pointer key exceeds u16::MAX",
                 )
             })?;
-            meta_buf.extend_from_slice(&klen_u16.to_le_bytes());
-            meta_buf.extend_from_slice(&fp.block_idx.to_le_bytes());
-            meta_buf.extend_from_slice(&fp.first_key);
+            fence_and_last_bytes = fence_and_last_bytes
+                .checked_add(6 + fp.first_key.len())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "idx metadata size overflow")
+                })?;
         }
         let last_klen_u16 = u16::try_from(self.last_key.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "idx last_key exceeds u16::MAX")
         })?;
+        fence_and_last_bytes = fence_and_last_bytes
+            .checked_add(2 + self.last_key.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "idx metadata size overflow")
+            })?;
+
+        const BLOOM_HEADER_BYTES: usize = 8;
+        let max_bloom_bytes = MAX_INDEX_META_BYTES
+            .checked_sub(fence_and_last_bytes + BLOOM_HEADER_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "idx segment metadata exceeds MAX_INDEX_META_BYTES",
+                )
+            })?;
+
+        // Build BloomFilter within the remaining metadata budget (or fail before allocating if
+        // capping is disabled) and drop the hash vector immediately.
+        let bloom_hashes = core::mem::take(&mut self.bloom_hashes);
+        let bloom = if self.cap_bloom_to_meta_budget {
+            BloomFilter::from_hashes64_bounded(
+                &bloom_hashes,
+                self.bloom_bits_per_key,
+                max_bloom_bytes,
+            )
+        } else {
+            let desired =
+                BloomFilter::desired_byte_len(bloom_hashes.len(), self.bloom_bits_per_key);
+            if desired > max_bloom_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "idx segment metadata exceeds MAX_INDEX_META_BYTES",
+                ));
+            }
+            BloomFilter::from_hashes64(&bloom_hashes, self.bloom_bits_per_key)
+        };
+        drop(bloom_hashes);
+
+        // Encode Filter + Sparse Fence Pointers + max_key metadata section
+        let meta_offset = self.write_offset;
+        let mut meta_buf = Vec::with_capacity(256);
+        bloom.encode(&mut meta_buf);
+        meta_buf.extend_from_slice(&fp_count_u32.to_le_bytes());
+        for fp in &self.fence_pointers {
+            let klen_u16 = fp.first_key.len() as u16;
+            meta_buf.extend_from_slice(&klen_u16.to_le_bytes());
+            meta_buf.extend_from_slice(&fp.block_idx.to_le_bytes());
+            meta_buf.extend_from_slice(&fp.first_key);
+        }
         meta_buf.extend_from_slice(&last_klen_u16.to_le_bytes());
         meta_buf.extend_from_slice(&self.last_key);
         if meta_buf.len() > MAX_INDEX_META_BYTES {
@@ -1302,6 +1361,15 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         block_buf: &'b mut [u8; IDX_BLOCK_SIZE],
         populate_cache: bool,
     ) -> io::Result<IdxBlockReader<'b>> {
+        if block_idx >= self.num_blocks {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "index block_idx {block_idx} out of bounds (num_blocks = {})",
+                    self.num_blocks
+                ),
+            ));
+        }
         if let Some(cache) = &self.block_cache {
             if cache.get_into(self.seq_id, block_idx, block_buf) {
                 return IdxBlockReader::open_preverified(block_buf);
@@ -2017,6 +2085,7 @@ pub fn compact_idx_segments<F: PlatformFile>(
     }
 
     let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
+    builder.set_cap_bloom_to_meta_budget(true);
     let mut dead_blob_map: BTreeMap<(u8, u16, u64), u64> = BTreeMap::new();
     let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
     let mut winning_val_buf: Vec<u8> = Vec::with_capacity(256);
@@ -2960,5 +3029,53 @@ mod tests {
         }
         assert_eq!(rev.current_key(), None);
         assert_eq!(rev.peek_raw(), None);
+    }
+
+    #[test]
+    fn index_public_bounds_checks_reject_invalid_blob_kind_and_oob_indices() {
+        let mut bb = IdxBlockBuilder::new();
+        let mut bad_ptr = [0u8; BLOB_PTR_ENCODED_LEN];
+        bad_ptr[0] = 99;
+        let err = bb.add_raw_entry(b"k1", 1, 2, &bad_ptr).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        bb.add_raw_entry(b"k1", 1, 1, b"v1").unwrap();
+        let mut raw_vec = Vec::new();
+        bb.finish_into(&mut raw_vec);
+        let raw_blk: [u8; IDX_BLOCK_SIZE] = raw_vec.try_into().unwrap();
+        let reader = IdxBlockReader::open_verified(&raw_blk).unwrap();
+        assert_eq!(
+            reader.raw_entry_at(1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            reader.decode_entry_at(5).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let tmp = TempTestDir::new("idx_oob_read_block");
+        let fs = OsFs::open(&tmp.path, true).unwrap();
+        let mut sb = IdxSegmentBuilder::create(&fs, 2, 0, 10).unwrap();
+        sb.add_raw_entry(b"k1", 1, 1, b"v1").unwrap();
+        let seg = sb.finish().unwrap();
+        let mut scratch = [0u8; IDX_BLOCK_SIZE];
+        let oob_idx = seg.num_blocks();
+        assert_eq!(
+            seg.read_block(oob_idx, &mut scratch, false)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut capped_sb =
+            IdxSegmentBuilder::create(&fs, 3, 0, (MAX_INDEX_META_BYTES + 1024) * 8).unwrap();
+        capped_sb.set_cap_bloom_to_meta_budget(true);
+        capped_sb.add_raw_entry(b"k1", 1, 1, b"v1").unwrap();
+        let capped_seg = capped_sb.finish().unwrap();
+        assert_eq!(
+            capped_seg.get(b"k1").unwrap(),
+            Some((1, IndexValue::Inline(b"v1".to_vec())))
+        );
     }
 }

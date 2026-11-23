@@ -7478,6 +7478,35 @@ fn drop_table_clears_access_tracker_on_commit_but_not_on_rollback() {
 }
 
 #[test]
+fn rolled_back_tx_with_capped_eviction_preserves_hot_access_ticks() {
+    let tmp = TempTestDir::new("tx_evict_preserves_hot_ticks");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    // Small cap so a second row triggers eviction + lazy promotion.
+    engine.register_capped_table(1, 200).unwrap();
+    engine
+        .put_row(1, b"k1", &[0x11; 150], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .put_row(1, b"k2", &[0x22; 40], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(engine.get_row(1, b"k1").unwrap(), Some(vec![0x11; 150]));
+    let hot_before = engine.access_tracker.peek_hot_tick(1, b"k1");
+    assert!(hot_before.is_some());
+
+    engine.begin_transaction();
+    engine
+        .put_row(1, b"k3", &[0x33; 150], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    engine.rollback_transaction().unwrap();
+    assert_eq!(engine.access_tracker.peek_hot_tick(1, b"k1"), hot_before);
+}
+
+#[test]
 fn relocate_fragmented_std_blobs_preserves_data_generation_and_does_not_recurse() {
     let tmp = TempTestDir::new("reloc_gen_no_recurse");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());

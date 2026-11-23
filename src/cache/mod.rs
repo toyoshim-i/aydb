@@ -82,37 +82,35 @@ impl PaddedBlockShard {
 /// Strictly-bounded in-process cache for verified 4 KB `idx_*.db` data blocks.
 pub struct VerifiedBlockCache {
     shards: Vec<PaddedBlockShard>,
-    slots_per_shard: usize,
+    total_slots: usize,
 }
 
 impl VerifiedBlockCache {
     /// Creates a new block cache budgeted at `capacity_bytes`.
-    /// `0` disables the cache completely (zero slot allocations).
+    /// Fewer than `IDX_BLOCK_SIZE` bytes (including `0`) disables the cache (zero slot allocations).
     pub fn new(capacity_bytes: usize) -> Self {
         let total_slots = capacity_bytes / IDX_BLOCK_SIZE;
-        let slots_per_shard = if total_slots == 0 {
-            0
-        } else {
-            (total_slots / NUM_SHARDS).max(1)
-        };
+        let base = total_slots / NUM_SHARDS;
+        let rem = total_slots % NUM_SHARDS;
 
         let mut shards = Vec::with_capacity(NUM_SHARDS);
-        for _ in 0..NUM_SHARDS {
+        for i in 0..NUM_SHARDS {
+            let shard_slots = base + usize::from(i < rem);
             shards.push(PaddedBlockShard(Mutex::new(BlockClockShard::new(
-                slots_per_shard,
+                shard_slots,
             ))));
         }
 
         Self {
             shards,
-            slots_per_shard,
+            total_slots,
         }
     }
 
-    /// Whether caching is enabled (`capacity_bytes > 0`).
+    /// Whether caching is enabled (at least one 4 KB slot allocated).
     #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.slots_per_shard > 0
+        self.total_slots > 0
     }
 
     #[inline]
@@ -125,7 +123,7 @@ impl VerifiedBlockCache {
     /// Returns a shared handle to the verified block `(seq_id, block_idx)` on a hit.
     /// The handle is cloned under the shard lock; the caller reads the block after it is released.
     pub fn get_arc(&self, seq_id: u64, block_idx: u32) -> Option<Arc<[u8; IDX_BLOCK_SIZE]>> {
-        if self.slots_per_shard == 0 {
+        if !self.is_enabled() {
             return None;
         }
 
@@ -165,7 +163,7 @@ impl VerifiedBlockCache {
 
     /// Inserts a verified 4 KB block into the cache using CLOCK second-chance replacement.
     pub fn insert(&self, seq_id: u64, block_idx: u32, block: &[u8; IDX_BLOCK_SIZE]) {
-        if self.slots_per_shard == 0 {
+        if !self.is_enabled() {
             return;
         }
 
@@ -224,7 +222,7 @@ impl VerifiedBlockCache {
 
     /// Invalidates all cached blocks for `seq_id` wholesale (called when an SSTable is retired).
     pub fn invalidate_segment(&self, seq_id: u64) {
-        if self.slots_per_shard == 0 {
+        if !self.is_enabled() {
             return;
         }
         let mut released = Vec::new();
@@ -249,7 +247,7 @@ impl VerifiedBlockCache {
 
     /// Number of cache hits since creation.
     pub fn hits(&self) -> u64 {
-        if self.slots_per_shard == 0 {
+        if !self.is_enabled() {
             return 0;
         }
         self.shards
@@ -259,7 +257,7 @@ impl VerifiedBlockCache {
 
     /// Number of cache misses since creation.
     pub fn misses(&self) -> u64 {
-        if self.slots_per_shard == 0 {
+        if !self.is_enabled() {
             return 0;
         }
         self.shards
@@ -364,39 +362,44 @@ impl PaddedBlobShard {
     }
 }
 
+const BLOB_CACHE_ENTRY_OVERHEAD: usize = 64;
+
 /// Strictly-bounded in-process cache for small verified out-of-line blob payloads.
 pub struct VerifiedBlobCache {
     shards: Vec<PaddedBlobShard>,
-    shard_capacity: usize,
+    max_shard_capacity: usize,
 }
 
 impl VerifiedBlobCache {
-    /// Creates a new blob cache budgeted at `capacity_bytes`.
-    /// `0` disables the cache completely.
+    /// Creates a new blob cache budgeted strictly within `capacity_bytes`.
+    /// Fewer than `64` bytes (the per-entry metadata overhead, including `0`) disables the cache.
     pub fn new(capacity_bytes: usize) -> Self {
-        let shard_capacity = if capacity_bytes == 0 {
-            0
-        } else {
-            (capacity_bytes / NUM_SHARDS).max(1024)
-        };
+        let mut shard_caps = [0usize; NUM_SHARDS];
+        if capacity_bytes >= BLOB_CACHE_ENTRY_OVERHEAD {
+            let active_shards = (capacity_bytes / BLOB_CACHE_ENTRY_OVERHEAD).min(NUM_SHARDS);
+            let base = capacity_bytes / active_shards;
+            let rem = capacity_bytes % active_shards;
+            for (i, cap) in shard_caps.iter_mut().take(active_shards).enumerate() {
+                *cap = base + usize::from(i < rem);
+            }
+        }
+        let max_shard_capacity = shard_caps.iter().copied().max().unwrap_or(0);
 
         let mut shards = Vec::with_capacity(NUM_SHARDS);
-        for _ in 0..NUM_SHARDS {
-            shards.push(PaddedBlobShard(Mutex::new(BlobClockShard::new(
-                shard_capacity,
-            ))));
+        for cap in shard_caps {
+            shards.push(PaddedBlobShard(Mutex::new(BlobClockShard::new(cap))));
         }
 
         Self {
             shards,
-            shard_capacity,
+            max_shard_capacity,
         }
     }
 
-    /// Whether caching is enabled (`capacity_bytes > 0`).
+    /// Whether caching is enabled (at least one entry fits within `capacity_bytes`).
     #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.shard_capacity > 0
+        self.max_shard_capacity > 0
     }
 
     #[inline]
@@ -412,7 +415,7 @@ impl VerifiedBlobCache {
     /// Appends the verified blob payload onto `out` if resident in cache.
     /// Returns `true` on cache hit, `false` on miss.
     pub fn get_append_into(&self, key: &BlobCacheKey, out: &mut Vec<u8>) -> bool {
-        if self.shard_capacity == 0 {
+        if !self.is_enabled() {
             return false;
         }
 
@@ -444,7 +447,7 @@ impl VerifiedBlobCache {
 
     /// Returns `true` if `key` is resident in the blob cache.
     pub fn contains(&self, key: &BlobCacheKey) -> bool {
-        if self.shard_capacity == 0 {
+        if !self.is_enabled() {
             return false;
         }
         let shard_idx = self.shard_index(key);
@@ -454,26 +457,32 @@ impl VerifiedBlobCache {
 
     /// Inserts a small verified blob payload into the cache.
     pub fn insert(&self, key: BlobCacheKey, payload: &[u8]) {
-        if self.shard_capacity == 0 || payload.len() > MAX_CACHED_BLOB_PAYLOAD_BYTES {
+        if !self.is_enabled() || payload.len() > MAX_CACHED_BLOB_PAYLOAD_BYTES {
             return;
         }
 
-        let entry_size = payload.len().saturating_add(64);
-        if entry_size > self.shard_capacity {
+        let entry_size = payload.len().saturating_add(BLOB_CACHE_ENTRY_OVERHEAD);
+        if entry_size > self.max_shard_capacity {
             return;
         }
 
         // Allocate outside the shard lock so lock hold time is purely pointer/map bookkeeping.
+        let shard_idx = self.shard_index(&key);
+        if entry_size > self.shards[shard_idx].lock().capacity_bytes {
+            return;
+        }
         let new_entry = BlobCacheEntry {
             key,
             payload: Arc::from(payload),
             size: entry_size,
             ref_bit: true,
         };
-        let shard_idx = self.shard_index(&key);
         let mut evicted: Vec<Arc<[u8]>> = Vec::new();
         {
             let mut shard = self.shards[shard_idx].lock();
+            if entry_size > shard.capacity_bytes {
+                return;
+            }
 
             // 1. If key is already resident, remove existing entry to adjust memory accounting
             if let Some(&existing_idx) = shard.index.get(&key) {
@@ -529,7 +538,7 @@ impl VerifiedBlobCache {
     where
         F: FnMut(&BlobCacheKey) -> bool,
     {
-        if self.shard_capacity == 0 {
+        if !self.is_enabled() {
             return;
         }
         let mut evicted: Vec<Arc<[u8]>> = Vec::new();
@@ -570,7 +579,7 @@ impl VerifiedBlobCache {
 
     /// Number of cache hits since creation.
     pub fn hits(&self) -> u64 {
-        if self.shard_capacity == 0 {
+        if !self.is_enabled() {
             return 0;
         }
         self.shards
@@ -580,7 +589,7 @@ impl VerifiedBlobCache {
 
     /// Number of cache misses since creation.
     pub fn misses(&self) -> u64 {
-        if self.shard_capacity == 0 {
+        if !self.is_enabled() {
             return 0;
         }
         self.shards
@@ -876,5 +885,72 @@ mod tests {
 
         assert_eq!(block_cache.hits() + block_cache.misses(), 2000);
         assert_eq!(blob_cache.hits() + blob_cache.misses(), 2000);
+    }
+
+    #[test]
+    fn tiny_non_zero_cache_budgets_never_exceed_configured_capacity() {
+        let disabled_blk = VerifiedBlockCache::new(IDX_BLOCK_SIZE - 1);
+        assert!(!disabled_blk.is_enabled());
+        assert_eq!(
+            disabled_blk
+                .shards
+                .iter()
+                .map(|s| s.lock().slots.len())
+                .sum::<usize>(),
+            0
+        );
+
+        let one_blk = VerifiedBlockCache::new(IDX_BLOCK_SIZE);
+        assert!(one_blk.is_enabled());
+        assert_eq!(
+            one_blk
+                .shards
+                .iter()
+                .map(|s| s.lock().slots.len())
+                .sum::<usize>(),
+            1
+        );
+        one_blk.insert(1, 0, &[0xAB; IDX_BLOCK_SIZE]);
+
+        let tiny_blob = VerifiedBlobCache::new(63);
+        assert!(!tiny_blob.is_enabled());
+        assert_eq!(
+            tiny_blob
+                .shards
+                .iter()
+                .map(|s| s.lock().capacity_bytes)
+                .sum::<usize>(),
+            0
+        );
+
+        let exact_blob = VerifiedBlobCache::new(100);
+        assert!(exact_blob.is_enabled());
+        assert_eq!(
+            exact_blob
+                .shards
+                .iter()
+                .map(|s| s.lock().capacity_bytes)
+                .sum::<usize>(),
+            100
+        );
+        let k = BlobCacheKey {
+            kind: crate::wal::BlobKind::Standard as u8,
+            table_id: 1,
+            seg_id: 1,
+            offset: 0,
+            len: 50,
+            crc32c: 1,
+            key_hash: 1,
+        };
+        // Overhead (64) + payload (50) = 114 > 100 must be rejected.
+        exact_blob.insert(k, &[0x11; 50]);
+        assert!(!exact_blob.contains(&k));
+        // Overhead (64) + payload (32) = 96 <= 100 may admit if hashed to active shard.
+        let k2 = BlobCacheKey { len: 32, ..k };
+        exact_blob.insert(k2, &[0x22; 32]);
+        for shard in &exact_blob.shards {
+            let g = shard.lock();
+            assert!(g.current_bytes <= g.capacity_bytes);
+        }
     }
 }

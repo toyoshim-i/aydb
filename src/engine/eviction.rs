@@ -229,7 +229,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut batch_est_bytes: usize = 0;
             let mut new_meta_ptrs: Vec<BlobPtr> = Vec::new();
             let mut old_dead_ptrs: Vec<BlobPtr> = Vec::new();
-            let mut evicted_pks: Vec<Vec<u8>> = Vec::new();
+            let mut consumed_hot_ticks: Vec<(Vec<u8>, u64)> = Vec::new();
             let mut window_evictions: u64 = 0;
             let mut window_promotions: u64 = 0;
             let mut evicted_logical_bytes: u64 = 0;
@@ -266,8 +266,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
 
                     // Check if this key was accessed in RAM since `old_tick` was indexed!
-                    if let Some(hot_tick) = self.access_tracker.take_hot_tick(table_id, &pk) {
+                    if let Some(hot_tick) = self.access_tracker.peek_hot_tick(table_id, &pk) {
                         if hot_tick > old_tick {
+                            consumed_hot_ticks.push((pk.clone(), hot_tick));
                             // LAZY PROMOTION: Move key to `hot_tick` in the LRU queue without evicting!
                             let rec_start = batch_records.len();
                             let meta_key = encode_row_meta_key(table_id, &pk);
@@ -408,7 +409,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         projected_logical_bytes.saturating_sub(old_logical_size);
                     window_evictions += 1;
                     window_next_cursor = Some(old_tick.saturating_add(1));
-                    evicted_pks.push(pk.clone());
+                    consumed_hot_ticks.push((pk.clone(), u64::MAX));
                     handled_pks.insert(pk, None);
 
                     if projected_logical_bytes <= max_bytes
@@ -455,8 +456,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 for p in &old_dead_ptrs {
                     self.record_dead_blob_bytes(p);
                 }
-                for pk in &evicted_pks {
-                    self.access_tracker.remove_key(table_id, pk);
+                if self.tx_depth == 0 {
+                    for (pk, max_tick) in consumed_hot_ticks {
+                        self.access_tracker
+                            .clear_if_tick_le(table_id, &pk, max_tick);
+                    }
+                } else {
+                    for (pk, max_tick) in consumed_hot_ticks {
+                        self.pending_tx_lru_clears.push((table_id, pk, max_tick));
+                    }
                 }
                 let advanced_cursor =
                     window_next_cursor.map(|c| c.max(last_scanned_tick.saturating_add(1)));

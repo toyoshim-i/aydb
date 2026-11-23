@@ -164,10 +164,40 @@ impl BloomFilter {
 
     /// Builds a [`BloomFilter`] from 64-bit hashes without retaining raw keys.
     pub fn from_hashes64(hashes: &[u64], bits_per_key: usize) -> Self {
-        if bits_per_key == 0 || hashes.is_empty() {
+        Self::from_hashes64_bounded(hashes, bits_per_key, usize::MAX)
+    }
+
+    /// Returns the bitset byte length that [`Self::from_hashes64`] would allocate for
+    /// `(num_keys, bits_per_key)`.
+    pub fn desired_byte_len(num_keys: usize, bits_per_key: usize) -> usize {
+        if bits_per_key == 0 || num_keys == 0 {
+            return 0;
+        }
+        compute_bloom_sizing(num_keys, bits_per_key).0
+    }
+
+    /// Like [`Self::from_hashes64`], capping the allocated bitset to at most `max_bytes`
+    /// (`< 8` bytes disables the filter) and recomputing the optimal probe count `k` for the
+    /// resulting effective bits per key.
+    pub fn from_hashes64_bounded(hashes: &[u64], bits_per_key: usize, max_bytes: usize) -> Self {
+        if bits_per_key == 0 || hashes.is_empty() || max_bytes < 8 {
             return Self::new(0, 0);
         }
-        let mut filter = Self::new(hashes.len(), bits_per_key);
+        let (desired_bytes, _) = compute_bloom_sizing(hashes.len(), bits_per_key);
+        let num_bytes = desired_bytes.min(max_bytes);
+        let clamped_bits = (num_bytes as u64).saturating_mul(8).min(MAX_BLOOM_BITS);
+        let num_bytes = (clamped_bits / 8) as usize;
+        if num_bytes < 8 {
+            return Self::new(0, 0);
+        }
+        let num_bits = (num_bytes as u64 * 8) as u32;
+        let effective_bpk = (bits_per_key as f64).min((num_bits as f64) / (hashes.len() as f64));
+        let k = ((effective_bpk * 0.69) as u8).clamp(1, 16);
+        let mut filter = Self {
+            bits: vec![0u8; num_bytes],
+            num_bits,
+            num_probes: k,
+        };
         for &packed in hashes {
             let (h1, h2) = Self::unpack_hash_pair(packed);
             filter.insert_pair(h1, h2);
@@ -401,5 +431,24 @@ mod tests {
             false_positives < 250,
             "unexpectedly high fastrange32 false positive rate: {false_positives}/10000"
         );
+    }
+
+    #[test]
+    fn from_hashes64_bounded_respects_max_bytes_and_has_zero_false_negatives() {
+        let hashes: Vec<u64> = (0..10_000u64)
+            .map(|i| BloomFilter::hash64(&i.to_le_bytes()))
+            .collect();
+        // Unbounded at 10 bpk would need 12_500 bytes; cap at 2_000 bytes.
+        let bounded = BloomFilter::from_hashes64_bounded(&hashes, 10, 2_000);
+        assert!(bounded.heap_bytes() <= 2_000);
+        assert!(bounded.heap_bytes() > 0);
+        for i in 0..10_000u64 {
+            assert!(bounded.may_contain(&i.to_le_bytes()));
+        }
+
+        // Tiny budget < 8 bytes disables the filter cleanly instead of failing.
+        let disabled = BloomFilter::from_hashes64_bounded(&hashes, 10, 7);
+        assert_eq!(disabled.heap_bytes(), 0);
+        assert!(disabled.may_contain(&0u64.to_le_bytes()));
     }
 }

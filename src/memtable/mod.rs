@@ -442,6 +442,7 @@ impl MemTable {
         bloom_bits_per_key: usize,
     ) -> io::Result<IdxSegmentReader<F>> {
         let mut builder = IdxSegmentBuilder::create(fs, seq_id, 0, bloom_bits_per_key)?;
+        builder.set_cap_bloom_to_meta_budget(true);
         for (k, entry) in self.chunks.iter().flat_map(|c| c.map.iter()) {
             match &entry.value {
                 IndexValue::Inline(val) => {

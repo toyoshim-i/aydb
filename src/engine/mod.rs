@@ -375,6 +375,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) savepoints: Vec<SavepointMarker>,
     pub(super) statement_savepoint_active: bool,
     pub(super) statement_blob_undo: Vec<tx::BlobUndo>,
+    /// Deferred `(table_id, pk, max_tick)` access-tracker clears recorded by in-transaction
+    /// writes/evictions and applied only once the transaction commits.
+    pub(super) pending_tx_lru_clears: Vec<(u16, Vec<u8>, u64)>,
     /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
     pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
@@ -1241,6 +1244,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             savepoints: Vec::new(),
             statement_savepoint_active: false,
             statement_blob_undo: Vec::new(),
+            pending_tx_lru_clears: Vec::new(),
             dropped_tables_in_tx: Vec::new(),
             vtabs_created_in_tx: Vec::new(),
             in_flight_autocommit_blob_starts: Vec::new(),
@@ -2396,7 +2400,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 4. Emit RowMetaRecord (`'t'`) and LRU Queue entry (`'l'`) if Capped Table or has secondary keys
         let assigned_tick = if is_capped {
-            self.access_tracker.remove_key(table_id, pk);
             let tick = self.access_tracker.next_tick();
             records.push(WalRecord::PutInline {
                 key: encode_lru_queue_key(table_id, tick, pk),
@@ -2451,6 +2454,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.record_dead_blob_bytes(p);
             }
             return Err(e);
+        }
+        if is_capped {
+            let stale_max_tick = assigned_tick.saturating_sub(1);
+            if self.tx_depth == 0 {
+                self.access_tracker
+                    .clear_if_tick_le(table_id, pk, stale_max_tick);
+            } else {
+                self.pending_tx_lru_clears
+                    .push((table_id, pk.to_vec(), stale_max_tick));
+            }
         }
         if need_meta {
             self.table_has_row_meta.insert(table_id, true);
@@ -2980,8 +2993,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        self.access_tracker.remove_key(table_id, pk);
+        let is_capped = self.capped_tables.contains_key(&table_id);
         self.commit_wal_and_memtable(records, durability)?;
+        if is_capped {
+            if self.tx_depth == 0 {
+                self.access_tracker.remove_key(table_id, pk);
+            } else {
+                self.pending_tx_lru_clears
+                    .push((table_id, pk.to_vec(), u64::MAX));
+            }
+        }
 
         if let Some(old_ptr) = old_blob_ptr {
             self.record_dead_blob_bytes(&old_ptr);
