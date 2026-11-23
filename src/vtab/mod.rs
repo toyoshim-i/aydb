@@ -844,6 +844,7 @@ thread_local! {
 }
 
 const RENAME_NEEDS_WRITE: &str = "ALTER TABLE RENAME of an aydb table inside a transaction needs an earlier write to an aydb table in that transaction";
+const STALE_VTAB_ERR: &str = "virtual table handle is stale: table was dropped";
 
 /// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
 /// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
@@ -1134,6 +1135,10 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
         }
+        if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
+            set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+            return SQLITE_ERROR;
+        }
         // SQLite does not call `xBegin` for a rename, so inside a user transaction the catalog
         // change joins the engine transaction only if an earlier write opened one. Otherwise it
         // would be committed at once, and a ROLLBACK of the SQL transaction (which restores the
@@ -1189,6 +1194,14 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
                     };
                     if let Err(e) = eng.check_write_allowed_for_conn(vtab_ref.db as usize) {
                         return io_err_to_sqlite_rc(&e);
+                    }
+                    if !eng.is_vtab_token_active(
+                        vtab_ref.table_id,
+                        vtab_ref.reg_token,
+                        vtab_ref.db as usize,
+                    ) {
+                        set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                        return SQLITE_ERROR;
                     }
                     if let Err(e) = eng.drop_table(vtab_ref.table_id, None) {
                         return io_err_to_sqlite_rc(&e);
@@ -2164,6 +2177,10 @@ unsafe extern "system" fn vtab_filter(
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
+            if !guard.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
+                set_vtab_err_msg(cursor.base.pVtab, STALE_VTAB_ERR);
+                return SQLITE_ERROR;
+            }
             let snapshot = match vtab.read_session.for_cursor_locked(&guard, conn_id) {
                 Ok(s) => s,
                 Err(error) => return io_err_to_sqlite_rc(&error),
@@ -2190,6 +2207,11 @@ unsafe extern "system" fn vtab_filter(
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
+        if snapshot.is_none() && !guard.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id)
+        {
+            set_vtab_err_msg(cursor.base.pVtab, STALE_VTAB_ERR);
+            return SQLITE_ERROR;
+        }
         let rc = match snapshot.as_ref() {
             Some(tok) => guard.with_snapshot_read(tok, |rd| {
                 execute_vtab_filter(cursor, vtab, rd, idx_num, argc, argv)
@@ -2601,6 +2623,10 @@ unsafe extern "system" fn vtab_update(
         };
         if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
             return io_err_to_sqlite_rc(&e);
+        }
+        if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
+            set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+            return SQLITE_ERROR;
         }
 
         let needs_synthetic_delete_check =
@@ -3161,6 +3187,16 @@ thread_local! {
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
+        {
+            let eng = match vtab.engine.read() {
+                Ok(g) => g,
+                Err(_) => return SQLITE_ERROR,
+            };
+            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
+                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                return SQLITE_ERROR;
+            }
+        }
         migrate_unique_index_before_begin(vtab);
         // Wait for a transaction on another connection to end. The wait is bounded because that
         // connection may be held open by the same thread, which could never end it.
@@ -3170,6 +3206,10 @@ unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
             };
+            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
+                set_vtab_err_msg(p_vtab, STALE_VTAB_ERR);
+                return SQLITE_ERROR;
+            }
             if let Some(snapshot) = vtab.read_session.current() {
                 if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
                     return io_err_to_sqlite_rc(&error);

@@ -1497,9 +1497,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .map(|(id, _)| id)
     }
 
-    fn add_vtab_holder(&mut self, table_id: u16) -> u64 {
+    fn alloc_vtab_token(&mut self) -> u64 {
         let tok = self.next_vtab_token;
         self.next_vtab_token = self.next_vtab_token.wrapping_add(1).max(1);
+        tok
+    }
+
+    fn add_vtab_holder(&mut self, table_id: u16) -> u64 {
+        let tok = self.alloc_vtab_token();
         self.active_vtab_holders
             .entry(table_id)
             .or_default()
@@ -1694,23 +1699,53 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// restores without clobbering any uncommitted rename/drop already recorded by the owner.
     pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
         let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
+        let tok = self.alloc_vtab_token();
         if self.tx_start_meta.active {
             let orig = self.tx_start_meta.active_vtab_ids.get(&table_id).cloned();
-            if self.active_vtab_ids.get(&table_id) == orig.as_ref() {
+            let dropped_in_tx = self
+                .dropped_tables_in_tx
+                .iter()
+                .any(|&(tid, _)| tid == table_id);
+            if !dropped_in_tx && self.active_vtab_ids.get(&table_id) == orig.as_ref() {
                 self.active_vtab_ids.insert(table_id, name.clone());
+            }
+            if !dropped_in_tx {
+                self.active_vtab_holders
+                    .entry(table_id)
+                    .or_default()
+                    .push(tok);
             }
             for marker in &mut self.savepoints {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
-                    if snap.active_vtab_ids.get(&table_id) == orig.as_ref() {
-                        snap.active_vtab_ids.insert(table_id, name.clone());
+                    let prefix_len = snap.dropped_tables_len.min(self.dropped_tables_in_tx.len());
+                    let dropped_before_sp = self.dropped_tables_in_tx[..prefix_len]
+                        .iter()
+                        .any(|&(tid, _)| tid == table_id);
+                    if !dropped_before_sp {
+                        if snap.active_vtab_ids.get(&table_id) == orig.as_ref() {
+                            snap.active_vtab_ids.insert(table_id, name.clone());
+                        }
+                        snap.active_vtab_holders
+                            .entry(table_id)
+                            .or_default()
+                            .push(tok);
                     }
                 }
             }
             self.tx_start_meta.active_vtab_ids.insert(table_id, name);
+            self.tx_start_meta
+                .active_vtab_holders
+                .entry(table_id)
+                .or_default()
+                .push(tok);
         } else {
             self.active_vtab_ids.insert(table_id, name);
+            self.active_vtab_holders
+                .entry(table_id)
+                .or_default()
+                .push(tok);
         }
-        self.add_vtab_holder(table_id)
+        tok
     }
 
     /// Notes that the active transaction created virtual table `(table_id, table_name)` in `db_name`.
@@ -1847,32 +1882,47 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    /// Returns `true` if `(table_id, token)` still refers to a live virtual table incarnation in
+    /// the view visible to `conn_id`.
+    pub(crate) fn is_vtab_token_active(&self, table_id: u16, token: u64, conn_id: usize) -> bool {
+        let holders = if self.read_view_for_conn(conn_id) == ReadView::Committed
+            && self.tx_start_meta.active
+        {
+            &self.tx_start_meta.active_vtab_holders
+        } else {
+            &self.active_vtab_holders
+        };
+        holders
+            .get(&table_id)
+            .is_some_and(|list| list.contains(&token))
+    }
+
     /// Unregisters a live virtual table handle identified by `(table_id, token)`, removing the
     /// catalog entry from `active_vtab_ids` only when the last live holder disconnects.
     pub(crate) fn unregister_vtab_token(&mut self, table_id: u16, token: u64) {
-        let Some(holders) = self.active_vtab_holders.get_mut(&table_id) else {
-            return;
+        let remove_from = |holders_map: &mut HashMap<u16, Vec<u64>>,
+                           ids_map: &mut HashMap<u16, Arc<str>>| {
+            let Some(holders) = holders_map.get_mut(&table_id) else {
+                return;
+            };
+            let Some(pos) = holders.iter().position(|&t| t == token) else {
+                return;
+            };
+            holders.swap_remove(pos);
+            if holders.is_empty() {
+                holders_map.remove(&table_id);
+                ids_map.remove(&table_id);
+            }
         };
-        let Some(pos) = holders.iter().position(|&t| t == token) else {
-            return;
-        };
-        holders.swap_remove(pos);
-        if !holders.is_empty() {
-            return;
-        }
-        self.active_vtab_holders.remove(&table_id);
-        let removed = self.active_vtab_ids.remove(&table_id);
-        if let Some(removed_name) = removed {
-            if self.tx_start_meta.active
-                && self.tx_start_meta.active_vtab_ids.get(&table_id) == Some(&removed_name)
-            {
-                self.tx_start_meta.active_vtab_ids.remove(&table_id);
-                for marker in &mut self.savepoints {
-                    if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
-                        if snap.active_vtab_ids.get(&table_id) == Some(&removed_name) {
-                            snap.active_vtab_ids.remove(&table_id);
-                        }
-                    }
+        remove_from(&mut self.active_vtab_holders, &mut self.active_vtab_ids);
+        if self.tx_start_meta.active {
+            remove_from(
+                &mut self.tx_start_meta.active_vtab_holders,
+                &mut self.tx_start_meta.active_vtab_ids,
+            );
+            for marker in &mut self.savepoints {
+                if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
+                    remove_from(&mut snap.active_vtab_holders, &mut snap.active_vtab_ids);
                 }
             }
         }

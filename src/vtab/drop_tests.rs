@@ -255,3 +255,161 @@ fn cross_connection_drop_after_rename_and_recreate_does_not_delete_new_table_cat
         id2
     );
 }
+
+#[test]
+fn reused_table_id_invalidates_stale_connection_handles() {
+    // Case 1: Two independent :memory: SQLite schemas sharing one StorageEngine with explicit table_id=7.
+    {
+        let tmp = crate::util::test_util::TempTestDir::new("reused_id_explicit");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, crate::engine::EngineConfig::default()).unwrap(),
+        ));
+
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+                .unwrap();
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(table_id=7, columns='k INTEGER PRIMARY KEY, v TEXT')",
+            )
+            .unwrap();
+        }
+        conn1
+            .execute_batch("INSERT INTO t VALUES (1, 'from_t')")
+            .unwrap();
+        assert_eq!(
+            conn2.query_all("SELECT v FROM t WHERE k = 1", &[]).unwrap(),
+            vec![vec![SqlValue::Text("from_t".to_string())]]
+        );
+
+        // Conn 1 drops `t` and recreates `u` reusing table_id=7.
+        conn1
+            .execute_batch(
+                "DROP TABLE t;
+                 CREATE VIRTUAL TABLE u USING aydb(table_id=7, columns='k INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO u VALUES (1, 'from_u');",
+            )
+            .unwrap();
+
+        // Stale handle on Conn 2 must fail every operation without touching `u`.
+        for (op, res) in [
+            (
+                "SELECT",
+                conn2.query_all("SELECT * FROM t", &[]).map(|_| ()),
+            ),
+            (
+                "INSERT",
+                conn2.execute_batch("INSERT INTO t VALUES (2, 'bad')"),
+            ),
+            (
+                "UPDATE",
+                conn2.execute_batch("UPDATE t SET v = 'mutated' WHERE k = 1"),
+            ),
+            ("DELETE", conn2.execute_batch("DELETE FROM t WHERE k = 1")),
+            ("RENAME", conn2.execute_batch("ALTER TABLE t RENAME TO z")),
+        ] {
+            let err = res
+                .expect_err(&format!("{op} on stale handle must fail"))
+                .to_string();
+            assert!(err.contains("stale"), "{op}: unexpected error: {err}");
+        }
+        // SQLite omits `xDestroy` error messages, so `DROP` reports a generic error code.
+        assert!(
+            conn2.execute_batch("DROP TABLE t").is_err(),
+            "DROP on stale handle must fail"
+        );
+
+        // `u` on Conn 1 is completely untouched.
+        assert_eq!(
+            conn1
+                .query_all("SELECT k, v FROM u ORDER BY k", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Integer(1),
+                SqlValue::Text("from_u".to_string()),
+            ]]
+        );
+
+        drop(conn2);
+        assert_eq!(
+            conn1
+                .query_all("SELECT k, v FROM u ORDER BY k", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Integer(1),
+                SqlValue::Text("from_u".to_string()),
+            ]]
+        );
+    }
+
+    // Case 2: Auto-assigned table_id reuse + `activate_persisted_vtab` during an active tx + rollback.
+    {
+        let tmp = crate::util::test_util::TempTestDir::new("reused_id_auto_and_activate");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, crate::engine::EngineConfig::default()).unwrap(),
+        ));
+
+        let conn1 = SqliteConnection::open_in_memory().unwrap();
+        let conn2 = SqliteConnection::open_in_memory().unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+                .unwrap();
+        }
+        conn1
+            .execute_batch(
+                "CREATE VIRTUAL TABLE other USING aydb(table_id=10, columns='k INTEGER PRIMARY KEY, v INT');
+                 CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO t VALUES (1, 'original');",
+            )
+            .unwrap();
+
+        // While conn1 holds an open transaction on `other`, conn2 connects to `t`
+        // (taking the `activate_persisted_vtab` path), and then conn1 rolls back.
+        conn1
+            .execute_batch("BEGIN; INSERT INTO other VALUES (1, 1);")
+            .unwrap();
+        conn2
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT')",
+            )
+            .unwrap();
+        conn1.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            conn2.query_all("SELECT v FROM t WHERE k = 1", &[]).unwrap(),
+            vec![vec![SqlValue::Text("original".to_string())]]
+        );
+
+        // Now conn1 drops `t` and auto-creates `u` (which reuses table_id=1).
+        conn1
+            .execute_batch(
+                "DROP TABLE t;
+                 CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO u VALUES (1, 'fresh_u');",
+            )
+            .unwrap();
+
+        let err = conn2
+            .execute_batch("UPDATE t SET v = 'hijacked' WHERE k = 1")
+            .expect_err("stale auto-id handle must fail UPDATE")
+            .to_string();
+        assert!(err.contains("stale"), "unexpected error: {err}");
+        let err = conn2
+            .query_all("SELECT v FROM t", &[])
+            .expect_err("stale auto-id handle must fail SELECT")
+            .to_string();
+        assert!(err.contains("stale"), "unexpected error: {err}");
+
+        assert_eq!(
+            conn1.query_all("SELECT v FROM u", &[]).unwrap(),
+            vec![vec![SqlValue::Text("fresh_u".to_string())]]
+        );
+        drop(conn2);
+        conn1
+            .execute_batch("INSERT INTO u VALUES (2, 'still_alive')")
+            .unwrap();
+        assert_eq!(conn1.query_all("SELECT v FROM u", &[]).unwrap().len(), 2);
+    }
+}
