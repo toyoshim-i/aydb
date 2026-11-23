@@ -19,7 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::engine::StorageEngine;
+use crate::engine::{StdBlobRelocStep, StorageEngine};
 use crate::pal::{OsFs, PlatformFs};
 
 const BASE_BACKOFF: Duration = Duration::from_millis(50);
@@ -303,7 +303,7 @@ fn run_drain_cycle<FS: PlatformFs>(
     signal: &Signal,
 ) -> PassOutcome {
     let mut contention_retries = 0usize;
-    let mut attempted_blob_reloc = false;
+    let mut blob_reloc_passes = 0usize;
 
     loop {
         if is_shutdown(signal) {
@@ -317,7 +317,7 @@ fn run_drain_cycle<FS: PlatformFs>(
             (
                 eng.is_poisoned(),
                 eng.compaction_pending(),
-                !attempted_blob_reloc && eng.has_fragmented_std_blobs(0.5),
+                blob_reloc_passes < 2 && eng.has_fragmented_std_blobs(0.5),
             )
         };
         if poisoned {
@@ -383,20 +383,89 @@ fn run_drain_cycle<FS: PlatformFs>(
                 }
             }
         } else {
-            attempted_blob_reloc = true;
-            let Ok(mut eng) = engine.write() else {
-                return PassOutcome::Poisoned;
-            };
-            if eng.is_poisoned() {
-                return PassOutcome::Poisoned;
-            }
-            if let Err(e) = eng.background_relocate_fragmented_std_blobs(0.5) {
-                eng.record_maintenance_failure(&e);
-                return if eng.is_poisoned() {
-                    PassOutcome::Poisoned
-                } else {
-                    PassOutcome::Error
+            // Up to two passes: rolling over an already-fragmented active writer during pass 1
+            // can seal one more fragmented segment that a bounded second pass immediately cleans.
+            blob_reloc_passes += 1;
+            let Some(mut session) = ({
+                let Ok(mut eng) = engine.write() else {
+                    return PassOutcome::Poisoned;
                 };
+                if eng.is_poisoned() {
+                    return PassOutcome::Poisoned;
+                }
+                match eng.start_std_blob_relocation(0.5) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        eng.record_maintenance_failure(&e);
+                        return if eng.is_poisoned() {
+                            PassOutcome::Poisoned
+                        } else {
+                            PassOutcome::Error
+                        };
+                    }
+                }
+            }) else {
+                blob_reloc_passes = 2;
+                continue;
+            };
+
+            const BG_RELOCATE_SCAN_KEYS: usize = 128;
+            const BG_RELOCATE_CHUNK_BYTES: usize = 256 * 1024;
+            loop {
+                if is_shutdown(signal) {
+                    return PassOutcome::IdleOrDone;
+                }
+                let step = {
+                    let Ok(mut eng) = engine.write() else {
+                        return PassOutcome::Poisoned;
+                    };
+                    if eng.is_poisoned() {
+                        return PassOutcome::Poisoned;
+                    }
+                    match eng.step_std_blob_relocation(
+                        &mut session,
+                        BG_RELOCATE_SCAN_KEYS,
+                        BG_RELOCATE_CHUNK_BYTES,
+                    ) {
+                        Ok(step) => step,
+                        Err(e) => {
+                            eng.record_maintenance_failure(&e);
+                            return if eng.is_poisoned() {
+                                PassOutcome::Poisoned
+                            } else {
+                                PassOutcome::Error
+                            };
+                        }
+                    }
+                };
+                match step {
+                    StdBlobRelocStep::Continue => std::thread::yield_now(),
+                    StdBlobRelocStep::Deferred => {
+                        blob_reloc_passes = 2;
+                        break;
+                    }
+                    StdBlobRelocStep::Finished { relocated } => {
+                        if relocated == 0 {
+                            blob_reloc_passes = 2;
+                        } else if !is_shutdown(signal) {
+                            let Ok(mut eng) = engine.write() else {
+                                return PassOutcome::Poisoned;
+                            };
+                            if eng.is_poisoned() {
+                                return PassOutcome::Poisoned;
+                            }
+                            if let Err(e) = eng.finish_std_blob_relocation(relocated) {
+                                eng.record_maintenance_failure(&e);
+                                return if eng.is_poisoned() {
+                                    PassOutcome::Poisoned
+                                } else {
+                                    PassOutcome::Error
+                                };
+                            }
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -702,5 +771,93 @@ mod tests {
             eng.last_maintenance_error()
                 .is_some_and(|m| m.contains("compaction worker panic"))
         );
+    }
+
+    #[test]
+    fn compaction_worker_chunked_blob_relocation_completes_and_shuts_down_promptly() {
+        let tmp = TempTestDir::new("worker_chunked_blob_reloc");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 2048;
+        cfg.inline_threshold_bytes = 128;
+        cfg.max_blob_segment_bytes = 64 * 1024;
+        cfg.auto_compact_segment_threshold = 64;
+        cfg.max_segments_before_inline_compaction = 10_000;
+        cfg.background_compaction = true;
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+        let payload = vec![0x5Au8; 16 * 1024];
+        {
+            let mut eng = engine.write().unwrap();
+            for i in 0..48u32 {
+                let k = format!("wk_{i:04}").into_bytes();
+                eng.put_row(1, &k, &payload, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.compact().unwrap();
+            for i in 0..48u32 {
+                if i % 3 < 2 {
+                    let k = format!("wk_{i:04}").into_bytes();
+                    eng.delete_row(1, &k, WriteDurability::BufferedFast)
+                        .unwrap();
+                }
+            }
+            eng.flush_memtable().unwrap();
+            assert!(eng.has_fragmented_std_blobs(0.5));
+        }
+
+        let worker = CompactionWorker::spawn(Arc::clone(&engine)).expect("spawn worker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.read().unwrap().has_fragmented_std_blobs(0.5) {
+            assert!(
+                Instant::now() < deadline,
+                "worker should finish chunked std-blob relocation"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        drop(worker);
+        assert!(worker_stats(&engine).is_none());
+        let mut eng = engine.write().unwrap();
+        assert!(!eng.is_relocating_std_blobs());
+        for i in 0..48u32 {
+            let k = format!("wk_{i:04}").into_bytes();
+            let expected = if i % 3 < 2 {
+                None
+            } else {
+                Some(payload.clone())
+            };
+            assert_eq!(eng.get_row(1, &k).unwrap(), expected);
+        }
+        drop(eng);
+
+        // Also exercise dropping the worker immediately after triggering a multi-chunk relocation.
+        {
+            let mut eng = engine.write().unwrap();
+            for i in 0..96u32 {
+                let k = format!("sh_{i:04}").into_bytes();
+                eng.put_row(1, &k, &payload, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.compact().unwrap();
+            for i in 0..96u32 {
+                if i % 3 < 2 {
+                    let k = format!("sh_{i:04}").into_bytes();
+                    eng.delete_row(1, &k, WriteDurability::BufferedFast)
+                        .unwrap();
+                }
+            }
+            eng.flush_memtable().unwrap();
+            assert!(eng.has_fragmented_std_blobs(0.5));
+        }
+        let worker2 = CompactionWorker::spawn(Arc::clone(&engine)).expect("spawn worker2");
+        std::thread::sleep(Duration::from_millis(1));
+        let drop_start = Instant::now();
+        drop(worker2);
+        assert!(
+            drop_start.elapsed() < Duration::from_secs(5),
+            "worker shutdown during chunked relocation took {:?}",
+            drop_start.elapsed()
+        );
+        assert!(!engine.read().unwrap().is_relocating_std_blobs());
     }
 }

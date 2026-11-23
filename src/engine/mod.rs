@@ -6,6 +6,7 @@
 //! compaction, and Capped Table (`MAX_BYTES`) delayed LRU eviction.
 
 mod compaction;
+pub(crate) use compaction::StdBlobRelocStep;
 pub use compaction::{CompactionJob, CompactionOutput};
 mod eviction;
 mod reader;

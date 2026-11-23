@@ -43,6 +43,24 @@ pub struct CompactionOutput<FS: PlatformFs> {
     drop_tombstones: bool,
 }
 
+/// Incremental session state for chunked background relocation of fragmented standard blobs.
+pub(crate) struct StdBlobRelocationSession {
+    fragmented_seqs: HashSet<u64>,
+    max_batch_wal_bytes: usize,
+    seek_key: Vec<u8>,
+    lower_inclusive: bool,
+    relocated: usize,
+    done: bool,
+}
+
+/// Progress outcome from one bounded chunk of [`StorageEngine::step_std_blob_relocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StdBlobRelocStep {
+    Continue,
+    Finished { relocated: usize },
+    Deferred,
+}
+
 impl<FS: PlatformFs> CompactionJob<FS> {
     /// `SeqID` reserved for the output segment.
     pub fn output_seq_id(&self) -> u64 {
@@ -417,18 +435,104 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `dead_bytes / file_len >= dead_ratio_threshold`, appending them to the active `blob_std`
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
     /// and can be reclaimed in $O(1)$.
+    #[cfg(test)]
+    pub(crate) fn is_relocating_std_blobs(&self) -> bool {
+        self.relocating_std_blobs
+    }
+
     pub fn relocate_fragmented_std_blobs(
         &mut self,
         dead_ratio_threshold: f64,
     ) -> io::Result<usize> {
-        self.check_not_poisoned()?;
-        if self.tx_depth > 0 || self.relocating_std_blobs {
+        let Some(mut session) = self.start_std_blob_relocation(dead_ratio_threshold)? else {
             return Ok(0);
-        }
+        };
         self.relocating_std_blobs = true;
-        let res = self.relocate_fragmented_std_blobs_inner(dead_ratio_threshold);
+        let res = self.relocate_fragmented_std_blobs_session(&mut session);
         self.relocating_std_blobs = false;
         res
+    }
+
+    /// Starts an incremental std-blob relocation session if fragmented segments exist and no
+    /// transaction or relocation is active.
+    pub(crate) fn start_std_blob_relocation(
+        &mut self,
+        dead_ratio_threshold: f64,
+    ) -> io::Result<Option<StdBlobRelocationSession>> {
+        self.check_not_poisoned()?;
+        if self.tx_depth > 0 || self.relocating_std_blobs {
+            return Ok(None);
+        }
+        self.drain_pending_durable()?;
+        let fragmented_seqs: HashSet<u64> =
+            self.fragmented_std_seqs(dead_ratio_threshold).collect();
+        if fragmented_seqs.is_empty() {
+            return Ok(None);
+        }
+        let wal_bytes = (self.buf_wal.total_sectors() as u64)
+            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
+        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
+        Ok(Some(StdBlobRelocationSession {
+            fragmented_seqs,
+            max_batch_wal_bytes,
+            seek_key: Vec::new(),
+            lower_inclusive: true,
+            relocated: 0,
+            done: false,
+        }))
+    }
+
+    /// Advances an incremental std-blob relocation session by at most `max_scan_keys` keys and
+    /// `max_reloc_bytes` relocated payload bytes (at least one matching blob per chunk when any
+    /// match is encountered), releasing `relocating_std_blobs` on every exit so callers can drop
+    /// `engine.write()` between chunks.
+    pub(crate) fn step_std_blob_relocation(
+        &mut self,
+        session: &mut StdBlobRelocationSession,
+        max_scan_keys: usize,
+        max_reloc_bytes: usize,
+    ) -> io::Result<StdBlobRelocStep> {
+        self.check_not_poisoned()?;
+        if session.done {
+            return Ok(StdBlobRelocStep::Finished {
+                relocated: session.relocated,
+            });
+        }
+        if self.tx_depth > 0 || self.relocating_std_blobs {
+            return Ok(StdBlobRelocStep::Deferred);
+        }
+        self.relocating_std_blobs = true;
+        let res = self.step_std_blob_relocation_inner(session, max_scan_keys, max_reloc_bytes);
+        self.relocating_std_blobs = false;
+        res
+    }
+
+    /// Flushes or reclaims newly dead sealed std-blob segments after a chunked relocation finishes.
+    pub(crate) fn finish_std_blob_relocation(&mut self, relocated: usize) -> io::Result<()> {
+        self.check_not_poisoned()?;
+        if relocated == 0 || self.tx_depth > 0 {
+            return Ok(());
+        }
+        if !self.memtable.is_empty() {
+            self.flush_memtable_no_auto_compact()?;
+        } else {
+            self.reclaim_fully_dead_blob_segments()?;
+        }
+        Ok(())
+    }
+
+    fn relocate_fragmented_std_blobs_session(
+        &mut self,
+        session: &mut StdBlobRelocationSession,
+    ) -> io::Result<usize> {
+        const RELOCATE_BATCH_SIZE: usize = 512;
+        loop {
+            match self.step_std_blob_relocation_inner(session, RELOCATE_BATCH_SIZE, usize::MAX)? {
+                StdBlobRelocStep::Continue => continue,
+                StdBlobRelocStep::Finished { relocated } => return Ok(relocated),
+                StdBlobRelocStep::Deferred => return Ok(session.relocated),
+            }
+        }
     }
 
     fn abort_relocation_batch(&mut self, new_ptrs: Vec<BlobPtr>) {
@@ -466,122 +570,139 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    fn relocate_fragmented_std_blobs_inner(
+    fn step_std_blob_relocation_inner(
         &mut self,
-        dead_ratio_threshold: f64,
-    ) -> io::Result<usize> {
+        session: &mut StdBlobRelocationSession,
+        max_scan_keys: usize,
+        max_reloc_bytes: usize,
+    ) -> io::Result<StdBlobRelocStep> {
+        if session.done {
+            return Ok(StdBlobRelocStep::Finished {
+                relocated: session.relocated,
+            });
+        }
+        if self.tx_depth > 0 {
+            return Ok(StdBlobRelocStep::Deferred);
+        }
         self.drain_pending_durable()?;
-        let fragmented_seqs: HashSet<u64> =
-            self.fragmented_std_seqs(dead_ratio_threshold).collect();
 
-        if fragmented_seqs.is_empty() {
-            return Ok(0);
+        let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
+        session.fragmented_seqs.retain(|seq| {
+            Some(*seq) != active_std_seq
+                && !self.unrelocatable_std_blobs.contains(seq)
+                && self
+                    .std_blobs
+                    .get(seq)
+                    .is_some_and(|b| b.file_len > 0 && b.dead_bytes < b.file_len)
+        });
+        if session.fragmented_seqs.is_empty() {
+            session.done = true;
+            return Ok(StdBlobRelocStep::Finished {
+                relocated: session.relocated,
+            });
         }
 
-        const RELOCATE_BATCH_SIZE: usize = 512;
-        let wal_bytes = (self.buf_wal.total_sectors() as u64)
-            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
-        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
-        let mut seek_key: Vec<u8> = Vec::new();
-        let mut lower_inclusive = true;
-        let mut relocated = 0usize;
+        let scan_limit = max_scan_keys.max(1);
+        let entries = self.scan_merged_prefix_range(
+            &[],
+            &session.seek_key,
+            session.lower_inclusive,
+            None,
+            scan_limit,
+            false,
+        )?;
+        let entries_len = entries.len();
+        if entries_len == 0 {
+            session.done = true;
+            return Ok(StdBlobRelocStep::Finished {
+                relocated: session.relocated,
+            });
+        }
 
-        loop {
-            let entries = self.scan_merged_prefix_range(
-                &[],
-                &seek_key,
-                lower_inclusive,
-                None,
-                RELOCATE_BATCH_SIZE,
-                false,
-            )?;
-            if entries.is_empty() {
+        let mut hit_chunk_budget = false;
+        let mut chunk_reloc_bytes = 0usize;
+        let mut batch_wal_records = Vec::new();
+        let mut batch_dead_ptrs = Vec::new();
+        let mut batch_new_ptrs = Vec::new();
+        let mut batch_est_bytes = 0usize;
+        for entry in entries {
+            if chunk_reloc_bytes > 0 && chunk_reloc_bytes >= max_reloc_bytes {
+                hit_chunk_budget = true;
                 break;
             }
-            seek_key = entries.last().unwrap().key.clone();
-            lower_inclusive = false;
-
-            let mut batch_wal_records = Vec::new();
-            let mut batch_dead_ptrs = Vec::new();
-            let mut batch_new_ptrs = Vec::new();
-            let mut batch_est_bytes = 0usize;
-            for entry in entries {
-                if let IndexValue::Blob(old_ptr) = entry.value {
-                    if old_ptr.kind == BlobKind::Standard
-                        && fragmented_seqs.contains(&old_ptr.seg_id)
-                    {
-                        let payload = match self.dereference_blob_lenient(&old_ptr, &entry.key) {
-                            Ok(Some(payload)) => payload,
-                            Ok(None) => {
-                                self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
-                                continue;
-                            }
-                            Err(e) => {
-                                self.abort_relocation_batch(batch_new_ptrs);
-                                return Err(e);
-                            }
-                        };
-                        let new_ptr = match self.append_to_blob_segment(
-                            BlobKind::Standard,
-                            0,
-                            &entry.key,
-                            &payload,
-                        ) {
-                            Ok(ptr) => ptr,
-                            Err(e) => {
-                                self.abort_relocation_batch(batch_new_ptrs);
-                                return Err(e);
-                            }
-                        };
-                        let rec = WalRecord::PutBlobPtr {
-                            key: entry.key,
-                            blob_ptr: new_ptr,
-                        };
-                        let rec_est = super::eviction::est_wal_record_bytes(&rec);
-                        batch_dead_ptrs.push(old_ptr);
-                        batch_new_ptrs.push(new_ptr);
-                        batch_wal_records.push(rec);
-                        batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
-                        relocated += 1;
-                        if batch_est_bytes >= max_batch_wal_bytes {
-                            self.flush_relocation_batch(
-                                &mut batch_wal_records,
-                                &mut batch_new_ptrs,
-                                &mut batch_dead_ptrs,
-                            )?;
-                            batch_est_bytes = 0;
+            if let IndexValue::Blob(old_ptr) = entry.value {
+                if old_ptr.kind == BlobKind::Standard
+                    && session.fragmented_seqs.contains(&old_ptr.seg_id)
+                {
+                    let payload = match self.dereference_blob_lenient(&old_ptr, &entry.key) {
+                        Ok(Some(payload)) => payload,
+                        Ok(None) => {
+                            self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
+                            session.seek_key.clear();
+                            session.seek_key.extend_from_slice(&entry.key);
+                            session.lower_inclusive = false;
+                            continue;
                         }
+                        Err(e) => {
+                            self.abort_relocation_batch(batch_new_ptrs);
+                            return Err(e);
+                        }
+                    };
+                    let payload_len = payload.len();
+                    let new_ptr = match self.append_to_blob_segment(
+                        BlobKind::Standard,
+                        0,
+                        &entry.key,
+                        &payload,
+                    ) {
+                        Ok(ptr) => ptr,
+                        Err(e) => {
+                            self.abort_relocation_batch(batch_new_ptrs);
+                            return Err(e);
+                        }
+                    };
+                    session.seek_key.clear();
+                    session.seek_key.extend_from_slice(&entry.key);
+                    session.lower_inclusive = false;
+                    let rec = WalRecord::PutBlobPtr {
+                        key: entry.key,
+                        blob_ptr: new_ptr,
+                    };
+                    let rec_est = super::eviction::est_wal_record_bytes(&rec);
+                    batch_dead_ptrs.push(old_ptr);
+                    batch_new_ptrs.push(new_ptr);
+                    batch_wal_records.push(rec);
+                    batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
+                    chunk_reloc_bytes = chunk_reloc_bytes.saturating_add(payload_len);
+                    session.relocated += 1;
+                    if batch_est_bytes >= session.max_batch_wal_bytes {
+                        self.flush_relocation_batch(
+                            &mut batch_wal_records,
+                            &mut batch_new_ptrs,
+                            &mut batch_dead_ptrs,
+                        )?;
+                        batch_est_bytes = 0;
                     }
+                    continue;
                 }
             }
-            self.flush_relocation_batch(
-                &mut batch_wal_records,
-                &mut batch_new_ptrs,
-                &mut batch_dead_ptrs,
-            )?;
+            session.seek_key.clear();
+            session.seek_key.extend_from_slice(&entry.key);
+            session.lower_inclusive = false;
         }
-        Ok(relocated)
-    }
-
-    /// Background-worker pass that relocates fragmented sealed `blob_std` segments and flushes or
-    /// reclaims them so dead disk space is freed even under background compaction mode.
-    pub(crate) fn background_relocate_fragmented_std_blobs(
-        &mut self,
-        dead_ratio_threshold: f64,
-    ) -> io::Result<usize> {
-        self.check_not_poisoned()?;
-        if self.tx_depth > 0 || !self.has_fragmented_std_blobs(dead_ratio_threshold) {
-            return Ok(0);
+        self.flush_relocation_batch(
+            &mut batch_wal_records,
+            &mut batch_new_ptrs,
+            &mut batch_dead_ptrs,
+        )?;
+        if !hit_chunk_budget && entries_len < scan_limit {
+            session.done = true;
+            Ok(StdBlobRelocStep::Finished {
+                relocated: session.relocated,
+            })
+        } else {
+            Ok(StdBlobRelocStep::Continue)
         }
-        let relocated = self.relocate_fragmented_std_blobs(dead_ratio_threshold)?;
-        if relocated > 0 {
-            if !self.memtable.is_empty() {
-                self.flush_memtable_no_auto_compact()?;
-            } else {
-                self.reclaim_fully_dead_blob_segments()?;
-            }
-        }
-        Ok(relocated)
     }
 
     /// Runs multi-way merge compaction across all active `idx_<SeqID>.db` segments, reclaims

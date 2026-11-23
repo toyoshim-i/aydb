@@ -7582,6 +7582,123 @@ fn relocate_fragmented_std_blobs_preserves_data_generation_and_does_not_recurse(
     }
 }
 
+#[test]
+fn chunked_std_blob_relocation_steps_interleave_and_reclaim_segments() {
+    let tmp = TempTestDir::new("chunked_std_reloc");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 1024;
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4096;
+    cfg.auto_compact_segment_threshold = 8;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    let payload = vec![0x6Du8; 96];
+    for i in 0..40u32 {
+        let pk = format!("cr_{i:04}").into_bytes();
+        engine
+            .put_row(1, &pk, &payload, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.compact().unwrap();
+
+    let mut initial_std_files: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_std_"))
+        .collect();
+    initial_std_files.sort();
+    assert!(initial_std_files.len() >= 2);
+    let fragmented_file = initial_std_files[0].clone();
+
+    for i in 0..20u32 {
+        let pk = format!("cr_{i:04}").into_bytes();
+        engine
+            .delete_row(1, &pk, WriteDurability::BufferedFast)
+            .unwrap();
+    }
+    engine.flush_memtable().unwrap();
+    assert!(engine.has_fragmented_std_blobs(0.5));
+
+    let mut session = engine
+        .start_std_blob_relocation(0.5)
+        .unwrap()
+        .expect("expected fragmented relocation session");
+
+    let first_step = engine
+        .step_std_blob_relocation(&mut session, 8, 200)
+        .unwrap();
+    assert_eq!(first_step, crate::engine::StdBlobRelocStep::Continue);
+    assert!(
+        !engine.is_relocating_std_blobs(),
+        "relocating_std_blobs guard must clear between steps"
+    );
+
+    // An active foreground transaction must defer stepping without poisoning or leaking the guard.
+    engine.begin_transaction();
+    engine
+        .put_row(
+            1,
+            b"cr_fg",
+            &[0x99u8; 128],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .step_std_blob_relocation(&mut session, 8, 200)
+            .unwrap(),
+        crate::engine::StdBlobRelocStep::Deferred
+    );
+    assert!(!engine.is_relocating_std_blobs());
+    engine.commit_transaction().unwrap();
+
+    let mut steps = 1usize;
+    let relocated = loop {
+        steps += 1;
+        match engine
+            .step_std_blob_relocation(&mut session, 8, 200)
+            .unwrap()
+        {
+            crate::engine::StdBlobRelocStep::Continue => {
+                assert!(!engine.is_relocating_std_blobs());
+            }
+            crate::engine::StdBlobRelocStep::Finished { relocated } => break relocated,
+            crate::engine::StdBlobRelocStep::Deferred => {
+                panic!("unexpected deferral outside transaction");
+            }
+        }
+    };
+    assert!(steps >= 2, "expected multi-chunk stepping, got {steps}");
+    assert!(
+        relocated >= 10,
+        "expected >= 10 relocated blobs, got {relocated}"
+    );
+    engine.finish_std_blob_relocation(relocated).unwrap();
+    assert!(!engine.has_fragmented_std_blobs(0.5));
+
+    let std_files: Vec<String> = fs
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.starts_with("blob_std_"))
+        .collect();
+    assert!(
+        !std_files.contains(&fragmented_file),
+        "expected fragmented {fragmented_file} reclaimed, remaining: {std_files:?}"
+    );
+    for i in 20..40u32 {
+        let pk = format!("cr_{i:04}").into_bytes();
+        assert_eq!(engine.get_row(1, &pk).unwrap(), Some(payload.clone()));
+    }
+    assert_eq!(
+        engine.get_row(1, b"cr_fg").unwrap(),
+        Some(vec![0x99u8; 128])
+    );
+}
+
 type SyncCountMap = Arc<std::sync::Mutex<HashMap<String, usize>>>;
 
 struct CountedFile {
