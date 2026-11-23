@@ -716,7 +716,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// Slot B **without** sweeping orphan segment files yet.
     ///
     /// For an existing non-zero `boot_meta.db`, preallocation (if short) and the initial
-    /// `sync_durable` are deferred until [`Self::ensure_durable`], [`Self::commit_update`], or
+    /// `sync_durable` are deferred until `ensure_durable`, [`Self::commit_update`], or
     /// [`Self::sweep_orphans`] so `StorageEngine::open` under `WalDamagePolicy::Fail` can inspect
     /// the WAL and refuse damaged databases without altering `boot_meta.db` or directory state.
     pub fn open_or_recover_deferred_sweep(fs: Arc<F>) -> io::Result<Self> {

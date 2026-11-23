@@ -152,7 +152,7 @@ impl MemEntry {
 
 /// Ordered in-memory mutation table with strict byte-size tracking.
 ///
-/// Entries live in a sorted directory of chunks of at most [`MAX_CHUNK_ENTRIES`] entries. A
+/// Entries live in a sorted directory of chunks of at most `MAX_CHUNK_ENTRIES` entries. A
 /// clone (read snapshot) shares the directory and, through it, every chunk. The first write
 /// after a clone copies the directory (one pair of reference-count increments per chunk) and
 /// then only the single chunk it touches, so a write never copies more than
