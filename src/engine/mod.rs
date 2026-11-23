@@ -518,6 +518,13 @@ fn merged_span_bytes(spans: &mut [(u64, u64)]) -> u64 {
     total + (cur_end - cur_start)
 }
 
+/// Normalizes a virtual-table or schema identifier according to SQLite's ASCII case-folding
+/// while preserving any leading, trailing, or internal whitespace.
+#[inline]
+pub(crate) fn normalize_vtab_ident(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 pub(crate) fn find_free_table_id(mut is_used: impl FnMut(u16) -> bool) -> io::Result<u16> {
     let mut candidate = 1u16;
     loop {
@@ -1583,7 +1590,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<VtabPlan> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
-        let norm_name = table_name.trim().to_ascii_lowercase();
+        let norm_name = normalize_vtab_ident(table_name);
+        if norm_name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual table name must not be empty",
+            ));
+        }
         let catalog_prefix = [0u8, 0u8, b'c'];
         let entries = self.scan_merged_prefix_view(view, &catalog_prefix)?;
         let mut persisted_name_to_id: HashMap<String, u16> = HashMap::new();
@@ -1680,7 +1693,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// survive that transaction's rollback, so it is also recorded in the snapshots a rollback
     /// restores without clobbering any uncommitted rename/drop already recorded by the owner.
     pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
-        let name: Arc<str> = Arc::from(table_name.trim().to_ascii_lowercase().as_str());
+        let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
         if self.tx_start_meta.active {
             let orig = self.tx_start_meta.active_vtab_ids.get(&table_id).cloned();
             if self.active_vtab_ids.get(&table_id) == orig.as_ref() {
@@ -1710,8 +1723,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_depth > 0 {
             self.vtabs_created_in_tx.push((
                 table_id,
-                table_name.trim().to_ascii_lowercase(),
-                db_name.trim().to_ascii_lowercase(),
+                normalize_vtab_ident(table_name),
+                normalize_vtab_ident(db_name),
             ));
         }
     }
@@ -1725,7 +1738,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_id: u16,
         table_name: &str,
     ) -> io::Result<()> {
-        let norm = table_name.trim().to_ascii_lowercase();
+        let norm = normalize_vtab_ident(table_name);
         let mut key = vec![0u8, 0u8, b'c'];
         key.extend_from_slice(norm.as_bytes());
         let mapped = match self.lookup_raw_entry_view(ReadView::Owner, &key)? {
@@ -1751,7 +1764,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_name: &str,
         mut is_stale: impl FnMut(&str, &str) -> bool,
     ) -> Vec<(u16, String)> {
-        let norm = table_name.trim().to_ascii_lowercase();
+        let norm = normalize_vtab_ident(table_name);
         let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
             .into_iter()
             .partition(|(id, name, db)| {
@@ -1878,8 +1891,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
-        let old_norm = old_name.trim().to_ascii_lowercase();
-        let new_norm = new_name.trim().to_ascii_lowercase();
+        let old_norm = normalize_vtab_ident(old_name);
+        let new_norm = normalize_vtab_ident(new_name);
+        if new_norm.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual table name must not be empty",
+            ));
+        }
         let catalog_key = |name: &str| {
             let mut key = Vec::with_capacity(3 + name.len());
             key.extend_from_slice(&[0u8, 0u8, b'c']);
@@ -1994,7 +2013,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let candidate_name = table_name
-            .map(|s| s.trim().to_ascii_lowercase())
+            .map(normalize_vtab_ident)
             .or_else(|| self.active_vtab_ids.get(&table_id).map(|s| s.to_string()));
         if let Some(norm_name) = candidate_name {
             let mut cat_key = Vec::with_capacity(3 + norm_name.len());

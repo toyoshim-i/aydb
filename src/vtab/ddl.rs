@@ -529,12 +529,12 @@ pub(super) unsafe fn parse_vtab_ddl(
     argv: *const *const c_char,
 ) -> Result<ParsedVtabDdl, c_int> {
     unsafe {
-        // Extract SQLite schema name from argv[1] and virtual table name from argv[2]
+        // Extract SQLite schema name from argv[1] and virtual table name from argv[2],
+        // preserving any leading/trailing whitespace so distinct quoted names do not collide.
         let db_name = if argc > 1 && !(*argv.offset(1)).is_null() {
             let s = CStr::from_ptr(*argv.offset(1))
                 .to_string_lossy()
-                .trim()
-                .to_string();
+                .into_owned();
             if s.is_empty() {
                 String::from("main")
             } else {
@@ -546,8 +546,7 @@ pub(super) unsafe fn parse_vtab_ddl(
         let table_name = if argc > 2 && !(*argv.offset(2)).is_null() {
             CStr::from_ptr(*argv.offset(2))
                 .to_string_lossy()
-                .trim()
-                .to_string()
+                .into_owned()
         } else {
             String::from("vtab")
         };

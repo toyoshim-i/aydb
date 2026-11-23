@@ -615,3 +615,75 @@ fn concurrent_writer_does_not_cause_busy_on_multi_table_commit_or_rollback() {
     assert_eq!(ints(&conn1, "SELECT count(*) FROM t2"), [40]);
     assert_eq!(ints(&conn1, "SELECT count(*) FROM u"), [competitor_rows]);
 }
+
+#[test]
+fn whitespace_padded_table_names_are_distinct() {
+    let mut fixture = Fixture::new("whitespace_padded_names");
+    let conn = fixture.open();
+
+    // Exact audit scenario: create `x`, insert row, then create `" x "` in the same SQLite schema.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE x USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO x VALUES (1, 100);
+         CREATE VIRTUAL TABLE \" x \" USING aydb(columns='k INTEGER PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    assert!(
+        ints(&conn, "SELECT v FROM \" x \"").is_empty(),
+        "\" x \" must not read rows belonging to x"
+    );
+    conn.execute_batch("INSERT INTO \" x \" VALUES (1, 200)")
+        .unwrap();
+
+    // Also test leading-only, trailing-only, and single-space identifiers.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE \" x\" USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         CREATE VIRTUAL TABLE \"x \" USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         CREATE VIRTUAL TABLE \" \" USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO \" x\" VALUES (1, 300);
+         INSERT INTO \"x \" VALUES (1, 400);
+         INSERT INTO \" \" VALUES (1, 500);",
+    )
+    .unwrap();
+
+    assert_eq!(ints(&conn, "SELECT v FROM x"), [100]);
+    assert_eq!(ints(&conn, "SELECT v FROM \" x \""), [200]);
+    assert_eq!(ints(&conn, "SELECT v FROM \" x\""), [300]);
+    assert_eq!(ints(&conn, "SELECT v FROM \"x \""), [400]);
+    assert_eq!(ints(&conn, "SELECT v FROM \" \""), [500]);
+
+    // Case-folding still preserves whitespace (`" X "` maps to `" x "`, not `x`).
+    let id_trimmed = fixture
+        .engine()
+        .write()
+        .unwrap()
+        .register_or_resolve_vtab("x", None)
+        .unwrap();
+    let id_padded_lower = fixture
+        .engine()
+        .write()
+        .unwrap()
+        .register_or_resolve_vtab(" x ", None)
+        .unwrap();
+    let id_padded_upper = fixture
+        .engine()
+        .write()
+        .unwrap()
+        .register_or_resolve_vtab(" X ", None)
+        .unwrap();
+    assert_ne!(id_trimmed, id_padded_lower);
+    assert_eq!(id_padded_lower, id_padded_upper);
+
+    // Rename `" x "` -> `" y "` and DROP `x`; other whitespace-named tables stay intact across restart.
+    conn.execute_batch("ALTER TABLE \" x \" RENAME TO \" y \"; DROP TABLE x;")
+        .unwrap();
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert!(conn.query_all("SELECT v FROM x", &[]).is_err());
+    assert!(conn.query_all("SELECT v FROM \" x \"", &[]).is_err());
+    assert_eq!(ints(&conn, "SELECT v FROM \" y \""), [200]);
+    assert_eq!(ints(&conn, "SELECT v FROM \" x\""), [300]);
+    assert_eq!(ints(&conn, "SELECT v FROM \"x \""), [400]);
+    assert_eq!(ints(&conn, "SELECT v FROM \" \""), [500]);
+}

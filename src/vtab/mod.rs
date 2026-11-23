@@ -1003,8 +1003,8 @@ unsafe fn vtab_create_or_connect(
             // what is left of it only if this connection owns the transaction and SQLite's
             // schema no longer has that table.
             if is_create && eng.conn_has_open_transaction(db as usize) {
-                let cur_norm_name = ddl.table_name.trim().to_ascii_lowercase();
-                let cur_norm_db = ddl.db_name.trim().to_ascii_lowercase();
+                let cur_norm_name = crate::engine::normalize_vtab_ident(&ddl.table_name);
+                let cur_norm_db = crate::engine::normalize_vtab_ident(&ddl.db_name);
                 for (id, name) in eng.take_vtabs_created_in_tx(
                     ddl.explicit_table_id,
                     &ddl.table_name,
@@ -3199,10 +3199,10 @@ unsafe fn schema_has_table(db: *mut sqlite3, db_name: &str, name: &str) -> bool 
     let Ok(c_name) = CString::new(name) else {
         return true;
     };
-    let c_db = if db_name.trim().is_empty() {
+    let c_db = if db_name.is_empty() {
         None
     } else {
-        let Ok(c_db) = CString::new(db_name.trim()) else {
+        let Ok(c_db) = CString::new(db_name) else {
             return true;
         };
         Some(c_db)
