@@ -4507,3 +4507,41 @@ fn statement_execute_reports_commit_failure_on_insert_returning() {
         vec![vec![SqlValue::Integer(3)]]
     );
 }
+
+#[test]
+fn flushed_reverse_scan_below_min_key_and_empty_full_compaction_reopen_do_not_panic() {
+    let tmp = TempTestDir::new("empty_cursor_vtab_reopen");
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k INTEGER PRIMARY KEY, v TEXT');
+             INSERT INTO t VALUES (10, 'a'), (20, 'b'), (30, 'c');",
+        )
+        .unwrap();
+        engine.write().unwrap().flush_memtable().unwrap();
+
+        // Reverse scan whose exclusive upper bound matches `seg.min_key()` must return 0 rows cleanly.
+        assert!(
+            conn.query_all("SELECT k, v FROM t WHERE k < 10 ORDER BY k DESC", &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        // Deleting every row, flushing, and running full compaction yields a 0-block SSTable.
+        conn.execute_batch("DELETE FROM t").unwrap();
+        let mut eng = engine.write().unwrap();
+        eng.flush_memtable().unwrap();
+        eng.compact().unwrap();
+    }
+
+    // Reopening and re-compacting with a 0-block SSTable must succeed without panicking.
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.compact().unwrap();
+}

@@ -1621,6 +1621,9 @@ impl CursorBlockStorage {
     ) -> io::Result<IdxBlockReader<'_>> {
         let preverified = if let Some(ra) = &mut self.read_ahead {
             if block_idx < ra.start_block || block_idx >= ra.start_block + ra.block_count {
+                // Invalidate window metadata before resizing so a failed read leaves no stale span.
+                ra.block_count = 0;
+                self.active = ActiveBlock::None;
                 let count = seg
                     .num_blocks
                     .saturating_sub(block_idx)
@@ -1644,6 +1647,7 @@ impl CursorBlockStorage {
             self.active = ActiveBlock::Cached(arc);
             true
         } else {
+            self.active = ActiveBlock::None;
             let scratch = self
                 .scratch
                 .get_or_insert_with(|| Box::new([0u8; IDX_BLOCK_SIZE]));
@@ -1653,17 +1657,33 @@ impl CursorBlockStorage {
             false
         };
 
-        if preverified {
-            IdxBlockReader::open_preverified(self.block_bytes())
-        } else {
-            let reader = IdxBlockReader::open_verified(self.block_bytes())?;
-            if populate_cache {
-                if let Some(cache) = &seg.block_cache {
-                    cache.insert(seg.seq_id, block_idx, reader.buf);
+        let num_entries = if preverified {
+            match IdxBlockReader::open_preverified(self.block_bytes()) {
+                Ok(r) => r.num_entries,
+                Err(e) => {
+                    self.active = ActiveBlock::None;
+                    return Err(e);
                 }
             }
-            Ok(reader)
-        }
+        } else {
+            let num_entries = match IdxBlockReader::open_verified(self.block_bytes()) {
+                Ok(r) => r.num_entries,
+                Err(e) => {
+                    self.active = ActiveBlock::None;
+                    return Err(e);
+                }
+            };
+            if populate_cache {
+                if let Some(cache) = &seg.block_cache {
+                    cache.insert(seg.seq_id, block_idx, self.block_bytes());
+                }
+            }
+            num_entries
+        };
+        Ok(IdxBlockReader::from_verified_buf(
+            self.block_bytes(),
+            num_entries,
+        ))
     }
 }
 
@@ -1757,17 +1777,17 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
     /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
+        let s = self.current_span.as_ref()?;
         let block = self.block.block_bytes();
-        self.current_span
-            .as_ref()
-            .map(|s| &block[s.key_range.clone()])
+        Some(&block[s.key_range.clone()])
     }
 
     /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        let s = self.current_span.as_ref()?;
         let block = self.block.block_bytes();
-        self.current_span.as_ref().map(|s| RawIdxEntry {
+        Some(RawIdxEntry {
             key: &block[s.key_range.clone()],
             lsn: s.lsn,
             val_type: s.val_type,
@@ -1795,9 +1815,9 @@ impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
     }
 
     fn advance_to_prev(&mut self) -> io::Result<()> {
+        self.current_span = None;
         while self.entry_idx == 0 {
             let Some(b) = self.next_block_idx else {
-                self.current_span = None;
                 return Ok(());
             };
             self.next_block_idx = b.checked_sub(1);
@@ -1911,17 +1931,17 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
     /// Returns the raw key slice of the current entry without heap allocation.
     #[inline]
     pub fn current_key(&self) -> Option<&[u8]> {
+        let s = self.current_span.as_ref()?;
         let block = self.block.block_bytes();
-        self.current_span
-            .as_ref()
-            .map(|s| &block[s.key_range.clone()])
+        Some(&block[s.key_range.clone()])
     }
 
     /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
     #[inline]
     pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        let s = self.current_span.as_ref()?;
         let block = self.block.block_bytes();
-        self.current_span.as_ref().map(|s| RawIdxEntry {
+        Some(RawIdxEntry {
             key: &block[s.key_range.clone()],
             lsn: s.lsn,
             val_type: s.val_type,
@@ -1949,9 +1969,9 @@ impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
     }
 
     fn advance_to_next(&mut self) -> io::Result<()> {
+        self.current_span = None;
         while self.entry_idx >= self.num_entries_in_block {
             if self.next_block_idx >= self.seg.num_blocks {
-                self.current_span = None;
                 return Ok(());
             }
             let b = self.next_block_idx;
@@ -2811,5 +2831,134 @@ mod tests {
             b2[entry_end..dir_start].iter().all(|&b| b == 0),
             "unused gap in reused IdxBlockBuilder must be zeroed"
         );
+    }
+
+    #[test]
+    fn empty_cursors_and_exclusive_min_upper_bound_return_none_without_panicking() {
+        let tmp = TempTestDir::new("empty_cursor_no_panic");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        // 1. Non-empty segment: forward seek past max_key and reverse seek with exclusive min_key.
+        let mut builder = IdxSegmentBuilder::create(&fs, 1, 0, 10).unwrap();
+        for i in 1..=10u32 {
+            let k = format!("k_{i:04}").into_bytes();
+            builder.add_raw_entry(&k, i as u64, 1, b"val").unwrap();
+        }
+        let seg = builder.finish().unwrap();
+
+        let mut fwd_past = seg.cursor_from(b"k_0010", false).unwrap();
+        assert_eq!(fwd_past.current_key(), None);
+        assert_eq!(fwd_past.peek_raw(), None);
+        assert_eq!(fwd_past.next_entry().unwrap(), None);
+        fwd_past.advance().unwrap();
+
+        let mut rev_below_min = seg
+            .cursor_reverse_from(Some((seg.min_key(), false)))
+            .unwrap();
+        assert_eq!(rev_below_min.current_key(), None);
+        assert_eq!(rev_below_min.peek_raw(), None);
+        assert_eq!(rev_below_min.next_entry().unwrap(), None);
+        rev_below_min.advance().unwrap();
+
+        // 2. 0-block segment (e.g. produced after full compaction drops all tombstones).
+        let empty_builder = IdxSegmentBuilder::create(&fs, 2, 1, 10).unwrap();
+        let empty_seg = empty_builder.finish().unwrap();
+        assert_eq!(empty_seg.num_blocks(), 0);
+
+        for mut cur in [
+            empty_seg.cursor_all().unwrap(),
+            empty_seg.cursor_all_batched(4).unwrap(),
+            empty_seg.cursor_from(b"k_0001", true).unwrap(),
+        ] {
+            assert_eq!(cur.current_key(), None);
+            assert_eq!(cur.peek_raw(), None);
+            assert_eq!(cur.next_entry().unwrap(), None);
+            cur.advance().unwrap();
+        }
+        let mut rev_empty = empty_seg.cursor_reverse_from(None).unwrap();
+        assert_eq!(rev_empty.current_key(), None);
+        assert_eq!(rev_empty.peek_raw(), None);
+        assert_eq!(rev_empty.next_entry().unwrap(), None);
+        rev_empty.advance().unwrap();
+    }
+
+    #[test]
+    fn cursor_load_error_leaves_cursor_empty_without_panicking() {
+        let tmp = TempTestDir::new("cursor_load_error_state");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let mut builder = IdxSegmentBuilder::create(&fs, 1, 0, 10).unwrap();
+        let val = vec![0x42u8; 512];
+        for i in 0..24u32 {
+            let k = format!("key_{i:04}").into_bytes();
+            builder.add_raw_entry(&k, i as u64 + 1, 1, &val).unwrap();
+        }
+        let seg = builder.finish().unwrap();
+        assert!(seg.num_blocks() >= 2);
+        drop(seg);
+
+        // Corrupt block 1's CRC while leaving block 0 and footer valid.
+        let fname = crate::meta::format_idx_file_name(1);
+        let file = fs
+            .open_file(&fname, false, true, OpenHint::ImmutableRandom)
+            .unwrap();
+        let mut b1 = [0u8; IDX_BLOCK_SIZE];
+        file.read_exact_at(&mut b1, IDX_BLOCK_SIZE as u64).unwrap();
+        b1[0] ^= 0xFF;
+        file.write_all_at(&b1, IDX_BLOCK_SIZE as u64).unwrap();
+        file.sync_barrier().unwrap();
+        drop(file);
+
+        // Single-block forward cursor: block 0 works, crossing into block 1 fails cleanly.
+        let seg = IdxSegmentReader::open(&fs, 1).unwrap();
+        let mut cur = seg.cursor_all().unwrap();
+        loop {
+            match cur.advance() {
+                Ok(()) if cur.current_key().is_none() => panic!("expected block 1 corruption"),
+                Ok(()) => {}
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                    break;
+                }
+            }
+        }
+        assert_eq!(cur.current_key(), None);
+        assert_eq!(cur.peek_raw(), None);
+
+        // Batched read-ahead cursor: failing to load block 1 resets current_span and active block.
+        let mut batched = seg.cursor_all_batched(1).unwrap();
+        assert!(batched.current_key().is_some());
+        loop {
+            match batched.advance() {
+                Ok(()) if batched.current_key().is_none() => {
+                    panic!("expected block 1 corruption on batched cursor")
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                    break;
+                }
+            }
+        }
+        assert_eq!(batched.current_key(), None);
+        assert_eq!(batched.peek_raw(), None);
+
+        // Reverse cursor: starting on last block then walking backward into corrupted block 1.
+        let mut rev = seg.cursor_reverse_from(None).unwrap();
+        assert!(rev.current_key().is_some());
+        loop {
+            match rev.advance() {
+                Ok(()) if rev.current_key().is_none() => {
+                    panic!("expected block 1 corruption on reverse cursor")
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                    break;
+                }
+            }
+        }
+        assert_eq!(rev.current_key(), None);
+        assert_eq!(rev.peek_raw(), None);
     }
 }
