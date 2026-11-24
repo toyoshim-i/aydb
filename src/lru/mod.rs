@@ -83,6 +83,13 @@ struct TrackerShardInner {
     evict_round: usize,
 }
 
+#[inline]
+fn maybe_shrink_table_map(map: &mut HashMap<Vec<u8>, u64>) {
+    if map.capacity() > 64 && map.len().saturating_mul(4) < map.capacity() {
+        map.shrink_to(map.len().saturating_mul(2).max(16));
+    }
+}
+
 impl AccessTracker {
     pub fn new(initial_tick: u64, max_entries: usize) -> Self {
         let max_entries_per_shard = (max_entries.max(64) / TRACKER_SHARDS).max(1);
@@ -191,7 +198,11 @@ impl AccessTracker {
                                 }
                             });
                             kept += m.len();
-                            m.is_empty()
+                            let empty = m.is_empty();
+                            if !empty {
+                                maybe_shrink_table_map(m);
+                            }
+                            empty
                         } else {
                             false
                         };
@@ -203,11 +214,7 @@ impl AccessTracker {
                 inner.total_entries = kept;
             }
         }
-        let cap = self.max_entries_per_shard.min(64);
-        let table_map = inner
-            .hot_ticks
-            .entry(table_id)
-            .or_insert_with(|| HashMap::with_capacity(cap));
+        let table_map = inner.hot_ticks.entry(table_id).or_default();
         if table_map.insert(pk.to_vec(), tick).is_none() {
             inner.total_entries += 1;
         }
@@ -223,7 +230,12 @@ impl AccessTracker {
         }
         let (removed, became_empty) = {
             let table_map = g.hot_ticks.get_mut(&table_id)?;
-            (table_map.remove(pk), table_map.is_empty())
+            let removed = table_map.remove(pk);
+            let empty = table_map.is_empty();
+            if removed.is_some() && !empty {
+                maybe_shrink_table_map(table_map);
+            }
+            (removed, empty)
         };
         if became_empty {
             g.hot_ticks.remove(&table_id);
@@ -255,7 +267,11 @@ impl AccessTracker {
         let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
             if table_map.get(pk).copied().is_some_and(|t| t <= max_tick) {
                 let did_remove = table_map.remove(pk).is_some();
-                (did_remove, table_map.is_empty())
+                let empty = table_map.is_empty();
+                if did_remove && !empty {
+                    maybe_shrink_table_map(table_map);
+                }
+                (did_remove, empty)
             } else {
                 (false, false)
             }
@@ -279,7 +295,12 @@ impl AccessTracker {
             return;
         }
         let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
-            (table_map.remove(pk).is_some(), table_map.is_empty())
+            let did_remove = table_map.remove(pk).is_some();
+            let empty = table_map.is_empty();
+            if did_remove && !empty {
+                maybe_shrink_table_map(table_map);
+            }
+            (did_remove, empty)
         } else {
             return;
         };
@@ -501,5 +522,58 @@ mod tests {
         }
         let g = saturated.shards[shard_idx].lock();
         assert!(g.total_entries <= saturated.max_entries_per_shard);
+    }
+
+    #[test]
+    fn access_tracker_starts_unallocated_and_shrinks_after_bulk_removal() {
+        let tracker = AccessTracker::new(1, 1024);
+        assert_eq!(tracker.len(), 0);
+        // Empty tables allocate nothing upfront.
+        for s in &tracker.shards {
+            assert!(s.lock().hot_ticks.is_empty());
+        }
+
+        // Force all keys into table 7 on the same shard until that per-table map grows well past 64.
+        let target_shard = AccessTracker::shard_index(7, b"seed");
+        let mut keys = Vec::new();
+        for i in 0..20_000u32 {
+            let k = format!("k_{i}");
+            if AccessTracker::shard_index(7, k.as_bytes()) == target_shard {
+                keys.push(k);
+                if keys.len() == 160 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(keys.len(), 160);
+        let big_tracker = AccessTracker::new(1, 10_000);
+        for k in &keys {
+            big_tracker.record_read_hit_with_tick(7, k.as_bytes(), 10);
+        }
+        let peak_cap = big_tracker.shards[target_shard].lock().hot_ticks[&7].capacity();
+        assert!(peak_cap > 64, "expected peak_cap > 64, got {peak_cap}");
+
+        // Clear all but 2 entries (`tick <= 10`). Map must remain and shrink down cleanly.
+        for k in &keys[..keys.len() - 2] {
+            big_tracker.clear_if_tick_le(7, k.as_bytes(), 10);
+        }
+        let shrunk_cap = big_tracker.shards[target_shard].lock().hot_ticks[&7].capacity();
+        assert!(
+            shrunk_cap < peak_cap && shrunk_cap <= 64,
+            "expected map capacity to shrink from {peak_cap}, got {shrunk_cap}"
+        );
+
+        // Repeat with remove_key.
+        big_tracker.record_read_hit_with_tick(8, keys[0].as_bytes(), 20);
+        for k in &keys[1..] {
+            big_tracker.record_read_hit_with_tick(8, k.as_bytes(), 20);
+        }
+        let target_shard8 = AccessTracker::shard_index(8, keys[0].as_bytes());
+        for k in &keys[..keys.len() - 1] {
+            big_tracker.remove_key(8, k.as_bytes());
+        }
+        if let Some(m) = big_tracker.shards[target_shard8].lock().hot_ticks.get(&8) {
+            assert!(m.capacity() <= 64);
+        }
     }
 }

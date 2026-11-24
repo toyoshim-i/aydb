@@ -196,7 +196,7 @@ impl MemTable {
     }
 
     pub fn should_flush(&self) -> bool {
-        self.approximate_bytes >= self.max_capacity_bytes
+        !self.is_empty() && self.approximate_bytes >= self.max_capacity_bytes
     }
 
     pub fn highest_lsn(&self) -> u64 {
@@ -1146,5 +1146,16 @@ mod tests {
             };
             assert_eq!(got.value, IndexValue::Inline(expected_val.clone()));
         }
+    }
+
+    #[test]
+    fn empty_memtable_does_not_trigger_should_flush_even_with_zero_capacity() {
+        let mut mt = MemTable::new(0);
+        assert!(mt.is_empty());
+        assert!(!mt.should_flush());
+
+        mt.put_inline(b"k".to_vec(), b"v".to_vec(), 1);
+        assert!(!mt.is_empty());
+        assert!(mt.should_flush());
     }
 }

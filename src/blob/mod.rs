@@ -242,6 +242,36 @@ impl<F: PlatformFile> Clone for BlobSegmentReader<F> {
     }
 }
 
+fn parse_and_check_blob_header(
+    hdr: &[u8],
+    expected_total_len: usize,
+    expected_crc: u32,
+    expected_key: Option<&[u8]>,
+) -> Option<(usize, usize)> {
+    if hdr.len() < BLOB_RECORD_HEADER_LEN || &hdr[0..4] != BLOB_RECORD_MAGIC {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    if stored_crc != expected_crc {
+        return None;
+    }
+    let key_len = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+    let val_len = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+    if BLOB_RECORD_HEADER_LEN
+        .checked_add(key_len)
+        .and_then(|n| n.checked_add(val_len))
+        != Some(expected_total_len)
+    {
+        return None;
+    }
+    if let Some(exp_k) = expected_key {
+        if key_len != exp_k.len() {
+            return None;
+        }
+    }
+    Some((key_len, val_len))
+}
+
 impl<F: PlatformFile> BlobSegmentReader<F> {
     pub fn new(file: Arc<F>, seq_id: u64) -> Self {
         Self::new_with_len(file, seq_id, 0)
@@ -285,31 +315,11 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         expected_crc: u32,
         expected_key: Option<&[u8]>,
     ) -> Option<&'a [u8]> {
-        if buf.len() < BLOB_RECORD_HEADER_LEN {
-            return None;
-        }
-        if &buf[0..4] != BLOB_RECORD_MAGIC {
-            return None;
-        }
-
-        let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        if stored_crc != expected_crc {
-            return None;
-        }
+        let (key_len, val_len) =
+            parse_and_check_blob_header(buf, buf.len(), expected_crc, expected_key)?;
 
         let actual_crc = crc32c(&buf[8..]);
         if actual_crc != expected_crc {
-            return None;
-        }
-
-        let key_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-        let val_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-
-        if BLOB_RECORD_HEADER_LEN
-            .checked_add(key_len)
-            .and_then(|n| n.checked_add(val_len))
-            != Some(buf.len())
-        {
             return None;
         }
 
@@ -390,6 +400,18 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         };
         let len = ptr.len as usize;
 
+        // Validate the 16-byte stack header before allocating `ptr.len` bytes in `out` so a
+        // tampered or mismatched record cannot force a huge reservation before failing checks.
+        let mut hdr = [0u8; BLOB_RECORD_HEADER_LEN];
+        match self.file.read_exact_at(&mut hdr, ptr.offset as u64) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if parse_and_check_blob_header(&hdr, len, ptr.crc32c, expected_key).is_none() {
+            return Ok(false);
+        }
+
         let orig_len = out.len();
         let new_len = orig_len.checked_add(len).ok_or_else(|| {
             io::Error::new(
@@ -409,19 +431,22 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             )
         })?;
         out.resize(new_len, 0);
-        match self
-            .file
-            .read_exact_at(&mut out[orig_len..new_len], ptr.offset as u64)
-        {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Power loss occurred before the buffered blob write reached physical disk.
-                out.truncate(orig_len);
-                return Ok(false);
-            }
-            Err(e) => {
-                out.truncate(orig_len);
-                return Err(e);
+        out[orig_len..orig_len + BLOB_RECORD_HEADER_LEN].copy_from_slice(&hdr);
+        if len > BLOB_RECORD_HEADER_LEN {
+            match self.file.read_exact_at(
+                &mut out[orig_len + BLOB_RECORD_HEADER_LEN..new_len],
+                (ptr.offset as u64) + BLOB_RECORD_HEADER_LEN as u64,
+            ) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Power loss occurred before the buffered blob write reached physical disk.
+                    out.truncate(orig_len);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    out.truncate(orig_len);
+                    return Err(e);
+                }
             }
         }
 
@@ -479,32 +504,17 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             );
         }
 
-        if &stack_buf[0..4] != BLOB_RECORD_MAGIC {
+        let Some((key_len, _)) = parse_and_check_blob_header(
+            &stack_buf[..BLOB_RECORD_HEADER_LEN],
+            total_len,
+            ptr.crc32c,
+            expected_key,
+        ) else {
             return Ok(false);
-        }
-        let stored_crc =
-            u32::from_le_bytes([stack_buf[4], stack_buf[5], stack_buf[6], stack_buf[7]]);
-        if stored_crc != ptr.crc32c {
-            return Ok(false);
-        }
-        let key_len =
-            u32::from_le_bytes([stack_buf[8], stack_buf[9], stack_buf[10], stack_buf[11]]) as usize;
-        let val_len =
-            u32::from_le_bytes([stack_buf[12], stack_buf[13], stack_buf[14], stack_buf[15]])
-                as usize;
-        if BLOB_RECORD_HEADER_LEN
-            .checked_add(key_len)
-            .and_then(|n| n.checked_add(val_len))
-            != Some(total_len)
-        {
-            return Ok(false);
-        }
+        };
 
         let mut remaining_key = match expected_key {
             Some(key) => {
-                if key.len() != key_len {
-                    return Ok(false);
-                }
                 let n = key_len.min(first_len - BLOB_RECORD_HEADER_LEN);
                 if key[..n] != stack_buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + n] {
                     return Ok(false);
@@ -1154,5 +1164,48 @@ mod tests {
             reader.read_blob(&ptr_small, Some(b"small")).unwrap(),
             Some(small)
         );
+    }
+
+    #[test]
+    fn append_blob_into_validates_header_before_reserving_payload() {
+        let dir = TempTestDir::new("blob_preheader_check");
+        let fs = OsFs::open(&dir.path, true).unwrap();
+
+        let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
+        let payload = vec![0x77u8; 512 * 1024];
+        let ptr = writer.append_blob(b"good_key", &payload).unwrap();
+        writer.sync_durable().unwrap();
+        let rw = Arc::clone(writer.file());
+        let reader = writer.reader();
+        drop(writer);
+
+        // Mismatched key length or bad CRC must reject using only the 16-byte stack header
+        // without reserving `ptr.len` bytes into `out`.
+        let mut out = Vec::with_capacity(64);
+        assert!(!reader.append_blob_into(&ptr, Some(b"k"), &mut out).unwrap());
+        assert_eq!(out.capacity(), 64);
+        assert!(out.is_empty());
+
+        let bad_crc_ptr = BlobPtr {
+            crc32c: ptr.crc32c ^ 1,
+            ..ptr
+        };
+        assert!(
+            !reader
+                .append_blob_into(&bad_crc_ptr, Some(b"good_key"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out.capacity(), 64);
+        assert!(out.is_empty());
+
+        // Corrupt magic bytes on disk: pre-header validation fails without allocating 512 KB.
+        rw.write_all_at(b"XXXX", ptr.offset as u64).unwrap();
+        assert!(
+            !reader
+                .append_blob_into(&ptr, Some(b"good_key"), &mut out)
+                .unwrap()
+        );
+        assert_eq!(out.capacity(), 64);
+        assert!(out.is_empty());
     }
 }

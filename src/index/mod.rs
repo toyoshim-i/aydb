@@ -519,11 +519,112 @@ struct CursorEntrySpan {
     val_range: core::ops::Range<usize>,
 }
 
+/// Minimum encoded header size of an entry in a 4 KB data block (`klen(2) + type(1) + lsn(8)`).
+const MIN_IDX_ENTRY_BYTES: usize = 11;
+
+/// Maximum number of entries that can fit in a 4 KB data block (`11B` entry + `2B` directory slot).
+const MAX_IDX_BLOCK_ENTRIES: usize = IDX_BLOCK_USABLE_SIZE / (MIN_IDX_ENTRY_BYTES + 2);
+
 /// Zero-copy reader for a single 4096-byte index data block.
 pub struct IdxBlockReader<'a> {
     buf: &'a [u8; IDX_BLOCK_SIZE],
     num_entries: usize,
     dir_start: usize,
+}
+
+fn validate_block_entry_layout(
+    buf: &[u8; IDX_BLOCK_SIZE],
+    num_entries: usize,
+    dir_start: usize,
+) -> io::Result<()> {
+    let mut prev_end = 0usize;
+    for i in 0..num_entries {
+        let dir_pos = dir_start + (i * 2);
+        let off = u16::from_le_bytes([buf[dir_pos], buf[dir_pos + 1]]) as usize;
+        if off < prev_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlapping or out-of-order entry offsets in 4 KB index block",
+            ));
+        }
+        let Some(kstart) = off.checked_add(MIN_IDX_ENTRY_BYTES) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted entry offset in 4 KB index block",
+            ));
+        };
+        if kstart > dir_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted entry offset in 4 KB index block",
+            ));
+        }
+        let klen = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+        let val_type = buf[off + 2];
+        let Some(kend) = kstart.checked_add(klen) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted key length in 4 KB index block",
+            ));
+        };
+        if kend > dir_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted key slice in 4 KB index block",
+            ));
+        }
+        let vend = match val_type {
+            1 => {
+                let Some(vstart) = kend.checked_add(2) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated inline value length",
+                    ));
+                };
+                if vstart > dir_start {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated inline value length",
+                    ));
+                }
+                let vlen = u16::from_le_bytes([buf[kend], buf[kend + 1]]) as usize;
+                let Some(vend) = vstart.checked_add(vlen) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated inline value payload",
+                    ));
+                };
+                vend
+            }
+            2 => {
+                let Some(vend) = kend.checked_add(BLOB_PTR_ENCODED_LEN) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated BlobPtr in 4 KB index block",
+                    ));
+                };
+                if vend <= dir_start {
+                    BlobKind::from_u8(buf[kend])?;
+                }
+                vend
+            }
+            3 => kend,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown IndexValue type_tag: {other}"),
+                ));
+            }
+        };
+        if vend > dir_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry extends past 4 KB index block directory",
+            ));
+        }
+        prev_end = vend;
+    }
+    Ok(())
 }
 
 impl<'a> IdxBlockReader<'a> {
@@ -539,13 +640,14 @@ impl<'a> IdxBlockReader<'a> {
         }
 
         let num_entries = u16::from_le_bytes([buf[4088], buf[4089]]) as usize;
-        if num_entries * 2 > IDX_BLOCK_USABLE_SIZE {
+        if num_entries > MAX_IDX_BLOCK_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted num_entries in 4 KB index data block",
             ));
         }
         let dir_start = IDX_BLOCK_USABLE_SIZE - (num_entries * 2);
+        validate_block_entry_layout(buf, num_entries, dir_start)?;
         Ok(Self {
             buf,
             num_entries,
@@ -556,7 +658,7 @@ impl<'a> IdxBlockReader<'a> {
     /// Structural bounds verification for an already-verified 4 KB index data block (skips CRC32C recalculation).
     pub fn open_preverified(buf: &'a [u8; IDX_BLOCK_SIZE]) -> io::Result<Self> {
         let num_entries = u16::from_le_bytes([buf[4088], buf[4089]]) as usize;
-        if num_entries * 2 > IDX_BLOCK_USABLE_SIZE {
+        if num_entries > MAX_IDX_BLOCK_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted num_entries in 4 KB index data block",
@@ -850,6 +952,9 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         val_bytes: &[u8],
     ) -> io::Result<()> {
         IdxBlockBuilder::validate_raw_entry_params(key.len(), val_type, val_bytes.len())?;
+        if val_type == 2 {
+            BlobKind::from_u8(val_bytes[0])?;
+        }
         if self.record_count > 0 && key <= self.last_key.as_slice() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -960,8 +1065,13 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
             })?;
 
         const BLOOM_HEADER_BYTES: usize = 8;
+        let non_bloom_bytes = fence_and_last_bytes
+            .checked_add(BLOOM_HEADER_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "idx metadata size overflow")
+            })?;
         let max_bloom_bytes = MAX_INDEX_META_BYTES
-            .checked_sub(fence_and_last_bytes + BLOOM_HEADER_BYTES)
+            .checked_sub(non_bloom_bytes)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -993,7 +1103,25 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
 
         // Encode Filter + Sparse Fence Pointers + max_key metadata section
         let meta_offset = self.write_offset;
-        let mut meta_buf = Vec::with_capacity(256);
+        let expected_meta_len =
+            non_bloom_bytes
+                .checked_add(bloom.heap_bytes())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "idx metadata size overflow")
+                })?;
+        if expected_meta_len > MAX_INDEX_META_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "idx segment metadata exceeds MAX_INDEX_META_BYTES",
+            ));
+        }
+        let mut meta_buf = Vec::new();
+        meta_buf.try_reserve_exact(expected_meta_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to allocate idx segment metadata buffer",
+            )
+        })?;
         bloom.encode(&mut meta_buf);
         meta_buf.extend_from_slice(&fp_count_u32.to_le_bytes());
         for fp in &self.fence_pointers {
@@ -1131,6 +1259,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             .and_then(|v| v.checked_add(IDX_FOOTER_SIZE as u64));
 
         if stored_seq_id != seq_id
+            || (num_blocks == 0) != (record_count == 0)
             || expected_meta_offset != Some(meta_offset)
             || expected_file_len != Some(file_len)
         {
@@ -1250,6 +1379,12 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated or trailing bytes in idx segment max_key",
+                ));
+            }
+            if num_blocks == 0 && !slice.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty idx segment must have empty max_key",
                 ));
             }
             if let Some(last_fp) = fence_pointers.last() {
@@ -3076,6 +3211,113 @@ mod tests {
         assert_eq!(
             capped_seg.get(b"k1").unwrap(),
             Some((1, IndexValue::Inline(b"v1".to_vec())))
+        );
+    }
+
+    #[test]
+    fn idx_block_and_segment_structural_checks_reject_crafted_corruption() {
+        // 1. `open_verified` rejects overlapping directory offsets and > MAX_IDX_BLOCK_ENTRIES.
+        let mut bb = IdxBlockBuilder::new();
+        bb.add_raw_entry(b"k1", 1, 1, b"v1").unwrap();
+        bb.add_raw_entry(b"k2", 2, 1, b"v2").unwrap();
+        let mut raw_vec = Vec::new();
+        bb.finish_into(&mut raw_vec);
+        let base_blk: [u8; IDX_BLOCK_SIZE] = raw_vec.try_into().unwrap();
+
+        let mut overlap_blk = base_blk;
+        let dir_start = IDX_BLOCK_USABLE_SIZE - 4;
+        // Force second entry offset to overlap first entry (offset 2 < prev_end).
+        overlap_blk[dir_start + 2..dir_start + 4].copy_from_slice(&2u16.to_le_bytes());
+        let crc = crc32c(&overlap_blk[0..4092]);
+        overlap_blk[4092..4096].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            IdxBlockReader::open_verified(&overlap_blk)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut too_many_blk = base_blk;
+        let bad_count = (MAX_IDX_BLOCK_ENTRIES + 1) as u16;
+        too_many_blk[4088..4090].copy_from_slice(&bad_count.to_le_bytes());
+        let crc = crc32c(&too_many_blk[0..4092]);
+        too_many_blk[4092..4096].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            IdxBlockReader::open_verified(&too_many_blk)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            IdxBlockReader::open_preverified(&too_many_blk)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 2. `IdxSegmentBuilder::add_raw_entry` rejects invalid BlobKind BEFORE flushing.
+        let tmp = TempTestDir::new("idx_raw_blobkind_and_empty");
+        let fs = OsFs::open(&tmp.path, true).unwrap();
+        let mut sb = IdxSegmentBuilder::create(&fs, 10, 0, 10).unwrap();
+        sb.add_raw_entry(b"a", 1, 1, b"x").unwrap();
+        let mut bad_ptr = [0u8; BLOB_PTR_ENCODED_LEN];
+        bad_ptr[0] = 77;
+        assert_eq!(
+            sb.add_raw_entry(b"b", 2, 2, &bad_ptr).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(sb.num_blocks, 0);
+        let valid_seg = sb.finish().unwrap();
+        assert_eq!(valid_seg.record_count(), 1);
+        drop(valid_seg);
+
+        // 3. `IdxSegmentReader::open` rejects num_blocks==0 with non-zero record_count or max_key.
+        let write_crafted_empty_seg = |seq_id: u64, record_count: u32, max_key: &[u8]| {
+            let mut meta_buf = Vec::new();
+            BloomFilter::new(0, 0).encode(&mut meta_buf);
+            meta_buf.extend_from_slice(&0u32.to_le_bytes());
+            meta_buf.extend_from_slice(&(max_key.len() as u16).to_le_bytes());
+            meta_buf.extend_from_slice(max_key);
+
+            let mut footer = [0u8; IDX_FOOTER_SIZE];
+            footer[0..4].copy_from_slice(IDX_FOOTER_MAGIC);
+            footer[4..6].copy_from_slice(&IDX_FORMAT_VERSION.to_le_bytes());
+            footer[8..16].copy_from_slice(&seq_id.to_le_bytes());
+            footer[16..20].copy_from_slice(&0u32.to_le_bytes()); // num_blocks == 0
+            footer[20..24].copy_from_slice(&record_count.to_le_bytes());
+            footer[24..32].copy_from_slice(&0u64.to_le_bytes()); // meta_offset == 0
+            footer[32..36].copy_from_slice(&(meta_buf.len() as u32).to_le_bytes());
+            footer[36..40].copy_from_slice(&crc32c(&meta_buf).to_le_bytes());
+            let fcrc = crc32c(&footer[0..44]);
+            footer[44..48].copy_from_slice(&fcrc.to_le_bytes());
+
+            let mut bytes = Vec::with_capacity(meta_buf.len() + IDX_FOOTER_SIZE);
+            bytes.extend_from_slice(&meta_buf);
+            bytes.extend_from_slice(&footer);
+            let f = fs
+                .open_file(
+                    &format_idx_file_name(seq_id),
+                    true,
+                    true,
+                    OpenHint::ImmutableRandom,
+                )
+                .unwrap();
+            f.write_all_at(&bytes, 0).unwrap();
+        };
+
+        write_crafted_empty_seg(11, 5, b"");
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 11).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        write_crafted_empty_seg(12, 0, b"nonempty");
+        assert_eq!(
+            IdxSegmentReader::open(&fs, 12).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 }

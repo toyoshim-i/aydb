@@ -98,6 +98,7 @@ pub struct BloomFilter {
 }
 
 const MAX_BLOOM_BITS: u64 = (u32::MAX - 7) as u64;
+const MAX_BLOOM_PROBES: u8 = 16;
 
 fn compute_bloom_sizing(num_keys: usize, bits_per_key: usize) -> (usize, u32) {
     let raw_bits = (num_keys as u64)
@@ -125,7 +126,7 @@ impl BloomFilter {
         }
 
         // Optimal number of probes k = ln(2) * bits_per_key (~0.69 * bits_per_key)
-        let k = ((bits_per_key as f64 * 0.69) as u8).clamp(1, 16);
+        let k = ((bits_per_key as f64 * 0.69) as u8).clamp(1, MAX_BLOOM_PROBES);
         let (num_bytes, num_bits) = compute_bloom_sizing(num_keys, bits_per_key);
 
         Self {
@@ -192,7 +193,7 @@ impl BloomFilter {
         }
         let num_bits = (num_bytes as u64 * 8) as u32;
         let effective_bpk = (bits_per_key as f64).min((num_bits as f64) / (hashes.len() as f64));
-        let k = ((effective_bpk * 0.69) as u8).clamp(1, 16);
+        let k = ((effective_bpk * 0.69) as u8).clamp(1, MAX_BLOOM_PROBES);
         let mut filter = Self {
             bits: vec![0u8; num_bytes],
             num_bits,
@@ -268,6 +269,19 @@ impl BloomFilter {
         let num_probes = input[0];
         let byte_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
         *input = &input[8..];
+
+        if byte_len == 0 && num_probes != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty BloomFilter cannot specify probes",
+            ));
+        }
+        if byte_len > 0 && (num_probes == 0 || num_probes > MAX_BLOOM_PROBES) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid num_probes in BloomFilter header",
+            ));
+        }
 
         if input.len() < byte_len {
             return Err(io::Error::new(
@@ -450,5 +464,38 @@ mod tests {
         let disabled = BloomFilter::from_hashes64_bounded(&hashes, 10, 7);
         assert_eq!(disabled.heap_bytes(), 0);
         assert!(disabled.may_contain(&0u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn bloom_decode_rejects_invalid_probe_counts() {
+        // Non-zero probes on an empty bitset.
+        let mut raw_empty_with_probes = Vec::new();
+        raw_empty_with_probes.push(4);
+        raw_empty_with_probes.extend_from_slice(&[0u8; 3]);
+        raw_empty_with_probes.extend_from_slice(&0u32.to_le_bytes());
+        let mut slice = raw_empty_with_probes.as_slice();
+        assert_eq!(
+            BloomFilter::decode(&mut slice).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 0 probes on a non-empty bitset.
+        let mut raw_zero_probes = vec![0u8; 16];
+        raw_zero_probes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let mut slice = raw_zero_probes.as_slice();
+        assert_eq!(
+            BloomFilter::decode(&mut slice).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Excessive probes > MAX_BLOOM_PROBES on a non-empty bitset.
+        let mut raw_too_many_probes = vec![0u8; 16];
+        raw_too_many_probes[0] = MAX_BLOOM_PROBES + 1;
+        raw_too_many_probes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let mut slice = raw_too_many_probes.as_slice();
+        assert_eq!(
+            BloomFilter::decode(&mut slice).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }
