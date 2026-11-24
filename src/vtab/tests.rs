@@ -2890,7 +2890,7 @@ fn vtab_inline_max_ddl_option_inlines_large_rows() {
     {
         let eng = engine.read().unwrap();
         assert_eq!(eng.effective_inline_threshold(2), 256);
-        assert!(eng.active_std_writer.is_some());
+        assert!(eng.active_std_seq_id().is_some());
     }
 }
 

@@ -1750,7 +1750,7 @@ impl<'a> Harness<'a> {
         }
         Coverage::bump(&self.cov.no_damage_checks);
         if self.fs.st().events.is_some() {
-            let st = e.meta_mgr.state();
+            let st = e.meta_mgr().state();
             self.log(format!(
                 "opened ({what}): generation {} idx={:?} std={:?} lru={:?}",
                 st.generation,
@@ -2263,7 +2263,7 @@ fn run_case_inner(
         h.verify(&mut e, last_was_process)?;
         h.oplog.clear();
         h.tickets.clear();
-        let rot0 = e.sync_wal.active_epoch();
+        let rot0 = e.sync_wal().active_epoch();
         let choice = pick_fault(
             &mut master,
             plan.and_then(|p| p.get(ep).or_else(|| p.last())),
@@ -2296,7 +2296,7 @@ fn run_case_inner(
             Coverage::bump(&cov.maintenance_failures);
         }
         cov.wal_rotations
-            .fetch_add(e.sync_wal.active_epoch() - rot0, Ordering::Relaxed);
+            .fetch_add(e.sync_wal().active_epoch() - rot0, Ordering::Relaxed);
         let (ops, kind_ops) = fs.op_stats();
         stats.push(EpochStat { ops, kind_ops });
         {
@@ -2835,7 +2835,7 @@ fn pending_delete_of_dead_blob_segment_is_not_adopted() {
     fs.st().fail_remove_prefix = Some("blob_std_");
     e.delete_row(1, b"k", sync).unwrap();
     e.flush_memtable().unwrap();
-    assert_eq!(e.meta_mgr.state().pending_delete_files.len(), 1);
+    assert_eq!(e.meta_mgr().state().pending_delete_files.len(), 1);
     // A buffered blob lands in the active segment, beyond its cataloged length.
     e.put_row(1, b"m", &[3u8; 1100], &[], WriteDurability::BufferedFast)
         .unwrap();
@@ -2936,7 +2936,7 @@ fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
     assert!(logical <= 3300, "quota exceeded: {logical}");
     // x's segment left the catalog but its file lingers while the WAL may mention it.
     assert!(e.lru_blobs.keys().all(|&(_, seq)| {
-        e.meta_mgr
+        e.meta_mgr()
             .state()
             .lru_blob_segments
             .iter()
@@ -2948,7 +2948,7 @@ fn reclaimed_lru_segment_is_unlinked_after_wal_rotation() {
     e.flush_memtable().unwrap();
     assert!(e.unlink_after_wal_rotation.is_empty());
     assert_eq!(lru_files(&fs), e.lru_blobs.len());
-    assert!(e.meta_mgr.state().pending_delete_files.is_empty());
+    assert!(e.meta_mgr().state().pending_delete_files.is_empty());
     assert_eq!(e.capped_tables[&1].current_logical_bytes, logical);
 
     // A crash while the file still lingers, then a checkpoint after the reopen.
@@ -3024,11 +3024,9 @@ fn reclaimed_lru_segment_with_pre_checkpoint_dead_bytes_is_swept_after_crash() {
         "reclaimed LRU segment {reclaimed_name} leaked as a zombie after crash"
     );
     assert_eq!(lru_files(&fs).len(), e.lru_blobs.len());
-    assert!(
-        !e.meta_mgr.state().lru_blob_segments.iter().any(
-            |m| crate::meta::format_lru_blob_file_name(m.table_id, m.seq_id) == reclaimed_name
-        )
-    );
+    assert!(!e.meta_mgr().state().lru_blob_segments.iter().any(|m| {
+        crate::meta::format_lru_blob_file_name(m.table_id, m.seq_id) == reclaimed_name
+    }));
 }
 
 /// Regression test for [H8]: when table 2 rolls over its LRU blob segment during buffered
@@ -3052,7 +3050,7 @@ fn lru_rollover_on_one_table_does_not_persist_unsynced_len_of_another_table() {
     e.put_row(2, b"t2_b", &[3u8; 1500], &[], buf).unwrap();
 
     let t1_meta = e
-        .meta_mgr
+        .meta_mgr()
         .state()
         .lru_blob_segments
         .iter()
@@ -3069,7 +3067,7 @@ fn lru_rollover_on_one_table_does_not_persist_unsynced_len_of_another_table() {
     fs.crash(Crash::Power { keep: 0, lose: 100 });
     let e = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
     for m in e
-        .meta_mgr
+        .meta_mgr()
         .state()
         .lru_blob_segments
         .iter()
@@ -3093,8 +3091,9 @@ fn pre_slot_meta_failure_on_blob_rollover_and_reclaim_keeps_maps_consistent() {
     e.register_capped_table(7, 100_000).unwrap();
 
     // Force every subsequent `commit_update` to write an external `manifest_*.db` (> 4028B).
-    e.meta_mgr
-        .commit_update(|st| {
+    e.healthy()
+        .unwrap()
+        .commit_meta_update(|st| {
             for tid in 100..360u16 {
                 st.table_quotas.push(crate::meta::TableQuotaMeta {
                     table_id: tid,
@@ -3105,7 +3104,7 @@ fn pre_slot_meta_failure_on_blob_rollover_and_reclaim_keeps_maps_consistent() {
             }
         })
         .unwrap();
-    assert!(e.meta_mgr.state().active_manifest_seq_id.is_some());
+    assert!(e.meta_mgr().state().active_manifest_seq_id.is_some());
 
     let arm_manifest_fail = |fs: &Arc<CrashFs>| {
         let mut st = fs.st();
@@ -4939,8 +4938,8 @@ fn tx_ring_full_flush_persists_settled_quotas_not_uncommitted_tx() {
     }
     let settled_bytes = e.capped_table_state(1).unwrap().current_logical_bytes;
     assert!(settled_bytes >= 12_000);
-    assert_eq!(e.meta_mgr.state().idx_segments.len(), 0);
-    assert_eq!(e.sync_wal.current_sector_idx(), 4);
+    assert_eq!(e.meta_mgr().state().idx_segments.len(), 0);
+    assert_eq!(e.sync_wal().current_sector_idx(), 4);
 
     // Inside a transaction, register table 2 and add enough rows to overflow `sync_wal` on commit
     // (`RingFull`) without tripping `prepare_commit_transaction`'s `exceeds_wal` pre-grow.
@@ -4952,16 +4951,16 @@ fn tx_ring_full_flush_persists_settled_quotas_not_uncommitted_tx() {
     }
     assert!(e.capped_table_state(1).unwrap().current_logical_bytes > settled_bytes);
 
-    let meta_gen_before = e.meta_mgr.state().generation;
+    let meta_gen_before = e.meta_mgr().state().generation;
     let wal_sync_nth = fs.op_stats().1[FileKind::WalSync as usize];
     // Fail the retry `WalSync` write immediately after `RingFull` flushes `idx` + `boot_meta.db`.
     fs.arm(None, Some((FileKind::WalSync, wal_sync_nth)));
     assert!(e.commit_transaction().is_err());
     assert!(
-        e.meta_mgr.state().generation > meta_gen_before,
+        e.meta_mgr().state().generation > meta_gen_before,
         "RingFull must have committed boot_meta.db"
     );
-    let quotas = &e.meta_mgr.state().table_quotas;
+    let quotas = &e.meta_mgr().state().table_quotas;
     assert_eq!(quotas.len(), 1, "uncommitted table 2 leaked into quotas");
     assert_eq!(quotas[0].table_id, 1);
     assert_eq!(quotas[0].current_logical_bytes, settled_bytes);

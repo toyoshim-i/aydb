@@ -177,6 +177,482 @@ mod scoped_guards {
     }
 }
 
+/// Type-enforced poison capability gate owning all durable writers and `BootMetaManager`.
+///
+/// Keeping durable handles private inside this sibling module ensures no path in `src/engine/`
+/// can issue metadata, WAL, or blob-segment mutations without first proving via
+/// [`HealthGatedStorage::try_healthy`] that neither the engine, `BootMetaManager`, nor `CommitGate`
+/// is poisoned, and consuming the resulting one-shot [`HealthyEngine`] token.
+mod health {
+    use std::collections::{BTreeMap, HashMap};
+    use std::io;
+
+    use super::tx::CommitGate;
+    use super::{TrackedLruBlob, TrackedStdBlob, WriteDurability};
+    use crate::blob::BlobSegmentWriter;
+    use crate::meta::{BootMetaManager, BootMetaState};
+    use crate::pal::PlatformFs;
+    use crate::wal::{BlobKind, BlobPtr, WalAppendOutcome, WalStreamWriter};
+
+    #[derive(Debug, Default)]
+    pub(super) enum EngineHealth {
+        #[default]
+        Healthy,
+        Poisoned(String),
+    }
+
+    pub(super) struct HealthGatedStorage<FS: PlatformFs> {
+        health: EngineHealth,
+        meta_mgr: BootMetaManager<FS>,
+        sync_wal: WalStreamWriter<FS::File>,
+        buf_wal: WalStreamWriter<FS::File>,
+        active_std_writer: Option<BlobSegmentWriter<FS::File>>,
+        active_lru_writers: HashMap<u16, BlobSegmentWriter<FS::File>>,
+    }
+
+    #[must_use = "HealthyEngine proves unpoisoned state for one durable operation"]
+    pub(super) struct HealthyEngine<'a, FS: PlatformFs> {
+        storage: &'a mut HealthGatedStorage<FS>,
+    }
+
+    impl<FS: PlatformFs> HealthGatedStorage<FS> {
+        pub(super) fn new(
+            meta_mgr: BootMetaManager<FS>,
+            sync_wal: WalStreamWriter<FS::File>,
+            buf_wal: WalStreamWriter<FS::File>,
+        ) -> Self {
+            Self {
+                health: EngineHealth::Healthy,
+                meta_mgr,
+                sync_wal,
+                buf_wal,
+                active_std_writer: None,
+                active_lru_writers: HashMap::new(),
+            }
+        }
+
+        #[inline]
+        pub(super) fn is_poisoned(&self, commit_gate: &CommitGate) -> bool {
+            !matches!(self.health, EngineHealth::Healthy)
+                || self.meta_mgr.is_poisoned()
+                || commit_gate.is_failed()
+        }
+
+        pub(super) fn check_healthy(&self, commit_gate: &CommitGate) -> io::Result<()> {
+            self.meta_mgr.check_healthy()?;
+            if let EngineHealth::Poisoned(msg) = &self.health {
+                return Err(io::Error::other(format!(
+                    "engine is poisoned by an earlier WAL I/O failure and must be reopened: {msg}"
+                )));
+            }
+            if let Some(err) = commit_gate.failed_error() {
+                return Err(err);
+            }
+            if commit_gate.is_failed() {
+                return Err(io::Error::other(
+                    "engine is poisoned after a group-commit leader failure and must be reopened",
+                ));
+            }
+            Ok(())
+        }
+
+        /// Records a WAL or blob-sync failure (first one wins) and returns the original error.
+        pub(super) fn poison(&mut self, e: io::Error) -> io::Error {
+            if matches!(self.health, EngineHealth::Healthy) {
+                self.health = EngineHealth::Poisoned(e.to_string());
+            }
+            e
+        }
+
+        #[inline]
+        pub(super) fn try_healthy(
+            &mut self,
+            commit_gate: &CommitGate,
+        ) -> io::Result<HealthyEngine<'_, FS>> {
+            self.check_healthy(commit_gate)?;
+            Ok(HealthyEngine { storage: self })
+        }
+
+        #[inline]
+        pub(super) fn meta_mgr(&self) -> &BootMetaManager<FS> {
+            &self.meta_mgr
+        }
+
+        #[inline]
+        pub(super) fn sync_wal(&self) -> &WalStreamWriter<FS::File> {
+            &self.sync_wal
+        }
+
+        #[inline]
+        pub(super) fn buf_wal(&self) -> &WalStreamWriter<FS::File> {
+            &self.buf_wal
+        }
+
+        #[inline]
+        pub(super) fn set_sync_defer_barrier(&mut self, defer: bool) {
+            self.sync_wal.set_defer_barrier(defer);
+        }
+
+        #[inline]
+        pub(super) fn active_std_seq_id(&self) -> Option<u64> {
+            self.active_std_writer.as_ref().map(|w| w.seq_id())
+        }
+
+        #[cfg(test)]
+        #[inline]
+        pub(super) fn active_std_len(&self) -> Option<u64> {
+            self.active_std_writer.as_ref().map(|w| w.current_len())
+        }
+
+        #[inline]
+        pub(super) fn active_lru_seq_id(&self, table_id: u16) -> Option<u64> {
+            self.active_lru_writers.get(&table_id).map(|w| w.seq_id())
+        }
+
+        #[inline]
+        pub(super) fn active_lru_table_ids(&self) -> Vec<u16> {
+            self.active_lru_writers.keys().copied().collect()
+        }
+
+        #[inline]
+        pub(super) fn blob_unflushed(&self, ptr: &BlobPtr) -> bool {
+            let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
+            match ptr.kind {
+                BlobKind::Standard => self
+                    .active_std_writer
+                    .as_ref()
+                    .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
+                BlobKind::Lru => self
+                    .active_lru_writers
+                    .get(&ptr.table_id)
+                    .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
+            }
+        }
+
+        pub(super) fn any_blob_unflushed(&self) -> bool {
+            self.active_std_writer
+                .as_ref()
+                .is_some_and(|w| w.current_len() > w.flushed_offset())
+                || self
+                    .active_lru_writers
+                    .values()
+                    .any(|w| w.current_len() > w.flushed_offset())
+        }
+
+        #[inline]
+        pub(super) fn is_blob_flushed_for_cache(&self, ptr: &BlobPtr) -> bool {
+            match ptr.kind {
+                BlobKind::Standard => self.active_std_writer.as_ref().is_none_or(|w| {
+                    w.seq_id() != ptr.seg_id
+                        || (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset()
+                }),
+                BlobKind::Lru => self.active_lru_writers.get(&ptr.table_id).is_none_or(|w| {
+                    w.seq_id() != ptr.seg_id
+                        || (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset()
+                }),
+            }
+        }
+
+        #[inline]
+        pub(super) fn active_std_needs_roll(&self, needed: u64, max_bytes: u64) -> bool {
+            self.active_std_writer
+                .as_ref()
+                .map(|w| w.current_len() > 0 && w.current_len() + needed > max_bytes)
+                .unwrap_or(true)
+        }
+
+        #[inline]
+        pub(super) fn active_lru_needs_roll(
+            &self,
+            table_id: u16,
+            needed: u64,
+            max_bytes: u64,
+        ) -> bool {
+            self.active_lru_writers
+                .get(&table_id)
+                .map(|w| w.current_len() > 0 && w.current_len() + needed > max_bytes)
+                .unwrap_or(true)
+        }
+
+        /// Flushes in-RAM blob write buffers to OS handles so read paths (which remain permitted
+        /// on a poisoned engine) can read buffered owner blobs without altering durability.
+        pub(super) fn flush_buffered_blobs_for_read(
+            &mut self,
+            std_blobs: &mut BTreeMap<u64, TrackedStdBlob<FS::File>>,
+            lru_blobs: &mut BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+        ) -> io::Result<()> {
+            if let Some(w) = &mut self.active_std_writer {
+                w.flush_buffer()?;
+                if let Some(b) = std_blobs.get_mut(&w.seq_id()) {
+                    b.file_len = w.current_len();
+                }
+            }
+            for w in self.active_lru_writers.values_mut() {
+                w.flush_buffer()?;
+                if let Some(b) = lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
+                    b.file_len = w.current_len();
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn ensure_blob_flushed_for_read(
+            &mut self,
+            ptr: &BlobPtr,
+            std_blobs: &mut BTreeMap<u64, TrackedStdBlob<FS::File>>,
+            lru_blobs: &mut BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+        ) -> io::Result<()> {
+            match ptr.kind {
+                BlobKind::Standard => {
+                    if let Some(w) = &mut self.active_std_writer {
+                        if w.seq_id() == ptr.seg_id
+                            && (ptr.offset as u64).saturating_add(ptr.len as u64)
+                                > w.flushed_offset()
+                        {
+                            w.flush_buffer()?;
+                            if let Some(b) = std_blobs.get_mut(&w.seq_id()) {
+                                b.file_len = w.current_len();
+                            }
+                        }
+                    }
+                }
+                BlobKind::Lru => {
+                    if let Some(w) = self.active_lru_writers.get_mut(&ptr.table_id) {
+                        if w.seq_id() == ptr.seg_id
+                            && (ptr.offset as u64).saturating_add(ptr.len as u64)
+                                > w.flushed_offset()
+                        {
+                            w.flush_buffer()?;
+                            if let Some(b) = lru_blobs.get_mut(&(ptr.table_id, w.seq_id())) {
+                                b.file_len = w.current_len();
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn debug_meta_mgr_mut(&mut self) -> &mut BootMetaManager<FS> {
+            &mut self.meta_mgr
+        }
+
+        #[cfg(test)]
+        pub(super) fn debug_discard_buf_wal_user_space(&mut self) {
+            self.buf_wal.discard_user_space_buffer_for_test();
+        }
+
+        #[cfg(test)]
+        pub(super) fn debug_append_sync_batch(&mut self, batch: &crate::wal::WalBatch) {
+            self.sync_wal.append_batch(batch).unwrap();
+        }
+
+        #[cfg(test)]
+        pub(super) fn debug_clear_active_std_writer(&mut self) {
+            self.active_std_writer = None;
+        }
+    }
+
+    impl<FS: PlatformFs> HealthyEngine<'_, FS> {
+        pub(super) fn commit_meta_update<M: FnOnce(&mut BootMetaState)>(
+            self,
+            mutate: M,
+        ) -> io::Result<()> {
+            self.storage.meta_mgr.commit_update(mutate)
+        }
+
+        pub(super) fn commit_wal_epoch_rotation<M: FnOnce(&mut BootMetaState)>(
+            self,
+            new_sync_epoch: u64,
+            new_buf_epoch: u64,
+            mutate: M,
+        ) -> io::Result<()> {
+            self.storage.meta_mgr.commit_update(mutate)?;
+            self.storage.sync_wal.reset_for_new_epoch(new_sync_epoch)?;
+            self.storage.buf_wal.reset_for_new_epoch(new_buf_epoch)?;
+            Ok(())
+        }
+
+        pub(super) fn commit_and_install_std_writer<M: FnOnce(&mut BootMetaState)>(
+            self,
+            writer: BlobSegmentWriter<FS::File>,
+            mutate: M,
+        ) -> io::Result<()> {
+            self.storage.meta_mgr.commit_update(mutate)?;
+            self.storage.active_std_writer = Some(writer);
+            Ok(())
+        }
+
+        pub(super) fn commit_and_install_lru_writer<M: FnOnce(&mut BootMetaState)>(
+            self,
+            table_id: u16,
+            writer: BlobSegmentWriter<FS::File>,
+            mutate: M,
+        ) -> io::Result<()> {
+            self.storage.meta_mgr.commit_update(mutate)?;
+            self.storage.active_lru_writers.insert(table_id, writer);
+            Ok(())
+        }
+
+        pub(super) fn reserve_seq_id(self) -> io::Result<u64> {
+            self.storage.meta_mgr.try_reserve_seq_id()
+        }
+
+        pub(super) fn try_process_pending_deletes(self) {
+            self.storage.meta_mgr.try_process_pending_deletes();
+        }
+
+        pub(super) fn sweep_orphans(self) -> io::Result<()> {
+            self.storage.meta_mgr.sweep_orphans()
+        }
+
+        pub(super) fn append_wal_raw_batch(
+            self,
+            durability: WriteDurability,
+            encoded: &[u8],
+        ) -> io::Result<WalAppendOutcome> {
+            let res = match durability {
+                WriteDurability::SyncTransactional => {
+                    self.storage.sync_wal.append_raw_batch(encoded)
+                }
+                WriteDurability::BufferedFast => self.storage.buf_wal.append_raw_batch(encoded),
+            };
+            res.map_err(|e| self.storage.poison(e))
+        }
+
+        pub(super) fn make_buf_wal_durable_and_seal(self, durable: bool) -> io::Result<()> {
+            self.storage
+                .buf_wal
+                .make_durable_and_seal(durable)
+                .map_err(|e| self.storage.poison(e))
+        }
+
+        pub(super) fn flush_buf_wal_to_os(self) -> io::Result<()> {
+            self.storage.buf_wal.flush_buffered_to_os()
+        }
+
+        pub(super) fn ensure_wal_min_size(
+            self,
+            durability: WriteDurability,
+            target_bytes: u64,
+        ) -> io::Result<()> {
+            match durability {
+                WriteDurability::SyncTransactional => {
+                    self.storage.sync_wal.ensure_min_size(target_bytes)
+                }
+                WriteDurability::BufferedFast => self.storage.buf_wal.ensure_min_size(target_bytes),
+            }
+        }
+
+        pub(super) fn flush_active_blob_buffers(
+            self,
+            std_blobs: &mut BTreeMap<u64, TrackedStdBlob<FS::File>>,
+            lru_blobs: &mut BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+        ) -> io::Result<()> {
+            self.storage
+                .flush_buffered_blobs_for_read(std_blobs, lru_blobs)
+        }
+
+        pub(super) fn sync_active_std_writer(
+            self,
+            std_blobs: &mut BTreeMap<u64, TrackedStdBlob<FS::File>>,
+            seal: bool,
+        ) -> io::Result<()> {
+            let Some(w) = &mut self.storage.active_std_writer else {
+                return Ok(());
+            };
+            // A failed write never reached the page cache and its buffer is kept, so it is retryable.
+            w.flush_buffer()?;
+            let synced = w.sync_durable();
+            let (seq_id, len) = (w.seq_id(), w.current_len());
+            synced.map_err(|e| self.storage.poison(e))?;
+            if let Some(b) = std_blobs.get_mut(&seq_id) {
+                b.file_len = len;
+            }
+            if seal {
+                self.storage.active_std_writer = None;
+            }
+            Ok(())
+        }
+
+        pub(super) fn sync_active_lru_writer(
+            self,
+            table_id: u16,
+            lru_blobs: &mut BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+            seal: bool,
+        ) -> io::Result<()> {
+            let Some(w) = self.storage.active_lru_writers.get_mut(&table_id) else {
+                return Ok(());
+            };
+            // A failed write never reached the page cache and its buffer is kept, so it is retryable.
+            w.flush_buffer()?;
+            let synced = w.sync_durable();
+            let (seq_id, len) = (w.seq_id(), w.current_len());
+            synced.map_err(|e| self.storage.poison(e))?;
+            if let Some(b) = lru_blobs.get_mut(&(table_id, seq_id)) {
+                b.file_len = len;
+            }
+            if seal {
+                self.storage.active_lru_writers.remove(&table_id);
+            }
+            Ok(())
+        }
+
+        pub(super) fn sync_and_remove_dropped_lru_writer(
+            self,
+            table_id: u16,
+            lru_blobs: &mut BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+        ) -> io::Result<()> {
+            let Some(mut old_w) = self.storage.active_lru_writers.remove(&table_id) else {
+                return Ok(());
+            };
+            if let Err(e) = old_w.sync_durable() {
+                self.storage.active_lru_writers.insert(table_id, old_w);
+                return Err(self.storage.poison(e));
+            }
+            if let Some(b) = lru_blobs.get_mut(&(table_id, old_w.seq_id())) {
+                b.file_len = old_w.current_len();
+                b.dead_bytes = b.file_len;
+            }
+            Ok(())
+        }
+
+        pub(super) fn append_std_blob(
+            self,
+            key: &[u8],
+            value: &[u8],
+        ) -> io::Result<(u64, BlobPtr, u64)> {
+            let writer = self
+                .storage
+                .active_std_writer
+                .as_mut()
+                .expect("std blob writer must be installed before append");
+            let seg_id = writer.seq_id();
+            let ptr = writer.append_blob(key, value)?;
+            let new_len = writer.current_len();
+            Ok((seg_id, ptr, new_len))
+        }
+
+        pub(super) fn append_lru_blob(
+            self,
+            table_id: u16,
+            key: &[u8],
+            value: &[u8],
+        ) -> io::Result<(u64, BlobPtr, u64)> {
+            let writer = self
+                .storage
+                .active_lru_writers
+                .get_mut(&table_id)
+                .expect("lru blob writer must be installed before append");
+            let seg_id = writer.seq_id();
+            let ptr = writer.append_blob(key, value)?;
+            let new_len = writer.current_len();
+            Ok((seg_id, ptr, new_len))
+        }
+    }
+}
+
 /// Result of a policy-free `'t'` row-meta lookup.
 pub(super) enum MetaLookup {
     Absent,
@@ -411,19 +887,16 @@ pub struct StorageEngine<FS: PlatformFs> {
     snapshot_cache: RwLock<snapshot::SnapshotCache<FS::File>>,
     pub(super) fs: Arc<FS>,
     pub(super) config: EngineConfig,
-    pub(super) meta_mgr: BootMetaManager<FS>,
-    pub(super) sync_wal: WalStreamWriter<FS::File>,
-    pub(super) buf_wal: WalStreamWriter<FS::File>,
+    /// Poison-gated storage owner wrapping `BootMetaManager`, WAL writers, and active blob writers.
+    storage: health::HealthGatedStorage<FS>,
     pub(super) next_lsn: u64,
     pub(super) memtable: MemTable,
     /// Active immutable index segments (`idx_<SeqID>.db`), ordered oldest to newest (`last()` is newest).
     pub(super) idx_segments: Vec<Arc<IdxSegmentReader<FS::File>>>,
     /// Active standard blob segments (`seq_id -> reader + stats`).
     pub(super) std_blobs: BTreeMap<u64, TrackedStdBlob<FS::File>>,
-    pub(super) active_std_writer: Option<BlobSegmentWriter<FS::File>>,
     /// Active per-table LRU blob segments (`(table_id, seq_id) -> reader + stats`).
     pub(super) lru_blobs: BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
-    pub(super) active_lru_writers: HashMap<u16, BlobSegmentWriter<FS::File>>,
     /// Capped tables (`table_id -> CappedTableState`).
     pub(super) capped_tables: HashMap<u16, CappedTableState>,
     /// Bounded in-memory `AccessTick` tracker.
@@ -507,9 +980,6 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) wal_links: wal_links::WalLinks,
     /// What recovery found in the WAL during `open` (section 4.6.8).
     last_wal_recovery: WalRecoveryReport,
-    /// Set after a WAL append/sync failure (original error text). While set, every mutating
-    /// operation fails and the engine must be reopened (the on-disk state is unknown).
-    pub(super) poisoned: Option<String>,
     /// Number of post-commit maintenance steps (flush, quota eviction, reclaim, compaction) that
     /// failed after their triggering write was already committed.
     maintenance_failures: AtomicU64,
@@ -1290,9 +1760,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             snapshot_cache: RwLock::new(snapshot::SnapshotCache::new()),
             fs,
             config,
-            meta_mgr,
-            sync_wal,
-            buf_wal,
+            storage: health::HealthGatedStorage::new(meta_mgr, sync_wal, buf_wal),
             next_lsn: rec
                 .max_recovered_lsn
                 .checked_add(1)
@@ -1300,9 +1768,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             memtable,
             idx_segments,
             std_blobs,
-            active_std_writer: None,
             lru_blobs,
-            active_lru_writers: HashMap::new(),
             capped_tables,
             access_tracker: AccessTracker::new(1, 65_536),
             tx_state: tx::TxState::Idle,
@@ -1334,7 +1800,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // at or below the checkpoint, as recovery requires.
             wal_links: wal_links::WalLinks::new(rec.max_recovered_lsn),
             last_wal_recovery: wal_report,
-            poisoned: None,
             maintenance_failures: AtomicU64::new(0),
             last_maintenance_error: Mutex::new(None),
             corrupt_policies: HashMap::new(),
@@ -1386,7 +1851,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // Now that WAL recovery and the post-recovery checkpoint are complete, sweep any truly
         // orphaned segment/manifest files and process pending deletes!
-        engine.meta_mgr.sweep_orphans()?;
+        engine.healthy()?.sweep_orphans()?;
 
         Ok((engine, salvaged))
     }
@@ -1416,10 +1881,40 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.relocating_std_blobs.is_active()
     }
 
+    #[inline]
+    fn healthy(&mut self) -> io::Result<health::HealthyEngine<'_, FS>> {
+        self.storage.try_healthy(&self.commit_gate)
+    }
+
+    #[inline]
+    fn meta_mgr(&self) -> &BootMetaManager<FS> {
+        self.storage.meta_mgr()
+    }
+
+    #[inline]
+    fn sync_wal(&self) -> &WalStreamWriter<FS::File> {
+        self.storage.sync_wal()
+    }
+
+    #[inline]
+    fn buf_wal(&self) -> &WalStreamWriter<FS::File> {
+        self.storage.buf_wal()
+    }
+
+    #[inline]
+    pub(crate) fn active_std_seq_id(&self) -> Option<u64> {
+        self.storage.active_std_seq_id()
+    }
+
+    #[inline]
+    fn active_lru_seq_id(&self, table_id: u16) -> Option<u64> {
+        self.storage.active_lru_seq_id(table_id)
+    }
+
     /// Returns true if a WAL, metadata, or group-commit flush failure poisoned this engine. Reads keep
     /// working, but all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.is_some() || self.meta_mgr.is_poisoned() || self.commit_gate.is_failed()
+        self.storage.is_poisoned(&self.commit_gate)
     }
 
     /// Test seam: poisons the engine as a failed WAL write would.
@@ -1474,29 +1969,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Fails if a prior WAL, metadata, or group-commit leader failure left the on-disk state uncertain.
     pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
-        self.meta_mgr.check_healthy()?;
-        if let Some(msg) = &self.poisoned {
-            return Err(io::Error::other(format!(
-                "engine is poisoned by an earlier WAL I/O failure and must be reopened: {msg}"
-            )));
-        }
-        if let Some(err) = self.commit_gate.failed_error() {
-            return Err(err);
-        }
-        if self.commit_gate.is_failed() {
-            return Err(io::Error::other(
-                "engine is poisoned after a group-commit leader failure and must be reopened",
-            ));
-        }
-        Ok(())
+        self.storage.check_healthy(&self.commit_gate)
     }
 
     /// Records a WAL I/O failure (first one wins) and returns the original error.
     pub(super) fn poison(&mut self, e: io::Error) -> io::Error {
-        if self.poisoned.is_none() {
-            self.poisoned = Some(e.to_string());
-        }
-        e
+        self.storage.poison(e)
     }
 
     /// How long a SQL writer waits for its turn before failing with `SQLITE_BUSY`.
@@ -2951,28 +3429,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Whether `ptr` lives in an active writer's not-yet-flushed buffer.
     #[inline]
     pub(super) fn blob_unflushed(&self, ptr: &BlobPtr) -> bool {
-        let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
-        match ptr.kind {
-            BlobKind::Standard => self
-                .active_std_writer
-                .as_ref()
-                .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
-            BlobKind::Lru => self
-                .active_lru_writers
-                .get(&ptr.table_id)
-                .is_some_and(|w| w.seq_id() == ptr.seg_id && end > w.flushed_offset()),
-        }
+        self.storage.blob_unflushed(ptr)
     }
 
     /// True if any active blob writer holds buffered (unflushed) bytes.
     pub(super) fn any_blob_unflushed(&self) -> bool {
-        self.active_std_writer
-            .as_ref()
-            .is_some_and(|w| w.current_len() > w.flushed_offset())
-            || self
-                .active_lru_writers
-                .values()
-                .any(|w| w.current_len() > w.flushed_offset())
+        self.storage.any_blob_unflushed()
     }
 
     /// Read-path replacement for `ensure_blob_flushed` under `&self`. Committed blobs are always
@@ -3093,7 +3555,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let r = f(&*self, &cx);
             if cx.need_flush.get() && attempts < 2 {
                 attempts += 1;
-                if let Err(e) = self.flush_active_blob_buffers() {
+                if let Err(e) = self
+                    .storage
+                    .flush_buffered_blobs_for_read(&mut self.std_blobs, &mut self.lru_blobs)
+                {
                     return (r, Some(e));
                 }
                 continue;
@@ -3875,26 +4340,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     // =========================================================================
 
     pub(super) fn flush_active_blob_buffers(&mut self) -> io::Result<()> {
-        if let Some(w) = &mut self.active_std_writer {
-            w.flush_buffer()?;
-            if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                b.file_len = w.current_len();
-            }
-        }
-        for w in self.active_lru_writers.values_mut() {
-            w.flush_buffer()?;
-            if let Some(b) = self.lru_blobs.get_mut(&(w.table_id(), w.seq_id())) {
-                b.file_len = w.current_len();
-            }
-        }
-        Ok(())
+        self.storage
+            .try_healthy(&self.commit_gate)?
+            .flush_active_blob_buffers(&mut self.std_blobs, &mut self.lru_blobs)
     }
 
     /// Syncs every active blob writer. A failure poisons the engine, see
     /// [`Self::sync_active_std_writer`].
     pub(super) fn sync_active_blob_writers(&mut self) -> io::Result<()> {
         self.sync_active_std_writer()?;
-        let table_ids: Vec<u16> = self.active_lru_writers.keys().copied().collect();
+        let table_ids = self.storage.active_lru_table_ids();
         for table_id in table_ids {
             self.sync_active_lru_writer(table_id)?;
         }
@@ -3908,36 +4363,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Continuing would let a later checkpoint or WAL record cover a lost blob. Once poisoned,
     /// no further blob sync is attempted.
     pub(super) fn sync_active_std_writer(&mut self) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        let Some(w) = &mut self.active_std_writer else {
-            return Ok(());
-        };
-        // A failed write never reached the page cache and its buffer is kept, so it is retryable.
-        w.flush_buffer()?;
-        let synced = w.sync_durable();
-        let (seq_id, len) = (w.seq_id(), w.current_len());
-        synced.map_err(|e| self.poison(e))?;
-        if let Some(b) = self.std_blobs.get_mut(&seq_id) {
-            b.file_len = len;
-        }
-        Ok(())
+        self.storage
+            .try_healthy(&self.commit_gate)?
+            .sync_active_std_writer(&mut self.std_blobs, false)
     }
 
     /// Per-table LRU counterpart of [`Self::sync_active_std_writer`].
     pub(super) fn sync_active_lru_writer(&mut self, table_id: u16) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        let Some(w) = self.active_lru_writers.get_mut(&table_id) else {
-            return Ok(());
-        };
-        // A failed write never reached the page cache and its buffer is kept, so it is retryable.
-        w.flush_buffer()?;
-        let synced = w.sync_durable();
-        let (seq_id, len) = (w.seq_id(), w.current_len());
-        synced.map_err(|e| self.poison(e))?;
-        if let Some(b) = self.lru_blobs.get_mut(&(table_id, seq_id)) {
-            b.file_len = len;
-        }
-        Ok(())
+        self.storage
+            .try_healthy(&self.commit_gate)?
+            .sync_active_lru_writer(table_id, &mut self.lru_blobs, false)
     }
 
     #[inline]
@@ -3970,20 +4405,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let needed = (16 + key.len() + value.len()) as u64;
         match kind {
             BlobKind::Standard => {
-                let roll = self
-                    .active_std_writer
-                    .as_ref()
-                    .map(|w| {
-                        w.current_len() > 0
-                            && w.current_len() + needed > self.config.max_blob_segment_bytes
-                    })
-                    .unwrap_or(true);
-                if roll {
-                    if self.active_std_writer.is_some() {
-                        self.sync_active_std_writer()?;
-                        self.active_std_writer = None;
+                if self
+                    .storage
+                    .active_std_needs_roll(needed, self.config.max_blob_segment_bytes)
+                {
+                    if self.active_std_seq_id().is_some() {
+                        self.storage
+                            .try_healthy(&self.commit_gate)?
+                            .sync_active_std_writer(&mut self.std_blobs, true)?;
                     }
-                    let seq_id = self.meta_mgr.try_reserve_seq_id()?;
+                    let seq_id = self.healthy()?.reserve_seq_id()?;
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
                     let reader = writer.reader();
                     let mut std_metas = self.build_checkpointed_std_blob_metas();
@@ -3993,12 +4424,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         dead_bytes: 0,
                     });
                     std_metas.sort_by_key(|m| m.seq_id);
-                    if let Err(e) = self.meta_mgr.commit_update(|st| {
+                    if let Err(e) = self.healthy()?.commit_and_install_std_writer(writer, |st| {
                         st.std_blob_segments = std_metas;
                     }) {
                         drop(reader);
-                        drop(writer);
-                        if !self.meta_mgr.is_poisoned() {
+                        if !self.meta_mgr().is_poisoned() {
                             let _ = self.fs.remove_file(&format_std_blob_file_name(seq_id));
                         }
                         return Err(e);
@@ -4012,12 +4442,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             dead_bytes: 0,
                         },
                     );
-                    self.active_std_writer = Some(writer);
                 }
-                let writer = self.active_std_writer.as_mut().unwrap();
-                let seg_id = writer.seq_id();
-                let ptr = writer.append_blob(key, value)?;
-                let new_len = writer.current_len();
+                let (seg_id, ptr, new_len) = self.healthy()?.append_std_blob(key, value)?;
                 if let Some(prev_len) = self.std_blobs.get_mut(&seg_id).map(|b| {
                     let prev = b.file_len;
                     b.file_len = new_len;
@@ -4050,20 +4476,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Ok(ptr)
             }
             BlobKind::Lru => {
-                let roll = self
-                    .active_lru_writers
-                    .get(&table_id)
-                    .map(|w| {
-                        w.current_len() > 0
-                            && w.current_len() + needed > self.config.max_blob_segment_bytes
-                    })
-                    .unwrap_or(true);
-                if roll {
-                    if self.active_lru_writers.contains_key(&table_id) {
-                        self.sync_active_lru_writer(table_id)?;
-                        self.active_lru_writers.remove(&table_id);
+                if self.storage.active_lru_needs_roll(
+                    table_id,
+                    needed,
+                    self.config.max_blob_segment_bytes,
+                ) {
+                    if self.active_lru_seq_id(table_id).is_some() {
+                        self.storage
+                            .try_healthy(&self.commit_gate)?
+                            .sync_active_lru_writer(table_id, &mut self.lru_blobs, true)?;
                     }
-                    let seq_id = self.meta_mgr.try_reserve_seq_id()?;
+                    let seq_id = self.healthy()?.reserve_seq_id()?;
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
                     let reader = writer.reader();
@@ -4075,12 +4498,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         table_id,
                     });
                     lru_metas.sort_by_key(|m| (m.table_id, m.seq_id));
-                    if let Err(e) = self.meta_mgr.commit_update(|st| {
-                        st.lru_blob_segments = lru_metas;
-                    }) {
+                    if let Err(e) =
+                        self.healthy()?
+                            .commit_and_install_lru_writer(table_id, writer, |st| {
+                                st.lru_blob_segments = lru_metas;
+                            })
+                    {
                         drop(reader);
-                        drop(writer);
-                        if !self.meta_mgr.is_poisoned() {
+                        if !self.meta_mgr().is_poisoned() {
                             let _ = self
                                 .fs
                                 .remove_file(&format_lru_blob_file_name(table_id, seq_id));
@@ -4097,12 +4522,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             dead_bytes: 0,
                         },
                     );
-                    self.active_lru_writers.insert(table_id, writer);
                 }
-                let writer = self.active_lru_writers.get_mut(&table_id).unwrap();
-                let seg_id = writer.seq_id();
-                let ptr = writer.append_blob(key, value)?;
-                let new_len = writer.current_len();
+                let (seg_id, ptr, new_len) =
+                    self.healthy()?.append_lru_blob(table_id, key, value)?;
                 if let Some(prev_len) = self.lru_blobs.get_mut(&(table_id, seg_id)).map(|b| {
                     let prev = b.file_len;
                     b.file_len = new_len;
@@ -4188,33 +4610,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn ensure_blob_flushed(&mut self, ptr: &BlobPtr) -> io::Result<()> {
-        match ptr.kind {
-            BlobKind::Standard => {
-                if let Some(w) = &mut self.active_std_writer {
-                    if w.seq_id() == ptr.seg_id
-                        && (ptr.offset as u64).saturating_add(ptr.len as u64) > w.flushed_offset()
-                    {
-                        w.flush_buffer()?;
-                        if let Some(b) = self.std_blobs.get_mut(&w.seq_id()) {
-                            b.file_len = w.current_len();
-                        }
-                    }
-                }
-            }
-            BlobKind::Lru => {
-                if let Some(w) = self.active_lru_writers.get_mut(&ptr.table_id) {
-                    if w.seq_id() == ptr.seg_id
-                        && (ptr.offset as u64).saturating_add(ptr.len as u64) > w.flushed_offset()
-                    {
-                        w.flush_buffer()?;
-                        if let Some(b) = self.lru_blobs.get_mut(&(ptr.table_id, w.seq_id())) {
-                            b.file_len = w.current_len();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.storage
+            .ensure_blob_flushed_for_read(ptr, &mut self.std_blobs, &mut self.lru_blobs)
     }
 
     /// Reads and verifies a blob; on failure applies the table's [`CorruptPolicy`]
@@ -4259,24 +4656,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.config.blob_cache_bytes == 0 || (ptr.len as usize) > 16 * 1024 {
             return false;
         }
-        match ptr.kind {
-            BlobKind::Standard => {
-                if let Some(w) = &self.active_std_writer {
-                    if w.seq_id() == ptr.seg_id {
-                        return (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset();
-                    }
-                }
-                true
-            }
-            BlobKind::Lru => {
-                if let Some(w) = self.active_lru_writers.get(&ptr.table_id) {
-                    if w.seq_id() == ptr.seg_id {
-                        return (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset();
-                    }
-                }
-                true
-            }
-        }
+        self.storage.is_blob_flushed_for_cache(ptr)
     }
 
     /// Reads and verifies a blob that is already flushed (no policy applied).
@@ -4517,9 +4897,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(super) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.sync_active_blob_writers()?;
-        self.buf_wal
-            .make_durable_and_seal(durable)
-            .map_err(|e| self.poison(e))?;
+        self.healthy()?.make_buf_wal_durable_and_seal(durable)?;
         self.last_buf_synced_lsn = self.last_buf_append_lsn;
         self.wal_links.buf_synced();
         Ok(())
@@ -4563,11 +4941,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // enforced by `wal_links_for_append`, which stamped this batch's header.
         // A failed append/sync leaves the on-disk outcome of this batch unknown (it may or may not
         // be replayed after restart), so the engine is poisoned and must be reopened.
-        let r = match durability {
-            WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded),
-            WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded),
-        };
-        let outcome = r.map_err(|e| self.poison(e))?;
+        let outcome = self.healthy()?.append_wal_raw_batch(durability, encoded)?;
 
         if outcome == WalAppendOutcome::RingFull {
             // The batch already holds `batch_lsn` but is not in the log yet, and the checkpoint
@@ -4586,14 +4960,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.auto_compaction_due = true;
             }
             debug_assert!(
-                self.next_lsn <= batch_lsn && self.meta_mgr.state().checkpoint_lsn < batch_lsn,
+                self.next_lsn <= batch_lsn && self.meta_mgr().state().checkpoint_lsn < batch_lsn,
                 "WAL rotation must not consume the LSN of the batch being appended"
             );
-            let r = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.append_raw_batch(encoded),
-                WriteDurability::BufferedFast => self.buf_wal.append_raw_batch(encoded),
-            };
-            let retry = r.map_err(|e| self.poison(e))?;
+            let retry = self.healthy()?.append_wal_raw_batch(durability, encoded)?;
             if retry == WalAppendOutcome::RingFull {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -4616,7 +4986,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .appended(LogStream::Buffered, batch_lsn, prev_lsn, false);
             }
             WriteDurability::SyncTransactional => {
-                let synced = !self.sync_wal.barrier_deferred();
+                let synced = !self.sync_wal().barrier_deferred();
                 self.wal_links
                     .appended(LogStream::Sync, batch_lsn, prev_lsn, synced);
             }

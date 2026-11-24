@@ -31,9 +31,9 @@ fn fresh(name: &str, cfg: EngineConfig) -> (TempTestDir, Arc<OsFs>, Eng, EngineC
 
 /// Every batch of the current epoch of both log files, merged by LSN.
 fn read_log(e: &mut Eng) -> Vec<Logged> {
-    e.buf_wal.flush_buffered_to_os().unwrap();
+    e.healthy().unwrap().flush_buf_wal_to_os().unwrap();
     let mut log = Vec::new();
-    for (sync_stream, w) in [(true, &e.sync_wal), (false, &e.buf_wal)] {
+    for (sync_stream, w) in [(true, e.sync_wal()), (false, e.buf_wal())] {
         let rec = recover_single_wal_stream(&**w.file(), w.active_epoch()).unwrap();
         log.extend(
             rec.batches
@@ -52,7 +52,7 @@ fn read_log(e: &mut Eng) -> Vec<Logged> {
 /// * `durable_lsn` never decreases, is below the batch's own LSN, and names a batch of the log or
 ///   lies at or below the checkpoint.
 fn check_links(e: &mut Eng) -> Vec<Logged> {
-    let checkpoint = e.meta_mgr.state().checkpoint_lsn;
+    let checkpoint = e.meta_mgr().state().checkpoint_lsn;
     let log = read_log(e);
     let lsns: Vec<u64> = log.iter().map(|l| l.batch.lsn).collect();
     for (i, l) in log.iter().enumerate() {
@@ -100,7 +100,7 @@ fn put(e: &mut Eng, key: &[u8], durability: WriteDurability) {
 #[test]
 fn interleaved_sync_and_buffered_commits_chain_and_carry_the_watermark() {
     let (_tmp, _fs, mut e, _) = fresh("links_interleaved", EngineConfig::default());
-    let base = e.meta_mgr.state().checkpoint_lsn;
+    let base = e.meta_mgr().state().checkpoint_lsn;
     let order = [SYNC, BUF, BUF, SYNC, BUF, SYNC, SYNC, BUF];
     for (i, d) in order.iter().enumerate() {
         put(&mut e, format!("k{i}").as_bytes(), *d);
@@ -219,7 +219,7 @@ fn lead_flush(e: &mut Eng, t: &Ticket) -> u64 {
 #[test]
 fn group_committed_batches_chain_in_append_order_and_claim_only_flushed_data() {
     let (_tmp, _fs, mut e, _) = fresh("links_group", EngineConfig::default());
-    let base = e.meta_mgr.state().checkpoint_lsn;
+    let base = e.meta_mgr().state().checkpoint_lsn;
     let g1 = group_commit(&mut e, 1, b"g1");
     let g2 = group_commit(&mut e, 2, b"g2");
     // Neither batch has been flushed yet, so a batch appended now cannot claim them.
@@ -311,7 +311,7 @@ fn chain_survives_wal_rotation_in_the_middle() {
     cfg.sync_wal_size_bytes = 8 * 4096;
     cfg.buf_wal_size_bytes = 8 * 4096;
     let (_tmp, _fs, mut e, _) = fresh("links_rotation", cfg);
-    let epoch0 = e.sync_wal.active_epoch();
+    let epoch0 = e.sync_wal().active_epoch();
     let value = vec![0x33u8; 600];
     for i in 0..300u32 {
         let d = if i % 3 == 0 { SYNC } else { BUF };
@@ -320,7 +320,7 @@ fn chain_survives_wal_rotation_in_the_middle() {
         check_links(&mut e);
     }
     assert!(
-        e.sync_wal.active_epoch() > epoch0 + 2,
+        e.sync_wal().active_epoch() > epoch0 + 2,
         "the logs must have wrapped"
     );
 
@@ -329,7 +329,7 @@ fn chain_survives_wal_rotation_in_the_middle() {
     put(&mut e, b"after-flush", BUF);
     let log = check_links(&mut e);
     assert_eq!(log.len(), 1);
-    let checkpoint = e.meta_mgr.state().checkpoint_lsn;
+    let checkpoint = e.meta_mgr().state().checkpoint_lsn;
     assert_eq!(log[0].batch.prev_lsn, log[0].batch.durable_lsn);
     assert!(log[0].batch.prev_lsn <= checkpoint);
 }
@@ -339,14 +339,14 @@ fn group_commit_is_drained_before_a_ring_full_rotation() {
     let mut cfg = EngineConfig::default();
     cfg.sync_wal_size_bytes = 4 * 4096;
     let (_tmp, _fs, mut e, _) = fresh("links_group_rotation", cfg);
-    let epoch0 = e.sync_wal.active_epoch();
+    let epoch0 = e.sync_wal().active_epoch();
     let mut tickets = Vec::new();
     for i in 0..12u32 {
         tickets.push(group_commit(&mut e, 1 + (i % 3) as usize, &i.to_le_bytes()));
         check_links(&mut e);
     }
     assert!(
-        e.sync_wal.active_epoch() > epoch0,
+        e.sync_wal().active_epoch() > epoch0,
         "the sync log must have wrapped"
     );
     // The first commit was appended before the first rotation, which flushed it.
@@ -366,7 +366,7 @@ fn first_batch_after_reopen_links_to_the_checkpoint() {
 
     // Unclean: the replayed batches are checkpointed before the epochs rotate.
     let mut e = open(&fs, &cfg);
-    assert_eq!(e.meta_mgr.state().checkpoint_lsn, last);
+    assert_eq!(e.meta_mgr().state().checkpoint_lsn, last);
     put(&mut e, b"d", BUF);
     let log = check_links(&mut e);
     assert_eq!(log.len(), 1);

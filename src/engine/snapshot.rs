@@ -759,7 +759,7 @@ mod tests {
         engine.compact().unwrap();
         assert_eq!(engine.cached_snapshot_strong_count(), None);
         assert!(
-            engine.meta_mgr.state().pending_delete_files.is_empty(),
+            engine.meta_mgr().state().pending_delete_files.is_empty(),
             "cached snapshot must release old handles so dead segments unlink immediately"
         );
     }

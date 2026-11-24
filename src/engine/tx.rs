@@ -980,46 +980,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .tx_state
                 .active_tx()
                 .map_or(0, |tx| tx.pending_buf.len());
-            let wal_total_sectors = match effective_durability {
-                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
-                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+            let (wal_current_sector, wal_total_sectors) = match effective_durability {
+                WriteDurability::SyncTransactional => (
+                    self.sync_wal().current_sector_idx(),
+                    self.sync_wal().total_sectors(),
+                ),
+                WriteDurability::BufferedFast => (
+                    self.buf_wal().current_sector_idx(),
+                    self.buf_wal().total_sectors(),
+                ),
             };
             let exceeds_wal = pending_buf_len / 4070 + 2 > wal_total_sectors;
             if pending_buf_len > MAX_WAL_CHUNK_BYTES || exceeds_wal {
                 let required_sectors = (pending_buf_len / 4070) + 8;
-                match effective_durability {
-                    WriteDurability::SyncTransactional => {
-                        let target_sectors = self
-                            .sync_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.sync_wal.total_sectors() {
-                            self.sync_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
-                    WriteDurability::BufferedFast => {
-                        let target_sectors = self
-                            .buf_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.buf_wal.total_sectors() {
-                            self.buf_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
+                let target_sectors = wal_current_sector
+                    .checked_add(required_sectors)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                    })?;
+                if target_sectors > wal_total_sectors {
+                    self.healthy()?.ensure_wal_min_size(
+                        effective_durability,
+                        checked_wal_bytes(target_sectors)?,
+                    )?;
                 }
             }
             Ok(())
@@ -1141,16 +1124,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Move to `FlushingWal` during the append so a full WAL can rotate without deferring
         // while still retaining the pre-transaction `start_meta` snapshot.
         self.tx_state.set_phase(TxPhase::FlushingWal);
-        self.sync_wal.set_defer_barrier(true);
+        self.storage.set_sync_defer_barrier(true);
         let appended = self.flush_pending_tx_records();
-        self.sync_wal.set_defer_barrier(false);
+        self.storage.set_sync_defer_barrier(false);
         if let Err(e) = appended {
             let _ = self.rollback_transaction();
             return Err(e);
         }
         if !groupable {
             self.tx_state.set_phase(TxPhase::SyncInFlight);
-            return Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()));
+            return Ok(CommitStep::AwaitingSync(self.sync_wal().file_handle()));
         }
 
         let lsn = self.next_lsn - 1;
@@ -1168,7 +1151,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
         Ok(CommitStep::AwaitingGroup {
             lsn,
-            file: self.sync_wal.file_handle(),
+            file: self.sync_wal().file_handle(),
             gate: Arc::clone(&self.commit_gate),
         })
     }
@@ -1214,9 +1197,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.commit_gate.is_durable_through(target) {
             self.commit_gate.mark_durable(target, true);
             if let Err(e) = flushed {
-                if self.poisoned.is_none() {
-                    let _ = self.poison(e);
-                }
+                let _ = self.poison(e);
             } else if !self.is_poisoned() {
                 self.run_due_auto_compaction();
             }
@@ -1267,7 +1248,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Ok(());
             };
             let res = if !gate.is_durable_through(target) {
-                self.sync_wal.file_handle().sync_barrier()
+                self.sync_wal().file_handle().sync_barrier()
             } else {
                 Ok(())
             };
@@ -1452,16 +1433,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             if !tid_recapped {
                 self.access_tracker.remove_table(tid);
-                if let Some(mut old_w) = self.active_lru_writers.remove(&tid) {
-                    if let Err(e) = old_w.sync_durable() {
-                        self.active_lru_writers.insert(tid, old_w);
-                        let e = self.poison(e);
+                if self.active_lru_seq_id(tid).is_some() {
+                    if let Err(e) = self.storage.try_healthy(&self.commit_gate).and_then(|h| {
+                        h.sync_and_remove_dropped_lru_writer(tid, &mut self.lru_blobs)
+                    }) {
                         self.record_maintenance_failure(&e);
                         break;
-                    }
-                    if let Some(b) = self.lru_blobs.get_mut(&(tid, old_w.seq_id())) {
-                        b.file_len = old_w.current_len();
-                        b.dead_bytes = b.file_len;
                     }
                 }
                 for (&(t, _), b) in &mut self.lru_blobs {
@@ -1496,7 +1473,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if (dropped_any_capped || quotas_modified) && !self.is_poisoned() {
             let mut quota_metas = self.build_quota_metas();
             quota_metas.sort_by_key(|q| q.table_id);
-            let mut stored = self.meta_mgr.state().table_quotas.clone();
+            let mut stored = self.meta_mgr().state().table_quotas.clone();
             stored.sort_by_key(|q| q.table_id);
             if stored != quota_metas {
                 // Persist quota additions/drops/changes even when deferred flush/compact ran on
@@ -1509,7 +1486,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Ok(())
                 };
                 if let Err(e) = sync_res.and_then(|()| {
-                    self.meta_mgr.commit_update(|st| {
+                    self.healthy()?.commit_meta_update(|st| {
                         st.table_quotas = quota_metas;
                     })
                 }) {
@@ -2075,39 +2052,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 // no transaction framing byte, so finalize and write it in-place with zero copies.
                 debug_assert_eq!(chunk_spans.first().map_or(0, |&(_, _, n)| n), record_count);
                 let required_sectors = (raw_buf.len() / 4070) + 2;
-                match durability {
-                    WriteDurability::SyncTransactional => {
-                        let target_sectors = self
-                            .sync_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.sync_wal.total_sectors() {
-                            self.sync_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
-                    WriteDurability::BufferedFast => {
-                        let target_sectors = self
-                            .buf_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.buf_wal.total_sectors() {
-                            self.buf_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
+                let (cur_sector, total_sectors) = match durability {
+                    WriteDurability::SyncTransactional => (
+                        self.sync_wal().current_sector_idx(),
+                        self.sync_wal().total_sectors(),
+                    ),
+                    WriteDurability::BufferedFast => (
+                        self.buf_wal().current_sector_idx(),
+                        self.buf_wal().total_sectors(),
+                    ),
+                };
+                let target_sectors = cur_sector.checked_add(required_sectors).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                })?;
+                if target_sectors > total_sectors {
+                    self.healthy()?
+                        .ensure_wal_min_size(durability, checked_wal_bytes(target_sectors)?)?;
                 }
                 let lsn = self.next_lsn;
                 let (prev, durable) = self.wal_links_for_append(durability)?;
@@ -2127,41 +2087,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 max_chunk_len = max_chunk_len.max(chunk_len);
             }
 
-            let caller_deferred = self.sync_wal.barrier_deferred();
+            let caller_deferred = self.sync_wal().barrier_deferred();
             let chunked_res = (|| -> io::Result<()> {
-                match durability {
-                    WriteDurability::SyncTransactional => {
-                        let target_sectors = self
-                            .sync_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.sync_wal.total_sectors() {
-                            self.sync_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
-                    WriteDurability::BufferedFast => {
-                        let target_sectors = self
-                            .buf_wal
-                            .current_sector_idx()
-                            .checked_add(required_sectors)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "WAL sector count overflow",
-                                )
-                            })?;
-                        if target_sectors > self.buf_wal.total_sectors() {
-                            self.buf_wal
-                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                        }
-                    }
+                let (cur_sector, total_sectors) = match durability {
+                    WriteDurability::SyncTransactional => (
+                        self.sync_wal().current_sector_idx(),
+                        self.sync_wal().total_sectors(),
+                    ),
+                    WriteDurability::BufferedFast => (
+                        self.buf_wal().current_sector_idx(),
+                        self.buf_wal().total_sectors(),
+                    ),
+                };
+                let target_sectors = cur_sector.checked_add(required_sectors).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                })?;
+                if target_sectors > total_sectors {
+                    self.healthy()?
+                        .ensure_wal_min_size(durability, checked_wal_bytes(target_sectors)?)?;
                 }
 
                 let mut chunk_buf = Vec::with_capacity(max_chunk_len);
@@ -2183,7 +2126,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     let chunk_records = user_records + 1;
                     if durability == WriteDurability::SyncTransactional {
-                        self.sync_wal.set_defer_barrier(if idx < last_idx {
+                        self.storage.set_sync_defer_barrier(if idx < last_idx {
                             true
                         } else {
                             caller_deferred
@@ -2204,7 +2147,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Ok(())
             })();
 
-            self.sync_wal.set_defer_barrier(caller_deferred);
+            self.storage.set_sync_defer_barrier(caller_deferred);
             chunked_res
         })();
 

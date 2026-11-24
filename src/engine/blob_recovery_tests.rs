@@ -428,7 +428,7 @@ fn reopen_accounts_interior_aborted_blob_gap_and_reclaims_segment() {
         engine
             .put_row(1, b"live0", &[0x11u8; 120], &[], sync)
             .unwrap();
-        seg1 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        seg1 = engine.active_std_seq_id().unwrap();
         engine.flush_memtable().unwrap();
 
         // Append inside an aborted transaction, leaving unreferenced bytes immediately above the
@@ -437,19 +437,19 @@ fn reopen_accounts_interior_aborted_blob_gap_and_reclaims_segment() {
         engine
             .put_row(1, b"aborted", &[0x22u8; 150], &[], fast)
             .unwrap();
-        assert_eq!(engine.active_std_writer.as_ref().unwrap().seq_id(), seg1);
+        assert_eq!(engine.active_std_seq_id().unwrap(), seg1);
         engine.rollback_transaction().unwrap();
 
         engine
             .put_row(1, b"live1", &[0x33u8; 150], &[], fast)
             .unwrap();
-        assert_eq!(engine.active_std_writer.as_ref().unwrap().seq_id(), seg1);
+        assert_eq!(engine.active_std_seq_id().unwrap(), seg1);
 
         // Rolling to seg2 seals seg1 with [live0 (cataloged) | aborted gap | live1 (WAL)].
         engine
             .put_row(1, b"live2", &[0x44u8; 300], &[], fast)
             .unwrap();
-        seg2 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        seg2 = engine.active_std_seq_id().unwrap();
         assert_ne!(seg1, seg2);
         engine.flush_active_blob_buffers().unwrap();
     }
@@ -507,9 +507,9 @@ fn blob_rollover_during_uncommitted_tx_does_not_leak_segment_after_rollback_and_
         let mut engine = open_plain(&tmp.path, &config);
         engine.begin_transaction();
         engine.put_row(1, b"t1", &[0xAAu8; 200], &[], fast).unwrap();
-        seg1 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        seg1 = engine.active_std_seq_id().unwrap();
         engine.put_row(1, b"t2", &[0xBBu8; 200], &[], fast).unwrap();
-        seg2 = engine.active_std_writer.as_ref().unwrap().seq_id();
+        seg2 = engine.active_std_seq_id().unwrap();
         assert_ne!(seg1, seg2);
         engine.rollback_transaction().unwrap();
         // Drop without checkpoint to simulate crash after rollback.
@@ -523,7 +523,7 @@ fn blob_rollover_during_uncommitted_tx_does_not_leak_segment_after_rollback_and_
     );
     assert!(
         !reopened
-            .meta_mgr
+            .meta_mgr()
             .state()
             .std_blob_segments
             .iter()
@@ -549,7 +549,7 @@ fn autocommit_ring_full_write_zero_preserves_settled_len_and_dead_bytes() {
     engine.flush_memtable().unwrap();
 
     let (seg_id, cataloged_len) = {
-        let m = &engine.meta_mgr.state().std_blob_segments[0];
+        let m = &engine.meta_mgr().state().std_blob_segments[0];
         (m.seq_id, m.file_len)
     };
     assert!(cataloged_len > 0);
@@ -572,7 +572,7 @@ fn autocommit_ring_full_write_zero_preserves_settled_len_and_dead_bytes() {
     assert!(engine.in_flight_autocommit_blob_starts.is_empty());
 
     let cataloged_after = engine
-        .meta_mgr
+        .meta_mgr()
         .state()
         .std_blob_segments
         .iter()

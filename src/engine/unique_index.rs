@@ -392,8 +392,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let is_capped = self.capped_tables.contains_key(&table_id);
         let max_batch_wal_bytes = if !self.tx_state.is_active() {
             let sectors = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
-                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+                WriteDurability::SyncTransactional => self.sync_wal().total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal().total_sectors(),
             };
             super::eviction::max_wal_sub_batch_bytes(sectors, 512 * 1024)
         } else {

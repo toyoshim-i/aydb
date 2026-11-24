@@ -686,7 +686,7 @@ fn writes_after_crash_recovery_survive_next_restart() {
             .unwrap();
     }
     // Simulate sudden process crash (`kill -9`) leaving a dangling `First` fragment at the end of Sector 0
-    engine1.buf_wal.discard_user_space_buffer_for_test();
+    engine1.storage.debug_discard_buf_wal_user_space();
     drop(engine1);
 
     // 2. Reopen (recovers first 4 rows and rotates WAL epochs), write 3 new rows, and close cleanly
@@ -811,7 +811,7 @@ fn multi_chunk_transaction_without_commit_marker_discards_all_chunks() {
                 },
             ],
         );
-        engine.sync_wal.append_batch(&chunk1).unwrap();
+        engine.storage.debug_append_sync_batch(&chunk1);
     }
 
     let mut reopened = StorageEngine::open(fs, EngineConfig::default()).unwrap();
@@ -1637,9 +1637,9 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
         // suffered a sub-sector torn write, forcing `boot_meta.db` to fall back to the prior
         // slot where `std_blob_segments` was still empty, while `wal_sync.db` and `blob_std_0001.db`
         // are intact on disk!
-        let active_slot = engine.meta_mgr.active_slot();
+        let active_slot = engine.meta_mgr().active_slot();
         engine
-            .meta_mgr
+            .meta_mgr()
             .file()
             .write_all_at(&[0xFF], active_slot.byte_offset() + 4095)
             .unwrap();
@@ -1864,7 +1864,7 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
         );
         assert!(
             engine
-                .meta_mgr
+                .meta_mgr()
                 .state()
                 .table_quotas
                 .iter()
@@ -2104,7 +2104,7 @@ fn tx_capped_quota_persistence_and_sync_catalog_durability() {
 
         // 2. `register_or_resolve_vtab_with_durability(..., SyncTransactional)` must
         //    commit the catalog record to `sync_wal` (`current_sector_idx() > 0`)!
-        let sync_sectors_before = engine.sync_wal.current_sector_idx();
+        let sync_sectors_before = engine.sync_wal().current_sector_idx();
         let id = engine
             .register_or_resolve_vtab_with_durability(
                 "sync_cat_tbl",
@@ -2113,7 +2113,7 @@ fn tx_capped_quota_persistence_and_sync_catalog_durability() {
             )
             .unwrap();
         assert!(
-            engine.sync_wal.current_sector_idx() > sync_sectors_before,
+            engine.sync_wal().current_sector_idx() > sync_sectors_before,
             "SyncTransactional catalog registration must append to sync_wal"
         );
         id
@@ -2532,17 +2532,17 @@ fn sync_point_seals_buf_wal_sector_so_it_is_never_rewritten() {
         engine
             .put_row(1, b"k1", b"v1", &[], WriteDurability::BufferedFast)
             .unwrap();
-        let before_sync = engine.buf_wal.current_sector_idx();
+        let before_sync = engine.buf_wal().current_sector_idx();
         engine
             .put_row(1, b"k2", b"v2", &[], WriteDurability::SyncTransactional)
             .unwrap();
         // The sector holding k1 was synced and sealed: the cursor moved past it.
-        assert!(engine.buf_wal.current_sector_idx() > before_sync);
-        let after_sync = engine.buf_wal.current_sector_idx();
+        assert!(engine.buf_wal().current_sector_idx() > before_sync);
+        let after_sync = engine.buf_wal().current_sector_idx();
         engine
             .put_row(1, b"k3", b"v3", &[], WriteDurability::BufferedFast)
             .unwrap();
-        assert!(engine.buf_wal.current_sector_idx() >= after_sync);
+        assert!(engine.buf_wal().current_sector_idx() >= after_sync);
         drop(engine);
 
         let mut engine = StorageEngine::open(fs, cfg).unwrap();
@@ -2732,7 +2732,7 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
     }
     let seg_a = {
         let engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
-        let segs = &engine.meta_mgr.state().std_blob_segments;
+        let segs = &engine.meta_mgr().state().std_blob_segments;
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].dead_bytes, 0);
         segs[0].seq_id
@@ -2768,7 +2768,7 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
     {
         let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
         let a = engine
-            .meta_mgr
+            .meta_mgr()
             .state()
             .std_blob_segments
             .iter()
@@ -3830,15 +3830,12 @@ fn table_inline_threshold_override_and_effective_default_for_capped_tables() {
     // Override inline threshold for Table 1 to 2500 bytes
     engine.set_table_inline_threshold(1, 2500);
     assert_eq!(engine.effective_inline_threshold(1), 2500);
-    let initial_blob_len = engine.active_std_writer.as_ref().unwrap().current_len();
+    let initial_blob_len = engine.storage.active_std_len().unwrap();
     engine
         .put_row(1, b"key2", &val_2048, &[], WriteDurability::BufferedFast)
         .unwrap();
     // Inlined into MemTable! No bytes appended to blob segment!
-    assert_eq!(
-        engine.active_std_writer.as_ref().unwrap().current_len(),
-        initial_blob_len
-    );
+    assert_eq!(engine.storage.active_std_len().unwrap(), initial_blob_len);
     assert_eq!(engine.get_row(1, b"key2").unwrap(), Some(val_2048.clone()));
 
     // 2. Table 2: Capped LRU Table
@@ -3856,7 +3853,7 @@ fn table_inline_threshold_override_and_effective_default_for_capped_tables() {
         .put_row(2, b"cap1", &val_1500, &[], WriteDurability::BufferedFast)
         .unwrap();
     // Spilled to LRU blob segment because 1500 >= 1024
-    assert!(engine.active_lru_writers.contains_key(&2));
+    assert!(engine.active_lru_seq_id(2).is_some());
 
     // Explicit override on capped table is honored:
     engine.set_table_inline_threshold(2, 2048);
@@ -3866,11 +3863,11 @@ fn table_inline_threshold_override_and_effective_default_for_capped_tables() {
     engine.set_table_inline_threshold(3, 256);
     assert_eq!(engine.effective_inline_threshold(3), 256);
     let val_500 = vec![0x77u8; 500];
-    let prev_blob_len = engine.active_std_writer.as_ref().unwrap().current_len();
+    let prev_blob_len = engine.storage.active_std_len().unwrap();
     engine
         .put_row(3, b"k3", &val_500, &[], WriteDurability::BufferedFast)
         .unwrap();
-    assert!(engine.active_std_writer.as_ref().unwrap().current_len() > prev_blob_len);
+    assert!(engine.storage.active_std_len().unwrap() > prev_blob_len);
 
     // 4. Dropping table cleans up threshold
     engine.drop_table(3, None).unwrap();
@@ -4288,7 +4285,7 @@ fn orphan_segment_file_name_is_not_reused_after_crashed_flush() {
         engine
             .put_row(1, b"b", b"2", &[], WriteDurability::BufferedFast)
             .unwrap();
-        engine.meta_mgr.state().next_seq_id
+        engine.meta_mgr().state().next_seq_id
     };
     // A crashed flush left an uncataloged segment, longer than any segment recovery will write.
     std::fs::write(
@@ -4442,8 +4439,9 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
         engine.flush_memtable().unwrap();
         // Persist a quota for table 1 although its rows carry no row-meta or LRU entries.
         engine
-            .meta_mgr
-            .commit_update(|st| {
+            .healthy()
+            .unwrap()
+            .commit_meta_update(|st| {
                 st.table_quotas = vec![crate::meta::TableQuotaMeta {
                     table_id: 1,
                     eviction_policy: EvictionPolicy::Lru,
@@ -4465,24 +4463,24 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
         // pending in the MemTable and backed only by the fresh WAL epoch.
         assert!(!engine.memtable.is_empty());
         assert_eq!(
-            engine.sync_wal.active_epoch(),
-            engine.meta_mgr.state().sync_wal_epoch
+            engine.sync_wal().active_epoch(),
+            engine.meta_mgr().state().sync_wal_epoch
         );
         assert_eq!(
-            engine.buf_wal.active_epoch(),
-            engine.meta_mgr.state().buf_wal_epoch
+            engine.buf_wal().active_epoch(),
+            engine.meta_mgr().state().buf_wal_epoch
         );
         assert!(engine.capped_table_state(1).unwrap().current_logical_bytes > 0);
         (
-            engine.sync_wal.active_epoch(),
-            engine.buf_wal.active_epoch(),
+            engine.sync_wal().active_epoch(),
+            engine.buf_wal().active_epoch(),
         )
         // Dropped without flushing: simulates a crash.
     };
 
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
-    assert!(engine.sync_wal.active_epoch() > epochs.0);
-    assert!(engine.buf_wal.active_epoch() > epochs.1);
+    assert!(engine.sync_wal().active_epoch() > epochs.0);
+    assert!(engine.buf_wal().active_epoch() > epochs.1);
     for k in [b"a", b"b", b"c"] {
         assert_eq!(engine.get_row(1, k).unwrap(), Some(b"value".to_vec()));
     }
@@ -4686,12 +4684,12 @@ fn checkpoint_with_empty_memtable_persists_blob_segment_lengths() {
     engine.put_row(1, b"b", &vec![2u8; 4000], &[], wal).unwrap();
     engine.rollback_transaction().unwrap();
     assert!(engine.memtable.is_empty());
-    let committed = engine.meta_mgr.state().std_blob_segments[0].file_len;
+    let committed = engine.meta_mgr().state().std_blob_segments[0].file_len;
     let in_memory = engine.std_blobs.values().next().unwrap().file_len;
     assert!(in_memory > committed);
 
     engine.checkpoint().unwrap();
-    let st = engine.meta_mgr.state();
+    let st = engine.meta_mgr().state();
     assert_eq!(st.std_blob_segments.len(), 1);
     assert_eq!(st.std_blob_segments[0].file_len, in_memory);
     let dead = st.std_blob_segments[0].dead_bytes;
@@ -4699,7 +4697,7 @@ fn checkpoint_with_empty_memtable_persists_blob_segment_lengths() {
     drop(engine);
 
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
-    let seg = &engine.meta_mgr.state().std_blob_segments[0];
+    let seg = &engine.meta_mgr().state().std_blob_segments[0];
     assert_eq!(seg.file_len, in_memory);
     assert_eq!(seg.dead_bytes, dead);
     assert_eq!(engine.get_row(1, b"a").unwrap(), Some(vec![1u8; 4000]));
@@ -4717,7 +4715,7 @@ fn checkpoint_flushes_pending_memtable() {
         .unwrap();
     engine.checkpoint().unwrap();
     assert!(engine.memtable.is_empty());
-    assert_eq!(engine.meta_mgr.state().idx_segments.len(), 1);
+    assert_eq!(engine.meta_mgr().state().idx_segments.len(), 1);
     drop(engine);
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
     assert!(engine.memtable.is_empty());
@@ -4768,8 +4766,9 @@ fn clean_reopen_skips_capped_reconcile_and_keeps_tick_order() {
     {
         let mut engine = StorageEngine::open(fs.clone(), cfg.clone()).unwrap();
         engine
-            .meta_mgr
-            .commit_update(|st| st.table_quotas[0].current_logical_bytes = 12_345)
+            .healthy()
+            .unwrap()
+            .commit_meta_update(|st| st.table_quotas[0].current_logical_bytes = 12_345)
             .unwrap();
     }
     let engine = StorageEngine::open(fs, cfg).unwrap();
@@ -5525,12 +5524,14 @@ fn fill_wal_to_last_sector(e: &mut StorageEngine<PowerLossFs>, durability: Write
     let mut i = 0;
     loop {
         let (idx, total) = match durability {
-            WriteDurability::SyncTransactional => {
-                (e.sync_wal.current_sector_idx(), e.sync_wal.total_sectors())
-            }
-            WriteDurability::BufferedFast => {
-                (e.buf_wal.current_sector_idx(), e.buf_wal.total_sectors())
-            }
+            WriteDurability::SyncTransactional => (
+                e.sync_wal().current_sector_idx(),
+                e.sync_wal().total_sectors(),
+            ),
+            WriteDurability::BufferedFast => (
+                e.buf_wal().current_sector_idx(),
+                e.buf_wal().total_sectors(),
+            ),
         };
         if idx + 2 >= total {
             break;
@@ -5544,8 +5545,8 @@ fn fill_wal_to_last_sector(e: &mut StorageEngine<PowerLossFs>, durability: Write
 
 fn wal_epoch(e: &StorageEngine<PowerLossFs>, durability: WriteDurability) -> u64 {
     match durability {
-        WriteDurability::SyncTransactional => e.sync_wal.active_epoch(),
-        WriteDurability::BufferedFast => e.buf_wal.active_epoch(),
+        WriteDurability::SyncTransactional => e.sync_wal().active_epoch(),
+        WriteDurability::BufferedFast => e.buf_wal().active_epoch(),
     }
 }
 
@@ -5730,18 +5731,18 @@ fn ring_full_rotation_does_not_relocate_blobs_under_the_held_lsn() {
     e.put_row(1, b"c", &[3u8; 1500], &[], sync).unwrap();
     e.put_row(1, b"a", b"x", &[], sync).unwrap();
     e.flush_memtable().unwrap();
-    let epoch = e.sync_wal.active_epoch();
+    let epoch = e.sync_wal().active_epoch();
     e.config.auto_compact_segment_threshold = 2;
     let mut i = 0;
-    while e.sync_wal.current_sector_idx() + 2 < e.sync_wal.total_sectors() {
+    while e.sync_wal().current_sector_idx() + 2 < e.sync_wal().total_sectors() {
         let k = format!("fill{i:04}");
         e.put_row(2, k.as_bytes(), b"v", &[], sync).unwrap();
         i += 1;
     }
-    assert_eq!(e.sync_wal.active_epoch(), epoch);
+    assert_eq!(e.sync_wal().active_epoch(), epoch);
     // Keep writing until one write has to rotate the ring.
     let mut last = Vec::new();
-    while e.sync_wal.active_epoch() == epoch {
+    while e.sync_wal().active_epoch() == epoch {
         let k = format!("last{}", last.len());
         e.put_row(3, k.as_bytes(), b"v", &[], sync).unwrap();
         last.push(k);
@@ -5811,7 +5812,7 @@ fn commit_overwrite_of_r1(e: &mut StorageEngine<PowerLossFs>, durability: WriteD
 }
 
 fn persisted_dead_bytes(e: &StorageEngine<PowerLossFs>) -> u64 {
-    let st = e.meta_mgr.state();
+    let st = e.meta_mgr().state();
     st.std_blob_segments
         .iter()
         .map(|s| s.dead_bytes)
@@ -7347,8 +7348,9 @@ fn reopen_skips_blob_fsync_when_replayed_pointers_are_within_cataloged_len() {
         // to replay on reopen.
         let seg1_len = engine.std_blobs[&seg1].file_len;
         engine
-            .meta_mgr
-            .commit_update(|st| {
+            .healthy()
+            .unwrap()
+            .commit_meta_update(|st| {
                 if let Some(m) = st.std_blob_segments.iter_mut().find(|m| m.seq_id == seg1) {
                     m.file_len = seg1_len;
                 }
@@ -7411,7 +7413,7 @@ fn drop_table_inside_rolled_back_tx_preserves_lru_writer_policies_and_holders() 
         )
         .unwrap();
 
-    assert!(engine.active_lru_writers.contains_key(&tid));
+    assert!(engine.active_lru_seq_id(tid).is_some());
     assert_eq!(engine.corrupt_policy(tid), CorruptPolicy::Error);
     assert_eq!(engine.effective_inline_threshold(tid), 96);
     assert_eq!(
@@ -7428,7 +7430,7 @@ fn drop_table_inside_rolled_back_tx_preserves_lru_writer_policies_and_holders() 
     engine.rollback_transaction().unwrap();
 
     assert!(
-        engine.active_lru_writers.contains_key(&tid),
+        engine.active_lru_seq_id(tid).is_some(),
         "active_lru_writers entry must survive rollback of drop_table"
     );
     assert_eq!(engine.corrupt_policy(tid), CorruptPolicy::Error);
@@ -8986,10 +8988,10 @@ fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
             .unwrap();
         engine.flush_memtable().unwrap();
         let (seg_id, len_after_k1) = if is_capped {
-            let m = &engine.meta_mgr.state().lru_blob_segments[0];
+            let m = &engine.meta_mgr().state().lru_blob_segments[0];
             (m.seq_id, m.file_len)
         } else {
-            let m = &engine.meta_mgr.state().std_blob_segments[0];
+            let m = &engine.meta_mgr().state().std_blob_segments[0];
             (m.seq_id, m.file_len)
         };
         assert!(len_after_k1 > 0);
@@ -8997,14 +8999,14 @@ fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
         // Fill sectors 0..=1 of the 3-sector buffered WAL with inline rows so we sit inside sector
         // 2 (final sector) without appending to any blob segment.
         let mut i = 0usize;
-        while engine.buf_wal.current_sector_idx() < 2 {
+        while engine.buf_wal().current_sector_idx() < 2 {
             let k = format!("pad_{i:04}");
             engine
                 .put_row(tid, k.as_bytes(), &[0x33u8; 32], &[], fast)
                 .unwrap();
             i += 1;
         }
-        let epoch_before = engine.buf_wal.active_epoch();
+        let epoch_before = engine.buf_wal().active_epoch();
 
         // Append an out-of-line blob whose WAL record (~9 KB) cannot fit in the partially used
         // final sector (<4 KB remaining) yet fits in the fresh 3-sector WAL after `RingFull`
@@ -9014,12 +9016,12 @@ fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
         engine
             .put_row(tid, &big_pk, &[0x22u8; 300], &[sec], fast)
             .unwrap();
-        assert_eq!(engine.buf_wal.active_epoch(), epoch_before + 1);
+        assert_eq!(engine.buf_wal().active_epoch(), epoch_before + 1);
         assert!(engine.in_flight_autocommit_blob_starts.is_empty());
 
         let cataloged_at_ring_full = if is_capped {
             engine
-                .meta_mgr
+                .meta_mgr()
                 .state()
                 .lru_blob_segments
                 .iter()
@@ -9028,7 +9030,7 @@ fn autocommit_ring_full_power_loss_reclaims_uncataloged_std_and_lru_blobs() {
                 .file_len
         } else {
             engine
-                .meta_mgr
+                .meta_mgr()
                 .state()
                 .std_blob_segments
                 .iter()
@@ -9204,7 +9206,7 @@ fn empty_sealed_blob_segments_are_reclaimed_and_corrupt_std_blobs_not_rescanned(
     let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
 
     // Register an empty sealed `blob_std` segment directly in state + meta, then reclaim.
-    let seq_empty = engine.meta_mgr.reserve_seq_id();
+    let seq_empty = engine.storage.debug_meta_mgr_mut().reserve_seq_id();
     let empty_writer = BlobSegmentWriter::open(&*fs, BlobKind::Standard, 0, seq_empty).unwrap();
     let empty_reader = empty_writer.reader();
     drop(empty_writer);
@@ -9234,7 +9236,7 @@ fn empty_sealed_blob_segments_are_reclaimed_and_corrupt_std_blobs_not_rescanned(
             .unwrap();
     }
     engine.sync_active_std_writer().unwrap();
-    engine.active_std_writer = None;
+    engine.storage.debug_clear_active_std_writer();
     for i in 0..3u32 {
         engine
             .delete_row(
@@ -9521,7 +9523,7 @@ fn quota_only_tx_drains_pending_group_before_persisting_boot_meta() {
         GroupRole::Durable
     ));
     let stored_q = engine
-        .meta_mgr
+        .meta_mgr()
         .state()
         .table_quotas
         .iter()
@@ -9743,7 +9745,7 @@ fn tiny_memtable_autocommit_updates_persist_exact_quotas_and_dead_bytes() {
             .put_row(1, b"k1", &[0x11u8; 600], &[], WriteDurability::BufferedFast)
             .unwrap();
         let stored1 = engine
-            .meta_mgr
+            .meta_mgr()
             .state()
             .table_quotas
             .iter()
@@ -9757,7 +9759,7 @@ fn tiny_memtable_autocommit_updates_persist_exact_quotas_and_dead_bytes() {
             .put_row(1, b"k1", &[0x22u8; 200], &[], WriteDurability::BufferedFast)
             .unwrap();
         let stored2 = engine
-            .meta_mgr
+            .meta_mgr()
             .state()
             .table_quotas
             .iter()
@@ -9766,7 +9768,7 @@ fn tiny_memtable_autocommit_updates_persist_exact_quotas_and_dead_bytes() {
             .current_logical_bytes;
         assert_eq!(stored2, 202);
         let stored_dead: u64 = engine
-            .meta_mgr
+            .meta_mgr()
             .state()
             .lru_blob_segments
             .iter()
@@ -9785,7 +9787,7 @@ fn tiny_memtable_autocommit_updates_persist_exact_quotas_and_dead_bytes() {
                 .unwrap()
         );
         let stored3 = engine
-            .meta_mgr
+            .meta_mgr()
             .state()
             .table_quotas
             .iter()
@@ -9995,14 +9997,14 @@ fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
 
-    let sync_sector_before = engine.sync_wal.current_sector_idx();
+    let sync_sector_before = engine.sync_wal().current_sector_idx();
     engine.begin_transaction();
     engine
         .prepare_commit_transaction(WriteDurability::SyncTransactional)
         .unwrap();
     engine.commit_transaction().unwrap();
     assert!(!engine.tx_state.pending_sync());
-    assert_eq!(engine.sync_wal.current_sector_idx(), sync_sector_before);
+    assert_eq!(engine.sync_wal().current_sector_idx(), sync_sector_before);
 
     engine.begin_transaction();
     engine
@@ -10014,7 +10016,7 @@ fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
     assert!(!engine.tx_state.pending_sync());
     engine.commit_transaction().unwrap();
     assert_eq!(
-        engine.sync_wal.current_sector_idx(),
+        engine.sync_wal().current_sector_idx(),
         sync_sector_before,
         "BufferedFast tx must not spill to wal_sync.db after an empty sync tx"
     );
@@ -10114,7 +10116,7 @@ fn tx_state_idle_clears_all_state_across_commit_group_and_rollback() {
     assert_idle(&engine);
 
     // 2. Subsequent buffered transaction must not inherit prior sync state.
-    let sync_sector_before = engine.sync_wal.current_sector_idx();
+    let sync_sector_before = engine.sync_wal().current_sector_idx();
     engine.begin_transaction_for_conn(1).unwrap();
     engine
         .put_row(1, b"k2", b"v2", &[], WriteDurability::BufferedFast)
@@ -10122,7 +10124,7 @@ fn tx_state_idle_clears_all_state_across_commit_group_and_rollback() {
     assert!(!engine.tx_state.pending_sync());
     engine.commit_transaction_for_conn(1).unwrap();
     assert_idle(&engine);
-    assert_eq!(engine.sync_wal.current_sector_idx(), sync_sector_before);
+    assert_eq!(engine.sync_wal().current_sector_idx(), sync_sector_before);
 
     // 3. Group-commit handoff moves `tx_state` to `Idle` while awaiting barrier completion.
     let ticket = commit_into_group(&mut engine, 2, b"k_grp", b"v_grp");
@@ -10348,4 +10350,347 @@ fn flushing_wal_phase_keeps_start_meta_settled_during_ring_full_rotation() {
     let restored_dead: u64 = eng.std_blobs.values().map(|b| b.dead_bytes).sum();
     assert_eq!(restored_dead, base_dead);
     assert_eq!(eng.get_row(1, b"base").unwrap(), Some(OLD_BLOB.to_vec()));
+}
+
+#[test]
+fn healthy_capability_rejects_all_three_poison_sources_and_preserves_reads() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    let assert_rejected_and_readable = |eng: &mut StorageEngine<OsFs>| {
+        assert!(eng.is_poisoned());
+        assert!(eng.healthy().is_err());
+        let lsn_before = eng.next_lsn();
+        let gen_before = eng.meta_mgr().state().generation;
+
+        assert!(
+            eng.put_row(1, b"blocked", b"v", &[], WriteDurability::SyncTransactional)
+                .is_err()
+        );
+        assert!(
+            eng.delete_row(1, b"k1", WriteDurability::SyncTransactional)
+                .is_err()
+        );
+        assert!(eng.flush_memtable().is_err());
+        assert!(eng.checkpoint().is_err());
+        assert!(eng.prepare_compaction().is_err());
+        assert!(eng.register_capped_table(2, 4096).is_err());
+        assert!(
+            eng.append_to_blob_segment(BlobKind::Standard, 0, b"kb", b"vb")
+                .is_err()
+        );
+        assert_eq!(eng.next_lsn(), lsn_before);
+        assert_eq!(eng.meta_mgr().state().generation, gen_before);
+        assert_eq!(eng.get_row(1, b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(
+            eng.scan_table(1).unwrap(),
+            vec![(b"k1".to_vec(), b"v1".to_vec())]
+        );
+    };
+
+    // 1. EngineHealth::Poisoned
+    {
+        let tmp = TempTestDir::new("m2_poison_engine_health");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine
+            .put_row(1, b"k1", b"v1", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        engine.debug_poison("wal disk fault");
+        let err = engine.healthy().err().unwrap().to_string();
+        assert!(err.contains("wal disk fault"), "unexpected err: {err}");
+        assert_rejected_and_readable(&mut engine);
+    }
+
+    // 2. CommitGate failure alone
+    {
+        let tmp = TempTestDir::new("m2_poison_commit_gate");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine
+            .put_row(1, b"k1", b"v1", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        engine
+            .commit_gate
+            .fail(&io::Error::other("group leader EIO"));
+        let err = engine.healthy().err().unwrap().to_string();
+        assert!(err.contains("group leader EIO"), "unexpected err: {err}");
+        assert_rejected_and_readable(&mut engine);
+    }
+
+    // 3. BootMetaManager poison alone
+    {
+        struct MetaWriteFaultFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            is_meta: bool,
+            fail_meta: Arc<AtomicBool>,
+        }
+        impl PlatformFile for MetaWriteFaultFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                if self.is_meta && self.fail_meta.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("injected boot_meta write failure"));
+                }
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+        struct MetaWriteFaultFs {
+            inner: OsFs,
+            fail_meta: Arc<AtomicBool>,
+        }
+        impl PlatformFs for MetaWriteFaultFs {
+            type File = MetaWriteFaultFile;
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                Ok(Arc::new(MetaWriteFaultFile {
+                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                    is_meta: rel_name == "boot_meta.db",
+                    fail_meta: Arc::clone(&self.fail_meta),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("m2_poison_meta_mgr");
+        let fail_meta = Arc::new(AtomicBool::new(false));
+        let fs = Arc::new(MetaWriteFaultFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            fail_meta: Arc::clone(&fail_meta),
+        });
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine
+            .put_row(1, b"k1", b"v1", &[], WriteDurability::SyncTransactional)
+            .unwrap();
+        fail_meta.store(true, Ordering::SeqCst);
+        assert!(engine.flush_memtable().is_err());
+        assert!(engine.meta_mgr().is_poisoned());
+        assert!(engine.is_poisoned());
+        let lsn_before = engine.next_lsn();
+        assert!(engine.healthy().is_err());
+        assert!(
+            engine
+                .put_row(1, b"k2", b"v2", &[], WriteDurability::SyncTransactional)
+                .is_err()
+        );
+        assert_eq!(engine.next_lsn(), lsn_before);
+        assert_eq!(engine.get_row(1, b"k1").unwrap(), Some(b"v1".to_vec()));
+    }
+}
+
+#[test]
+fn healthy_capability_auto_poisons_on_wal_append_and_sync_errors_while_defer_barrier_unwinds() {
+    // 1. WAL append failure via `begin_commit_for_conn` poisons `EngineHealth` while still
+    //    restoring `sync_wal.barrier_deferred()` to false.
+    {
+        let tmp = TempTestDir::new("m2_auto_poison_wal_defer");
+        let mut engine = open_group_engine(&tmp);
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine.put_row(1, b"k1", b"v1", &[], GROUP_SYNC).unwrap();
+        engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+        engine.tx_state.active_tx_mut().unwrap().deferred_flush = true;
+        engine.debug_fail_next_wal_append();
+        assert!(engine.begin_commit_for_conn(1).is_err());
+        assert!(engine.is_poisoned());
+        assert!(!engine.sync_wal().barrier_deferred());
+        assert!(engine.healthy().is_err());
+    }
+
+    // 2. Blob sync failure auto-poisons `EngineHealth` inside `HealthyEngine::sync_active_std_writer`.
+    {
+        use blob_sync_counting::{CountFs, Ctl};
+
+        let tmp = TempTestDir::new("m2_auto_poison_blob_sync");
+        let ctl = Arc::new(Ctl::default());
+        let fs = Arc::new(CountFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            ctl: Arc::clone(&ctl),
+        });
+        let mut cfg = EngineConfig::default();
+        cfg.inline_threshold_bytes = 64;
+        let mut engine = StorageEngine::open(fs, cfg).unwrap();
+        engine
+            .put_row(
+                1,
+                b"blob_k",
+                &[0x44u8; 256],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+        ctl.fail_blob_sync.store(true, Ordering::SeqCst);
+        let err = engine.sync_active_std_writer().unwrap_err();
+        assert!(err.to_string().contains("simulated blob sync failure"));
+        assert!(engine.is_poisoned());
+        assert!(engine.healthy().is_err());
+    }
+}
+
+#[test]
+fn healthy_capability_allows_retryable_buf_flush_without_poisoning() {
+    use crate::pal::PreallocStrategy;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    struct RetryableFlushFile {
+        inner: Arc<<OsFs as PlatformFs>::File>,
+        is_buf_wal: bool,
+        is_std_blob: bool,
+        fail_next_buf_wal: Arc<AtomicBool>,
+        fail_next_std_blob: Arc<AtomicBool>,
+    }
+    impl PlatformFile for RetryableFlushFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+            if self.is_buf_wal && self.fail_next_buf_wal.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transient buf wal write failure",
+                ));
+            }
+            if self.is_std_blob && self.fail_next_std_blob.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transient blob buffer write failure",
+                ));
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn file_len(&self) -> io::Result<u64> {
+            self.inner.file_len()
+        }
+        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+            self.inner.preallocate(target_len, strategy)
+        }
+        fn sync_barrier(&self) -> io::Result<()> {
+            self.inner.sync_barrier()
+        }
+        fn sync_durable(&self) -> io::Result<()> {
+            self.inner.sync_durable()
+        }
+        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.inner.evict_os_cache(offset, len)
+        }
+    }
+    struct RetryableFlushFs {
+        inner: OsFs,
+        fail_next_buf_wal: Arc<AtomicBool>,
+        fail_next_std_blob: Arc<AtomicBool>,
+    }
+    impl PlatformFs for RetryableFlushFs {
+        type File = RetryableFlushFile;
+        fn open_file(
+            &self,
+            rel_name: &str,
+            create: bool,
+            writable: bool,
+            hint: OpenHint,
+        ) -> io::Result<Arc<Self::File>> {
+            Ok(Arc::new(RetryableFlushFile {
+                inner: self.inner.open_file(rel_name, create, writable, hint)?,
+                is_buf_wal: rel_name == "wal_buf.db",
+                is_std_blob: rel_name.starts_with("blob_std_"),
+                fail_next_buf_wal: Arc::clone(&self.fail_next_buf_wal),
+                fail_next_std_blob: Arc::clone(&self.fail_next_std_blob),
+            }))
+        }
+        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+            self.inner.remove_file(rel_name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn root_path(&self) -> &Path {
+            self.inner.root_path()
+        }
+    }
+
+    let tmp = TempTestDir::new("m2_retryable_buf_flush");
+    let fail_buf = Arc::new(AtomicBool::new(false));
+    let fail_blob = Arc::new(AtomicBool::new(false));
+    let fs = Arc::new(RetryableFlushFs {
+        inner: OsFs::open(&tmp.path, true).unwrap(),
+        fail_next_buf_wal: Arc::clone(&fail_buf),
+        fail_next_std_blob: Arc::clone(&fail_blob),
+    });
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    // Put a small buffered row so `wal_buf.db` holds user-space buffered data.
+    engine
+        .put_row(1, b"buf_k", b"v", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    fail_buf.store(true, Ordering::SeqCst);
+    let err = engine.healthy().unwrap().flush_buf_wal_to_os().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        !engine.is_poisoned(),
+        "failed buf flush must stay retryable"
+    );
+    assert!(engine.healthy().is_ok());
+    engine.healthy().unwrap().flush_buf_wal_to_os().unwrap();
+
+    // Put a buffered blob inside an open transaction so `active_std_writer` holds user-space
+    // buffered data; failing its buffer flush before `sync_durable` must remain retryable
+    // without poisoning.
+    engine.begin_transaction();
+    engine
+        .put_row(
+            1,
+            b"blob_k",
+            &[0x33u8; 256],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    fail_blob.store(true, Ordering::SeqCst);
+    let blob_err = engine.sync_active_std_writer().unwrap_err();
+    assert_eq!(blob_err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        !engine.is_poisoned(),
+        "failed blob buffer flush before sync must stay retryable"
+    );
+    assert!(engine.healthy().is_ok());
+    engine.sync_active_std_writer().unwrap();
+    engine.commit_transaction().unwrap();
 }

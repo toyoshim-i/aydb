@@ -122,11 +122,11 @@ impl Lab {
 
     /// Metadata commits and syncs that `register_capped_table(TABLE, max_bytes)` caused.
     fn reconnect(&self, engine: &mut StorageEngine<CountFs>, max_bytes: u64) -> (u64, usize) {
-        let generation = engine.meta_mgr.state().generation;
+        let generation = engine.meta_mgr().state().generation;
         let syncs = self.syncs.load(Ordering::SeqCst);
         engine.register_capped_table(TABLE, max_bytes).unwrap();
         (
-            engine.meta_mgr.state().generation - generation,
+            engine.meta_mgr().state().generation - generation,
             self.syncs.load(Ordering::SeqCst) - syncs,
         )
     }
@@ -296,7 +296,7 @@ fn a_lost_quota_change_converges_on_the_next_connect() {
         let mut engine = lab.open();
         // Simulate the lost commit: the in-memory quota moves on, the stored one does not.
         engine.capped_tables.get_mut(&TABLE).unwrap().max_bytes = QUOTA * 3;
-        assert_eq!(engine.meta_mgr.state().table_quotas[0].max_bytes, QUOTA);
+        assert_eq!(engine.meta_mgr().state().table_quotas[0].max_bytes, QUOTA);
     }
     let mut engine = lab.open();
     assert_eq!(engine.capped_table_state(TABLE).unwrap().max_bytes, QUOTA);
@@ -384,7 +384,7 @@ fn sector_0_wal_damage_reconciles_capped_table_quotas() {
         baseline_bytes
     );
     assert_eq!(
-        reopened.meta_mgr.state().table_quotas[0].current_logical_bytes,
+        reopened.meta_mgr().state().table_quotas[0].current_logical_bytes,
         baseline_bytes
     );
 }
@@ -406,12 +406,13 @@ fn empty_memtable_wal_recovery_commits_quota_and_epochs_atomically() {
             .unwrap();
         assert!(engine.memtable.is_empty());
         engine
-            .meta_mgr
-            .commit_update(|st| {
+            .healthy()
+            .unwrap()
+            .commit_meta_update(|st| {
                 st.table_quotas[0].current_logical_bytes = expected + 999;
             })
             .unwrap();
-        (expected, engine.meta_mgr.state().generation)
+        (expected, engine.meta_mgr().state().generation)
     };
 
     let reopened = lab.open();
@@ -423,11 +424,11 @@ fn empty_memtable_wal_recovery_commits_quota_and_epochs_atomically() {
         expected_bytes
     );
     assert_eq!(
-        reopened.meta_mgr.state().table_quotas[0].current_logical_bytes,
+        reopened.meta_mgr().state().table_quotas[0].current_logical_bytes,
         expected_bytes
     );
     assert_eq!(
-        reopened.meta_mgr.state().generation,
+        reopened.meta_mgr().state().generation,
         gen_before + 1,
         "epoch rotation and reconciled table_quotas must commit in a single boot_meta generation"
     );

@@ -111,9 +111,19 @@ fn assert_fail_stop(engine: &mut StorageEngine<MetadataFaultFs>) {
             )
             .is_err()
     );
-    assert!(engine.meta_mgr.sweep_orphans().is_err());
-    assert!(engine.meta_mgr.commit_update(|_| {}).is_err());
-    engine.meta_mgr.try_process_pending_deletes();
+    assert!(engine.healthy().is_err());
+    assert!(engine.storage.debug_meta_mgr_mut().sweep_orphans().is_err());
+    assert!(
+        engine
+            .storage
+            .debug_meta_mgr_mut()
+            .commit_update(|_| {})
+            .is_err()
+    );
+    engine
+        .storage
+        .debug_meta_mgr_mut()
+        .try_process_pending_deletes();
     assert_eq!(engine.get_row(1, b"key").unwrap(), Some(b"value".to_vec()));
 }
 
@@ -132,7 +142,7 @@ fn uncertain_metadata_flush_keeps_output_until_reopen() {
         engine
             .put_row(1, b"key", b"value", &[], WriteDurability::SyncTransactional)
             .unwrap();
-        let output = format_idx_file_name(engine.meta_mgr.state().next_seq_id);
+        let output = format_idx_file_name(engine.meta_mgr().state().next_seq_id);
         fault.store(fault_mode, Ordering::SeqCst);
         assert!(engine.flush_memtable().is_err());
         fault.store(0, Ordering::SeqCst);
@@ -226,7 +236,7 @@ fn open_with_large_catalog(
     for i in 0..300u16 {
         engine.register_capped_table(1000 + i, 1 << 40).unwrap();
     }
-    assert!(engine.meta_mgr.state().active_manifest_seq_id.is_some());
+    assert!(engine.meta_mgr().state().active_manifest_seq_id.is_some());
     (tmp, fs, fault, config, engine)
 }
 

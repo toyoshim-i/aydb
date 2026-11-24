@@ -113,7 +113,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // here changes it and needs a commit of its own.
             let mut quota_metas = self.build_quota_metas();
             quota_metas.sort_by_key(|q| q.table_id);
-            let mut stored = self.meta_mgr.state().table_quotas.clone();
+            let mut stored = self.meta_mgr().state().table_quotas.clone();
             stored.sort_by_key(|q| q.table_id);
             let same_registrations = stored.len() == quota_metas.len()
                 && stored.iter().zip(&quota_metas).all(|(old, new)| {
@@ -132,7 +132,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     Ok(())
                 }
                 .and_then(|()| {
-                    self.meta_mgr.commit_update(|st| {
+                    self.healthy()?.commit_meta_update(|st| {
                         st.table_quotas = quota_metas;
                     })
                 });
@@ -238,8 +238,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let max_window_wal_bytes = if !self.tx_state.is_active() {
             let sectors = match durability {
-                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
-                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+                WriteDurability::SyncTransactional => self.sync_wal().total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal().total_sectors(),
             };
             max_wal_sub_batch_bytes(sectors, 64 * 1024)
         } else {
@@ -645,7 +645,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         apply_repairs: bool,
     ) -> io::Result<bool> {
         const RECONCILE_BATCH_SIZE: usize = 512;
-        let max_batch_wal_bytes = max_wal_sub_batch_bytes(self.buf_wal.total_sectors(), 512 * 1024);
+        let max_batch_wal_bytes =
+            max_wal_sub_batch_bytes(self.buf_wal().total_sectors(), 512 * 1024);
         let meta_prefix = encode_namespace_prefix(tid, NS_ROW_META);
         let user_prefix = encode_namespace_prefix(tid, NS_PRIMARY_ROW);
 
