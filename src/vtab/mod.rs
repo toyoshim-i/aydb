@@ -1134,11 +1134,11 @@ fn connect_table(
             None => eng.reset_table_inline_threshold(table_id),
         }
     }
-    let existing_marker = eng.unique_marker_view(view, table_id).ok().flatten();
+    let existing_marker = eng.unique_marker_view(crate::engine::ReadView::Committed, table_id);
     let unique_ready = if unique_def.is_empty() {
-        existing_marker.is_none()
+        matches!(existing_marker, Ok(None))
     } else {
-        existing_marker.is_some_and(|found| found == unique_def.marker_value())
+        matches!(existing_marker, Ok(Some(ref found)) if *found == unique_def.marker_value())
     };
     Ok(Some(Connected {
         table_id,
@@ -3032,6 +3032,59 @@ unsafe extern "system" fn vtab_column(
             }
             let pk_bytes = &cursor.pks[cursor.pos];
             if i_col as usize == vtab.pk_col_idx {
+                if is_canonical_float_zero_key(pk_bytes) {
+                    let pk_copy = pk_bytes.clone();
+                    let row_res = with_snapshot_read_access(
+                        &vtab.engine,
+                        vtab.db as usize,
+                        vtab.table_id,
+                        cursor.snapshot.as_ref(),
+                        |eng| {
+                            cursor.lazy_row_buf.clear();
+                            let mut spans = Vec::with_capacity(1);
+                            let found = eng.get_row_into(
+                                vtab.table_id,
+                                &pk_copy,
+                                &mut cursor.lazy_row_buf,
+                                &mut spans,
+                            )?;
+                            Ok((found, spans))
+                        },
+                    );
+                    let map_res = |res: io::Result<()>| -> c_int {
+                        match res {
+                            Ok(()) => SQLITE_OK,
+                            Err(e) => {
+                                let rc = io_err_to_sqlite_rc(&e);
+                                if rc != SQLITE_TOOBIG {
+                                    sqlite3_result_error_code(p_ctx, rc);
+                                }
+                                rc
+                            }
+                        }
+                    };
+                    return match row_res {
+                        Ok(Ok((true, spans))) => {
+                            let (start, end) = spans
+                                .first()
+                                .copied()
+                                .unwrap_or((0, cursor.lazy_row_buf.len()));
+                            map_res(project_column_zero_copy(
+                                &cursor.lazy_row_buf[start..end],
+                                i_col as usize,
+                                p_ctx,
+                            ))
+                        }
+                        Ok(Ok((false, _))) => map_res(project_key_zero_copy(&pk_copy, p_ctx)),
+                        Ok(Err(e)) | Err(e) => {
+                            let rc = io_err_to_sqlite_rc(&e);
+                            if rc != SQLITE_TOOBIG {
+                                sqlite3_result_error_code(p_ctx, rc);
+                            }
+                            rc
+                        }
+                    };
+                }
                 return match project_key_zero_copy(pk_bytes, p_ctx) {
                     Ok(()) => SQLITE_OK,
                     Err(e) => {
@@ -3205,6 +3258,43 @@ unsafe extern "system" fn vtab_rowid(
     .unwrap_or(SQLITE_ERROR)
 }
 
+fn has_stale_unique_marker(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) -> io::Result<bool> {
+    if vtab.unique_ready.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
+    if vtab.unique_def.is_empty() {
+        Ok(existing.is_some())
+    } else {
+        let want = vtab.unique_def.marker_value();
+        Ok(existing.is_some_and(|found| found != want))
+    }
+}
+
+fn invalidate_stale_unique_marker_if_needed(
+    eng: &mut StorageEngine<OsFs>,
+    vtab: &AydbVTab,
+) -> io::Result<()> {
+    if vtab.unique_ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
+    if vtab.unique_def.is_empty() {
+        if existing.is_some() {
+            eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
+        }
+        if !eng.in_active_transaction() {
+            vtab.unique_ready.store(true, Ordering::Release);
+        }
+    } else {
+        let want = vtab.unique_def.marker_value();
+        if existing.is_some_and(|found| found != want) {
+            eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
+        }
+    }
+    Ok(())
+}
+
 unsafe extern "system" fn vtab_update(
     p_vtab: *mut sqlite3_vtab,
     argc: c_int,
@@ -3225,27 +3315,6 @@ unsafe extern "system" fn vtab_update(
             return SQLITE_ERROR;
         }
         vtab.pending_ddl.clear_tx_commit();
-        // When `xBegin` skipped migration (for example because the connection held a read snapshot
-        // before upgrading to write), remove any stale UNIQUE completion marker transactionally now
-        // so removing all UNIQUE constraints cannot leave an obsolete marker behind.
-        if vtab.unique_def.is_empty() && !vtab.unique_ready.load(Ordering::Acquire) {
-            match eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id) {
-                Ok(Some(_)) => {
-                    if let Err(e) = eng.remove_unique_marker(vtab.table_id, vtab.durability) {
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                    if !eng.in_active_transaction() {
-                        vtab.unique_ready.store(true, Ordering::Release);
-                    }
-                }
-                Ok(None) => {
-                    if !eng.in_active_transaction() {
-                        vtab.unique_ready.store(true, Ordering::Release);
-                    }
-                }
-                Err(e) => return io_err_to_sqlite_rc(&e),
-            }
-        }
 
         let needs_synthetic_delete_check =
             |pk: &[u8]| -> bool { !(vtab.pk_rowid_alias && decode_i64_tagged_key(pk).is_some()) };
@@ -3253,8 +3322,8 @@ unsafe extern "system" fn vtab_update(
         // Case 1: DELETE (`argc == 1`)
         if argc == 1 {
             let arg0 = *argv.offset(0);
-            if let Some(rid) = extract_lossless_rowid_arg(arg0) {
-                let old_pk_opt = match resolve_pk_for_rowid(
+            let old_pk_opt = if let Some(rid) = extract_lossless_rowid_arg(arg0) {
+                match resolve_pk_for_rowid(
                     vtab,
                     rid,
                     |t, pk| eng.row_exists(t, pk),
@@ -3262,33 +3331,53 @@ unsafe extern "system" fn vtab_update(
                 ) {
                     Ok(opt) => opt,
                     Err(e) => return io_err_to_sqlite_rc(&e),
-                };
-                if let Some(old_pk) = old_pk_opt {
-                    let check_syn = needs_synthetic_delete_check(&old_pk);
-                    if let Err(e) = eng.delete_row_with_rowid_hint(
-                        vtab.table_id,
-                        &old_pk,
-                        vtab.durability,
-                        check_syn,
-                    ) {
-                        return io_err_to_sqlite_rc(&e);
-                    }
                 }
-                return SQLITE_OK;
             } else {
-                let old_pk = sqlite_value_to_key_bytes_with_schema(
+                Some(sqlite_value_to_key_bytes_with_schema(
                     arg0,
                     vtab.pk_affinity,
                     vtab.pk_collation,
                     false,
-                );
-                let check_syn = needs_synthetic_delete_check(&old_pk);
-                if let Err(e) = eng.delete_row_with_rowid_hint(
-                    vtab.table_id,
-                    &old_pk,
-                    vtab.durability,
-                    check_syn,
-                ) {
+                ))
+            };
+            if let Some(old_pk) = old_pk_opt {
+                let stale_marker = match has_stale_unique_marker(&eng, vtab) {
+                    Ok(b) => b,
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
+                if stale_marker {
+                    if let Err(e) =
+                        eng.statement_savepoint_for_conn(vtab.db as usize, vtab.table_id)
+                    {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                }
+                let del_res = (|| -> io::Result<()> {
+                    let check_syn = needs_synthetic_delete_check(&old_pk);
+                    let deleted = eng.delete_row_with_rowid_hint(
+                        vtab.table_id,
+                        &old_pk,
+                        vtab.durability,
+                        check_syn,
+                    )?;
+                    if deleted {
+                        invalidate_stale_unique_marker_if_needed(&mut eng, vtab)?;
+                    }
+                    Ok(())
+                })();
+                if stale_marker {
+                    if del_res.is_err() {
+                        let _ = eng
+                            .rollback_to_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);
+                        let _ =
+                            eng.release_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT);
+                    } else if let Err(e) =
+                        eng.release_savepoint_for_conn(vtab.db as usize, STATEMENT_SAVEPOINT)
+                    {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                }
+                if let Err(e) = del_res {
                     return io_err_to_sqlite_rc(&e);
                 }
             }
@@ -3336,6 +3425,9 @@ unsafe extern "system" fn vtab_update(
         // new rowid of an UPDATE, which equals the old one unless the statement changed it.
         // `new_rowid_req` is set only when the statement really asks for a rowid.
         let new_rowid_arg = *argv.offset(1);
+        if !is_insert && sqlite3_value_type(new_rowid_arg) == SQLITE_NULL {
+            return SQLITE_MISMATCH;
+        }
         let old_rowid_arg = if is_insert {
             None
         } else {
@@ -3635,7 +3727,12 @@ unsafe extern "system" fn vtab_update(
         // are folded into the single atomic `put_row_owned_with_hint_and_extra` WAL batch so
         // inserts and in-place updates never need a per-row statement savepoint.
         let in_place_same_pk = !is_insert && old_pk_opt.as_deref() == Some(new_pk.as_slice());
-        let removes_rows = pk_conflict_to_delete.is_some()
+        let stale_marker = match has_stale_unique_marker(&eng, vtab) {
+            Ok(b) => b,
+            Err(e) => return io_err_to_sqlite_rc(&e),
+        };
+        let removes_rows = stale_marker
+            || pk_conflict_to_delete.is_some()
             || !unique_conflicts.is_empty()
             || rowid_conflict_pk.is_some()
             || old_pk_opt
@@ -3719,6 +3816,7 @@ unsafe extern "system" fn vtab_update(
                 vtab.durability,
                 known_absent,
             )?;
+            invalidate_stale_unique_marker_if_needed(&mut eng, vtab)?;
 
             Ok(rid)
         })();

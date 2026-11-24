@@ -1183,3 +1183,161 @@ fn reconcile_unique_keys_batch_skips_queued_corrupt_eviction_on_capped_table() {
         k2_only_bytes
     );
 }
+
+#[test]
+fn rejected_snapshot_writes_preserve_marker_and_schema_change_invalidates_it() {
+    let dir = TempTestDir::new("unique_mig_reject_and_schema_change");
+    let engine = open_engine(&dir);
+    let connect_cols = |columns: &str| {
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module_with_options(engine.clone(), false)
+            .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE u USING aydb(table_id=2, columns='{columns}')"
+        ))
+        .unwrap();
+        conn
+    };
+
+    let first = connect_cols("k TEXT PRIMARY KEY NOT NULL, a TEXT UNIQUE NOT NULL, b TEXT");
+    first
+        .execute_batch("INSERT INTO u VALUES('k1','a1','b1')")
+        .unwrap();
+    let initial_marker = marker_of(&engine, 2).expect("initial UNIQUE(a) marker");
+    drop(first);
+
+    // Reconnect without UNIQUE; failed/ignored writes after snapshot upgrade must leave the
+    // marker untouched if the transaction commits with no actual mutation.
+    let no_unique = connect_cols("k TEXT PRIMARY KEY NOT NULL, a TEXT NOT NULL, b TEXT");
+    no_unique
+        .execute_batch(
+            "BEGIN; SELECT * FROM u;
+             INSERT OR IGNORE INTO u VALUES('k1','a_new','b_new');
+             INSERT OR IGNORE INTO u VALUES('k2',NULL,'b_new');",
+        )
+        .unwrap();
+    assert!(
+        no_unique
+            .execute_batch("INSERT INTO u VALUES('k1','dup_pk','b2')")
+            .is_err()
+    );
+    no_unique.execute_batch("COMMIT;").unwrap();
+    assert_eq!(
+        marker_of(&engine, 2).as_deref(),
+        Some(initial_marker.as_slice()),
+        "rejected writes must not drop the UNIQUE marker"
+    );
+    drop(no_unique);
+
+    // An unsupported legacy CHECK table attached via xConnect also fails before mutating.
+    let schema_dir = TempTestDir::new("unique_mig_reject_check_schema");
+    let schema_path = schema_dir.path.join("schema.db");
+    {
+        let c = SqliteConnection::open_file(&schema_path).unwrap();
+        c.register_aydb_module_with_options(engine.clone(), false)
+            .unwrap();
+        c.execute_batch(
+            "CREATE VIRTUAL TABLE u USING aydb(table_id=2, columns='k TEXT PRIMARY KEY NOT NULL, a TEXT NOT NULL, b TEXT');
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_master
+                SET sql = replace(sql, 'b TEXT', 'b TEXT CHECK(length(b) > 0)')
+              WHERE name = 'u';",
+        )
+        .unwrap();
+    }
+    {
+        let with_check = SqliteConnection::open_file(&schema_path).unwrap();
+        with_check
+            .register_aydb_module_with_options(engine.clone(), false)
+            .unwrap();
+        with_check.execute_batch("BEGIN; SELECT * FROM u;").unwrap();
+        assert!(
+            with_check
+                .execute_batch("INSERT INTO u VALUES('k2','a2','ok')")
+                .is_err()
+        );
+        with_check.execute_batch("COMMIT;").unwrap();
+        assert_eq!(
+            marker_of(&engine, 2).as_deref(),
+            Some(initial_marker.as_slice()),
+            "unsupported table write failure must not drop the UNIQUE marker"
+        );
+    }
+
+    // Changing UNIQUE(a) -> UNIQUE(b) and committing a write under snapshot upgrade must remove
+    // the stale UNIQUE(a) marker even though migration was skipped at xBegin.
+    let swapped = connect_cols("k TEXT PRIMARY KEY NOT NULL, a TEXT NOT NULL, b TEXT UNIQUE");
+    swapped
+        .execute_batch(
+            "BEGIN; SELECT * FROM u;
+             INSERT INTO u VALUES('k2','a1','b2');
+             COMMIT;",
+        )
+        .unwrap();
+    assert_eq!(
+        marker_of(&engine, 2),
+        None,
+        "mutating write with mismatched UNIQUE schema must clear stale prior marker"
+    );
+    drop(swapped);
+
+    // Reconnecting with UNIQUE(a) again must rebuild/scan and catch the duplicate `'a1'`.
+    let restored = connect_cols("k TEXT PRIMARY KEY NOT NULL, a TEXT UNIQUE NOT NULL, b TEXT");
+    assert!(
+        restored
+            .execute_batch("INSERT INTO u VALUES('k3','a1','b3')")
+            .is_err(),
+        "stale marker must not prevent catching duplicate `'a1'` after schema reverts"
+    );
+}
+
+#[test]
+fn connect_table_does_not_latch_uncommitted_owner_marker() {
+    let dir = TempTestDir::new("connect_uncommitted_marker");
+    let engine = open_engine(&dir);
+    let c_args = [
+        CString::new("aydb").unwrap(),
+        CString::new("main").unwrap(),
+        CString::new("t").unwrap(),
+        CString::new("table_id=4").unwrap(),
+        CString::new("columns='k TEXT PRIMARY KEY, a TEXT UNIQUE'").unwrap(),
+    ];
+    let c_ptrs: Vec<*const core::ffi::c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
+    let ddl = unsafe {
+        crate::vtab::ddl::parse_vtab_ddl(c_ptrs.len() as core::ffi::c_int, c_ptrs.as_ptr())
+    }
+    .unwrap();
+
+    // Create a persisted empty table with its marker removed so a transaction can write an
+    // uncommitted marker on it.
+    {
+        let mut eng = engine.write().unwrap();
+        let plan = eng
+            .plan_vtab_registration(&ddl.table_name, Some(4))
+            .unwrap();
+        let (tid, _) = eng.register_vtab_plan(plan, ddl.durability, None).unwrap();
+        assert_eq!(tid, 4);
+    }
+
+    let conn_id = 0x1234usize;
+    let connected_ready = {
+        let mut eng = engine.write().unwrap();
+        eng.begin_vtab_transaction(conn_id, 0x5678).unwrap();
+        let def =
+            UniqueDef::from_columns(&ddl.col_unique, &ddl.col_collations, &ddl.col_affinities);
+        eng.write_unique_marker(4, def.marker_value(), WriteDurability::BufferedFast)
+            .unwrap();
+        let connected = super::connect_table(&mut eng, conn_id, &ddl, false)
+            .unwrap()
+            .expect("persisted table connects in active tx");
+        connected.unique_ready
+    };
+    assert!(
+        !connected_ready,
+        "uncommitted owner-only UNIQUE marker must never latch unique_ready at connect"
+    );
+    {
+        let mut eng = engine.write().unwrap();
+        eng.rollback_transaction().unwrap();
+    }
+}

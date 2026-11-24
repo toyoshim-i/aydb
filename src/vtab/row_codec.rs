@@ -231,6 +231,9 @@ pub fn format_sqlite_float_text(f: f64) -> String {
     let sign = if f.is_sign_negative() { "-" } else { "" };
     // Round to 15 significant digits before choosing fixed vs scientific notation, matching
     // SQLite's `%.15g` threshold (`-4 <= exp < 15` uses fixed point) on rounding boundaries.
+    // Note that Rust's `{:.14e}` uses IEEE round-half-to-even (matching SQLite's `%.15g` on
+    // glibc/musl/MSVC targets), while arbitrary-precision sprintf implementations can differ
+    // only on sub-ULP halfway rounding boundaries.
     let sci = format!("{:.14e}", f.abs());
     let Some((mant_raw, exp_raw)) = sci.split_once('e') else {
         return format!("{f}");

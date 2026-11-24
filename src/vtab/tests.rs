@@ -4613,3 +4613,113 @@ fn real_pk_negative_zero_preserves_sign_and_corrupt_rowid_fails_without_panic() 
         "expected SQLITE_CORRUPT / malformed error, got: {err}"
     );
 }
+
+#[test]
+fn keys_only_pk_scan_preserves_negative_zero() {
+    let tmp = TempTestDir::new("keys_only_neg_zero");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING aydb(table_id=1, columns='k REAL PRIMARY KEY, v INT');
+         CREATE VIRTUAL TABLE b USING aydb(table_id=2, columns='k BLOB PRIMARY KEY, v INT');
+         CREATE VIRTUAL TABLE n USING aydb(table_id=3, columns='k NUMERIC PRIMARY KEY, v INT');",
+    )
+    .unwrap();
+    for table in ["t", "b", "n"] {
+        let mut ins = conn
+            .prepare(&format!("INSERT INTO {table} VALUES (?1, ?2)"))
+            .unwrap();
+        ins.execute(&[SqlValue::Float(-0.0), SqlValue::Integer(1)])
+            .unwrap();
+    }
+
+    for (sql, expected_flag) in [
+        ("SELECT k FROM t", RANGE_FLAG_KEYS_ONLY),
+        ("SELECT k FROM t WHERE k = 0.0", POINT_FLAG_KEYS_ONLY),
+        ("SELECT k FROM b", RANGE_FLAG_KEYS_ONLY),
+        ("SELECT k FROM b WHERE k = 0.0", POINT_FLAG_KEYS_ONLY),
+    ] {
+        LAST_BEST_INDEX_PLAN.with(|cell| cell.borrow_mut().take());
+        let rows = conn.query_all(sql, &[]).unwrap();
+        let (idx_num, _, _) = LAST_BEST_INDEX_PLAN
+            .with(|cell| cell.borrow_mut().take())
+            .expect("best index plan recorded");
+        assert_ne!(
+            (idx_num >> 8) & expected_flag,
+            0,
+            "query `{sql}` must use keys-only plan (idx_num={idx_num:#x})"
+        );
+        assert_eq!(rows.len(), 1, "query: {sql}");
+        match rows[0][0] {
+            SqlValue::Float(f) => assert_eq!(
+                f.to_bits(),
+                (-0.0f64).to_bits(),
+                "keys-only query `{sql}` must preserve -0.0 sign bit"
+            ),
+            ref other => panic!("expected Float(-0.0) for `{sql}`, got {other:?}"),
+        }
+    }
+
+    // Native SQLite NUMERIC affinity coerces `-0.0` to INTEGER `0`.
+    for sql in ["SELECT k FROM n", "SELECT k FROM n WHERE k = 0.0"] {
+        assert_eq!(
+            conn.query_all(sql, &[]).unwrap(),
+            vec![vec![SqlValue::Integer(0)]]
+        );
+    }
+}
+
+#[test]
+fn update_set_rowid_null_fails_with_datatype_mismatch() {
+    let tmp = TempTestDir::new("update_rowid_null");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_int USING aydb(table_id=1, columns='id INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIRTUAL TABLE t_txt USING aydb(table_id=2, columns='id TEXT PRIMARY KEY, v TEXT');
+         INSERT INTO t_int VALUES (10, 'a');
+         INSERT INTO t_txt VALUES ('k1', 'a');",
+    )
+    .unwrap();
+
+    for sql in [
+        "UPDATE t_int SET rowid = NULL WHERE id = 10",
+        "UPDATE OR IGNORE t_int SET rowid = NULL WHERE id = 10",
+        "UPDATE t_txt SET rowid = NULL WHERE id = 'k1'",
+        "UPDATE OR IGNORE t_txt SET rowid = NULL WHERE id = 'k1'",
+    ] {
+        let err = conn.execute_batch(sql).unwrap_err().to_string();
+        assert!(
+            err.to_ascii_lowercase().contains("mismatch"),
+            "expected datatype mismatch for `{sql}`, got: {err}"
+        );
+    }
+
+    assert_eq!(
+        conn.query_all("SELECT rowid, id, v FROM t_int", &[])
+            .unwrap(),
+        vec![vec![
+            SqlValue::Integer(10),
+            SqlValue::Integer(10),
+            SqlValue::Text("a".into()),
+        ]]
+    );
+    let txt_rows = conn.query_all("SELECT id, v FROM t_txt", &[]).unwrap();
+    assert_eq!(
+        txt_rows,
+        vec![vec![
+            SqlValue::Text("k1".into()),
+            SqlValue::Text("a".into())
+        ]]
+    );
+}
