@@ -469,6 +469,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_bypass_size_limit = false;
             self.tx_sync_durability_upgrade = false;
             self.pending_tx_bytes = 0;
+            self.pending_tx_sync = false;
         }
         self.tx_depth += 1;
     }
@@ -502,6 +503,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_bypass_size_limit = false;
             self.tx_sync_durability_upgrade = false;
             self.pending_tx_bytes = 0;
+            self.pending_tx_sync = false;
         }
         self.tx_depth += 1;
         Ok(())
@@ -1067,6 +1069,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_sync_durability_upgrade = false;
         self.tx_sync_in_flight = false;
         self.pending_tx_bytes = 0;
+        self.pending_tx_sync = false;
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
@@ -1620,6 +1623,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub(super) fn flush_pending_tx_records(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
         if self.pending_tx_record_count == 0 {
+            self.pending_tx_sync = false;
             return Ok(());
         }
         self.lsn_after_batches(1)?;

@@ -59,17 +59,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             .entry(table_id)
             .or_insert_with(|| CappedTableState::new(table_id, max_bytes));
         entry.max_bytes = max_bytes;
-        if prev_max.is_none() {
-            if let Err(e) = self.reconcile_single_capped_table(table_id) {
-                self.capped_tables.remove(&table_id);
-                match prev_has_row_meta {
-                    Some(v) => {
-                        self.table_has_row_meta.insert(table_id, v);
-                    }
-                    None => {
-                        self.table_has_row_meta.remove(&table_id);
+        let restore_on_err = |this: &mut Self| {
+            match prev_max {
+                Some(old_max) => {
+                    if let Some(ct) = this.capped_tables.get_mut(&table_id) {
+                        ct.max_bytes = old_max;
                     }
                 }
+                None => {
+                    this.capped_tables.remove(&table_id);
+                }
+            }
+            match prev_has_row_meta {
+                Some(v) => {
+                    this.table_has_row_meta.insert(table_id, v);
+                }
+                None => {
+                    this.table_has_row_meta.remove(&table_id);
+                }
+            }
+        };
+        if prev_max.is_none() {
+            self.reconciling_capped_table = Some(table_id);
+            let res = self.reconcile_single_capped_table(table_id);
+            self.reconciling_capped_table = None;
+            if let Err(e) = res {
+                restore_on_err(self);
                 return Err(e);
             }
         }
@@ -78,7 +93,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .capped_tables
                 .get(&table_id)
                 .map_or(0, |ct| ct.current_logical_bytes);
-            self.evict_until_within_quota(table_id, WriteDurability::BufferedFast)?;
+            if let Err(e) = self.evict_until_within_quota(table_id, WriteDurability::BufferedFast) {
+                if !self.is_poisoned() {
+                    restore_on_err(self);
+                }
+                return Err(e);
+            }
             let evicted = self
                 .capped_tables
                 .get(&table_id)
@@ -105,12 +125,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 // durable in `wal_buf.db` before persisting `table_quotas`, so a power cut cannot
                 // drop the WAL while leaving a stale `current_logical_bytes` that `replayed_wal ==
                 // false` would trust on reopen.
-                if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                    self.make_buf_wal_durable(true)?;
+                let commit_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                    self.make_buf_wal_durable(true)
+                } else {
+                    Ok(())
                 }
-                self.meta_mgr.commit_update(|st| {
-                    st.table_quotas = quota_metas;
-                })?;
+                .and_then(|()| {
+                    self.meta_mgr.commit_update(|st| {
+                        st.table_quotas = quota_metas;
+                    })
+                });
+                if let Err(e) = commit_res {
+                    if !self.is_poisoned() {
+                        restore_on_err(self);
+                    }
+                    return Err(e);
+                }
             }
         } else if prev_max != Some(max_bytes) {
             self.quotas_modified_in_tx = true;
@@ -909,7 +939,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.tx_start_meta.active {
             Self::quota_metas_from_map(&self.tx_start_meta.capped_tables)
         } else {
-            Self::quota_metas_from_map(&self.capped_tables)
+            let mut metas = Self::quota_metas_from_map(&self.capped_tables);
+            if let Some(tid) = self.reconciling_capped_table {
+                metas.retain(|q| q.table_id != tid);
+            }
+            metas
         }
     }
 

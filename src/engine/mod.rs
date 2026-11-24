@@ -356,6 +356,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Re-entrancy guard preventing `relocate_fragmented_std_blobs` from triggering another
     /// relocation pass if its internal MemTable flush invokes auto-compaction.
     pub(super) relocating_std_blobs: bool,
+    /// Table currently executing initial `register_capped_table` reconciliation; excluded from
+    /// checkpointed `table_quotas` until reconciliation completes.
+    pub(super) reconciling_capped_table: Option<u16>,
     /// Sealed `blob_std` segment IDs containing an unreadable corrupt blob under lenient
     /// relocation, skipped on subsequent relocation passes until reclaimed by compaction/drop.
     pub(super) unrelocatable_std_blobs: std::collections::HashSet<u64>,
@@ -1250,6 +1253,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             deferred_compact_on_commit: false,
             auto_compaction_due: false,
             relocating_std_blobs: false,
+            reconciling_capped_table: None,
             unrelocatable_std_blobs: std::collections::HashSet::new(),
             compaction_hook: None,
             compaction_hook_id: 0,

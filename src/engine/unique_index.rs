@@ -348,15 +348,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let may_have_meta = self.may_have_row_meta(table_id)?;
         let is_capped = self.capped_tables.contains_key(&table_id);
         let max_batch_wal_bytes = if self.tx_depth == 0 {
-            let wal_bytes = match durability {
-                WriteDurability::SyncTransactional => {
-                    self.sync_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
-                }
-                WriteDurability::BufferedFast => {
-                    self.buf_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
-                }
+            let sectors = match durability {
+                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
             };
-            (wal_bytes / 2).clamp(4096, 512 * 1024)
+            super::eviction::max_wal_sub_batch_bytes(sectors, 512 * 1024)
         } else {
             usize::MAX
         };

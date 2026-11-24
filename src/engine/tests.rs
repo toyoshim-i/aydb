@@ -9906,3 +9906,109 @@ fn open_ignores_non_canonical_hex_blob_filenames() {
         assert!(tmp.path.join(name).exists(), "missing decoy {name}");
     }
 }
+
+#[test]
+fn register_capped_table_mid_reconcile_ring_full_persists_exact_logical_bytes() {
+    // R3-H6: a RingFull flush mid-reconcile must not persist `current_logical_bytes = 0` and
+    // cause `register_capped_table()` to skip syncing buffered repairs and committing real totals.
+    let fs = Arc::new(PowerLossFs::new());
+    let mut cfg = EngineConfig::default();
+    cfg.buf_wal_size_bytes = 4096; // 1 sector: forces RingFull flushes during reconciliation.
+    cfg.sync_wal_size_bytes = 4096;
+    cfg.memtable_capacity_bytes = 64 << 20;
+    cfg.auto_compact_segment_threshold = 0;
+
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+    let val = vec![b'v'; 50];
+    let mut expected_bytes = 0u64;
+    for i in 0..40u32 {
+        let pk = format!("capped_init_{i:03}_{}", "p".repeat(80)).into_bytes();
+        expected_bytes += (pk.len() + val.len()) as u64;
+        engine
+            .put_row(1, &pk, &val, &[], WriteDurability::BufferedFast)
+            .unwrap();
+    }
+
+    engine.register_capped_table(1, 1_000_000).unwrap();
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        expected_bytes
+    );
+
+    // Simulate power loss immediately after `register_capped_table` returns.
+    std::mem::forget(engine);
+    fs.power_loss();
+
+    let reopened = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+    assert_eq!(
+        reopened
+            .capped_table_state(1)
+            .unwrap()
+            .current_logical_bytes,
+        expected_bytes
+    );
+    let lru_prefix = crate::lru::encode_namespace_prefix(1, crate::lru::NS_LRU_QUEUE);
+    assert_eq!(reopened.scan_merged_prefix(&lru_prefix).unwrap().len(), 40);
+}
+
+#[test]
+fn reconcile_unique_keys_batch_respects_single_sector_wal_limit() {
+    // R3-M5: on a 1-sector (4096 B) WAL, cumulative batch bytes between 4046 and 4096 must split
+    // before overflowing the 4077 B fragment payload cap (`WriteZero`).
+    let tmp = TempTestDir::new("r3_m5_unique_single_sector");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.sync_wal_size_bytes = 4096;
+    cfg.buf_wal_size_bytes = 4096;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    // Build rows with ~300 B primary keys + 40 B unique component; ~370 B estimated per row so
+    // accumulating hits 4046..=4096 before exceeding 4096 if clamped naively to 4096.
+    let mut items = Vec::new();
+    for i in 0..25u32 {
+        let pk = format!("pk_{i:04}_{}", "k".repeat(290)).into_bytes();
+        let comp = format!("uniq_{i:04}_{}", "u".repeat(30)).into_bytes();
+        engine
+            .put_row(1, &pk, b"row_val", &[], WriteDurability::BufferedFast)
+            .unwrap();
+        items.push((pk, b"row_val".len(), vec![(0x8001, comp)]));
+    }
+
+    let count = engine
+        .reconcile_unique_keys_batch(1, &items, WriteDurability::SyncTransactional)
+        .unwrap();
+    assert_eq!(count, 25);
+}
+
+#[test]
+fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
+    // R3-M6: an empty SyncTransactional prepare/commit must clear `pending_tx_sync` so subsequent
+    // BufferedFast transactions stay on `wal_buf.db` without hitting `wal_sync.db`.
+    let tmp = TempTestDir::new("r3_m6_empty_sync_tx_leak");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    let sync_sector_before = engine.sync_wal.current_sector_idx();
+    engine.begin_transaction();
+    engine
+        .prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+    engine.commit_transaction().unwrap();
+    assert!(!engine.pending_tx_sync);
+    assert_eq!(engine.sync_wal.current_sector_idx(), sync_sector_before);
+
+    engine.begin_transaction();
+    engine
+        .put_row(1, b"k_buf", b"v_buf", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(!engine.pending_tx_sync);
+    engine.commit_transaction().unwrap();
+    assert_eq!(
+        engine.sync_wal.current_sector_idx(),
+        sync_sector_before,
+        "BufferedFast tx must not spill to wal_sync.db after an empty sync tx"
+    );
+}
