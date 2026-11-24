@@ -514,3 +514,69 @@ fn concurrent_create_rename_and_connect_across_connections_stay_consistent() {
     drop(verify);
     assert!(fx.engine.read().unwrap().active_vtab_ids.is_empty());
 }
+
+#[test]
+fn lazy_xconnect_by_tx_owner_and_non_owner_preserve_registration_and_settings_on_rollback() {
+    // R2-H6: connecting an existing persisted table lazily from the active transaction owner (or
+    // from a non-owner connection) must keep its live registration token and runtime DDL options
+    // (`on_corrupt`, `inline_max`) intact across ROLLBACK and ROLLBACK TO SAVEPOINT.
+    let fx = fixture("r2_h6_lazy_xconnect_rollback", 2_000);
+    {
+        let conn1 = fx.open();
+        conn1
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t2 USING aydb(table_id=2, on_corrupt='evict', inline_max=128, columns='id INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO t2 VALUES (1, 'one');",
+            )
+            .unwrap();
+    }
+
+    // 1. Reopen connection so SQLite has not called xConnect on t2 yet; owner starts a tx on t,
+    //    lazily connects t2 via SELECT, then ROLLBACKs.
+    let conn2 = fx.open();
+    conn2
+        .execute_batch("BEGIN; INSERT INTO t VALUES (99, 'tmp');")
+        .unwrap();
+    assert_eq!(ids(&conn2, "t2"), vec![1]);
+    assert_eq!(
+        fx.engine.read().unwrap().corrupt_policy(2),
+        crate::engine::CorruptPolicy::Evict
+    );
+    assert_eq!(fx.engine.read().unwrap().effective_inline_threshold(2), 128);
+    conn2.execute_batch("ROLLBACK;").unwrap();
+    // t2 handle must still be active (not STALE_VTAB_ERR) and keep its runtime settings.
+    conn2
+        .execute_batch("INSERT INTO t2 VALUES (2, 'two');")
+        .unwrap();
+    assert_eq!(ids(&conn2, "t2"), vec![1, 2]);
+    assert_eq!(
+        fx.engine.read().unwrap().corrupt_policy(2),
+        crate::engine::CorruptPolicy::Evict
+    );
+    assert_eq!(fx.engine.read().unwrap().effective_inline_threshold(2), 128);
+
+    // 2. Also verify ROLLBACK TO SAVEPOINT preserves lazy xConnect on a fresh handle.
+    let conn3 = fx.open();
+    conn3
+        .execute_batch("BEGIN; SAVEPOINT sp1; INSERT INTO t VALUES (100, 'sp');")
+        .unwrap();
+    let conn3_lazy_reader = fx.open();
+    // Test both owner lazy xConnect inside savepoint and non-owner xConnect before rollback.
+    assert_eq!(ids(&conn3, "t2"), vec![1, 2]);
+    assert_eq!(ids(&conn3_lazy_reader, "t2"), vec![1, 2]);
+    conn3
+        .execute_batch("ROLLBACK TO sp1; RELEASE sp1; ROLLBACK;")
+        .unwrap();
+    conn3
+        .execute_batch("INSERT INTO t2 VALUES (3, 'three');")
+        .unwrap();
+    conn3_lazy_reader
+        .execute_batch("INSERT INTO t2 VALUES (4, 'four');")
+        .unwrap();
+    assert_eq!(ids(&conn3, "t2"), vec![1, 2, 3, 4]);
+    assert_eq!(
+        fx.engine.read().unwrap().corrupt_policy(2),
+        crate::engine::CorruptPolicy::Evict
+    );
+    assert_eq!(fx.engine.read().unwrap().effective_inline_threshold(2), 128);
+}

@@ -408,9 +408,22 @@ pub(super) enum PendingDdl {
     },
 }
 
+pub(super) struct InTxRename {
+    engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    conn_id: usize,
+    table_id: u16,
+    db_name: String,
+    old_name: String,
+    new_name: String,
+    table_name: Arc<std::sync::Mutex<String>>,
+    durability: WriteDurability,
+}
+
 pub(super) struct PendingDdlSlot {
     pending: std::sync::Mutex<Option<PendingDdl>>,
     last_error: std::sync::Mutex<Option<String>>,
+    in_tx_renames: std::sync::Mutex<Vec<InTxRename>>,
+    tx_renamed_handles: std::sync::Mutex<Vec<(u16, Arc<std::sync::Mutex<String>>)>>,
 }
 
 impl PendingDdlSlot {
@@ -418,6 +431,95 @@ impl PendingDdlSlot {
         Self {
             pending: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(None),
+            in_tx_renames: std::sync::Mutex::new(Vec::new()),
+            tx_renamed_handles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record_in_tx_rename(&self, item: InTxRename) {
+        if let Ok(mut handles) = self.tx_renamed_handles.lock() {
+            if !handles
+                .iter()
+                .any(|(tid, h)| *tid == item.table_id && Arc::ptr_eq(h, &item.table_name))
+            {
+                handles.push((item.table_id, Arc::clone(&item.table_name)));
+            }
+        }
+        if let Ok(mut queue) = self.in_tx_renames.lock() {
+            queue.push(item);
+        }
+    }
+
+    pub(super) fn clear_tx_renames(&self) {
+        if let Ok(mut queue) = self.in_tx_renames.lock() {
+            queue.clear();
+        }
+        if let Ok(mut handles) = self.tx_renamed_handles.lock() {
+            handles.clear();
+        }
+    }
+
+    fn sync_tx_renamed_handles(&self, eng: &StorageEngine<OsFs>) {
+        if let Ok(handles) = self.tx_renamed_handles.lock() {
+            for (tid, handle) in handles.iter() {
+                if let Some(actual) = eng.active_vtab_name(*tid) {
+                    if let Ok(mut name) = handle.lock() {
+                        *name = actual;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reconciles in-transaction `ALTER TABLE ... RENAME TO` operations whose schema change SQLite
+    /// silently rolled back via its statement journal (for instance because a view or trigger was
+    /// invalid), where SQLite invokes neither `xRollback` nor `xRollbackTo`.
+    pub(super) unsafe fn reconcile_in_tx_renames(&self, db: *mut sqlite3) {
+        let items: Vec<InTxRename> = {
+            let Ok(mut queue) = self.in_tx_renames.lock() else {
+                return;
+            };
+            if queue.is_empty() {
+                return;
+            }
+            core::mem::take(&mut *queue)
+        };
+        let mut retry = Vec::new();
+        for item in items.into_iter().rev() {
+            let has_new = unsafe { schema_has_aydb_table_exact(db, &item.db_name, &item.new_name) };
+            let has_old = unsafe { schema_has_aydb_table_exact(db, &item.db_name, &item.old_name) };
+            match (has_new, has_old) {
+                (Some(false), Some(true)) => {
+                    if let Ok(mut eng) = item.engine.write() {
+                        let new_norm = crate::engine::normalize_vtab_ident(&item.new_name);
+                        if eng.conn_has_open_transaction(item.conn_id)
+                            && eng.active_vtab_name(item.table_id).as_deref()
+                                == Some(new_norm.as_str())
+                        {
+                            let _ = eng.rename_vtab(
+                                item.table_id,
+                                &item.new_name,
+                                &item.old_name,
+                                item.durability,
+                            );
+                        }
+                    }
+                    if let Ok(mut name) = item.table_name.lock() {
+                        *name = item.old_name;
+                    }
+                }
+                (None, _) | (_, None) => {
+                    retry.push(item);
+                }
+                _ => {}
+            }
+        }
+        if !retry.is_empty() {
+            retry.reverse();
+            if let Ok(mut queue) = self.in_tx_renames.lock() {
+                retry.extend(queue.drain(..));
+                *queue = retry;
+            }
         }
     }
 
@@ -585,10 +687,12 @@ impl PendingDdlSlot {
             self.set_error(e.to_string());
             return 1;
         }
+        self.clear_tx_renames();
         0
     }
 
     pub(super) fn rollback_pending(&self) {
+        self.clear_tx_renames();
         if let Some(ddl) = self.take() {
             Self::cleanup_aborted(ddl, true);
         }
@@ -615,9 +719,6 @@ pub(super) struct AydbVTab {
     db_name: String,
     /// Normalised at use. Changes when the table is renamed.
     table_name: Arc<std::sync::Mutex<String>>,
-    /// Name before an uncommitted rename inside the current transaction, used to clean up live
-    /// registration if the rename is rolled back without SQLite invoking `xRollback` on this vtab.
-    pre_tx_name: std::sync::Mutex<Option<String>>,
     durability: WriteDurability,
     /// The UNIQUE columns with the collation and affinity that shape their index keys.
     unique_def: unique_key::UniqueDef,
@@ -958,6 +1059,7 @@ fn connect_table(
     eng: &mut StorageEngine<OsFs>,
     conn_id: usize,
     ddl: &ParsedVtabDdl,
+    is_create: bool,
 ) -> io::Result<Option<Connected>> {
     let view = eng.read_view_for_conn(conn_id);
     let plan = eng.plan_vtab_registration_view(view, &ddl.table_name, ddl.explicit_table_id)?;
@@ -993,14 +1095,23 @@ fn connect_table(
     } else {
         None
     };
-    let reg_token = if eng.check_write_allowed_for_conn(conn_id).is_err() {
-        let quota_registered = ddl.max_bytes == 0
-            || eng
-                .capped_table_state_view(view, table_id)
-                .is_some_and(|state| state.max_bytes == ddl.max_bytes);
+    let quota_registered = ddl.max_bytes == 0
+        || eng
+            .capped_table_state_view(view, table_id)
+            .is_some_and(|state| state.max_bytes == ddl.max_bytes);
+    let use_persisted_activation = if eng.check_write_allowed_for_conn(conn_id).is_err() {
         if !(plan.persisted && quota_registered) {
             return Ok(None);
         }
+        true
+    } else {
+        !is_create
+            && eng.conn_has_open_transaction(conn_id)
+            && plan.persisted
+            && quota_registered
+            && !eng.is_vtab_created_in_tx(table_id)
+    };
+    let reg_token = if use_persisted_activation {
         eng.activate_persisted_vtab(table_id, &ddl.table_name)
     } else {
         register_table(eng, ddl, plan, initial_unique_marker)?
@@ -1011,13 +1122,17 @@ fn connect_table(
         return Err(io::Error::other("injected connect failure"));
     }
     // Runtime-only settings: re-derived from the DDL on every connect.
-    match ddl.on_corrupt {
-        Some(policy) => eng.set_table_corrupt_policy(table_id, policy),
-        None => eng.reset_table_corrupt_policy(table_id),
-    }
-    match ddl.inline_max {
-        Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
-        None => eng.reset_table_inline_threshold(table_id),
+    if use_persisted_activation {
+        eng.apply_persisted_vtab_runtime_settings(table_id, ddl.on_corrupt, ddl.inline_max);
+    } else {
+        match ddl.on_corrupt {
+            Some(policy) => eng.set_table_corrupt_policy(table_id, policy),
+            None => eng.reset_table_corrupt_policy(table_id),
+        }
+        match ddl.inline_max {
+            Some(max_bytes) => eng.set_table_inline_threshold(table_id, max_bytes),
+            None => eng.reset_table_inline_threshold(table_id),
+        }
     }
     let existing_marker = eng.unique_marker_view(view, table_id).ok().flatten();
     let unique_ready = if unique_def.is_empty() {
@@ -1190,6 +1305,9 @@ unsafe fn vtab_create_or_connect(
         // committed in `sqlite3_commit_hook` so `SQLITE_BUSY` or WAL sync errors abort atomically.
         let mut deadline = None;
         let autocommit = sqlite3_get_autocommit(db) != 0;
+        if is_create && !autocommit {
+            aux.pending_ddl.reconcile_in_tx_renames(db);
+        }
         let mut began_here = false;
         let (mut eng, connected) = loop {
             let mut eng = match aux.engine.write() {
@@ -1285,7 +1403,7 @@ unsafe fn vtab_create_or_connect(
                     return io_err_to_sqlite_rc(&e);
                 }
             }
-            match connect_table(&mut eng, db as usize, &ddl) {
+            match connect_table(&mut eng, db as usize, &ddl, is_create) {
                 Ok(Some(connected)) => {
                     if guard_create_sp {
                         if let Err(e) =
@@ -1348,7 +1466,6 @@ unsafe fn vtab_create_or_connect(
             reg_token,
             db_name: ddl.db_name,
             table_name: Arc::new(std::sync::Mutex::new(ddl.table_name)),
-            pre_tx_name: std::sync::Mutex::new(None),
             durability: ddl_durability,
             unique_def: unique_key::UniqueDef::from_columns(
                 &ddl.col_unique,
@@ -1436,6 +1553,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
 
         if !autocommit {
             vtab.pending_ddl.clear_tx_commit();
+            vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
             let mut eng = match vtab.engine.write() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
@@ -1487,8 +1605,19 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
                 set_vtab_err_msg(vtab.base.get(), &e.to_string());
                 return io_err_to_sqlite_rc(&e);
             }
-            if let Ok(mut prev) = vtab.pre_tx_name.lock() {
-                prev.get_or_insert(old_effective);
+            if crate::engine::normalize_vtab_ident(&old_effective)
+                != crate::engine::normalize_vtab_ident(&new_name)
+            {
+                vtab.pending_ddl.record_in_tx_rename(InTxRename {
+                    engine: Arc::clone(&vtab.engine),
+                    conn_id,
+                    table_id: vtab.table_id,
+                    db_name: vtab.db_name.clone(),
+                    old_name: old_effective,
+                    new_name: new_name.clone(),
+                    table_name: Arc::clone(&vtab.table_name),
+                    durability: vtab.durability,
+                });
             }
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = new_name;
@@ -1535,9 +1664,6 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
             let _ = eng.rollback_transaction_for_conn(conn_id);
             set_vtab_err_msg(vtab.base.get(), &e.to_string());
             return io_err_to_sqlite_rc(&e);
-        }
-        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
-            *prev = None;
         }
         if let Ok(mut name) = vtab.table_name.lock() {
             *name = new_name;
@@ -4040,18 +4166,24 @@ unsafe fn query_schema_for_aydb_table(db: *mut sqlite3, catalog: &str, name: &st
 }
 
 /// Whether SQLite's schema (`db_name`, or `temp`/`main` if empty) still has an `aydb` virtual
+/// table of this name. Returns `None` if the schema catalog could not be queried.
+unsafe fn schema_has_aydb_table_exact(db: *mut sqlite3, db_name: &str, name: &str) -> Option<bool> {
+    let _guard = snapshot::enter_internal_schema_query();
+    if !db_name.is_empty() {
+        return unsafe { query_schema_for_aydb_table(db, db_name, name) };
+    }
+    match unsafe { query_schema_for_aydb_table(db, "temp", name) } {
+        Some(true) => Some(true),
+        Some(false) => unsafe { query_schema_for_aydb_table(db, "main", name) },
+        None => None,
+    }
+}
+
+/// Whether SQLite's schema (`db_name`, or `temp`/`main` if empty) still has an `aydb` virtual
 /// table of this name. Any doubt counts as "yes": a table is only removed when the catalog query
 /// definitively finds no `USING aydb` virtual table with this name.
 unsafe fn schema_has_aydb_table(db: *mut sqlite3, db_name: &str, name: &str) -> bool {
-    let _guard = snapshot::enter_internal_schema_query();
-    if !db_name.is_empty() {
-        return unsafe { query_schema_for_aydb_table(db, db_name, name) }.unwrap_or(true);
-    }
-    match unsafe { query_schema_for_aydb_table(db, "temp", name) } {
-        Some(true) => true,
-        Some(false) => unsafe { query_schema_for_aydb_table(db, "main", name) }.unwrap_or(true),
-        None => true,
-    }
+    unsafe { schema_has_aydb_table_exact(db, db_name, name) }.unwrap_or(true)
 }
 
 fn run_commit_sync_barrier(
@@ -4178,6 +4310,7 @@ unsafe fn complete_commit_step(
 unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
+        vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
         // Run prepare, WAL append, and device flush in `xSync` rather than `xCommit`: SQLite
         // discards `xCommit`'s return code, whereas returning an error from `xSync` aborts
         // `COMMIT` and rolls back any native SQLite tables updated in the same transaction.
@@ -4246,6 +4379,7 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
         vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.clear_tx_renames();
         // SQLite invokes `xCommit` once per virtual table in `aVTrans`. Normal transactions
         // already appended, flushed, and published in `xSync` or `ddl_commit_hook`, so
         // `conn_has_open_transaction` is false here; keep prepare+commit as a fallback only if an
@@ -4271,19 +4405,12 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             }
             Err(_) => return SQLITE_ERROR,
         };
-        let rc = complete_commit_step(
+        complete_commit_step(
             vtab,
             step,
             #[cfg(test)]
             fail_sync_flag,
-        );
-        if rc != SQLITE_OK {
-            return rc;
-        }
-        if let Ok(mut prev) = vtab.pre_tx_name.lock() {
-            *prev = None;
-        }
-        SQLITE_OK
+        )
     }))
     .unwrap_or(SQLITE_ERROR)
 }
@@ -4301,13 +4428,12 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 if let Err(e) = eng.rollback_transaction_for_conn(vtab.db as usize) {
                     return io_err_to_sqlite_rc(&e);
                 }
-                eng.active_vtab_name(vtab.table_id)
-            } else {
-                None
             }
+            vtab.pending_ddl.sync_tx_renamed_handles(&eng);
+            eng.active_vtab_name(vtab.table_id)
         };
-        let prev_name = vtab.pre_tx_name.lock().ok().and_then(|mut p| p.take());
-        if let Some(actual) = prev_name.or(restored_name) {
+        vtab.pending_ddl.clear_tx_renames();
+        if let Some(actual) = restored_name {
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = actual;
             }
@@ -4356,6 +4482,7 @@ unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoin
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
         vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
         let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
@@ -4363,6 +4490,7 @@ unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoin
         if let Err(e) = eng.rollback_to_savepoint_for_conn(vtab.db as usize, i_savepoint) {
             return io_err_to_sqlite_rc(&e);
         }
+        vtab.pending_ddl.sync_tx_renamed_handles(&eng);
         if let Some(actual) = eng.active_vtab_name(vtab.table_id) {
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = actual;

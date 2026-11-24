@@ -657,3 +657,82 @@ fn rename_wal_failure_rolls_back_sqlite_schema() {
         assert_eq!(ints(&reader, "SELECT v FROM t"), [10]);
     }
 }
+
+#[test]
+fn in_tx_aborted_rename_with_broken_view_reconciles_before_commit() {
+    // R2-H7: when `ALTER TABLE t RENAME TO u` fails inside an open transaction due to a broken
+    // view, SQLite rolls back its statement journal without calling xRollback / xRollbackTo.
+    // Reconcile immediately restores `aydb`'s catalog and live table name back to `t`.
+    let mut fixture = Fixture::new("r2_h7_in_tx_broken_view_rename");
+    let conn = fixture.open();
+    conn.execute_batch(TABLE).unwrap();
+    conn.execute_batch("INSERT INTO t VALUES (1, 'a', 10)")
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE helper(x INT);
+         CREATE VIEW broken_v AS SELECT k FROM t, helper;
+         DROP TABLE helper;",
+    )
+    .unwrap();
+
+    conn.execute_batch("BEGIN; INSERT INTO t VALUES (2, 'b', 20);")
+        .unwrap();
+    assert!(conn.execute_batch("ALTER TABLE t RENAME TO u").is_err());
+
+    assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+    assert_eq!(
+        fixture
+            .engine()
+            .read()
+            .unwrap()
+            .active_vtab_name(1)
+            .as_deref(),
+        Some("t")
+    );
+    // Creating an unrelated table named `u` in the same tx succeeds cleanly, then COMMIT persists both.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+         INSERT INTO u VALUES (9, 'z', 90);
+         COMMIT;",
+    )
+    .unwrap();
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM t ORDER BY k"), [10, 20]);
+    assert_eq!(ints(&conn, "SELECT v FROM u ORDER BY k"), [90]);
+}
+
+#[test]
+fn cross_table_tx_rename_commit_does_not_leave_stale_name_on_later_rollback() {
+    // R2-L9: if table `a` is renamed in a transaction where only table `b` was modified via SQL
+    // INSERT, `a`'s xCommit never runs; a subsequent transaction rollback on `a2` must NOT revert
+    // its live name handle back to `a`.
+    let mut fixture = Fixture::new("r2_l9_cross_table_rename_no_stale");
+    let conn = fixture.open();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE a USING aydb(columns='k INTEGER PRIMARY KEY, u TEXT UNIQUE, v INT');
+         CREATE VIRTUAL TABLE b USING aydb(columns='k INTEGER PRIMARY KEY, v INT');
+         INSERT INTO a VALUES (1, 'k1', 10);",
+    )
+    .unwrap();
+
+    // Tx 1: write to `b` so `ALTER TABLE a RENAME TO a2` joins the tx without `a` entering aVTrans.
+    conn.execute_batch("BEGIN; INSERT INTO b VALUES (1, 100); ALTER TABLE a RENAME TO a2; COMMIT;")
+        .unwrap();
+
+    // Tx 2: mutate `a2`, then ROLLBACK, then rename `a2 -> a3`.
+    conn.execute_batch("BEGIN; INSERT INTO a2 VALUES (2, 'k2', 20); ROLLBACK;")
+        .unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM a2 ORDER BY k"), [10]);
+    conn.execute_batch("ALTER TABLE a2 RENAME TO a3;").unwrap();
+    assert_eq!(ints(&conn, "SELECT v FROM a3 ORDER BY k"), [10]);
+
+    drop(conn);
+    fixture.restart();
+    let conn = fixture.open();
+    assert_eq!(ints(&conn, "SELECT v FROM a3 ORDER BY k"), [10]);
+    assert!(conn.query_all("SELECT v FROM a2", &[]).is_err());
+    assert!(conn.query_all("SELECT v FROM a", &[]).is_err());
+}

@@ -175,8 +175,11 @@ pub(super) unsafe extern "system" fn trace_reads(
             statements.is_empty()
         };
         if transaction_ended || (autocommit && idle) {
+            trace.pending_ddl.clear_tx_renames();
             trace.abort_pending_ddl();
             trace.clear();
+        } else if event == TRACE_PROFILE && !autocommit {
+            trace.pending_ddl.reconcile_in_tx_renames(trace.database);
         }
     }));
     0

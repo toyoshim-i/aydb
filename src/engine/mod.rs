@@ -1736,22 +1736,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Registers an already persisted virtual table as live for a connection that does not own
-    /// the active transaction. Unlike a registration made by the transaction owner, it must
-    /// survive that transaction's rollback, so it is also recorded in the snapshots a rollback
-    /// restores without clobbering any uncommitted rename/drop already recorded by the owner.
+    /// the active transaction (or for the owner lazily reconnecting an existing persisted table).
+    /// Unlike a registration made for a newly created table, it must survive transaction and
+    /// savepoint rollbacks, so it is recorded in `tx_start_meta` and savepoint snapshots without
+    /// clobbering any existing committed or renamed table name already captured there.
     pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
         let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
         let tok = self.alloc_vtab_token();
         if self.tx_start_meta.active {
-            let orig = self.tx_start_meta.active_vtab_ids.get(&table_id).cloned();
             let dropped_in_tx = self
                 .dropped_tables_in_tx
                 .iter()
                 .any(|&(tid, _)| tid == table_id);
-            if !dropped_in_tx && self.active_vtab_ids.get(&table_id) == orig.as_ref() {
-                self.active_vtab_ids.insert(table_id, name.clone());
-            }
             if !dropped_in_tx {
+                self.active_vtab_ids
+                    .entry(table_id)
+                    .or_insert_with(|| name.clone());
                 self.active_vtab_holders
                     .entry(table_id)
                     .or_default()
@@ -1764,9 +1764,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         .iter()
                         .any(|&(tid, _)| tid == table_id);
                     if !dropped_before_sp {
-                        if snap.active_vtab_ids.get(&table_id) == orig.as_ref() {
-                            snap.active_vtab_ids.insert(table_id, name.clone());
-                        }
+                        snap.active_vtab_ids
+                            .entry(table_id)
+                            .or_insert_with(|| name.clone());
                         snap.active_vtab_holders
                             .entry(table_id)
                             .or_default()
@@ -1774,7 +1774,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                 }
             }
-            self.tx_start_meta.active_vtab_ids.insert(table_id, name);
+            self.tx_start_meta
+                .active_vtab_ids
+                .entry(table_id)
+                .or_insert(name);
             self.tx_start_meta
                 .active_vtab_holders
                 .entry(table_id)
@@ -1788,6 +1791,78 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .push(tok);
         }
         tok
+    }
+
+    /// Applies runtime-only DDL options (`on_corrupt`, `inline_max`) for an existing persisted
+    /// table without letting a transaction rollback wipe them from `tx_start_meta` or savepoints.
+    pub(crate) fn apply_persisted_vtab_runtime_settings(
+        &mut self,
+        table_id: u16,
+        on_corrupt: Option<CorruptPolicy>,
+        inline_max: Option<usize>,
+    ) {
+        let apply_to = |policies: &mut HashMap<u16, CorruptPolicy>,
+                        thresholds: &mut BTreeMap<u16, usize>| {
+            match on_corrupt {
+                Some(policy) => {
+                    policies.insert(table_id, policy);
+                }
+                None => {
+                    policies.remove(&table_id);
+                }
+            }
+            match inline_max {
+                Some(max_bytes) => {
+                    thresholds.insert(table_id, max_bytes);
+                }
+                None => {
+                    thresholds.remove(&table_id);
+                }
+            }
+        };
+
+        if self.tx_start_meta.active {
+            let dropped_in_tx = self
+                .dropped_tables_in_tx
+                .iter()
+                .any(|&(tid, _)| tid == table_id);
+            if !dropped_in_tx {
+                apply_to(
+                    &mut self.corrupt_policies,
+                    &mut self.table_inline_thresholds,
+                );
+            }
+            for marker in &mut self.savepoints {
+                if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
+                    let prefix_len = snap.dropped_tables_len.min(self.dropped_tables_in_tx.len());
+                    let dropped_before_sp = self.dropped_tables_in_tx[..prefix_len]
+                        .iter()
+                        .any(|&(tid, _)| tid == table_id);
+                    if !dropped_before_sp {
+                        apply_to(
+                            &mut snap.corrupt_policies,
+                            &mut snap.table_inline_thresholds,
+                        );
+                    }
+                }
+            }
+            apply_to(
+                &mut self.tx_start_meta.corrupt_policies,
+                &mut self.tx_start_meta.table_inline_thresholds,
+            );
+        } else {
+            apply_to(
+                &mut self.corrupt_policies,
+                &mut self.table_inline_thresholds,
+            );
+        }
+    }
+
+    /// Returns `true` if `table_id` was created (`xCreate`) inside the active transaction.
+    pub(crate) fn is_vtab_created_in_tx(&self, table_id: u16) -> bool {
+        self.vtabs_created_in_tx
+            .iter()
+            .any(|(id, _, _)| *id == table_id)
     }
 
     /// Notes that the active transaction created virtual table `(table_id, table_name)` in `db_name`.
