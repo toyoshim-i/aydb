@@ -41,16 +41,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
 
-      # Every step below runs under "bash -e -o pipefail", so a cargo
-      # failure is not hidden by the tee that follows it.
+      # Each step disables `set -e` around the pipeline so both PIPESTATUS[0]
+      # (cargo) and PIPESTATUS[1] (tee) are captured without masking failures.
       - name: Prepare results directory
-        run: mkdir -p results
+        run: mkdir -p results && : > results/test-status.txt
 
       - name: Format
         run: |
           set +e
           cargo fmt --check 2>&1 | tee results/fmt.txt
           status=${PIPESTATUS[0]}
+          tee_status=${PIPESTATUS[1]}
+          if [ "$status" -eq 0 ] && [ "$tee_status" -ne 0 ]; then
+            status=$tee_status
+          fi
           set -e
           echo "fmt exit=$status" >> results/test-status.txt
           exit "$status"
@@ -60,6 +64,10 @@ jobs:
           set +e
           cargo clippy --all-targets -- -D warnings 2>&1 | tee results/clippy.txt
           status=${PIPESTATUS[0]}
+          tee_status=${PIPESTATUS[1]}
+          if [ "$status" -eq 0 ] && [ "$tee_status" -ne 0 ]; then
+            status=$tee_status
+          fi
           set -e
           echo "clippy exit=$status" >> results/test-status.txt
           exit "$status"
@@ -69,6 +77,10 @@ jobs:
           set +e
           cargo test --all-targets 2>&1 | tee results/tests.txt
           status=${PIPESTATUS[0]}
+          tee_status=${PIPESTATUS[1]}
+          if [ "$status" -eq 0 ] && [ "$tee_status" -ne 0 ]; then
+            status=$tee_status
+          fi
           set -e
           echo "tests exit=$status" >> results/test-status.txt
           exit "$status"
@@ -78,6 +90,10 @@ jobs:
           set +e
           cargo run --release --example reliability_bench 2>&1 | tee results/reliability.txt
           status=${PIPESTATUS[0]}
+          tee_status=${PIPESTATUS[1]}
+          if [ "$status" -eq 0 ] && [ "$tee_status" -ne 0 ]; then
+            status=$tee_status
+          fi
           set -e
           echo "reliability exit=$status" >> results/test-status.txt
           exit "$status"

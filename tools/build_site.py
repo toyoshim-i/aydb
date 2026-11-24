@@ -276,7 +276,8 @@ def first_heading(text, fallback):
     match = re.search(r"^#\s+(.+?)\s*$", text, re.M)
     if not match:
         return fallback
-    return re.sub(r"[`*_]", "", match.group(1))
+    cleaned = re.sub(r"[`*]", "", match.group(1))
+    return re.sub(r"(?<!\w)_+|_+(?!\w)", "", cleaned)
 
 
 class LinkRewriter:
@@ -587,18 +588,24 @@ def os_summary_table(os_name, entry):
         ("reliability", "Reliability benchmark", entry["reliability"], classify_reliability),
     ):
         state, detail = classify(text)
-        if test_status is not None:
-            if key in test_status:
-                exit_code = test_status[key]
-                if exit_code != 0:
-                    state = "bad"
-                    if detail == "no result":
-                        detail = "exit status {}".format(exit_code)
-                    else:
-                        detail = "exit status {} ({})".format(exit_code, detail)
-            elif text is not None:
+        if test_status is None:
+            if text is not None:
                 state = "bad"
                 detail = "exit status not recorded ({})".format(detail)
+        elif key in test_status:
+            exit_code = test_status[key]
+            if exit_code != 0:
+                state = "bad"
+                if detail == "no result":
+                    detail = "exit status {}".format(exit_code)
+                else:
+                    detail = "exit status {} ({})".format(exit_code, detail)
+            elif text is None:
+                state = "bad"
+                detail = "exit status 0, output missing"
+        elif text is not None:
+            state = "bad"
+            detail = "exit status not recorded ({})".format(detail)
         rows.append((label, state, detail))
     for name in BENCHES:
         text = entry["bench"][name]

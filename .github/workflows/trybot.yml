@@ -36,15 +36,34 @@ jobs:
       SEED_COUNT: ${{ inputs.seed_count }}
     steps:
       - name: Validate seed range
-        shell: python
         run: |
-          import os
-          start = os.environ["SEED_START"]
-          count = os.environ["SEED_COUNT"]
-          if not (1 <= len(start) <= 20 and start.isascii() and start.isdecimal()):
-              raise SystemExit("First seed must be an unsigned decimal integer")
-          if count not in {"1", "100", "1000", "5000"} or int(start) + int(count) >= 2**64:
-              raise SystemExit("Invalid seed range")
+          export LC_ALL=C
+          if [[ ! "$SEED_START" =~ ^[0-9]{1,20}$ ]]; then
+            echo "First seed must be an unsigned decimal integer" >&2
+            exit 1
+          fi
+          case "$SEED_COUNT" in
+            1) limit="18446744073709551614" ;;
+            100) limit="18446744073709551515" ;;
+            1000) limit="18446744073709550615" ;;
+            5000) limit="18446744073709546615" ;;
+            *)
+              echo "Invalid seed count" >&2
+              exit 1
+              ;;
+          esac
+          trimmed="${SEED_START#"${SEED_START%%[!0]*}"}"
+          if [[ -z "$trimmed" ]]; then
+            trimmed="0"
+          fi
+          printf -v padded_start "%020s" "$trimmed"
+          padded_start="${padded_start// /0}"
+          printf -v padded_limit "%020s" "$limit"
+          padded_limit="${padded_limit// /0}"
+          if [[ "$padded_start" > "$padded_limit" ]]; then
+            echo "Invalid seed range" >&2
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

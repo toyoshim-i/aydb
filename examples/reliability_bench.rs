@@ -328,7 +328,7 @@ impl PlatformFs for FaultInjectingFs {
 // Suite 1: Power-Loss Sync Durability & 512 B Torn-Write Resilience
 // ============================================================================
 
-fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
+fn bench_suite_1_power_loss_sync_durability(failures: &mut Vec<String>) -> (f64, f64) {
     println!(
         "=========================================================================================="
     );
@@ -376,6 +376,11 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
         "{:<48} | {:>14} | {:>14} | {:>9.1}%",
         "1A. Volatile Drive Cache / Unix PAL (No fsync)", COMMITS, survived_strict, pct_strict
     );
+    if survived_strict != COMMITS {
+        failures.push(format!(
+            "1A. Volatile Drive Cache / Unix PAL: survived {survived_strict}/{COMMITS}"
+        ));
+    }
 
     // Model 1B: FUA Write-Through + 512 B Sub-Sector Torn Write on the 201st in-flight commit
     let survived_fua_torn = {
@@ -412,6 +417,11 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
         "{:<48} | {:>14} | {:>14} | {:>9.1}%",
         "1B. FUA Write-Through + 512B Torn Tail Sector", COMMITS, survived_fua_torn, pct_fua
     );
+    if survived_fua_torn != COMMITS {
+        failures.push(format!(
+            "1B. FUA Write-Through + 512B Torn Tail Sector: survived {survived_fua_torn}/{COMMITS}"
+        ));
+    }
 
     (pct_strict, pct_fua)
 }
@@ -420,7 +430,7 @@ fn bench_suite_1_power_loss_sync_durability() -> (f64, f64) {
 // Suite 2: Process Crash (`kill -9`) Survival Across WAL Buffering Modes
 // ============================================================================
 
-fn bench_suite_2_process_crash_wal_modes() {
+fn bench_suite_2_process_crash_wal_modes(failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -480,6 +490,9 @@ fn bench_suite_2_process_crash_wal_modes() {
             (hits as f64) * 100.0 / (N_COMMITS as f64),
             rec_ms
         );
+        if mode == WalStreamMode::BufferedImmediateOsCache && hits != N_COMMITS {
+            failures.push(format!("2. {label}: recovered {hits}/{N_COMMITS}"));
+        }
     }
 }
 
@@ -487,7 +500,7 @@ fn bench_suite_2_process_crash_wal_modes() {
 // Suite 3: Transaction Atomicity & Rollback Invariants (Differential Oracle)
 // ============================================================================
 
-fn bench_suite_3_transaction_rollback_invariants() {
+fn bench_suite_3_transaction_rollback_invariants(failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -527,6 +540,9 @@ fn bench_suite_3_transaction_rollback_invariants() {
             if ok { "PASS" } else { "FAIL" },
             if ok { "100% Restored" } else { "Corrupted" }
         );
+        if !ok {
+            failures.push("3A. Small Inline Tx Rollback (< 4 MB) failed".to_string());
+        }
     }
 
     // Scenario 3B: Sealed Blob Segment Overwrite + Rollback
@@ -571,6 +587,9 @@ fn bench_suite_3_transaction_rollback_invariants() {
             "{:<54} | {:>14} | {:>20}",
             "3B. Sealed Blob Overwrite + Rollback", status, note
         );
+        if status != "PASS" {
+            failures.push(format!("3B. Sealed Blob Overwrite + Rollback: {note}"));
+        }
     }
 
     // Scenario 3C: Large Transaction (> 4 MB) Rollback Atomicity
@@ -608,6 +627,11 @@ fn bench_suite_3_transaction_rollback_invariants() {
                 format!("{leaked_rows}/5000 Survived!")
             }
         );
+        if !ok {
+            failures.push(format!(
+                "3C. Large Transaction (> 4 MB) Rollback Atomicity: {leaked_rows}/5000 leaked"
+            ));
+        }
     }
 
     // Scenario 3D: Tombstone-Shadowed Multi-Segment Range Scan with `limit`
@@ -645,6 +669,12 @@ fn bench_suite_3_transaction_rollback_invariants() {
                 format!("{} Rows (20 Live!)", rows.len())
             }
         );
+        if !ok {
+            failures.push(format!(
+                "3D. Multi-Segment Range Scan w/ Tombstones: returned {} rows",
+                rows.len()
+            ));
+        }
     }
 }
 
@@ -652,7 +682,7 @@ fn bench_suite_3_transaction_rollback_invariants() {
 // Suite 4: Post-Crash Blob Garbage Collection & Storage Leak
 // ============================================================================
 
-fn bench_suite_4_post_crash_blob_leak() {
+fn bench_suite_4_post_crash_blob_leak(failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -705,6 +735,11 @@ fn bench_suite_4_post_crash_blob_leak() {
             "{:<54} | {:>14} | {:>20}",
             "4A. Delete Full Sealed Blob Seg + Crash Before Flush", status, detail
         );
+        if status != "PASS" {
+            failures.push(format!(
+                "4A. Delete Full Sealed Blob Seg + Crash Before Flush: {detail}"
+            ));
+        }
     }
 
     // Scenario 4B: Delete 3/4 of each sealed blob segment -> Crash -> Recover -> Delete last 1/4 -> Flush & Compact
@@ -764,6 +799,11 @@ fn bench_suite_4_post_crash_blob_leak() {
             if leaked_sealed == 0 { "PASS" } else { "FAIL" },
             format!("{leaked_sealed} Segs Leaked Forever")
         );
+        if leaked_sealed != 0 {
+            failures.push(format!(
+                "4B. Partial Blob Delete + Crash + Delete Rest (GC): {leaked_sealed} leaked"
+            ));
+        }
     }
 }
 
@@ -771,7 +811,7 @@ fn bench_suite_4_post_crash_blob_leak() {
 // Suite 5: Deterministic I/O Fault Countdown During `flush_memtable()`
 // ============================================================================
 
-fn bench_suite_5_io_fault_countdown() {
+fn bench_suite_5_io_fault_countdown(failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -840,6 +880,11 @@ fn bench_suite_5_io_fault_countdown() {
             "Step {:<9} | {:>24} | {:>17}/{:<4} | {:>20}",
             fault_step, res_str, surviving, TOTAL_KEYS, status
         );
+        if surviving != TOTAL_KEYS {
+            failures.push(format!(
+                "5. I/O Fault Step #{fault_step}: survived {surviving}/{TOTAL_KEYS}"
+            ));
+        }
     }
 }
 
@@ -847,7 +892,7 @@ fn bench_suite_5_io_fault_countdown() {
 // Suite 6: SQLite VTab Key Encoding & Rowid Integrity
 // ============================================================================
 
-fn bench_suite_6_vtab_key_and_rowid_integrity() {
+fn bench_suite_6_vtab_key_and_rowid_integrity(failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -898,6 +943,9 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
             "Inverted Negative Order"
         }
     );
+    if !ok_order {
+        failures.push("6A. REAL (f64) PK Index Scan Sort Order failed".to_string());
+    }
 
     // 6B: 32-Bit Entropy Collision in 64-Bit `pk_to_rowid` Hash
     // Find two ordinary TEXT keys whose 32-bit CRC32C collides (takes ~2 ms via birthday bound),
@@ -961,6 +1009,9 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
             "Wrong Row Deleted!"
         }
     );
+    if !ok_collision {
+        failures.push("6B. TEXT PK 64-Bit rowid Hash Collision failed".to_string());
+    }
 
     // 6C: Empty / Inverted Range Query (`WHERE k >= 10 AND k <= 5` or `k >= -10.0 AND k <= 10.0`)
     // Tested via `catch_unwind` on `StorageEngine::scan_table_range` because a panic inside
@@ -997,6 +1048,9 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
             "PANIC in BTreeMap::range"
         }
     );
+    if !ok_range {
+        failures.push("6C. Inverted/Empty Range Query failed".to_string());
+    }
 
     drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1006,7 +1060,7 @@ fn bench_suite_6_vtab_key_and_rowid_integrity() {
 // Suite 7: Technical Architecture & Edge-Case Regression Verification
 // ============================================================================
 
-pub fn suite_7_audit_regressions(base_dir: &Path) {
+pub fn suite_7_audit_regressions(base_dir: &Path, failures: &mut Vec<String>) {
     println!(
         "\n=========================================================================================="
     );
@@ -1096,6 +1150,9 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
                 "Post-Crash Writes Lost"
             }
         );
+        if !ok {
+            failures.push("7A. Post-Recovery WAL Epoch Rotation failed".to_string());
+        }
     }
 
     // 7B: Oversized PK rejection & near-4KB row/meta auto-spill without wedging flush_memtable
@@ -1139,6 +1196,9 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
                 "Flush Wedged!"
             }
         );
+        if !ok {
+            failures.push("7B. 4KB Block Guard & Meta Blob Spill failed".to_string());
+        }
     }
 
     // 7C: SQL VTab PK uniqueness, ON CONFLICT, type-tagged keys, and auto table_id
@@ -1204,6 +1264,9 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
                 "Key Collision/Leak"
             }
         );
+        if !ok {
+            failures.push("7C. VTab PK Uniqueness & Type Tags failed".to_string());
+        }
     }
 
     // 7D: Multi-chunk (>512 KB) tx crash atomicity, SAVEPOINT, & DROP TABLE
@@ -1291,6 +1354,9 @@ pub fn suite_7_audit_regressions(base_dir: &Path) {
                 "Partial Tx/Drop Leak"
             }
         );
+        if !ok {
+            failures.push("7D. >512KB Tx Atomicity, SAVEPOINT & DROP failed".to_string());
+        }
     }
 }
 
@@ -2604,16 +2670,24 @@ fn main() {
     let _ = std::fs::remove_dir_all(&base_dir);
     std::fs::create_dir_all(&base_dir).unwrap();
 
-    bench_suite_1_power_loss_sync_durability();
-    bench_suite_2_process_crash_wal_modes();
-    bench_suite_3_transaction_rollback_invariants();
-    bench_suite_4_post_crash_blob_leak();
-    bench_suite_5_io_fault_countdown();
-    bench_suite_6_vtab_key_and_rowid_integrity();
-    suite_7_audit_regressions(&base_dir);
+    let mut failures = Vec::new();
+    bench_suite_1_power_loss_sync_durability(&mut failures);
+    bench_suite_2_process_crash_wal_modes(&mut failures);
+    bench_suite_3_transaction_rollback_invariants(&mut failures);
+    bench_suite_4_post_crash_blob_leak(&mut failures);
+    bench_suite_5_io_fault_countdown(&mut failures);
+    bench_suite_6_vtab_key_and_rowid_integrity(&mut failures);
+    suite_7_audit_regressions(&base_dir, &mut failures);
     suite_8_followup_audit_regressions(&base_dir);
     suite_9_multi_angle_audit_regressions(&base_dir);
     suite_10_collation_rowid_cross_conn_audit_regressions(&base_dir);
 
     let _ = std::fs::remove_dir_all(&base_dir);
+    if !failures.is_empty() {
+        eprintln!("\nFAIL: {} reliability check(s) failed:", failures.len());
+        for failure in &failures {
+            eprintln!("  - {failure}");
+        }
+        std::process::exit(1);
+    }
 }
