@@ -271,7 +271,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Consumed in memory before the file exists, so a failed write whose cleanup also fails
         // never leaves a file that a retry would reuse (ARCHITECTURE.md section 2.3). The commit
         // below persists the advanced counter.
-        let new_seq_id = self.meta_mgr.reserve_seq_id();
+        let new_seq_id = self.meta_mgr.try_reserve_seq_id()?;
 
         let mut new_reader = match self.memtable.write_to_segment(
             &*self.fs,
@@ -836,7 +836,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if start_idx + 2 > self.idx_segments.len() {
             return Ok(None);
         }
-        let out_seq_id = self.meta_mgr.reserve_seq_id();
+        let out_seq_id = self.meta_mgr.try_reserve_seq_id()?;
         let full = start_idx == 0;
         let level = if full {
             1

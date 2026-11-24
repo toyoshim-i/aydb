@@ -243,14 +243,23 @@ impl BootMetaState {
         Ok(())
     }
 
+    /// Allocates and returns a fresh, monotonically increasing `SeqID`, failing cleanly if
+    /// allocating would reach the reserved `u64::MAX` sentinel.
+    pub fn try_allocate_seq_id(&mut self) -> io::Result<u64> {
+        if self.next_seq_id >= u64::MAX - 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "64-bit SeqID exhausted",
+            ));
+        }
+        let id = self.next_seq_id;
+        self.next_seq_id += 1;
+        Ok(id)
+    }
+
     /// Allocates and returns a fresh, monotonically increasing `SeqID`.
     pub fn allocate_seq_id(&mut self) -> u64 {
-        let id = self.next_seq_id;
-        self.next_seq_id = self
-            .next_seq_id
-            .checked_add(1)
-            .expect("64-bit SeqID overflow");
-        id
+        self.try_allocate_seq_id().expect("64-bit SeqID overflow")
     }
 
     /// Queues a managed segment or manifest filename for deferred deletion if not already queued.
@@ -949,13 +958,19 @@ impl<F: PlatformFs> BootMetaManager<F> {
         &self.state
     }
 
+    /// Takes the next `SeqID` in memory, before the file that will carry it is created, returning
+    /// an error instead of panicking if 64-bit sequence IDs are exhausted.
+    pub fn try_reserve_seq_id(&mut self) -> io::Result<u64> {
+        self.state.try_allocate_seq_id()
+    }
+
     /// Takes the next `SeqID` in memory, before the file that will carry it is created. The id
     /// stays consumed whatever happens to that file, so a failed creation (which can leave the
     /// file behind with a directory entry that is not durable) is never retried under the same
     /// name. The next commit persists the advanced counter; a crash before that is covered by
     /// `reserve_seq_ids_above_existing_files` at the next open.
     pub fn reserve_seq_id(&mut self) -> u64 {
-        self.state.allocate_seq_id()
+        self.try_reserve_seq_id().expect("64-bit SeqID overflow")
     }
 
     /// Returns which ping-pong slot currently holds the latest committed state.
@@ -1135,7 +1150,7 @@ impl<F: PlatformFs> BootMetaManager<F> {
                 ));
             }
             // Overflow to an immutable external manifest file FIRST before updating boot_meta.db!
-            let mf_seq_id = state.allocate_seq_id();
+            let mf_seq_id = state.try_allocate_seq_id()?;
             let mf_name = format_manifest_file_name(mf_seq_id);
 
             let mut mf_buf = Vec::with_capacity(mf_total_len as usize);
@@ -3232,5 +3247,25 @@ mod tests {
             st.decode_catalog_payload(&dup).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn try_seq_id_allocation_fails_cleanly_before_u64_max() {
+        let tmp = TempTestDir::new("meta_seq_exhausted");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).expect("open OsFs"));
+        let mut mgr = BootMetaManager::open_or_recover(fs).unwrap();
+
+        mgr.state.next_seq_id = u64::MAX - 2;
+        assert_eq!(mgr.try_reserve_seq_id().unwrap(), u64::MAX - 2);
+        assert_eq!(mgr.state().next_seq_id, u64::MAX - 1);
+
+        // `u64::MAX - 1` must return Err without advancing `next_seq_id` to invalid `u64::MAX`.
+        let err = mgr.try_reserve_seq_id().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(mgr.state().next_seq_id, u64::MAX - 1);
+
+        let err2 = mgr.state.try_allocate_seq_id().unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(mgr.state().next_seq_id, u64::MAX - 1);
     }
 }

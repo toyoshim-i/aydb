@@ -505,6 +505,12 @@ impl PlatformFile for UnixPlatformFile {
     }
 
     fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
+        if target_len > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "preallocate target_len exceeds i64::MAX",
+            ));
+        }
         let current_len = self.file_len()?;
         if current_len >= target_len {
             return Ok(());

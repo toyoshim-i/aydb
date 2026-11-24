@@ -9878,3 +9878,31 @@ fn evict_until_within_quota_removes_orphan_lru_key_without_lazy_promotion() {
     let lru_prefix = crate::lru::encode_namespace_prefix(1, crate::lru::NS_LRU_QUEUE);
     assert!(engine.scan_merged_prefix(&lru_prefix).unwrap().is_empty());
 }
+
+#[test]
+fn open_ignores_non_canonical_hex_blob_filenames() {
+    let tmp = TempTestDir::new("non_canon_hex_blobs");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let eng = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+    drop(eng);
+
+    let decoy_files = [
+        "blob_std_1.db",
+        "blob_std_000000000000000A.db",
+        "blob_std_+000000000000001.db",
+        "blob_lru_1_1.db",
+        "blob_lru_0001_000000000000000A.db",
+    ];
+    for name in decoy_files {
+        std::fs::write(tmp.path.join(name), b"not_a_canonical_blob").unwrap();
+    }
+
+    let reopened = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
+    assert!(reopened.std_blobs.is_empty());
+    assert!(reopened.lru_blobs.is_empty());
+    drop(reopened);
+    // Decoys must remain untouched because open_inner neither adopts nor sweeps non-canonical names.
+    for name in decoy_files {
+        assert!(tmp.path.join(name).exists(), "missing decoy {name}");
+    }
+}

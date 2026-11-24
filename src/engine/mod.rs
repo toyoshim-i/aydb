@@ -706,7 +706,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .and_then(|s| s.strip_suffix(".db"))
             {
                 if let Ok(seq_id) = u64::from_str_radix(hex, 16) {
-                    if !std_blobs.contains_key(&seq_id) {
+                    if fname == format_std_blob_file_name(seq_id)
+                        && !std_blobs.contains_key(&seq_id)
+                    {
                         if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                             let flen = file.file_len()?;
                             std_blobs.insert(
@@ -729,7 +731,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         u16::from_str_radix(tbl_hex, 16),
                         u64::from_str_radix(seq_hex, 16),
                     ) {
-                        if !lru_blobs.contains_key(&(tbl_id, seq_id)) {
+                        if fname == crate::meta::format_lru_blob_file_name(tbl_id, seq_id)
+                            && !lru_blobs.contains_key(&(tbl_id, seq_id))
+                        {
                             if let Some(file) = open_uncataloged_blob(&*fs, &fname)? {
                                 let flen = file.file_len()?;
                                 lru_blobs.insert(
@@ -3851,7 +3855,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         self.sync_active_std_writer()?;
                         self.active_std_writer = None;
                     }
-                    let seq_id = self.meta_mgr.reserve_seq_id();
+                    let seq_id = self.meta_mgr.try_reserve_seq_id()?;
                     let writer = BlobSegmentWriter::open(&*self.fs, BlobKind::Standard, 0, seq_id)?;
                     let reader = writer.reader();
                     let mut std_metas = self.build_checkpointed_std_blob_metas();
@@ -3927,7 +3931,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         self.sync_active_lru_writer(table_id)?;
                         self.active_lru_writers.remove(&table_id);
                     }
-                    let seq_id = self.meta_mgr.reserve_seq_id();
+                    let seq_id = self.meta_mgr.try_reserve_seq_id()?;
                     let writer =
                         BlobSegmentWriter::open(&*self.fs, BlobKind::Lru, table_id, seq_id)?;
                     let reader = writer.reader();
@@ -4281,6 +4285,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         "too many records in transaction",
                     )
                 })?;
+            if self.pending_tx_record_count == 0 {
+                self.pending_tx_buf.clear();
+                self.pending_tx_buf
+                    .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
+            }
+            let prev_buf_len = self.pending_tx_buf.len();
+            if let Err(e) = WalBatch::try_append_records_to_buf(&records, &mut self.pending_tx_buf)
+            {
+                self.pending_tx_buf.truncate(prev_buf_len);
+                return Err(e);
+            }
             if !self.tx_preparing {
                 self.tx_prepared = false;
                 self.tx_synced_vtabs.clear();
@@ -4291,12 +4306,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if durability == WriteDurability::SyncTransactional {
                 self.pending_tx_sync = true;
             }
-            if self.pending_tx_record_count == 0 {
-                self.pending_tx_buf.clear();
-                self.pending_tx_buf
-                    .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
-            }
-            WalBatch::append_records_to_buf(&records, &mut self.pending_tx_buf);
             self.pending_tx_record_count = record_count;
             self.note_records_table_mutations(&records);
             let record_undo = !self.savepoints.is_empty();
@@ -4313,8 +4322,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.flush_active_blob_buffers()?;
             (batch.prev_lsn, batch.durable_lsn) = self.wal_links_for_append(durability)?;
             let mut raw = core::mem::take(&mut self.scratch_wal_encoded);
-            batch.encode_into(&mut raw);
-            let res = self.append_raw_wal_batch_with_rotation(&raw, durability);
+            let res = match batch.try_encode_into(&mut raw) {
+                Ok(()) => self.append_raw_wal_batch_with_rotation(&raw, durability),
+                Err(e) => Err(e),
+            };
             raw.clear();
             self.scratch_wal_encoded = raw;
             res?;

@@ -169,18 +169,55 @@ impl WalBatch {
         }
     }
 
-    /// Appends serialized record bytes for `records` into `buf`.
-    pub fn append_records_to_buf(records: &[WalRecord], buf: &mut Vec<u8>) {
+    /// Appends serialized record bytes for `records` into `buf`, validating 32-bit length bounds.
+    pub fn try_append_records_to_buf(records: &[WalRecord], buf: &mut Vec<u8>) -> io::Result<()> {
         let mut extra = 0usize;
         for rec in records {
-            extra += match rec {
-                WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
-                WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),
-                WalRecord::Delete { key } => 5 + key.len(),
-                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
-            };
+            let rec_bytes = match rec {
+                WalRecord::PutInline { key, value } => {
+                    if u32::try_from(key.len()).is_err() || u32::try_from(value.len()).is_err() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "WAL PutInline key or value exceeds u32::MAX bytes",
+                        ));
+                    }
+                    9usize
+                        .checked_add(key.len())
+                        .and_then(|n| n.checked_add(value.len()))
+                }
+                WalRecord::PutBlobPtr { key, .. } => {
+                    if u32::try_from(key.len()).is_err() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "WAL PutBlobPtr key exceeds u32::MAX bytes",
+                        ));
+                    }
+                    28usize.checked_add(key.len())
+                }
+                WalRecord::Delete { key } => {
+                    if u32::try_from(key.len()).is_err() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "WAL Delete key exceeds u32::MAX bytes",
+                        ));
+                    }
+                    5usize.checked_add(key.len())
+                }
+                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => Some(1),
+            }
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "WAL record size overflow")
+            })?;
+            extra = extra.checked_add(rec_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "WAL batch byte size overflow")
+            })?;
         }
-        buf.reserve(extra);
+        buf.try_reserve(extra).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to reserve buffer for WAL records",
+            )
+        })?;
         for rec in records {
             match rec {
                 WalRecord::PutInline { key, value } => {
@@ -217,6 +254,13 @@ impl WalBatch {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Appends serialized record bytes for `records` into `buf`.
+    pub fn append_records_to_buf(records: &[WalRecord], buf: &mut Vec<u8>) {
+        Self::try_append_records_to_buf(records, buf)
+            .expect("WAL batch exceeds 32-bit length limits");
     }
 
     /// Fills in the 32-byte `[lsn (8B) | batch_crc32c (4B) | record_count (4B) | prev_lsn (8B) |
@@ -236,19 +280,33 @@ impl WalBatch {
         buf[8..12].copy_from_slice(&batch_crc.to_le_bytes());
     }
 
+    /// Serializes this batch into the 32-byte header followed by the records, returning an error
+    /// if counts or lengths exceed 32-bit wire limits or buffer allocation fails.
+    pub fn try_encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let record_count = u32::try_from(self.records.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL batch record count exceeds u32::MAX",
+            )
+        })?;
+        out.clear();
+        out.try_reserve(WAL_BATCH_HEADER_SIZE).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "failed to reserve buffer for WAL batch header",
+            )
+        })?;
+        out.extend_from_slice(&[0u8; WAL_BATCH_HEADER_SIZE]);
+        Self::try_append_records_to_buf(&self.records, out)?;
+        Self::finalize_encoded_buf(self.lsn, self.prev_lsn, self.durable_lsn, record_count, out);
+        Ok(())
+    }
+
     /// Serializes this batch into the 32-byte header followed by the records,
     /// reusing an existing buffer `out` without intermediate heap allocations.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.clear();
-        out.extend_from_slice(&[0u8; WAL_BATCH_HEADER_SIZE]);
-        Self::append_records_to_buf(&self.records, out);
-        Self::finalize_encoded_buf(
-            self.lsn,
-            self.prev_lsn,
-            self.durable_lsn,
-            self.records.len() as u32,
-            out,
-        );
+        self.try_encode_into(out)
+            .expect("WAL batch exceeds 32-bit length limits");
     }
 
     /// Serializes this batch into the 32-byte header followed by the records
@@ -439,19 +497,23 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
     fn validate_wal_target_size(target_size: u64) -> io::Result<usize> {
         if target_size < WAL_SECTOR_SIZE as u64
+            || target_size > i64::MAX as u64
             || !target_size.is_multiple_of(WAL_SECTOR_SIZE as u64)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "WAL size must be a positive multiple of 4096 bytes",
+                "WAL size must be a positive multiple of 4096 bytes within i64::MAX",
             ));
         }
-        usize::try_from(target_size / WAL_SECTOR_SIZE as u64).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WAL sector count exceeds usize::MAX",
-            )
-        })
+        usize::try_from(target_size / WAL_SECTOR_SIZE as u64)
+            .ok()
+            .filter(|&n| n <= usize::MAX / 2)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "WAL sector count exceeds addressable limit",
+                )
+            })
     }
 
     fn init_with_file(
@@ -637,18 +699,28 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// Grows the underlying WAL file if `target_size > current_size` to accommodate an oversized
     /// multi-chunk transaction in a single epoch.
     pub fn ensure_min_size(&mut self, target_size: u64) -> io::Result<()> {
+        if target_size > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL target size exceeds i64::MAX",
+            ));
+        }
         let new_sectors_u64 = target_size.div_ceil(WAL_SECTOR_SIZE as u64);
         let aligned = new_sectors_u64
             .checked_mul(WAL_SECTOR_SIZE as u64)
+            .filter(|&bytes| bytes <= i64::MAX as u64)
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "WAL target size overflow")
             })?;
-        let new_sectors = usize::try_from(new_sectors_u64).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WAL sector count exceeds usize::MAX",
-            )
-        })?;
+        let new_sectors = usize::try_from(new_sectors_u64)
+            .ok()
+            .filter(|&n| n <= usize::MAX / 2)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "WAL sector count exceeds addressable limit",
+                )
+            })?;
         if new_sectors > self.total_sectors {
             let prealloc = match self.mode {
                 WalStreamMode::SyncSectorIsolated => PreallocStrategy::PhysicalZeroFill,
@@ -664,8 +736,11 @@ impl<F: PlatformFile> WalStreamWriter<F> {
     /// Appends an atomic [`WalBatch`] to the WAL stream, fragmenting across 4 KB sectors if needed.
     pub fn append_batch(&mut self, batch: &WalBatch) -> io::Result<WalAppendOutcome> {
         let mut raw = core::mem::take(&mut self.scratch_encode_buf);
-        batch.encode_into(&mut raw);
-        let res = self.append_raw_batch(&raw);
+        let encode_res = batch.try_encode_into(&mut raw);
+        let res = match encode_res {
+            Ok(()) => self.append_raw_batch(&raw),
+            Err(e) => Err(e),
+        };
         raw.clear();
         self.scratch_encode_buf = raw;
         res
@@ -738,8 +813,7 @@ impl<F: PlatformFile> WalStreamWriter<F> {
 
         // First, calculate accurately how many sectors this batch will require so we never
         // write half a batch before discovering that the ring is full!
-        let required_final_sector = self.preview_end_sector(remaining.len());
-        if required_final_sector > self.total_sectors {
+        if self.preview_end_sector(remaining.len()).is_none() {
             return Ok(WalAppendOutcome::RingFull);
         }
 
@@ -927,18 +1001,18 @@ impl<F: PlatformFile> WalStreamWriter<F> {
         }
     }
 
-    fn preview_end_sector(&self, mut rem_len: usize) -> usize {
+    fn preview_end_sector(&self, mut rem_len: usize) -> Option<usize> {
         let mut sec_idx = self.current_sector_idx;
         let mut valid = self.current_valid_bytes;
 
         if valid > 0 && WAL_SECTOR_PAYLOAD_CAP - valid < FRAGMENT_HEADER_SIZE {
-            sec_idx += 1;
+            sec_idx = sec_idx.checked_add(1)?;
             valid = 0;
         }
 
         while rem_len > 0 {
             if sec_idx >= self.total_sectors {
-                return self.total_sectors + 1;
+                return None;
             }
             let max_data = (WAL_SECTOR_PAYLOAD_CAP - valid) - FRAGMENT_HEADER_SIZE;
             let take = rem_len.min(max_data);
@@ -949,13 +1023,18 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                 || rem_len > 0
                 || WAL_SECTOR_PAYLOAD_CAP - valid < FRAGMENT_HEADER_SIZE
             {
-                sec_idx += 1;
+                sec_idx = sec_idx.checked_add(1)?;
                 valid = 0;
             }
         }
 
         // If `valid > 0` in buffered mode, the active sector at `sec_idx` must be < total_sectors.
-        if valid > 0 { sec_idx + 1 } else { sec_idx }
+        let end = if valid > 0 {
+            sec_idx.checked_add(1)?
+        } else {
+            sec_idx
+        };
+        (end <= self.total_sectors).then_some(end)
     }
 
     fn seal_current_sector_in_memory(&mut self) {
@@ -2498,5 +2577,69 @@ mod tests {
         let rec = recover_single_wal_stream(&*f, 1).unwrap();
         let lsns: Vec<u64> = rec.batches.iter().map(|b| b.lsn).collect();
         assert_eq!(lsns, (1..=13).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn wal_bounds_reject_above_i64_max_and_preview_saturates_without_overflow() {
+        let tmp = TempTestDir::new("wal_bounds_overflow");
+        let fs = OsFs::open(&tmp.path, true).expect("open OsFs");
+
+        let above_i64 =
+            ((i64::MAX as u64) / (WAL_SECTOR_SIZE as u64) + 1) * (WAL_SECTOR_SIZE as u64);
+        assert_eq!(
+            WalStreamWriter::<crate::pal::OsFile>::validate_wal_target_size(above_i64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut w = WalStreamWriter::open_unallocated(
+            &fs,
+            WAL_SYNC_FILE_NAME,
+            8 * WAL_SECTOR_SIZE as u64,
+            1,
+            WalStreamMode::SyncSectorIsolated,
+        )
+        .unwrap();
+        assert_eq!(
+            w.ensure_min_size((i64::MAX as u64) + 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // Near-`usize::MAX` sector cursor must return `None` rather than wrapping in release mode.
+        w.total_sectors = usize::MAX;
+        w.current_sector_idx = usize::MAX;
+        w.current_valid_bytes = WAL_SECTOR_PAYLOAD_CAP;
+        assert_eq!(w.preview_end_sector(64), None);
+
+        // Checked encoding path matches `encode()` across all WalRecord variants.
+        let batch = WalBatch::new(
+            7,
+            vec![
+                WalRecord::TxBegin,
+                WalRecord::PutInline {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                },
+                WalRecord::PutBlobPtr {
+                    key: b"bk".to_vec(),
+                    blob_ptr: BlobPtr {
+                        kind: BlobKind::Standard,
+                        table_id: 0,
+                        seg_id: 3,
+                        offset: 64,
+                        len: 2048,
+                        crc32c: 0x1234_5678,
+                    },
+                },
+                WalRecord::Delete {
+                    key: b"dk".to_vec(),
+                },
+                WalRecord::TxCommit,
+            ],
+        );
+        let mut checked = Vec::new();
+        batch.try_encode_into(&mut checked).unwrap();
+        assert_eq!(checked, batch.encode());
     }
 }

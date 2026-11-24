@@ -38,19 +38,57 @@ fn clean_lexical_path(path: &Path) -> io::Result<PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Prefix;
 
-    // Preserve verbatim `\\?\` / device `\\.\` paths exactly as supplied; strip trailing
-    // ASCII spaces and dots from regular components before `\\?\` disables Win32 normalization.
-    let is_verbatim = matches!(
+    // Preserve verbatim `\\?\` / device `\\.\` trailing dots/spaces untouched; however, if a
+    // verbatim path contains `/` (never valid inside a Windows filename), convert `/` -> `\` and
+    // lexically normalize `.` and `..` on post-prefix segments so `..` never escapes into the prefix.
+    let mut wide_raw: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let has_slash = wide_raw.contains(&(b'/' as u16));
+    let is_verbatim_or_device = matches!(
         path.components().next(),
         Some(Component::Prefix(p))
             if p.kind().is_verbatim() || matches!(p.kind(), Prefix::DeviceNS(_))
+    ) || (wide_raw.len() >= 4
+        && (wide_raw[0] == b'\\' as u16 || wide_raw[0] == b'/' as u16)
+        && (wide_raw[1] == b'\\' as u16 || wide_raw[1] == b'/' as u16)
+        && (wide_raw[2] == b'?' as u16 || wide_raw[2] == b'.' as u16)
+        && (wide_raw[3] == b'\\' as u16 || wide_raw[3] == b'/' as u16));
+
+    let converted_backing: Option<PathBuf> = if is_verbatim_or_device && has_slash {
+        for u in &mut wide_raw {
+            if *u == b'/' as u16 {
+                *u = b'\\' as u16;
+            }
+        }
+        Some(PathBuf::from(OsString::from_wide(&wide_raw)))
+    } else {
+        None
+    };
+    let effective_path = converted_backing.as_deref().unwrap_or(path);
+    let is_verbatim = matches!(
+        effective_path.components().next(),
+        Some(Component::Prefix(p))
+            if p.kind().is_verbatim() || matches!(p.kind(), Prefix::DeviceNS(_))
     );
+    let collapse_verbatim_dots = is_verbatim && has_slash;
+
     let mut out = PathBuf::new();
-    for comp in path.components() {
+    let mut normal_depth = 0usize;
+    for comp in effective_path.components() {
         match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
             Component::CurDir => {}
+            Component::Normal(s) if collapse_verbatim_dots && s == "." => {}
             Component::ParentDir => {
-                out.pop();
+                if normal_depth > 0 {
+                    out.pop();
+                    normal_depth -= 1;
+                }
+            }
+            Component::Normal(s) if collapse_verbatim_dots && s == ".." => {
+                if normal_depth > 0 {
+                    out.pop();
+                    normal_depth -= 1;
+                }
             }
             Component::Normal(s) if !is_verbatim => {
                 let mut wide: Vec<u16> = s.encode_wide().collect();
@@ -68,8 +106,14 @@ fn clean_lexical_path(path: &Path) -> io::Result<PathBuf> {
                     ));
                 }
                 out.push(OsString::from_wide(&wide));
+                normal_depth += 1;
             }
-            other => out.push(other.as_os_str()),
+            other => {
+                out.push(other.as_os_str());
+                if matches!(other, Component::Normal(_)) {
+                    normal_depth += 1;
+                }
+            }
         }
     }
     Ok(out)
@@ -284,5 +328,31 @@ mod tests {
 
         let err = clean_lexical_path(Path::new(r"C:\data\...")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn clean_lexical_path_normalizes_verbatim_mixed_slashes_without_stripping_trailing_spaces() {
+        assert_eq!(
+            clean_lexical_path(Path::new(r"\\?\C:\foo/bar/../baz")).unwrap(),
+            PathBuf::from(r"\\?\C:\foo\baz")
+        );
+        assert_eq!(
+            clean_lexical_path(Path::new("//?/C:/foo/./bar/../../qux")).unwrap(),
+            PathBuf::from(r"\\?\C:\qux")
+        );
+        assert_eq!(
+            clean_lexical_path(Path::new(r"\\?\C:\../..")).unwrap(),
+            PathBuf::from(r"\\?\C:\")
+        );
+        // Trailing space on verbatim component must remain intact while `/` + `..` collapse.
+        assert_eq!(
+            clean_lexical_path(Path::new(r"\\?\C:\dir /sub/../end ")).unwrap(),
+            PathBuf::from(r"\\?\C:\dir \end ")
+        );
+        assert_eq!(
+            clean_lexical_path(Path::new(r"\\?\UNC\server\share/a/./b/../c")).unwrap(),
+            PathBuf::from(r"\\?\UNC\server\share\a\c")
+        );
     }
 }
