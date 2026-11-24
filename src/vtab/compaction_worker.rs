@@ -294,6 +294,7 @@ fn wait_for_signal_or_backoff(signal: &Signal, next_retry_at: Option<Instant>) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassOutcome {
     IdleOrDone,
+    Deferred,
     Poisoned,
     Error,
 }
@@ -386,7 +387,7 @@ fn run_drain_cycle<FS: PlatformFs>(
             // Up to two passes: rolling over an already-fragmented active writer during pass 1
             // can seal one more fragmented segment that a bounded second pass immediately cleans.
             blob_reloc_passes += 1;
-            let Some(mut session) = ({
+            let (session_opt, tx_active) = {
                 let Ok(mut eng) = engine.write() else {
                     return PassOutcome::Poisoned;
                 };
@@ -394,7 +395,8 @@ fn run_drain_cycle<FS: PlatformFs>(
                     return PassOutcome::Poisoned;
                 }
                 match eng.start_std_blob_relocation(0.5) {
-                    Ok(session) => session,
+                    Ok(Some(session)) => (Some(session), false),
+                    Ok(None) => (None, eng.in_active_transaction()),
                     Err(e) => {
                         eng.record_maintenance_failure(&e);
                         return if eng.is_poisoned() {
@@ -404,7 +406,11 @@ fn run_drain_cycle<FS: PlatformFs>(
                         };
                     }
                 }
-            }) else {
+            };
+            let Some(mut session) = session_opt else {
+                if tx_active {
+                    return PassOutcome::Deferred;
+                }
                 blob_reloc_passes = 2;
                 continue;
             };
@@ -441,8 +447,7 @@ fn run_drain_cycle<FS: PlatformFs>(
                 match step {
                     StdBlobRelocStep::Continue => std::thread::yield_now(),
                     StdBlobRelocStep::Deferred => {
-                        blob_reloc_passes = 2;
-                        break;
+                        return PassOutcome::Deferred;
                     }
                     StdBlobRelocStep::Finished { relocated } => {
                         if relocated == 0 {
@@ -488,6 +493,11 @@ fn worker_loop<FS: PlatformFs>(
                 consecutive_failures = 0;
                 consecutive_panics = 0;
                 next_retry_at = None;
+            }
+            Ok(PassOutcome::Deferred) => {
+                consecutive_failures = 0;
+                consecutive_panics = 0;
+                next_retry_at = Some(Instant::now() + BASE_BACKOFF);
             }
             Ok(PassOutcome::Poisoned) => {
                 next_retry_at = None;
@@ -859,5 +869,67 @@ mod tests {
             drop_start.elapsed()
         );
         assert!(!engine.read().unwrap().is_relocating_std_blobs());
+    }
+
+    #[test]
+    fn compaction_worker_resumes_deferred_relocation_after_tx_commits() {
+        // R2-M9a: when an open transaction defers std-blob relocation, the worker must retry and
+        // finish once the transaction ends rather than parking permanently in IdleOrDone.
+        let tmp = TempTestDir::new("r2_m9a_worker_deferred_resume");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 2048;
+        cfg.inline_threshold_bytes = 128;
+        cfg.max_blob_segment_bytes = 64 * 1024;
+        cfg.auto_compact_segment_threshold = 64;
+        cfg.max_segments_before_inline_compaction = 10_000;
+        cfg.background_compaction = true;
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+
+        let payload = vec![0x5Au8; 16 * 1024];
+        {
+            let mut eng = engine.write().unwrap();
+            for i in 0..24u32 {
+                let k = format!("dk_{i:04}").into_bytes();
+                eng.put_row(1, &k, &payload, &[], WriteDurability::BufferedFast)
+                    .unwrap();
+            }
+            eng.compact().unwrap();
+            for i in 0..24u32 {
+                if i % 3 < 2 {
+                    let k = format!("dk_{i:04}").into_bytes();
+                    eng.delete_row(1, &k, WriteDurability::BufferedFast)
+                        .unwrap();
+                }
+            }
+            eng.flush_memtable().unwrap();
+            assert!(eng.has_fragmented_std_blobs(0.5));
+            // Hold a transaction open BEFORE spawning the worker so the initial drain is deferred.
+            eng.begin_transaction_for_conn(42).unwrap();
+        }
+
+        let worker = CompactionWorker::spawn(Arc::clone(&engine)).expect("spawn worker");
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            engine.read().unwrap().has_fragmented_std_blobs(0.5),
+            "relocation must stay deferred while tx is active"
+        );
+
+        // Commit an empty tx (emits NO compaction hook notification) and confirm the worker wakes
+        // from Deferred backoff and finishes the relocation on its own.
+        engine
+            .write()
+            .unwrap()
+            .commit_transaction_for_conn(42)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.read().unwrap().has_fragmented_std_blobs(0.5) {
+            assert!(
+                Instant::now() < deadline,
+                "worker must resume deferred relocation once tx commits"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(worker);
     }
 }

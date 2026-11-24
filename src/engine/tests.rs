@@ -9572,3 +9572,147 @@ fn mixed_durability_sync_vtab_before_buffered_vtab_keeps_sync_upgrade() {
         "upgraded mixed tx must go through synchronous WAL group commit"
     );
 }
+
+#[test]
+fn reclaim_dead_blobs_defers_unlink_until_wal_rotation_and_finish_reloc_drains_group() {
+    // R2-C2 & R2-M9a:
+    // 1. reclaim_fully_dead_blob_segments must defer unlinking while MemTable/WAL is non-empty,
+    //    and remove reclaimed std seqs from `unrelocatable_std_blobs`.
+    let tmp = TempTestDir::new("r2_c2_reclaim_defers_unlink");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 1024;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    engine
+        .put_row(1, b"k1", &[0x11u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let seg1 = *engine.std_blobs.keys().next().unwrap();
+    engine
+        .put_row(1, b"k2", &[0x22u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.unrelocatable_std_blobs.insert(seg1);
+    // Delete k1 in MemTable without flushing; seg1 is dead in MemTable/WAL.
+    engine
+        .delete_row(1, b"k1", WriteDurability::BufferedFast)
+        .unwrap();
+    engine.reclaim_fully_dead_blob_segments().unwrap();
+
+    let seg1_name = crate::meta::format_std_blob_file_name(seg1);
+    assert!(!engine.std_blobs.contains_key(&seg1));
+    assert!(!engine.unrelocatable_std_blobs.contains(&seg1));
+    assert_eq!(engine.unlink_after_wal_rotation, vec![seg1_name.clone()]);
+    assert!(
+        fs.list_files().unwrap().contains(&seg1_name),
+        "dead segment referenced by uncheckpointed WAL must stay on disk until WAL rotation"
+    );
+
+    // Flush MemTable rotates WAL and deletes `seg1_name`.
+    engine.flush_memtable().unwrap();
+    assert!(engine.unlink_after_wal_rotation.is_empty());
+    assert!(!fs.list_files().unwrap().contains(&seg1_name));
+
+    // 2. finish_std_blob_relocation drains `pending_group` before checking memtable emptiness, and
+    //    sets `deferred_flush_on_commit` when called inside an active transaction.
+    engine.flush_memtable().unwrap();
+    let _ticket = commit_into_group(&mut engine, 1, b"grp_k", b"grp_v");
+    assert!(engine.memtable.is_empty());
+    assert!(!engine.pending_group.is_empty());
+    engine.finish_std_blob_relocation(1).unwrap();
+    assert!(engine.pending_group.is_empty());
+    assert!(engine.memtable.is_empty());
+
+    engine.begin_transaction_for_conn(9).unwrap();
+    engine.finish_std_blob_relocation(1).unwrap();
+    assert!(engine.deferred_flush_on_commit);
+    engine.rollback_transaction().unwrap();
+}
+
+#[test]
+fn single_sector_wal_sub_batches_eviction_and_relocation_and_stops_on_flush_err() {
+    // R2-M4 & R2-M5
+    assert_eq!(
+        crate::engine::eviction::max_wal_sub_batch_bytes(1, 64 * 1024),
+        4045
+    );
+
+    let tmp = TempTestDir::new("r2_m4_m5_one_sector_wal");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.buf_wal_size_bytes = 4096; // 1 sector
+    cfg.sync_wal_size_bytes = 4096; // 1 sector
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4096;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    // Insert 150 small inline rows into capped table 2 under a large quota, then shrink quota
+    // to force multi-sub-batch eviction on a 1-sector WAL.
+    engine.register_capped_table(2, 1_000_000).unwrap();
+    for i in 0..150u32 {
+        let pk = format!("ev_{i:04}");
+        engine
+            .put_row(
+                2,
+                pk.as_bytes(),
+                &[0x55u8; 40],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    engine.register_capped_table(2, 512).unwrap();
+    assert!(
+        engine.capped_table_state(2).unwrap().current_logical_bytes <= 512,
+        "1-sector WAL eviction must split sub-batches <= 4045 B without WriteZero"
+    );
+
+    // Populate fragmented std blobs across many keys so relocation spans multiple WAL sub-batches
+    // on the 1-sector WAL.
+    for i in 0..220u32 {
+        let pk = format!("rel_{i:04}_padded_pk_to_fill_wal_batch");
+        engine
+            .put_row(
+                1,
+                pk.as_bytes(),
+                &[0x77u8; 128],
+                &[],
+                WriteDurability::BufferedFast,
+            )
+            .unwrap();
+    }
+    engine.compact().unwrap();
+    for i in 0..220u32 {
+        if i % 3 < 2 {
+            let pk = format!("rel_{i:04}_padded_pk_to_fill_wal_batch");
+            engine
+                .delete_row(1, pk.as_bytes(), WriteDurability::BufferedFast)
+                .unwrap();
+        }
+    }
+    engine.flush_memtable().unwrap();
+
+    // Test R2-M4: mid-chunk flush failure must not advance `session.seek_key` past un-flushed keys.
+    if let Some(mut session) = engine.start_std_blob_relocation(0.2).unwrap() {
+        let initial_seek = session.seek_key.clone();
+        engine.debug_fail_next_wal_append();
+        let err = engine.step_std_blob_relocation(&mut session, 200, usize::MAX);
+        assert!(err.is_err());
+        assert!(engine.is_poisoned());
+        assert_eq!(
+            session.seek_key, initial_seek,
+            "failed sub-batch flush must not advance seek_key beyond last committed sub-batch"
+        );
+    }
+
+    // Reopen clean engine and confirm 1-sector WAL relocation succeeds cleanly end-to-end.
+    drop(engine);
+    let mut cfg2 = EngineConfig::default();
+    cfg2.buf_wal_size_bytes = 4096;
+    cfg2.sync_wal_size_bytes = 4096;
+    cfg2.inline_threshold_bytes = 64;
+    cfg2.max_blob_segment_bytes = 4096;
+    let mut engine2 = StorageEngine::open(Arc::clone(&fs), cfg2).unwrap();
+    let relocated = engine2.relocate_fragmented_std_blobs(0.2).unwrap();
+    assert!(relocated > 0);
+}

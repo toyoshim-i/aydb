@@ -28,6 +28,24 @@ pub(super) fn est_wal_record_bytes(rec: &WalRecord) -> usize {
     }
 }
 
+/// Computes a safe sub-batch WAL byte cap that fits within `total_sectors` without overflowing a
+/// 1-sector (`4096 B`) WAL, capped at `max_cap_bytes`.
+#[inline]
+pub(super) fn max_wal_sub_batch_bytes(total_sectors: usize, max_cap_bytes: usize) -> usize {
+    let single_sector_cap =
+        crate::wal::MAX_FRAGMENT_DATA_LEN.saturating_sub(crate::wal::WAL_BATCH_HEADER_SIZE);
+    if total_sectors <= 1 {
+        return single_sector_cap.min(max_cap_bytes);
+    }
+    let wal_bytes = (total_sectors as u64).saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
+    let max_usable = ((total_sectors as u64)
+        .saturating_mul(crate::wal::MAX_FRAGMENT_DATA_LEN as u64))
+    .saturating_sub(crate::wal::WAL_BATCH_HEADER_SIZE as u64);
+    (wal_bytes / 2)
+        .clamp(single_sector_cap as u64, max_cap_bytes as u64)
+        .min(max_usable) as usize
+}
+
 impl<FS: PlatformFs> StorageEngine<FS> {
     /// Registers or updates a Capped Table with a strict `max_bytes` quota and automatic LRU eviction.
     pub fn register_capped_table(&mut self, table_id: u16, max_bytes: u64) -> io::Result<()> {
@@ -186,15 +204,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.drain_group_for_autocommit()?;
 
         let max_window_wal_bytes = if self.tx_depth == 0 {
-            let wal_bytes = match durability {
-                WriteDurability::SyncTransactional => {
-                    self.sync_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
-                }
-                WriteDurability::BufferedFast => {
-                    self.buf_wal.total_sectors() * crate::wal::WAL_SECTOR_SIZE
-                }
+            let sectors = match durability {
+                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
             };
-            (wal_bytes / 2).clamp(4096, 64 * 1024)
+            max_wal_sub_batch_bytes(sectors, 64 * 1024)
         } else {
             usize::MAX
         };
@@ -243,22 +257,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "invalid LRU queue key")
                         })?;
-                    last_scanned_tick = old_tick;
 
                     if matches!(entry.value, IndexValue::Tombstone) {
+                        last_scanned_tick = old_tick;
                         continue;
                     }
                     let pk = pk_slice.to_vec();
 
                     if let Some(&prev_action) = handled_pks.get(&pk) {
                         if prev_action == Some(old_tick) {
+                            last_scanned_tick = old_tick;
                             continue;
                         }
                         // Duplicate or stale `'l'` entry for a PK already handled in this window.
                         let del = WalRecord::Delete { key: entry.key };
-                        batch_est_bytes =
-                            batch_est_bytes.saturating_add(est_wal_record_bytes(&del));
+                        let del_est = est_wal_record_bytes(&del);
+                        if !batch_records.is_empty()
+                            && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
+                        {
+                            break;
+                        }
+                        batch_est_bytes = batch_est_bytes.saturating_add(del_est);
                         batch_records.push(del);
+                        last_scanned_tick = old_tick;
                         window_next_cursor = Some(old_tick.saturating_add(1));
                         if batch_est_bytes >= max_window_wal_bytes {
                             break;
@@ -269,29 +290,54 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     // Check if this key was accessed in RAM since `old_tick` was indexed!
                     if let Some(hot_tick) = self.access_tracker.peek_hot_tick(table_id, &pk) {
                         if hot_tick > old_tick {
-                            consumed_hot_ticks.push((pk.clone(), hot_tick));
                             // LAZY PROMOTION: Move key to `hot_tick` in the LRU queue without evicting!
-                            let rec_start = batch_records.len();
                             let meta_key = encode_row_meta_key(table_id, &pk);
-                            batch_records.push(WalRecord::Delete {
+                            let promo_del_lru = WalRecord::Delete {
                                 key: entry.key.clone(),
-                            });
-                            batch_records.push(WalRecord::PutInline {
+                            };
+                            let promo_put_lru = WalRecord::PutInline {
                                 key: encode_lru_queue_key(table_id, hot_tick, &pk),
                                 value: Vec::new(),
-                            });
-                            if let Some((mut mrec, m_ptr)) =
+                            };
+                            let mut cand_est = est_wal_record_bytes(&promo_del_lru)
+                                .saturating_add(est_wal_record_bytes(&promo_put_lru));
+                            let meta_info = if let Some((mut mrec, m_ptr)) =
                                 self.get_row_meta_with_ptr(&meta_key)?
                             {
+                                mrec.recorded_tick = hot_tick;
+                                let meta_bytes = mrec.to_bytes()?;
+                                let inline = IndexEntry::inline_fits_in_block(
+                                    meta_key.len(),
+                                    meta_bytes.len(),
+                                );
+                                let meta_est = if inline {
+                                    9 + meta_key.len() + meta_bytes.len()
+                                } else {
+                                    28 + meta_key.len()
+                                };
+                                cand_est = cand_est.saturating_add(meta_est);
+                                Some((m_ptr, meta_bytes, inline))
+                            } else {
+                                None
+                            };
+                            if !batch_records.is_empty()
+                                && batch_est_bytes.saturating_add(cand_est) > max_window_wal_bytes
+                            {
+                                break;
+                            }
+                            consumed_hot_ticks.push((pk.clone(), hot_tick));
+                            batch_records.push(promo_del_lru);
+                            batch_records.push(promo_put_lru);
+                            if let Some((m_ptr, meta_bytes, inline)) = meta_info {
                                 if let Some(p) = m_ptr {
                                     old_dead_ptrs.push(p);
                                 }
-                                mrec.recorded_tick = hot_tick;
-                                let meta_bytes = mrec.to_bytes()?;
-                                if !IndexEntry::inline_fits_in_block(
-                                    meta_key.len(),
-                                    meta_bytes.len(),
-                                ) {
+                                if inline {
+                                    batch_records.push(WalRecord::PutInline {
+                                        key: meta_key,
+                                        value: meta_bytes,
+                                    });
+                                } else {
                                     let ptr = self.append_to_blob_segment(
                                         BlobKind::Standard,
                                         0,
@@ -303,18 +349,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                         key: meta_key,
                                         blob_ptr: ptr,
                                     });
-                                } else {
-                                    batch_records.push(WalRecord::PutInline {
-                                        key: meta_key,
-                                        value: meta_bytes,
-                                    });
                                 }
                             }
-                            for r in &batch_records[rec_start..] {
-                                batch_est_bytes =
-                                    batch_est_bytes.saturating_add(est_wal_record_bytes(r));
-                            }
+                            batch_est_bytes = batch_est_bytes.saturating_add(cand_est);
                             window_promotions += 1;
+                            last_scanned_tick = old_tick;
                             window_next_cursor = Some(old_tick.saturating_add(1));
                             handled_pks.insert(pk, Some(hot_tick));
                             if batch_est_bytes >= max_window_wal_bytes {
@@ -330,9 +369,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if existing == ExistingRowStatus::NotFound {
                         // Stale LRU queue entry whose row was already gone; clean up the orphan `'l'` key.
                         let del = WalRecord::Delete { key: entry.key };
-                        batch_est_bytes =
-                            batch_est_bytes.saturating_add(est_wal_record_bytes(&del));
+                        let del_est = est_wal_record_bytes(&del);
+                        if !batch_records.is_empty()
+                            && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
+                        {
+                            break;
+                        }
+                        batch_est_bytes = batch_est_bytes.saturating_add(del_est);
                         batch_records.push(del);
+                        last_scanned_tick = old_tick;
                         window_next_cursor = Some(old_tick.saturating_add(1));
                         handled_pks.insert(pk, None);
                         if batch_est_bytes >= max_window_wal_bytes {
@@ -340,15 +385,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         continue;
                     }
+
+                    let mut cand_records = Vec::new();
+                    let mut cand_dead_ptrs = Vec::new();
                     if let ExistingRowStatus::Blob(old_ptr) = existing {
-                        old_dead_ptrs.push(old_ptr);
+                        cand_dead_ptrs.push(old_ptr);
                     }
 
-                    let rec_start = batch_records.len();
-                    batch_records.push(WalRecord::Delete {
+                    cand_records.push(WalRecord::Delete {
                         key: row_key.clone(),
                     });
-                    self.append_rowid_deletes(table_id, &pk, &mut batch_records)?;
+                    self.append_rowid_deletes(table_id, &pk, &mut cand_records)?;
                     let mut old_logical_size = 0u64;
                     let mut deleted_entry_key = false;
 
@@ -357,7 +404,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         match self.get_row_meta_lookup(&meta_key)? {
                             MetaLookup::Found(old_meta, m_ptr) => {
                                 if let Some(p) = m_ptr {
-                                    old_dead_ptrs.push(p);
+                                    cand_dead_ptrs.push(p);
                                 }
                                 old_logical_size = old_meta.logical_size as u64;
                                 if old_meta.recorded_tick > 0 {
@@ -366,10 +413,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                     if lru_k == entry.key {
                                         deleted_entry_key = true;
                                     }
-                                    batch_records.push(WalRecord::Delete { key: lru_k });
+                                    cand_records.push(WalRecord::Delete { key: lru_k });
                                 }
                                 for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                                    batch_records.push(WalRecord::Delete {
+                                    cand_records.push(WalRecord::Delete {
                                         key: encode_secondary_index_key(
                                             table_id,
                                             *old_idx_id,
@@ -378,11 +425,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                         ),
                                     });
                                 }
-                                batch_records.push(WalRecord::Delete { key: meta_key });
+                                cand_records.push(WalRecord::Delete { key: meta_key });
                             }
                             MetaLookup::Corrupt(m_ptr) => {
                                 if let Some(p) = m_ptr {
-                                    old_dead_ptrs.push(p);
+                                    cand_dead_ptrs.push(p);
                                 }
                                 let (orphans, est) =
                                     self.collect_orphans_for_pk(table_id, &pk, &row_key)?;
@@ -391,24 +438,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                     if key == entry.key {
                                         deleted_entry_key = true;
                                     }
-                                    batch_records.push(WalRecord::Delete { key });
+                                    cand_records.push(WalRecord::Delete { key });
                                 }
-                                batch_records.push(WalRecord::Delete { key: meta_key });
+                                cand_records.push(WalRecord::Delete { key: meta_key });
                             }
                             MetaLookup::Absent => {}
                         }
                     }
                     if !deleted_entry_key {
-                        batch_records.push(WalRecord::Delete { key: entry.key });
+                        cand_records.push(WalRecord::Delete { key: entry.key });
                     }
-                    for r in &batch_records[rec_start..] {
-                        batch_est_bytes = batch_est_bytes.saturating_add(est_wal_record_bytes(r));
+                    let cand_est = cand_records
+                        .iter()
+                        .fold(0usize, |acc, r| acc.saturating_add(est_wal_record_bytes(r)));
+                    if !batch_records.is_empty()
+                        && batch_est_bytes.saturating_add(cand_est) > max_window_wal_bytes
+                    {
+                        break;
                     }
+                    batch_records.extend(cand_records);
+                    old_dead_ptrs.extend(cand_dead_ptrs);
+                    batch_est_bytes = batch_est_bytes.saturating_add(cand_est);
 
                     evicted_logical_bytes = evicted_logical_bytes.saturating_add(old_logical_size);
                     projected_logical_bytes =
                         projected_logical_bytes.saturating_sub(old_logical_size);
                     window_evictions += 1;
+                    last_scanned_tick = old_tick;
                     window_next_cursor = Some(old_tick.saturating_add(1));
                     consumed_hot_ticks.push((pk.clone(), u64::MAX));
                     handled_pks.insert(pk, None);
@@ -539,9 +595,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         apply_repairs: bool,
     ) -> io::Result<bool> {
         const RECONCILE_BATCH_SIZE: usize = 512;
-        let wal_bytes = (self.buf_wal.total_sectors() as u64)
-            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
-        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
+        let max_batch_wal_bytes = max_wal_sub_batch_bytes(self.buf_wal.total_sectors(), 512 * 1024);
         let meta_prefix = encode_namespace_prefix(tid, NS_ROW_META);
         let user_prefix = encode_namespace_prefix(tid, NS_PRIMARY_ROW);
 

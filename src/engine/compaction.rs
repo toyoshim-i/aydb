@@ -47,7 +47,7 @@ pub struct CompactionOutput<FS: PlatformFs> {
 pub(crate) struct StdBlobRelocationSession {
     fragmented_seqs: HashSet<u64>,
     max_batch_wal_bytes: usize,
-    seek_key: Vec<u8>,
+    pub(super) seek_key: Vec<u8>,
     lower_inclusive: bool,
     relocated: usize,
     done: bool,
@@ -470,9 +470,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if fragmented_seqs.is_empty() {
             return Ok(None);
         }
-        let wal_bytes = (self.buf_wal.total_sectors() as u64)
-            .saturating_mul(crate::wal::WAL_SECTOR_SIZE as u64);
-        let max_batch_wal_bytes = (wal_bytes / 2).clamp(4096, 512 * 1024) as usize;
+        let max_batch_wal_bytes =
+            super::eviction::max_wal_sub_batch_bytes(self.buf_wal.total_sectors(), 512 * 1024);
         Ok(Some(StdBlobRelocationSession {
             fragmented_seqs,
             max_batch_wal_bytes,
@@ -511,9 +510,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Flushes or reclaims newly dead sealed std-blob segments after a chunked relocation finishes.
     pub(crate) fn finish_std_blob_relocation(&mut self, relocated: usize) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if relocated == 0 || self.tx_depth > 0 {
+        if relocated == 0 {
             return Ok(());
         }
+        if self.tx_depth > 0 {
+            self.deferred_flush_on_commit = true;
+            return Ok(());
+        }
+        self.drain_pending_durable()?;
         if !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         } else {
@@ -626,6 +630,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut batch_dead_ptrs = Vec::new();
         let mut batch_new_ptrs = Vec::new();
         let mut batch_est_bytes = 0usize;
+        let mut batch_last_key: Option<Vec<u8>> = None;
+        let mut batch_relocated = 0usize;
         for entry in entries {
             if chunk_reloc_bytes > 0 && chunk_reloc_bytes >= max_reloc_bytes {
                 hit_chunk_budget = true;
@@ -639,9 +645,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         Ok(Some(payload)) => payload,
                         Ok(None) => {
                             self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
-                            session.seek_key.clear();
-                            session.seek_key.extend_from_slice(&entry.key);
-                            session.lower_inclusive = false;
+                            session.fragmented_seqs.remove(&old_ptr.seg_id);
+                            batch_last_key = Some(entry.key);
                             continue;
                         }
                         Err(e) => {
@@ -649,6 +654,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             return Err(e);
                         }
                     };
+                    let rec_est = 28usize.saturating_add(entry.key.len());
+                    if !batch_wal_records.is_empty()
+                        && batch_est_bytes.saturating_add(rec_est) > session.max_batch_wal_bytes
+                    {
+                        self.flush_relocation_batch(
+                            &mut batch_wal_records,
+                            &mut batch_new_ptrs,
+                            &mut batch_dead_ptrs,
+                        )?;
+                        if let Some(last) = batch_last_key.take() {
+                            session.seek_key = last;
+                            session.lower_inclusive = false;
+                        }
+                        session.relocated += core::mem::take(&mut batch_relocated);
+                        batch_est_bytes = 0;
+                    }
                     let payload_len = payload.len();
                     let new_ptr = match self.append_to_blob_segment(
                         BlobKind::Standard,
@@ -662,40 +683,32 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             return Err(e);
                         }
                     };
-                    session.seek_key.clear();
-                    session.seek_key.extend_from_slice(&entry.key);
-                    session.lower_inclusive = false;
                     let rec = WalRecord::PutBlobPtr {
-                        key: entry.key,
+                        key: entry.key.clone(),
                         blob_ptr: new_ptr,
                     };
-                    let rec_est = super::eviction::est_wal_record_bytes(&rec);
+                    batch_last_key = Some(entry.key);
                     batch_dead_ptrs.push(old_ptr);
                     batch_new_ptrs.push(new_ptr);
                     batch_wal_records.push(rec);
                     batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
                     chunk_reloc_bytes = chunk_reloc_bytes.saturating_add(payload_len);
-                    session.relocated += 1;
-                    if batch_est_bytes >= session.max_batch_wal_bytes {
-                        self.flush_relocation_batch(
-                            &mut batch_wal_records,
-                            &mut batch_new_ptrs,
-                            &mut batch_dead_ptrs,
-                        )?;
-                        batch_est_bytes = 0;
-                    }
+                    batch_relocated += 1;
                     continue;
                 }
             }
-            session.seek_key.clear();
-            session.seek_key.extend_from_slice(&entry.key);
-            session.lower_inclusive = false;
+            batch_last_key = Some(entry.key);
         }
         self.flush_relocation_batch(
             &mut batch_wal_records,
             &mut batch_new_ptrs,
             &mut batch_dead_ptrs,
         )?;
+        if let Some(last) = batch_last_key {
+            session.seek_key = last;
+            session.lower_inclusive = false;
+        }
+        session.relocated += batch_relocated;
         if !hit_chunk_budget && entries_len < scan_limit {
             session.done = true;
             Ok(StdBlobRelocStep::Finished {
@@ -1259,13 +1272,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Reclaims any sealed `blob_std` or `blob_lru` segment where `dead_bytes >= file_len`
     /// ($O(1)$ Copy-less Segment Deletion!).
     pub(super) fn reclaim_fully_dead_blob_segments(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         let (dead_std, dead_lru, deleted_files) = self.collect_fully_dead_blob_segments();
         if deleted_files.is_empty() {
             return Ok(());
         }
-        // The catalog records segment lengths: make them durable first (see `install_compaction`).
-        self.sync_active_blob_writers()?;
+        // The catalog records segment lengths and buffered eviction/overwrite deletions must be
+        // durable before dropping segments from `boot_meta.db` (`make_buf_wal_durable` also syncs
+        // the active blob writers).
+        if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+            self.make_buf_wal_durable(true)?;
+        } else {
+            self.sync_active_blob_writers()?;
+        }
 
         let mut std_metas = self.build_checkpointed_std_blob_metas();
         std_metas.retain(|m| !dead_std.contains(&m.seq_id));
@@ -1274,9 +1294,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.meta_mgr.commit_update(|st| {
             st.std_blob_segments = std_metas;
             st.lru_blob_segments = lru_metas;
-            for fname in &deleted_files {
-                st.queue_pending_delete(fname.clone());
-            }
         })?;
 
         if !dead_std.is_empty() {
@@ -1288,6 +1305,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         for seq in dead_std {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
+            self.unrelocatable_std_blobs.remove(&seq);
             self.std_blobs.remove(&seq);
         }
         for key in dead_lru {
@@ -1295,7 +1313,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
-        self.meta_mgr.try_process_pending_deletes();
+        // Defer unlinking whenever uncheckpointed WAL batches may still reference these segments.
+        self.unlink_after_wal_rotation.extend(deleted_files);
+        self.release_unlinkable_blob_files()?;
         Ok(())
     }
 

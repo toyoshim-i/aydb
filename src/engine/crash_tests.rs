@@ -3145,6 +3145,8 @@ fn pre_slot_meta_failure_on_blob_rollover_and_reclaim_keeps_maps_consistent() {
     fs.arm(None, None);
     e.reclaim_fully_dead_blob_segments().unwrap();
     assert!(!e.std_blobs.contains_key(&seg1_seq));
+    // Reclaiming while WAL/MemTable still holds pre-deletion batches defers unlinking until rotation.
+    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
 
     // 3. LRU blob rollover & reclaim_fully_dead_lru_blob_segments pre-slot failures.
     e.put_row(7, b"l1", &[0x33u8; 1500], &[], sync).unwrap();
@@ -3165,12 +3167,12 @@ fn pre_slot_meta_failure_on_blob_rollover_and_reclaim_keeps_maps_consistent() {
     assert!(e.reclaim_fully_dead_lru_blob_segments(7).is_err());
     assert!(!e.is_poisoned());
     assert!(e.lru_blobs.contains_key(&(7, lru_seg1_seq)));
-    assert!(e.unlink_after_wal_rotation.is_empty());
+    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
 
     fs.arm(None, None);
     e.reclaim_fully_dead_lru_blob_segments(7).unwrap();
     assert!(!e.lru_blobs.contains_key(&(7, lru_seg1_seq)));
-    assert_eq!(e.unlink_after_wal_rotation.len(), 1);
+    assert_eq!(e.unlink_after_wal_rotation.len(), 2);
 }
 
 /// A table's catalog entry and its rowid mapping marker are one atomic write. A power cut at
