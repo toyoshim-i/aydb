@@ -348,6 +348,15 @@ impl BlobClockShard {
             self.entries.clear();
             self.free_slots.clear();
             self.clock_hand = 0;
+            if self.entries.capacity() > 64 {
+                self.entries.shrink_to(0);
+            }
+            if self.free_slots.capacity() > 64 {
+                self.free_slots.shrink_to(0);
+            }
+            if self.index.capacity() > 64 {
+                self.index.shrink_to(0);
+            }
             return;
         }
         if self.entries.len() > 64 && self.free_slots.len() > self.entries.len() / 2 {
@@ -362,6 +371,17 @@ impl BlobClockShard {
             self.entries.truncate(write);
             self.free_slots.clear();
             self.clock_hand %= write.max(1);
+            let target_entries = (write * 2).max(64);
+            if self.entries.capacity() > target_entries.saturating_mul(2) {
+                self.entries.shrink_to(target_entries);
+            }
+            if self.free_slots.capacity() > 64 {
+                self.free_slots.shrink_to(0);
+            }
+            let target_index = (self.index.len() * 2).max(64);
+            if self.index.capacity() > target_index.saturating_mul(2) {
+                self.index.shrink_to(target_index);
+            }
         }
     }
 }
@@ -1023,6 +1043,58 @@ mod tests {
                 "16 KB blob must fit in {budget}-byte cache"
             );
             assert_eq!(out, max_payload);
+        }
+    }
+
+    #[test]
+    fn blob_shard_compaction_shrinks_over_allocated_containers() {
+        let cache = VerifiedBlobCache::new(16 * 1024 * 1024);
+        for i in 0..4096u32 {
+            let k = BlobCacheKey {
+                kind: crate::wal::BlobKind::Standard as u8,
+                table_id: 1,
+                seg_id: (i % 4) as u64 + 1,
+                offset: i * 16,
+                len: 8,
+                crc32c: i,
+                key_hash: i as u64,
+            };
+            cache.insert(k, &[0x42u8; 8]);
+        }
+        let total_cap_before: usize = cache
+            .shards
+            .iter()
+            .map(|s| {
+                let g = s.lock();
+                g.entries.capacity() + g.free_slots.capacity() + g.index.capacity()
+            })
+            .sum();
+        assert!(total_cap_before >= 4096);
+
+        // Remove 3/4 of segments to trigger partial shard compaction, then remaining segment to clear.
+        for seg in 1..=3u64 {
+            cache.invalidate_blob_segment(crate::wal::BlobKind::Standard as u8, 1, seg);
+        }
+        let total_cap_mid: usize = cache
+            .shards
+            .iter()
+            .map(|s| {
+                let g = s.lock();
+                g.entries.capacity() + g.free_slots.capacity() + g.index.capacity()
+            })
+            .sum();
+        assert!(
+            total_cap_mid < total_cap_before,
+            "mid capacity {total_cap_mid} should shrink below {total_cap_before}"
+        );
+
+        cache.invalidate_blob_segment(crate::wal::BlobKind::Standard as u8, 1, 4);
+        for s in &cache.shards {
+            let g = s.lock();
+            assert!(g.index.is_empty());
+            assert!(g.entries.capacity() <= 64);
+            assert!(g.free_slots.capacity() <= 64);
+            assert!(g.index.capacity() <= 64);
         }
     }
 }

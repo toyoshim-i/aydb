@@ -538,6 +538,7 @@ fn validate_block_entry_layout(
     dir_start: usize,
 ) -> io::Result<()> {
     let mut prev_end = 0usize;
+    let mut prev_key: Option<&[u8]> = None;
     for i in 0..num_entries {
         let dir_pos = dir_start + (i * 2);
         let off = u16::from_le_bytes([buf[dir_pos], buf[dir_pos + 1]]) as usize;
@@ -573,6 +574,14 @@ fn validate_block_entry_layout(
                 "corrupted key slice in 4 KB index block",
             ));
         }
+        let key = &buf[kstart..kend];
+        if prev_key.is_some_and(|prev| key <= prev) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsorted or duplicate keys in 4 KB index block",
+            ));
+        }
+        prev_key = Some(key);
         let vend = match val_type {
             1 => {
                 let Some(vstart) = kend.checked_add(2) else {
@@ -1115,13 +1124,24 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
                 "idx segment metadata exceeds MAX_INDEX_META_BYTES",
             ));
         }
+        let expected_total_len =
+            expected_meta_len
+                .checked_add(IDX_FOOTER_SIZE)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "idx metadata and footer size overflow",
+                    )
+                })?;
         let mut meta_buf = Vec::new();
-        meta_buf.try_reserve_exact(expected_meta_len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "failed to allocate idx segment metadata buffer",
-            )
-        })?;
+        meta_buf
+            .try_reserve_exact(expected_total_len)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "failed to allocate idx segment metadata buffer",
+                )
+            })?;
         bloom.encode(&mut meta_buf);
         meta_buf.extend_from_slice(&fp_count_u32.to_le_bytes());
         for fp in &self.fence_pointers {
@@ -1162,6 +1182,7 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
         footer[44..48].copy_from_slice(&footer_crc.to_le_bytes());
 
         meta_buf.extend_from_slice(&footer);
+        debug_assert_eq!(meta_buf.capacity(), expected_total_len);
         self.file.write_all_at(&meta_buf, meta_offset)?;
         self.write_offset += meta_buf.len() as u64;
         self.file.sync_durable()?;
@@ -3319,5 +3340,64 @@ mod tests {
             IdxSegmentReader::open(&fs, 12).err().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
+
+        // 4. `IdxBlockReader::open_verified` rejects unsorted and duplicate keys even with valid CRC.
+        let craft_two_key_block = |k_first: &[u8], k_second: &[u8]| -> [u8; IDX_BLOCK_SIZE] {
+            let mut blk = [0u8; IDX_BLOCK_SIZE];
+            let mut write_entry = |pos: usize, key: &[u8], lsn: u64| -> usize {
+                blk[pos..pos + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+                blk[pos + 2] = 1; // Inline
+                blk[pos + 3..pos + 11].copy_from_slice(&lsn.to_le_bytes());
+                let ks = pos + 11;
+                blk[ks..ks + key.len()].copy_from_slice(key);
+                let vs = ks + key.len();
+                blk[vs..vs + 2].copy_from_slice(&1u16.to_le_bytes());
+                blk[vs + 2] = b'v';
+                vs + 3
+            };
+            let off0 = 0usize;
+            let off1 = write_entry(off0, k_first, 1);
+            let _end = write_entry(off1, k_second, 2);
+            let dir_start = IDX_BLOCK_USABLE_SIZE - 4;
+            blk[dir_start..dir_start + 2].copy_from_slice(&(off0 as u16).to_le_bytes());
+            blk[dir_start + 2..dir_start + 4].copy_from_slice(&(off1 as u16).to_le_bytes());
+            blk[4088..4090].copy_from_slice(&2u16.to_le_bytes());
+            let crc = crc32c(&blk[0..4092]);
+            blk[4092..4096].copy_from_slice(&crc.to_le_bytes());
+            blk
+        };
+
+        let descending_blk = craft_two_key_block(b"k2", b"k1");
+        assert_eq!(
+            IdxBlockReader::open_verified(&descending_blk)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let duplicate_blk = craft_two_key_block(b"k1", b"k1");
+        assert_eq!(
+            IdxBlockReader::open_verified(&duplicate_blk)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // 5. `IdxSegmentBuilder::finish` with bounded bloom & multi-block segment completes with exact footer reservation.
+        let mut sb2 = IdxSegmentBuilder::create(&fs, 13, 0, 10).unwrap();
+        for i in 0..200u32 {
+            let k = format!("key_{i:04}");
+            let v = vec![0x33u8; 64];
+            sb2.add_entry(&IndexEntry {
+                key: k.into_bytes(),
+                lsn: i as u64 + 1,
+                value: IndexValue::Inline(v),
+            })
+            .unwrap();
+        }
+        let multi = sb2.finish().unwrap();
+        assert_eq!(multi.record_count(), 200);
+        assert!(multi.num_blocks() > 1);
     }
 }
