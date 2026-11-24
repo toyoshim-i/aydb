@@ -98,6 +98,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.quotas_modified_in_tx = true;
             self.tx_prepared = false;
             self.tx_synced_vtabs.clear();
+            self.tx_sync_durability_upgrade = false;
         }
         Ok(())
     }

@@ -344,6 +344,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `checkpoint_lsn` and recovery skips it before verifying its blobs. A non-empty `MemTable`
     /// leaves the list for the flush that rotates the WAL.
     pub(super) fn release_unlinkable_blob_files(&mut self) -> io::Result<()> {
+        self.check_not_poisoned()?;
         if self.unlink_after_wal_rotation.is_empty()
             || !self.memtable.is_empty()
             || !self.pending_group.is_empty()
@@ -1206,6 +1207,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the catalog. The files themselves are unlinked only after the WAL epochs that may still
     /// mention them have been rotated away (see `unlink_after_wal_rotation`).
     pub(super) fn reclaim_fully_dead_lru_blob_segments(&mut self, table_id: u16) -> io::Result<()> {
+        self.check_not_poisoned()?;
         let active_seq = self.active_lru_writers.get(&table_id).map(|w| w.seq_id());
         let dead_lru: Vec<(u16, u64)> = self
             .lru_blobs

@@ -369,6 +369,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) tx_prepared: bool,
     /// True while `prepare_commit_transaction()` is running internal quota eviction.
     pub(super) tx_preparing: bool,
+    /// True while `drop_table_with_durability()` is appending internal drop deletes, bypassing
+    /// `max_transaction_bytes` without pretending to be inside `prepare_commit_transaction()`.
+    pub(super) tx_bypass_size_limit: bool,
+    /// True after a participating sync vtab reached `xSync`, so a later buffered vtab preparing
+    /// the commit upgrades `pending_tx_sync` inside `prepare_commit_transaction()`.
+    pub(super) tx_sync_durability_upgrade: bool,
     /// True after a non-group `SyncTransactional` batch was appended to `sync_wal` and before
     /// `finish_commit_for_conn()` receives its barrier outcome.
     pub(super) tx_sync_in_flight: bool,
@@ -1243,6 +1249,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             compaction_hook_id: 0,
             tx_prepared: false,
             tx_preparing: false,
+            tx_bypass_size_limit: false,
+            tx_sync_durability_upgrade: false,
             tx_sync_in_flight: false,
             pending_tx_buf: Vec::new(),
             pending_tx_record_count: 0,
@@ -2139,9 +2147,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.begin_transaction();
         }
         if !records.is_empty() {
-            let was_preparing = core::mem::replace(&mut self.tx_preparing, true);
+            let prev_bypass = core::mem::replace(&mut self.tx_bypass_size_limit, true);
             let res = self.commit_wal_and_memtable(records, durability);
-            self.tx_preparing = was_preparing;
+            self.tx_bypass_size_limit = prev_bypass;
             if let Err(e) = res {
                 if internal_tx {
                     let _ = self.rollback_transaction();
@@ -4161,6 +4169,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .sum();
             let next_tx_bytes = self.pending_tx_bytes.saturating_add(batch_bytes);
             if !self.tx_preparing
+                && !self.tx_bypass_size_limit
                 && self.config.max_transaction_bytes > 0
                 && next_tx_bytes > self.config.max_transaction_bytes
             {
@@ -4181,6 +4190,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if !self.tx_preparing {
                 self.tx_prepared = false;
                 self.tx_synced_vtabs.clear();
+                self.tx_sync_durability_upgrade = false;
             }
             self.pending_tx_bytes = next_tx_bytes;
             self.next_lsn = successor;

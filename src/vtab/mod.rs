@@ -4216,10 +4216,11 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
                 return io_err_to_sqlite_rc(&e);
             }
             if sqlite3_txn_state(vtab.db, core::ptr::null()) == SQLITE_TXN_WRITE {
+                let durability = eng.effective_tx_durability(vtab.durability);
                 if !vtab.pending_ddl.set_tx_commit(PendingDdl::TxCommit {
                     engine: Arc::clone(&vtab.engine),
                     conn_id: vtab.db as usize,
-                    durability: vtab.durability,
+                    durability,
                 }) {
                     return SQLITE_ERROR;
                 }
@@ -4255,10 +4256,12 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             Ok(mut eng) => {
                 if !eng.conn_has_open_transaction(vtab.db as usize) {
                     Ok(CommitStep::Done)
-                } else if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
-                    set_vtab_err_msg(vtab.base.get(), &e.to_string());
-                    return io_err_to_sqlite_rc(&e);
                 } else {
+                    let durability = eng.effective_tx_durability(vtab.durability);
+                    if let Err(e) = eng.prepare_commit_transaction(durability) {
+                        set_vtab_err_msg(vtab.base.get(), &e.to_string());
+                        return io_err_to_sqlite_rc(&e);
+                    }
                     #[cfg(test)]
                     {
                         fail_sync_flag = Some(eng.debug_fail_wal_sync_flag());

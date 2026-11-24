@@ -9417,3 +9417,158 @@ fn group_gate_failure_and_awaiting_sync_abort_poison_and_block_compaction() {
         );
     }
 }
+
+#[test]
+fn commit_at_zero_depth_preserves_state_and_one_depth_rolls_back_on_poison() {
+    // R2-H2: commit_transaction at tx_depth == 0 on a poisoned engine is a no-op that never
+    // invokes restore_tx_state with an inactive TxMetaSnapshot; at tx_depth == 1 it rolls back
+    // the active transaction overlay and fails cleanly.
+    let tmp = TempTestDir::new("r2_h2_commit_poison_depth");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    let plan = engine.plan_vtab_registration("t", None).unwrap();
+    let (tid, _) = engine
+        .register_vtab_plan(plan, WriteDurability::BufferedFast, None)
+        .unwrap();
+    engine.register_capped_table(tid, 64 * 1024).unwrap();
+    engine
+        .put_row(
+            tid,
+            b"k1",
+            &[0x22u8; 2048],
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+
+    let next_lsn_before = engine.next_lsn();
+    let std_blob_cnt = engine.std_blobs.len();
+    let lru_blob_cnt = engine.lru_blobs.len();
+    let capped_cnt = engine.capped_tables.len();
+    let active_cnt = engine.active_vtab_ids.len();
+
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(
+            tid,
+            b"k2",
+            b"uncommitted",
+            &[],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    engine.debug_poison("simulated poison at depth 1");
+    assert!(engine.commit_transaction().is_err());
+    assert_eq!(engine.tx_depth, 0);
+    assert!(engine.get_row(tid, b"k2").unwrap().is_none());
+
+    // Calling commit_transaction again at tx_depth == 0 must NOT zero out state.
+    engine.commit_transaction().unwrap();
+    assert_eq!(engine.next_lsn(), next_lsn_before);
+    assert_eq!(engine.std_blobs.len(), std_blob_cnt);
+    assert_eq!(engine.lru_blobs.len(), lru_blob_cnt);
+    assert_eq!(engine.capped_tables.len(), capped_cnt);
+    assert_eq!(engine.active_vtab_ids.len(), active_cnt);
+
+    // Defensive check on restore_tx_state with an inactive default snapshot.
+    engine.restore_tx_state(0, &crate::engine::tx::TxMetaSnapshot::default());
+    assert_eq!(engine.next_lsn(), next_lsn_before);
+    assert_eq!(engine.active_vtab_ids.len(), active_cnt);
+}
+
+#[test]
+fn poisoned_engine_rejects_lru_reclaim_and_release_unlinkable() {
+    // R2-H4
+    let tmp = TempTestDir::new("r2_h4_poison_reclaim_guards");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.register_capped_table(1, 64 * 1024).unwrap();
+    engine
+        .unlink_after_wal_rotation
+        .push("blob_lru_0001_0000000000000001.db".to_string());
+    engine.debug_poison("simulated WAL poison");
+
+    assert!(engine.reclaim_fully_dead_lru_blob_segments(1).is_err());
+    assert!(engine.release_unlinkable_blob_files().is_err());
+    assert_eq!(engine.unlink_after_wal_rotation.len(), 1);
+}
+
+#[test]
+fn quota_only_tx_drains_pending_group_before_persisting_boot_meta() {
+    // R2-H5: a zero-record tx that modifies table_quotas must drain pending_group before
+    // persisting `table_quotas` to `boot_meta.db`.
+    let tmp = TempTestDir::new("r2_h5_quota_drains_group");
+    let mut engine = open_group_engine(&tmp);
+    let ticket = commit_into_group(&mut engine, 1, b"seed", &[0x44u8; 64]);
+    assert!(!engine.pending_group.is_empty());
+
+    engine.begin_transaction_for_conn(2).unwrap();
+    engine.register_capped_table(2, 4096).unwrap();
+    assert_eq!(engine.pending_tx_record_count, 0);
+    assert!(engine.quotas_modified_in_tx);
+
+    engine.commit_transaction_for_conn(2).unwrap();
+    assert!(engine.pending_group.is_empty());
+    assert!(matches!(
+        ticket.2.join_group(ticket.0).unwrap(),
+        GroupRole::Durable
+    ));
+    let stored_q = engine
+        .meta_mgr
+        .state()
+        .table_quotas
+        .iter()
+        .find(|q| q.table_id == 2)
+        .expect("table quota persisted");
+    assert_eq!(stored_q.max_bytes, 4096);
+}
+
+#[test]
+fn mixed_durability_sync_vtab_before_buffered_vtab_keeps_sync_upgrade() {
+    // R2-M6: if a sync vtab executes `xSync` before a buffered vtab in a multi-vtab tx where no
+    // sync table writes occurred (or after tx_prepared), `prepare_commit_transaction` must still
+    // see `need_sync_upgrade` and upgrade `pending_tx_sync` / WAL prefix durability.
+    let tmp = TempTestDir::new("r2_m6_mixed_vtab_sync_order");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    // Seed an unsynced buffered commit first so a sync upgrade must make it durable.
+    engine
+        .put_row(1, b"buf_pre", b"v0", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(engine.last_buf_append_lsn > engine.last_buf_synced_lsn);
+
+    engine.begin_vtab_transaction(7, 1001).unwrap();
+    engine.begin_vtab_transaction(7, 1002).unwrap();
+    // Write only to the buffered table (1002).
+    engine
+        .put_row(2, b"k_buf", b"v1", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    // Prepare earlier once under buffered durability (e.g. a retried COMMIT).
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(engine.tx_prepared);
+    assert!(!engine.pending_tx_sync);
+
+    // Now vtab 1001 (SyncTransactional) enters xSync first, followed by vtab 1002 (BufferedFast).
+    assert!(!engine.mark_vtab_synced_ready_to_commit(1001, WriteDurability::SyncTransactional));
+    assert!(
+        !engine.pending_tx_sync,
+        "mark_vtab_synced_ready_to_commit must not prematurely flip pending_tx_sync"
+    );
+    assert!(engine.mark_vtab_synced_ready_to_commit(1002, WriteDurability::BufferedFast));
+
+    // vtab 1002 calls prepare_commit_transaction with its own BufferedFast durability:
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(engine.pending_tx_sync);
+    assert_eq!(engine.last_buf_synced_lsn, engine.last_buf_append_lsn);
+
+    let step = engine.begin_commit_for_conn(7).unwrap();
+    assert!(
+        matches!(step, CommitStep::AwaitingGroup { .. }),
+        "upgraded mixed tx must go through synchronous WAL group commit"
+    );
+}

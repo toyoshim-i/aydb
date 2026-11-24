@@ -26,6 +26,13 @@ const MAX_WAL_CHUNK_BYTES: usize = 512 * 1024;
 /// Upper bound on one condition-variable wait. Callers re-check their condition afterwards.
 const COMMIT_GATE_WAIT: Duration = Duration::from_millis(50);
 
+#[inline]
+fn checked_wal_bytes(sectors: usize) -> io::Result<u64> {
+    (sectors as u64)
+        .checked_mul(crate::wal::WAL_SECTOR_SIZE as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "WAL target size overflow"))
+}
+
 /// A failed group flush as reported to every commit of the group.
 fn group_flush_error(message: &str) -> io::Error {
     io::Error::other(format!("group commit flush failed: {message}"))
@@ -459,6 +466,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_compact_on_commit = false;
             self.tx_prepared = false;
             self.tx_preparing = false;
+            self.tx_bypass_size_limit = false;
+            self.tx_sync_durability_upgrade = false;
             self.pending_tx_bytes = 0;
         }
         self.tx_depth += 1;
@@ -490,6 +499,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.deferred_compact_on_commit = false;
             self.tx_prepared = false;
             self.tx_preparing = false;
+            self.tx_bypass_size_limit = false;
+            self.tx_sync_durability_upgrade = false;
             self.pending_tx_bytes = 0;
         }
         self.tx_depth += 1;
@@ -514,6 +525,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !self.tx_vtabs.contains(&vtab_id) {
             self.tx_vtabs.push(vtab_id);
             self.tx_synced_vtabs.clear();
+            self.tx_sync_durability_upgrade = false;
         }
         Ok(())
     }
@@ -524,6 +536,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.conn_has_open_transaction(conn_id) && !self.tx_vtabs.contains(&vtab_id) {
             self.tx_vtabs.push(vtab_id);
             self.tx_synced_vtabs.clear();
+            self.tx_sync_durability_upgrade = false;
         }
     }
 
@@ -532,6 +545,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.conn_has_open_transaction(conn_id) {
             self.tx_vtabs.retain(|&id| id != vtab_id);
             self.tx_synced_vtabs.retain(|&id| id != vtab_id);
+        }
+    }
+
+    /// Returns the effective durability of the active transaction, upgrading `fallback` if any
+    /// participating table requested synchronous durability.
+    pub(crate) fn effective_tx_durability(&self, fallback: WriteDurability) -> WriteDurability {
+        if self.pending_tx_sync || self.tx_sync_durability_upgrade {
+            WriteDurability::SyncTransactional
+        } else {
+            fallback
         }
     }
 
@@ -544,7 +567,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         durability: WriteDurability,
     ) -> bool {
         if durability == WriteDurability::SyncTransactional {
-            self.pending_tx_sync = true;
+            self.tx_sync_durability_upgrade = true;
         }
         if !self.tx_synced_vtabs.contains(&vtab_id) {
             self.tx_synced_vtabs.push(vtab_id);
@@ -630,12 +653,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         self.check_not_poisoned()?;
-        let need_sync_upgrade =
-            durability == WriteDurability::SyncTransactional && !self.pending_tx_sync;
+        let requested_sync =
+            durability == WriteDurability::SyncTransactional || self.tx_sync_durability_upgrade;
+        let need_sync_upgrade = requested_sync && !self.pending_tx_sync;
         if self.tx_prepared && !need_sync_upgrade {
             return Ok(());
         }
-        if durability == WriteDurability::SyncTransactional {
+        if requested_sync {
             self.pending_tx_sync = true;
         }
         let effective_durability = if self.pending_tx_sync {
@@ -678,19 +702,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let required_sectors = (self.pending_tx_buf.len() / 4070) + 8;
             match effective_durability {
                 WriteDurability::SyncTransactional => {
-                    let target_sectors = self.sync_wal.current_sector_idx() + required_sectors;
+                    let target_sectors = self
+                        .sync_wal
+                        .current_sector_idx()
+                        .checked_add(required_sectors)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                        })?;
                     if target_sectors > self.sync_wal.total_sectors() {
-                        self.sync_wal.ensure_min_size(
-                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                        )?;
+                        self.sync_wal
+                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                     }
                 }
                 WriteDurability::BufferedFast => {
-                    let target_sectors = self.buf_wal.current_sector_idx() + required_sectors;
+                    let target_sectors = self
+                        .buf_wal
+                        .current_sector_idx()
+                        .checked_add(required_sectors)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                        })?;
                     if target_sectors > self.buf_wal.total_sectors() {
-                        self.buf_wal.ensure_min_size(
-                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                        )?;
+                        self.buf_wal
+                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                     }
                 }
             }
@@ -709,22 +743,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// persistence, compaction, flush) fails; such failures are counted in
     /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
-        if self.tx_depth == 1 {
-            self.check_not_poisoned()?;
+        if self.tx_depth == 0 {
+            return Ok(());
         }
-        if self.tx_depth == 1 && !self.tx_prepared {
-            let durability = if self.pending_tx_sync {
-                WriteDurability::SyncTransactional
-            } else {
-                WriteDurability::BufferedFast
-            };
-            if let Err(e) = self.prepare_commit_transaction(durability) {
+        if self.tx_depth == 1 {
+            if let Err(e) = self.check_not_poisoned() {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
-        }
-        if self.tx_depth == 1 {
-            if self.pending_tx_record_count == 0 {
+            if !self.tx_prepared {
+                let durability = self.effective_tx_durability(WriteDurability::BufferedFast);
+                if let Err(e) = self.prepare_commit_transaction(durability) {
+                    let _ = self.rollback_transaction();
+                    return Err(e);
+                }
+            }
+            let has_metadata_changes = self.quotas_modified_in_tx
+                || !self.dropped_tables_in_tx.is_empty()
+                || self.deferred_flush_on_commit
+                || self.deferred_compact_on_commit
+                || self.memtable.should_flush();
+            if self.pending_tx_record_count == 0 && !has_metadata_changes {
                 // Nothing of its own to publish: drop what it saw from earlier, undurable commits.
                 self.tx_overlay.clear();
             } else if let Err(e) = self.drain_pending_durable() {
@@ -732,9 +771,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Err(e);
             }
         }
-        if self.tx_depth > 0 {
-            self.tx_depth -= 1;
-        }
+        self.tx_depth -= 1;
         if self.tx_depth == 0 {
             if let Err(e) = self.flush_pending_tx_records() {
                 self.tx_depth = 1;
@@ -1026,6 +1063,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_owner_conn = None;
         self.tx_prepared = false;
         self.tx_preparing = false;
+        self.tx_bypass_size_limit = false;
+        self.tx_sync_durability_upgrade = false;
         self.tx_sync_in_flight = false;
         self.pending_tx_bytes = 0;
         self.savepoints.clear();
@@ -1071,6 +1110,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in capped_table_ids {
+            if self.is_poisoned() {
+                break;
+            }
             if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
                 self.record_maintenance_failure(&e);
             }
@@ -1080,6 +1122,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
         let mut dropped_any_capped = false;
         for (tid, was_capped) in dropped_tables {
+            if self.is_poisoned() {
+                break;
+            }
             let tid_reused =
                 self.active_vtab_ids.contains_key(&tid) || self.capped_tables.contains_key(&tid);
             let tid_recapped = self.capped_tables.contains_key(&tid);
@@ -1093,7 +1138,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         self.active_lru_writers.insert(tid, old_w);
                         let e = self.poison(e);
                         self.record_maintenance_failure(&e);
-                        continue;
+                        break;
                     }
                     if let Some(b) = self.lru_blobs.get_mut(&(tid, old_w.seq_id())) {
                         b.file_len = old_w.current_len();
@@ -1108,6 +1153,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             if let Err(e) = self.reclaim_fully_dead_lru_blob_segments(tid) {
                 self.record_maintenance_failure(&e);
+                if self.is_poisoned() {
+                    break;
+                }
             }
             if was_capped {
                 dropped_any_capped = true;
@@ -1115,16 +1163,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
         let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
-        let maintenance = if do_compact {
-            self.auto_compaction_due = false;
-            self.compact()
-        } else if do_flush || self.memtable.should_flush() {
-            self.flush_memtable()
-        } else {
-            Ok(())
-        };
-        if let Err(e) = maintenance {
-            self.record_maintenance_failure(&e);
+        if !self.is_poisoned() {
+            let maintenance = if do_compact {
+                self.auto_compaction_due = false;
+                self.compact()
+            } else if do_flush || self.memtable.should_flush() {
+                self.flush_memtable()
+            } else {
+                Ok(())
+            };
+            if let Err(e) = maintenance {
+                self.record_maintenance_failure(&e);
+            }
         }
         if (dropped_any_capped || quotas_modified) && !self.is_poisoned() {
             let mut quota_metas = self.build_quota_metas();
@@ -1156,7 +1206,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // The transaction is durable at this point; remove rows queued by `Evict`-policy
         // reads. Best effort: a failure here must not turn a successful commit into an error
         // (the rows are simply re-detected and re-queued by the next read).
-        let _ = self.drain_corrupt_evictions();
+        if !self.is_poisoned() {
+            let _ = self.drain_corrupt_evictions();
+        }
     }
 
     /// Commits an explicit transaction for SQLite connection `conn_id`.
@@ -1186,6 +1238,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.deferred_compact_on_commit = false;
         self.tx_prepared = false;
         self.tx_preparing = false;
+        self.tx_bypass_size_limit = false;
+        self.tx_sync_durability_upgrade = false;
         if self.tx_sync_in_flight {
             self.tx_sync_in_flight = false;
             let _ = self.poison(io::Error::other("WAL sync interrupted before completion"));
@@ -1232,6 +1286,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn savepoint(&mut self, sp_id: i32) {
         self.tx_prepared = false;
         self.tx_synced_vtabs.clear();
+        self.tx_sync_durability_upgrade = false;
         let mut implicit_tx = false;
         if self.tx_depth == 0 {
             self.begin_transaction();
@@ -1272,6 +1327,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_write_allowed_for_conn(conn_id)?;
         self.tx_prepared = false;
         self.tx_synced_vtabs.clear();
+        self.tx_sync_durability_upgrade = false;
         let mut implicit_tx = false;
         if self.tx_depth == 0 {
             self.begin_transaction();
@@ -1369,6 +1425,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.tx_prepared = false;
         self.tx_synced_vtabs.clear();
+        self.tx_sync_durability_upgrade = false;
         let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
             if self.savepoints.iter().any(|s| s.sp_id < sp_id) {
                 return Err(io::Error::new(
@@ -1530,6 +1587,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn restore_tx_state(&mut self, undo_target_len: usize, snap: &TxMetaSnapshot) {
+        if !snap.active {
+            return;
+        }
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.bump_table_epochs_from_undo_suffix(undo_target_len);
         self.tx_overlay.rollback_to(undo_target_len);
@@ -1661,19 +1721,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let res = (|| -> io::Result<()> {
                 match durability {
                     WriteDurability::SyncTransactional => {
-                        let target_sectors = self.sync_wal.current_sector_idx() + required_sectors;
+                        let target_sectors = self
+                            .sync_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
                         if target_sectors > self.sync_wal.total_sectors() {
-                            self.sync_wal.ensure_min_size(
-                                (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                            )?;
+                            self.sync_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                         }
                     }
                     WriteDurability::BufferedFast => {
-                        let target_sectors = self.buf_wal.current_sector_idx() + required_sectors;
+                        let target_sectors = self
+                            .buf_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
                         if target_sectors > self.buf_wal.total_sectors() {
-                            self.buf_wal.ensure_min_size(
-                                (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                            )?;
+                            self.buf_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                         }
                     }
                 }
@@ -1703,19 +1779,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let res = (|| -> io::Result<()> {
             match durability {
                 WriteDurability::SyncTransactional => {
-                    let target_sectors = self.sync_wal.current_sector_idx() + required_sectors;
+                    let target_sectors = self
+                        .sync_wal
+                        .current_sector_idx()
+                        .checked_add(required_sectors)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                        })?;
                     if target_sectors > self.sync_wal.total_sectors() {
-                        self.sync_wal.ensure_min_size(
-                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                        )?;
+                        self.sync_wal
+                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                     }
                 }
                 WriteDurability::BufferedFast => {
-                    let target_sectors = self.buf_wal.current_sector_idx() + required_sectors;
+                    let target_sectors = self
+                        .buf_wal
+                        .current_sector_idx()
+                        .checked_add(required_sectors)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+                        })?;
                     if target_sectors > self.buf_wal.total_sectors() {
-                        self.buf_wal.ensure_min_size(
-                            (target_sectors * crate::wal::WAL_SECTOR_SIZE) as u64,
-                        )?;
+                        self.buf_wal
+                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
                     }
                 }
             }
