@@ -365,6 +365,42 @@ pub struct DiscardedTx {
     pub records: Vec<WalRecord>,
 }
 
+fn is_catalog_record(r: &WalRecord) -> bool {
+    let key = match r {
+        WalRecord::PutInline { key, .. }
+        | WalRecord::PutBlobPtr { key, .. }
+        | WalRecord::Delete { key } => key.as_slice(),
+        WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => return false,
+    };
+    key.len() >= 3 && key[0] == 0 && key[1] == 0 && key[2] == b'c'
+}
+
+fn replayed_indices(all: &[Found], valid: usize) -> Vec<bool> {
+    let mut replayed = vec![false; all.len()];
+    let mut open = Vec::new();
+    for (i, found) in all[..valid].iter().enumerate() {
+        match framing(&found.batch) {
+            Framing::Begin => {
+                open.clear();
+                open.push(i);
+            }
+            Framing::Continue if !open.is_empty() => open.push(i),
+            Framing::Commit if !open.is_empty() => {
+                open.push(i);
+                for idx in open.drain(..) {
+                    replayed[idx] = true;
+                }
+            }
+            Framing::None => {
+                open.clear();
+                replayed[i] = true;
+            }
+            Framing::Continue | Framing::Commit => {}
+        }
+    }
+    replayed
+}
+
 /// Finds the transactions that are discarded as a whole although their batches are intact:
 /// those that lie completely at or after the cut (every index `>= valid` of the merged chain
 /// `all`). A batch without markers is a complete single-batch transaction. A multi-chunk
@@ -372,7 +408,12 @@ pub struct DiscardedTx {
 /// each links to the one before it by `prev_lsn` (the engine appends the chunks of a transaction
 /// back to back). A `TxContinue` or `TxCommit` batch without its open transaction, because the
 /// begin chunk or an earlier chunk is lost, is an orphan: it is never returned and not counted.
+#[cfg(test)]
 pub(crate) fn post_cut_transactions(all: &[Found], valid: usize) -> Vec<DiscardedTx> {
+    post_cut_transactions_with_mask(all, valid).0
+}
+
+fn post_cut_transactions_with_mask(all: &[Found], valid: usize) -> (Vec<DiscardedTx>, Vec<bool>) {
     // Each group is a list of indices into `all`; an open group is the last one, until it ends.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut open = false;
@@ -403,10 +444,14 @@ pub(crate) fn post_cut_transactions(all: &[Found], valid: usize) -> Vec<Discarde
     if open {
         groups.pop();
     }
-    groups
+    let mut discarded_mask = vec![false; all.len()];
+    let txs = groups
         .into_iter()
         .filter(|g| g.iter().all(|&i| i >= valid))
         .map(|g| {
+            for &i in &g {
+                discarded_mask[i] = true;
+            }
             let last = g.last().map_or(0, |&i| all[i].batch.lsn);
             let records = g
                 .iter()
@@ -416,7 +461,8 @@ pub(crate) fn post_cut_transactions(all: &[Found], valid: usize) -> Vec<Discarde
                 .collect();
             DiscardedTx { lsn: last, records }
         })
-        .collect()
+        .collect();
+    (txs, discarded_mask)
 }
 
 /// Output of the two-stream (`wal_sync.db` + `wal_buf.db`) crash-recovery coordinator.
@@ -436,6 +482,9 @@ pub struct TwoStreamRecoveryResult {
     /// The salvageable transactions at or after the cut, in LSN order; filled in only when
     /// `report.damage` is set.
     pub discarded_txs: Vec<DiscardedTx>,
+    /// Catalog records from transactions that were neither replayed nor returned in
+    /// `discarded_txs` (straddling or incomplete multi-chunk transactions), sorted by LSN.
+    pub(crate) skipped_catalog_records: Vec<(u64, Vec<WalRecord>)>,
 }
 
 /// Recovers both `wal_sync.db` and `wal_buf.db` as one log (ARCHITECTURE.md 4.6): the batches
@@ -600,11 +649,29 @@ where
         found_per_stream.bump(f.stream);
     }
     let verdict = judge(walk.cut, floor, last_good, flags);
-    let discarded_txs = if verdict.is_some() {
-        post_cut_transactions(&all, walk.valid)
+    let replayed_mask = replayed_indices(&all, walk.valid);
+    let (discarded_txs, discarded_mask, skipped_catalog_records) = if verdict.is_some() {
+        let (txs, mask) = post_cut_transactions_with_mask(&all, walk.valid);
+        let mut skipped = Vec::new();
+        for (i, found) in all.iter().enumerate() {
+            if !replayed_mask[i] && !mask[i] {
+                let cat_recs: Vec<WalRecord> = found
+                    .batch
+                    .records
+                    .iter()
+                    .filter(|r| is_catalog_record(r))
+                    .cloned()
+                    .collect();
+                if !cat_recs.is_empty() {
+                    skipped.push((found.batch.lsn, cat_recs));
+                }
+            }
+        }
+        (txs, mask, skipped)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new(), Vec::new())
     };
+    let _ = discarded_mask;
     all.truncate(walk.valid);
     let completed = complete_transactions(all);
 
@@ -643,5 +710,6 @@ where
         next_buf_sector_idx,
         report,
         discarded_txs,
+        skipped_catalog_records,
     })
 }

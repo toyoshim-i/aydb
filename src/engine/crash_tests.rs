@@ -4260,6 +4260,128 @@ fn salvage_does_not_misattribute_rows_after_discarded_drop_and_create_reusing_ta
     );
 }
 
+#[test]
+fn salvage_taints_catalog_across_incomplete_and_straddling_multi_chunk_transactions() {
+    // 1. Incomplete post-cut multi-chunk tx that drops `orders` (id 1) and creates `reused` (id 1)
+    //    before losing its `TxCommit` chunk to sector corruption.
+    let fs = damaged_fs(|e| {
+        e.begin_transaction();
+        e.drop_table(1, None).unwrap();
+        let reused = e
+            .register_or_resolve_vtab_with_durability("reused", Some(1), SYNC)
+            .unwrap();
+        assert_eq!(reused, 1);
+        e.set_table_inline_threshold(1, 4000);
+        for i in 0..300 {
+            let key = format!("r{i:03}");
+            e.put_row(1, key.as_bytes(), &[0x22; 3000], &[], SYNC)
+                .unwrap();
+        }
+        e.commit_transaction().unwrap();
+        e.put_row(1, b"after_incomplete", b"v_new", &[], SYNC)
+            .unwrap();
+        e.put_row(2, b"keep_indexed", b"ok", &[], SYNC).unwrap();
+    });
+    let epoch = u64::from_le_bytes(
+        content(&fs, "wal_sync.db").unwrap()[4..12]
+            .try_into()
+            .unwrap(),
+    );
+    let rec = crate::wal::recover_single_wal_stream(&*raw_file(&fs, "wal_sync.db"), epoch).unwrap();
+    assert!(
+        rec.past_stop
+            .iter()
+            .any(|b| b.records.contains(&WalRecord::TxCommit)),
+        "multi-chunk tx must have a TxCommit chunk"
+    );
+    // Corrupt a sector inside the final (`TxCommit`) chunk, which carries `r299`.
+    let img = content(&fs, "wal_sync.db").unwrap();
+    let sector = (0..img.len() / 4096)
+        .find(|&s| {
+            let sec = &img[s * 4096..(s + 1) * 4096];
+            sec.windows(4).any(|w| w == b"r299")
+        })
+        .expect("locate TxCommit sector containing r299");
+    damage_synced(&fs, "wal_sync.db", |buf| buf[sector * 4096 + 100] ^= 0x01);
+
+    let (e, salvaged) = open_salvage(&fs);
+    let damage = e.last_wal_recovery().damage.clone().expect("damage");
+    assert!(
+        damage.unsalvageable >= 1,
+        "recycled-table write after incomplete multi-chunk catalog tx must be unsalvageable: {damage:?}"
+    );
+    assert_eq!(
+        salvaged.iter().map(|t| &t.ops).collect::<Vec<_>>(),
+        vec![&vec![put_op("indexed", b"keep_indexed", b"ok")]],
+        "after_incomplete must never be misattributed to 'orders': {salvaged:?}"
+    );
+
+    // 2. Straddling multi-chunk tx (`TxBegin` below cut, `TxCommit` cut by unverifiable blob),
+    //    followed by a write to table 1 (`reused`) and an unrelated table 2 (`indexed`).
+    let fs2 = Arc::new(CrashFs::new(DirMode::Unix, 1));
+    let mut cfg = salvage_config();
+    cfg.inline_threshold_bytes = 2500;
+    {
+        let mut e = StorageEngine::open(Arc::clone(&fs2), cfg.clone()).unwrap();
+        let t1 = e
+            .register_or_resolve_vtab_with_durability("orders", Some(1), SYNC)
+            .unwrap();
+        let t2 = e
+            .register_or_resolve_vtab_with_durability("indexed", Some(2), SYNC)
+            .unwrap();
+        assert_eq!((t1, t2), (1, 2));
+        e.put_row(1, b"base", b"vb", &[], SYNC).unwrap();
+        e.flush_memtable().unwrap();
+
+        e.begin_transaction();
+        e.drop_table(1, None).unwrap();
+        let reused = e
+            .register_or_resolve_vtab_with_durability("reused", Some(1), SYNC)
+            .unwrap();
+        assert_eq!(reused, 1);
+        // Chunk 1 (< 512 KB, stays in `TxBegin` below cut): inline 2 KB rows.
+        for i in 0..320 {
+            let key = format!("m{i:03}");
+            e.put_row(1, key.as_bytes(), &[0x33; 2000], &[], SYNC)
+                .unwrap();
+        }
+        // Final row >= inline_threshold_bytes lands in the last (`TxCommit`) chunk as a BlobPtr.
+        e.put_row(1, b"cut_blob_row", &[0x44; 3000], &[], SYNC)
+            .unwrap();
+        e.commit_transaction().unwrap();
+
+        // Subsequent intact transactions after the straddling tx:
+        e.put_row(1, b"post_straddle", b"v_reused", &[], SYNC)
+            .unwrap();
+        e.put_row(2, b"keep_indexed2", b"ok2", &[], SYNC).unwrap();
+        fs2.cut_now();
+        drop(e);
+        fs2.crash(Crash::Process);
+    }
+    let blob_name = fs2
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.starts_with("blob_std_"))
+        .expect("straddling blob");
+    damage_synced(&fs2, &blob_name, |buf| {
+        let at = buf.windows(32).position(|w| w == [0x44; 32]).unwrap();
+        buf[at + 100] ^= 0x01;
+    });
+
+    let (e2, salvaged2) = StorageEngine::open_with_salvage(Arc::clone(&fs2), cfg).unwrap();
+    let damage2 = e2.last_wal_recovery().damage.clone().expect("damage2");
+    assert!(
+        damage2.unsalvageable >= 1,
+        "post_straddle write after straddling catalog tx must be unsalvageable: {damage2:?}"
+    );
+    assert_eq!(
+        salvaged2.iter().map(|t| &t.ops).collect::<Vec<_>>(),
+        vec![&vec![put_op("indexed", b"keep_indexed2", b"ok2")]],
+        "post_straddle must never be misattributed to 'orders': {salvaged2:?}"
+    );
+}
+
 // =============================================================================================
 // Minimal reproductions of bugs found by the group-commit and media-damage modes
 // =============================================================================================

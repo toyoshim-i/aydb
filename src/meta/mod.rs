@@ -768,15 +768,15 @@ impl<F: PlatformFs> BootMetaManager<F> {
     /// [`Self::sweep_orphans`] so `StorageEngine::open` under `WalDamagePolicy::Fail` can inspect
     /// the WAL and refuse damaged databases without altering `boot_meta.db` or directory state.
     pub fn open_or_recover_deferred_sweep(fs: Arc<F>) -> io::Result<Self> {
+        let mut created_via_not_found = false;
         let file = match fs.open_file(BOOT_META_FILE_NAME, false, true, OpenHint::MutableSyncLog) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // Guard against a missing `boot_meta.db` destroying an existing database before
                 // creating the file or calling `sync_dir`.
                 Self::ensure_no_existing_db_files(&fs)?;
-                let created =
-                    fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
-                return Self::init_fresh_boot_meta(fs, created);
+                created_via_not_found = true;
+                fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?
             }
             Err(e) => return Err(e),
         };
@@ -800,12 +800,12 @@ impl<F: PlatformFs> BootMetaManager<F> {
             // Guard against a zeroed `boot_meta.db` destroying an existing database before
             // preallocating or writing Slot A.
             Self::ensure_no_existing_db_files(&fs)?;
-            // Drop the existing handle (Windows exclusive lock) and reopen with create=true so
-            // Unix `sync_dir` covers a directory entry created before an interrupted first open.
-            drop(file);
-            let created =
-                fs.open_file(BOOT_META_FILE_NAME, true, true, OpenHint::MutableSyncLog)?;
-            return Self::init_fresh_boot_meta(fs, created);
+            // Keep the exclusive handle held while syncing the parent directory so another opener
+            // cannot initialize or populate the database between close and reopen.
+            if !created_via_not_found {
+                fs.sync_dir()?;
+            }
+            return Self::init_fresh_boot_meta(fs, file);
         }
 
         // Parse both 4 KB slot envelopes first; only torn/corrupt headers or missing/corrupt
@@ -3267,5 +3267,153 @@ mod tests {
         let err2 = mgr.state.try_allocate_seq_id().unwrap_err();
         assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
         assert_eq!(mgr.state().next_seq_id, u64::MAX - 1);
+    }
+
+    #[test]
+    fn open_recovers_concurrently_populated_boot_meta_after_initial_not_found() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RacingOpenFs {
+            inner: OsFs,
+            inject_not_found: AtomicBool,
+        }
+
+        impl PlatformFs for RacingOpenFs {
+            type File = crate::pal::OsFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                if rel_name == BOOT_META_FILE_NAME
+                    && !create
+                    && self.inject_not_found.swap(false, Ordering::AcqRel)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "simulated concurrent creation race",
+                    ));
+                }
+                self.inner.open_file(rel_name, create, writable, hint)
+            }
+
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+
+            fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file_unsynced(rel_name)
+            }
+
+            fn sync_dir(&self) -> io::Result<()> {
+                self.inner.sync_dir()
+            }
+
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("meta_concurrent_create_race");
+        let os_fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        {
+            let mut p1 = BootMetaManager::open_or_recover(Arc::clone(&os_fs)).unwrap();
+            p1.commit_update(|s| {
+                s.idx_segments.push(IdxSegmentMeta {
+                    seq_id: 7,
+                    file_len: 4096,
+                    level: 0,
+                    record_count: 3,
+                });
+                s.next_seq_id = 8;
+                s.checkpoint_lsn = 42;
+            })
+            .unwrap();
+        }
+
+        let racing_fs = Arc::new(RacingOpenFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            inject_not_found: AtomicBool::new(true),
+        });
+        let p2 = BootMetaManager::open_or_recover_deferred_sweep(racing_fs).unwrap();
+        assert!(p2.state().generation > 1);
+        assert_eq!(p2.state().checkpoint_lsn, 42);
+        assert_eq!(p2.state().next_seq_id, 8);
+        assert_eq!(p2.state().idx_segments.len(), 1);
+        assert_eq!(p2.state().idx_segments[0].seq_id, 7);
+    }
+
+    #[test]
+    fn all_zero_boot_meta_initializes_without_dropping_handle() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct OpenCountFs {
+            inner: OsFs,
+            boot_meta_opens: AtomicUsize,
+            sync_dir_calls: AtomicUsize,
+        }
+
+        impl PlatformFs for OpenCountFs {
+            type File = crate::pal::OsFile;
+
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                if rel_name == BOOT_META_FILE_NAME {
+                    self.boot_meta_opens.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.open_file(rel_name, create, writable, hint)
+            }
+
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+
+            fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file_unsynced(rel_name)
+            }
+
+            fn sync_dir(&self) -> io::Result<()> {
+                self.sync_dir_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.sync_dir()
+            }
+
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp = TempTestDir::new("meta_zero_no_drop");
+        std::fs::write(
+            tmp.path.join(BOOT_META_FILE_NAME),
+            vec![0u8; BOOT_META_FILE_SIZE as usize],
+        )
+        .unwrap();
+        let fs = Arc::new(OpenCountFs {
+            inner: OsFs::open(&tmp.path, true).unwrap(),
+            boot_meta_opens: AtomicUsize::new(0),
+            sync_dir_calls: AtomicUsize::new(0),
+        });
+        let mgr = BootMetaManager::open_or_recover_deferred_sweep(Arc::clone(&fs)).unwrap();
+        assert_eq!(mgr.state().generation, 1);
+        assert_eq!(fs.boot_meta_opens.load(Ordering::Relaxed), 1);
+        assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 1);
     }
 }

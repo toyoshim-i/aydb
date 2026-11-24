@@ -103,6 +103,18 @@ fn catalog_names<F: PlatformFile>(
         .collect())
 }
 
+fn taint_catalog_names(key: &[u8], put_val: Option<&[u8]>, names: &mut HashMap<u16, String>) {
+    if key.len() > CATALOG_PREFIX.len() {
+        let cat_name = String::from_utf8_lossy(&key[CATALOG_PREFIX.len()..]);
+        names.retain(|_, v| v.as_str() != cat_name.as_ref());
+    }
+    if let Some(val) = put_val {
+        if let Some(reused_tid) = table_id_of(val) {
+            names.remove(&reused_tid);
+        }
+    }
+}
+
 /// Classifies the operations of the `discarded` transactions. A transaction with an operation
 /// that cannot be salvaged is dropped as a whole and each such operation counts once in
 /// [`Salvage::unsalvageable`]: a catalog record (a schema change), a primary-row record of a table
@@ -111,11 +123,14 @@ fn catalog_names<F: PlatformFile>(
 /// without a count: writing the rows back rebuilds them. With `keep_values` false the blobs are
 /// still read, to count the failures, but nothing is returned.
 ///
-/// `prefix_batches` are the batches that recovery replays; `std_blobs` and `lru_blobs` must still
-/// hold every segment, before reconciliation prunes them.
+/// `prefix_batches` are the batches that recovery replays; `skipped_catalog` carries any catalog
+/// records from transactions that were neither replayed nor returned in `discarded` (straddling or
+/// incomplete multi-chunk transactions); `std_blobs` and `lru_blobs` must still hold every
+/// segment, before reconciliation prunes them.
 pub(super) fn salvage<F: PlatformFile>(
     segments: &[Arc<IdxSegmentReader<F>>],
     prefix_batches: &[WalBatch],
+    skipped_catalog: &[(u64, Vec<WalRecord>)],
     discarded: Vec<DiscardedTx>,
     std_blobs: &BTreeMap<u64, TrackedStdBlob<F>>,
     lru_blobs: &BTreeMap<(u16, u64), TrackedLruBlob<F>>,
@@ -154,7 +169,22 @@ pub(super) fn salvage<F: PlatformFile>(
         }
     };
 
+    let mut skip_idx = 0usize;
     for tx in discarded {
+        while skip_idx < skipped_catalog.len() && skipped_catalog[skip_idx].0 <= tx.lsn {
+            for rec in &skipped_catalog[skip_idx].1 {
+                match rec {
+                    WalRecord::PutInline { key, value } => {
+                        taint_catalog_names(key, Some(value), &mut names);
+                    }
+                    WalRecord::PutBlobPtr { key, .. } | WalRecord::Delete { key } => {
+                        taint_catalog_names(key, None, &mut names);
+                    }
+                    WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => {}
+                }
+            }
+            skip_idx += 1;
+        }
         let mut ops = Vec::new();
         let mut bad = false;
         for rec in tx.records {
@@ -172,15 +202,11 @@ pub(super) fn salvage<F: PlatformFile>(
                 out.unsalvageable += 1;
                 bad = true;
                 ops.clear();
-                if key.len() > CATALOG_PREFIX.len() {
-                    let cat_name = String::from_utf8_lossy(&key[CATALOG_PREFIX.len()..]);
-                    names.retain(|_, v| v.as_str() != cat_name.as_ref());
-                }
-                if let Some(Ok(val)) = put {
-                    if let Some(reused_tid) = table_id_of(&val) {
-                        names.remove(&reused_tid);
-                    }
-                }
+                let put_val = match &put {
+                    Some(Ok(val)) => Some(val.as_slice()),
+                    _ => None,
+                };
+                taint_catalog_names(&key, put_val, &mut names);
                 continue;
             }
             if table_id == 0 || ns != NS_PRIMARY_ROW {

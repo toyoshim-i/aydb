@@ -869,10 +869,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // found, which is also the only case where a plain open pays for the blob reads.
         let mut salvaged = Vec::new();
         let discarded = core::mem::take(&mut rec.discarded_txs);
+        let skipped_catalog = core::mem::take(&mut rec.skipped_catalog_records);
         if let Some(damage) = rec.report.damage.as_mut() {
             let found = salvage::salvage(
                 &idx_segments,
                 &rec.merged_batches,
+                &skipped_catalog,
                 discarded,
                 &std_blobs,
                 &lru_blobs,
