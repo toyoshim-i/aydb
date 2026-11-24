@@ -25,6 +25,15 @@ This document defines the workflow, conventions, and engineering standards for d
    * Public and internal Rust API boundaries.
 3. **Incremental Verification:** Each subsystem must be accompanied by deterministic unit tests and fault-injection / crash-recovery tests before moving on to the next layer.
 
+### 3.1 State-Machine and Flag Hygiene
+
+To prevent boolean-soup regressions in `StorageEngine` and adapter state machines, follow the architecture in [State-Machine Type Safety and Formal Verification Plan](plans/STATE_MACHINE_AND_FORMAL_VERIFICATION.md):
+
+* **Own Per-Transaction State Inside `TxState`:** All per-transaction lifecycle fields live inside `ActiveTx`, owned exclusively by `TxState::InTx { phase: TxPhase, tx: Box<ActiveTx> }`. Returning to `TxState::Idle` drops `ActiveTx` by value so no loose `tx_*` or `pending_tx_*` flags can leak across commits, group-commit handoffs, or rollbacks (`INV-TX-1`). Keep `TxPhase::FlushingWal` distinct so `RingFull` WAL rotations run without deferring while keeping pre-transaction `start_meta` authoritative during checkpoints. Do not add loose transaction fields back onto `StorageEngine`.
+* **Pass Call-Frame Write Modes via `WriteScope`:** Pass `WriteScope::{Normal, InternalBypass}` explicitly as a parameter instead of mutating ambient mode booleans on `self` (`INV-TX-2`, `INV-TX-3`). `InternalBypass` preserves `TxPhase::Prepared`, `synced_vtabs`, and `sync_durability_upgrade`, whereas `Normal` enforces `max_transaction_bytes` and resets preparation back to `TxPhase::Active`.
+* **Guard Temporary Latches With Private `#[must_use]` RAII Drops:** Encapsulate re-entrancy and phase latches (such as `reconciling_capped_table` and `relocating_std_blobs`) inside private field wrappers in `scoped_guards` whose `#[must_use]` RAII guard clears the state on `Drop` across normal returns, `?` early exits, and panics (`INV-TX-6`).
+* **Eliminate `active: bool` Snapshot Sentinels:** Never represent an absent snapshot with `active: bool` or `Default` sentinels (as removed from `TxMetaSnapshot`); tie snapshot existence directly to the enclosing enum variant.
+
 ## 4. Living Textbook Documentation ("Build-to-Learn" Philosophy)
 
 Documentation has three complementary layers, indexed by the [Documentation Guide](README.md): application usage guides, API references (including Rustdoc), and the design textbook. Follow [Public API Boundaries](reference/PUBLIC_API.md) when documenting new interfaces. A public Rust item is not automatically an application entry point. Keep application-facing operations separate from adapter protocols and implementation helpers; changes to code visibility or facade modules require explicit implementation and migration work.

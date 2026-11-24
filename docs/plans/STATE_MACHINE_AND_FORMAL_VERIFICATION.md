@@ -1,6 +1,6 @@
 # State-Machine Type Safety and Formal Verification Plan
 
-> **Status: Approved Plan (M0 complete; M1 in progress).**  
+> **Status: Approved Plan (M0–M1 complete; Next: M2).**  
 > This document defines a phased engineering plan to replace loose boolean and `Option` state flags in `aydb` with compile-time Rust state machines, extract a deterministic Sans-I/O core, back the highest-risk state protocols with Lean 4 formal proofs and trace refinement, and codify every new mechanism into durable repository rules and CI gates.
 
 ---
@@ -223,7 +223,7 @@ Every milestone must leave all Cargo targets green and conclude with **both veri
 | Milestone | Scope | Concrete Deliverables | Verification Gate | Rule Codification |
 | :--- | :--- | :--- | :--- | :--- |
 | **M0: Plan Alignment (Done)** | Finalize design plan and confirm initial decisions (Section 7) | [`STATE_MACHINE_AND_FORMAL_VERIFICATION.md`](STATE_MACHINE_AND_FORMAL_VERIFICATION.md), index link in [`docs/README.md`](../README.md) | Docs link & heading check; user review sign-off | Establish 3-tier rule roadmap (Section 5) |
-| **M1: Engine `TxState`, `WriteScope`, RAII** | Replace loose engine tx/bypass/reconcile/relocate flags in `StorageEngine` | `enum TxPhase`, `enum TxState`, `struct ActiveTx`, `enum WriteScope`, `ReconcilingCappedGuard`, `RelocatingBlobsGuard` in `src/engine/` | Full `cargo test --all-targets`, `clippy`, `fmt`, `cargo doc`, `reliability_bench` | Add **State Machine & Flag Hygiene Rule** to `.agents/rules/` & [`DEVELOPMENT.md`](../DEVELOPMENT.md) |
+| **M1: Engine `TxState`, `WriteScope`, RAII (Done)** | Replace loose engine tx/bypass/reconcile/relocate flags in `StorageEngine` | `enum TxPhase`, `enum TxState`, `struct ActiveTx`, `enum WriteScope`, `ReconcilingCappedGuard`, `RelocatingBlobsGuard` in `src/engine/` | Full `cargo test --all-targets`, `clippy`, `fmt`, `cargo doc`, `reliability_bench` | Codified **State Machine & Flag Hygiene Rule** in `.agents/rules/state-machine-conventions.md` & [`DEVELOPMENT.md`](../DEVELOPMENT.md) §3.1 |
 | **M2: Poison Gate & VTab `ConnDdlState`** | Enforce capability-checked writes and typed VTab DDL state | `HealthyEngine` / `EngineHealth` capability wrapper; replace `PendingDdlSlot` mutexes with `ConnDdlState` | Existing `vtab::` + `engine::` suites + new compile/unit poison checks | Add **Poison Capability** and **VTab DDL State** rules |
 | **M3: Sans-I/O Core & Trace Recorder** | Extract pure transition module decoupled from PAL & SQLite C FFI | `src/engine/tx_fsm.rs` (pure `step(State, Event) -> Effects`), `#[cfg(test)]` structured trace exporter | Unit tests proving exact equivalence; trace golden tests | Add **Sans-I/O Separation Rule** (no `PlatformFs` / `sqlite3` imports inside `*_fsm.rs`) |
 | **M4: Lean 4 Proofs & Trace CI Gate** | Formalize SM-1, SM-2, SM-3 in Lean 4 + trace checker + CI job | Isolated `formal/lean/` (`lean-toolchain`, `lakefile.toml`, `TxFsm.lean`, `UniqueProtocol.lean`, `WalRecovery.lean`, `TraceCheck.lean`); `formal` job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) | Zero `sorry`; `#print axioms` clean; `lake exe aydb-trace-check` passes on exported Rust traces; CI `formal` job green | Add **Formal Spec Sync** & **Zero-`sorry`** rules + PR checklist |
@@ -245,13 +245,13 @@ Introducing typed state machines and Lean proofs without updating team and agent
 2. **Tier 2 — Human Engineering Standards ([`docs/DEVELOPMENT.md`](../DEVELOPMENT.md))**
    * Extend §3 ("Design-First, Phase-by-Phase Workflow") and add dedicated subsections defining when new state belongs in a `TxState` variant vs. a separate state machine, how Sans-I/O modules are bounded, and when formal specifications must move in lockstep with code.
 3. **Tier 3 — AI Agent Guardrails (`.agents/rules/`)**
-   * Add focused, modular rule files under `.agents/rules/` alongside [`local-memory.md`](../../.agents/rules/local-memory.md) as each milestone lands, so future coding and audit sessions automatically apply the new invariants before editing files.
+   * Add focused, modular rule files under `.agents/rules/` alongside `local-memory.md` (local-only, excluded via `.gitignore`) as each milestone lands, so future coding and audit sessions automatically apply the new invariants before editing files.
 
 ### 5.2 Milestone-to-Rule Codification Matrix
 
 | Completed Milestone | Rule / Convention Introduced | Tier 1 (Automated / Compiler / CI Gate) | Tier 2 (`docs/DEVELOPMENT.md`) | Tier 3 (`.agents/rules/`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **M1** | **No Loose Engine Lifecycle Flags:** Phase-dependent transaction state belongs inside `enum TxState`; call-scoped modes pass `WriteScope` as arguments; temporary locks/modes use RAII guards. | Rust struct privacy + Clippy `struct_excessive_bools` / module lints | Update §3 with state-machine & RAII guard policy | Create `.agents/rules/state-machine-conventions.md` |
+| **M1** | **No Loose Engine Lifecycle Flags:** Phase-dependent transaction state belongs inside `enum TxState`; call-scoped modes pass `WriteScope` as arguments; temporary locks/modes use RAII guards. | `pub(super)` / module privacy + `#[must_use]` RAII guards (`scoped_guards`) | [`DEVELOPMENT.md`](../DEVELOPMENT.md) §3.1 | `.agents/rules/state-machine-conventions.md` |
 | **M2** | **Capability-Gated Mutations & Single-Owner VTab DDL State:** Storage mutators accept a `Healthy` capability handle rather than calling ad-hoc poison checks; connection DDL goes through `ConnDdlState`. | `StorageEngine` mutating internals non-callable without `Healthy` token | Document poison-gate & VTab DDL transition table rules | Extend `.agents/rules/state-machine-conventions.md` |
 | **M3** | **Sans-I/O Purity Boundary:** `*_fsm.rs` modules never import `std::io` filesystem primitives, `PlatformFs`, or SQLite FFI bindings, and emit trace events for every step. | Clippy / module dependency check + `#[must_use]` on `Effects` | Add "Sans-I/O State Core" boundary specification | Document FSM vs. Imperative Shell split in `.agents/rules/` |
 | **M4** | **Formal Model Lockstep & Zero-`sorry` Policy:** Any edit to `tx_fsm`, `unique_marker_gen`, or `WalLinks` recovery updates `formal/lean/`, clears `#print axioms`, and passes trace refinement. | CI `formal` job (`lake build` + `#print axioms` + `aydb-trace-check`) | Add "Formal Verification Workflow" section | Create `.agents/rules/formal-verification.md` |
