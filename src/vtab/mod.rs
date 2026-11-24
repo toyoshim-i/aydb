@@ -842,13 +842,41 @@ struct AydbCursor {
 /// value (e.g., `CAST(1 AS INTEGER)` or a join against an integer column).
 ///
 /// Under SQLite's cross-affinity comparison rules, a single typed lookup key cannot match all
-/// storage representations (`'1'`, `'01'`, `'1.0'` for `TEXT`; integers and numeric strings under
-/// integer-affine joins for `BLOB`), so callers must fall back to a scan that lets SQLite's VDBE
-/// filter each candidate row (`omit = 0`).
+/// Returns `true` when an equality probe `(col = rhs)` cannot map SQLite's comparison
+/// semantics onto a single stored key probe and must fall back to a scan with `omit = 0`:
+/// - `TEXT` column vs `INTEGER | FLOAT` rhs: numeric literals compare via text/numeric conversion.
+/// - `BLOB` column vs `INTEGER | FLOAT | TEXT` rhs: `SQLITE_INTEGER`/`SQLITE_FLOAT` or
+///   `SQLITE_TEXT` probes from numeric-affine joins may have non-BLOB affinity in SQLite's
+///   comparison operator, so fall back cleanly to SQLite's VDBE filter (`omit = 0`).
 #[inline]
-fn is_cross_affinity_numeric_search(col_affinity: ColumnAffinity, val_type: c_int) -> bool {
-    matches!(col_affinity, ColumnAffinity::Text | ColumnAffinity::Blob)
-        && matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT)
+fn is_cross_affinity_eq_search(col_affinity: ColumnAffinity, val_type: c_int) -> bool {
+    match col_affinity {
+        ColumnAffinity::Text => matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT),
+        ColumnAffinity::Blob => matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT | SQLITE_TEXT),
+        _ => false,
+    }
+}
+
+/// Returns `true` when a range bound (`>`, `>=`, `<`, `<=`) on `col_affinity` cannot be safely
+/// encoded as a single key bound and must be left unbounded (`Ok(None)`) for SQLite (`omit = 0`):
+/// - `BLOB` columns with `INTEGER | FLOAT | TEXT` bounds.
+/// - `TEXT` columns with `INTEGER | FLOAT` bounds, or an upper bound (`is_lower == false`) with
+///   `SQLITE_TEXT` (since cross-affinity joins can coerce or match stored keys below `KEY_TAG_TEXT`
+///   and numeric/blob ordering diverges under upper bounds).
+#[inline]
+fn is_cross_affinity_range_bound(
+    col_affinity: ColumnAffinity,
+    val_type: c_int,
+    is_lower: bool,
+) -> bool {
+    match col_affinity {
+        ColumnAffinity::Blob => matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT | SQLITE_TEXT),
+        ColumnAffinity::Text => {
+            matches!(val_type, SQLITE_INTEGER | SQLITE_FLOAT)
+                || (!is_lower && val_type == SQLITE_TEXT)
+        }
+        _ => false,
+    }
 }
 
 /// Initializes a streaming primary-key full-table scan on `cursor`, used both for `PLAN_FULL_SCAN`
@@ -910,7 +938,7 @@ unsafe fn pk_range_bound_to_key(
             return Err(());
         }
     }
-    if is_cross_affinity_numeric_search(pk_affinity, val_type) {
+    if is_cross_affinity_range_bound(pk_affinity, val_type, is_lower) {
         return Ok(None);
     }
 
@@ -970,7 +998,7 @@ unsafe fn sec_range_bound_to_key(
             return Err(());
         }
     }
-    if is_cross_affinity_numeric_search(sec_affinity, val_type) {
+    if is_cross_affinity_range_bound(sec_affinity, val_type, is_lower) {
         return Ok(None);
     }
 
@@ -1126,18 +1154,25 @@ fn connect_table(
         || eng
             .capped_table_state_view(view, table_id)
             .is_some_and(|state| state.max_bytes == ddl.max_bytes);
-    let use_persisted_activation = if eng.check_write_allowed_for_conn(conn_id).is_err() {
-        if !(plan.persisted && quota_registered) {
-            return Ok(None);
-        }
-        true
-    } else {
-        !is_create
-            && eng.conn_has_open_transaction(conn_id)
-            && plan.persisted
-            && quota_registered
-            && !eng.is_vtab_created_in_tx(table_id)
-    };
+    let (use_persisted_activation, needs_owner_quota_register) =
+        if eng.check_write_allowed_for_conn(conn_id).is_err() {
+            if !(plan.persisted && quota_registered) {
+                return Ok(None);
+            }
+            (true, false)
+        } else {
+            let persisted_in_owner_tx = !is_create
+                && eng.conn_has_open_transaction(conn_id)
+                && plan.persisted
+                && !eng.is_vtab_created_in_tx(table_id);
+            (
+                persisted_in_owner_tx,
+                persisted_in_owner_tx && !quota_registered && ddl.max_bytes > 0,
+            )
+        };
+    if needs_owner_quota_register {
+        eng.register_capped_table(table_id, ddl.max_bytes)?;
+    }
     let reg_token = if use_persisted_activation {
         eng.activate_persisted_vtab(table_id, &ddl.table_name)
     } else {
@@ -1434,8 +1469,9 @@ unsafe fn vtab_create_or_connect(
                     }
                 };
             }
-            let guard_create_sp =
-                is_create && !began_here && eng.conn_has_open_transaction(db as usize);
+            let guard_create_sp = (is_create || ddl.max_bytes > 0)
+                && !began_here
+                && eng.conn_has_open_transaction(db as usize);
             if guard_create_sp {
                 if let Err(e) = eng.savepoint_for_conn(db as usize, CREATE_SAVEPOINT) {
                     return io_err_to_sqlite_rc(&e);
@@ -2404,7 +2440,7 @@ unsafe fn execute_exact_index_lookup(
             .get(col_idx)
             .copied()
             .unwrap_or(ColCollation::Binary);
-        if is_cross_affinity_numeric_search(col_aff, val_type) {
+        if is_cross_affinity_eq_search(col_aff, val_type) {
             if let Err(e) = start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false) {
                 return io_err_to_sqlite_rc(&e);
             }
@@ -2504,7 +2540,7 @@ unsafe fn execute_vtab_filter(
                     }
                     return SQLITE_OK;
                 } else {
-                    if is_cross_affinity_numeric_search(vtab.pk_affinity, val_type) {
+                    if is_cross_affinity_eq_search(vtab.pk_affinity, val_type) {
                         if let Err(e) =
                             start_pk_full_scan(cursor, eng, vtab.table_id, pt_keys_only, false)
                         {
@@ -3164,6 +3200,9 @@ unsafe extern "system" fn vtab_column(
                             ))
                         }
                         Ok(Ok((false, _))) => map_res(project_key_zero_copy(&pk_copy, p_ctx)),
+                        Ok(Err(e)) | Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                            map_res(project_key_zero_copy(&pk_copy, p_ctx))
+                        }
                         Ok(Err(e)) | Err(e) => {
                             let rc = io_err_to_sqlite_rc(&e);
                             if rc != SQLITE_TOOBIG {

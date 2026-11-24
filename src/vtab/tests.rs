@@ -4874,3 +4874,347 @@ fn poisoned_in_tx_rename_revert_fails_commit_instead_of_silently_ignoring() {
         "COMMIT must fail when reconcile_in_tx_renames encounters a poisoned engine"
     );
 }
+
+#[test]
+fn cross_affinity_text_and_blob_lookups_match_native_sqlite() {
+    // R3-H4: Differential checks against native SQLite for BLOB columns compared with SQLITE_TEXT
+    // (direct literals & numeric-affine joins) and TEXT columns with upper bounds in joins.
+    let tmp = TempTestDir::new("r3_h4_cross_affinity_text_blob");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module_with_options(engine, false)
+        .unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ay_bp USING aydb(table_id = 1, columns = 'k BLOB PRIMARY KEY, v INT');
+         CREATE TABLE nat_bp(k BLOB PRIMARY KEY, v INT);
+         CREATE VIRTUAL TABLE ay_bs USING aydb(table_id = 2, columns = 'id INT PRIMARY KEY, s BLOB', indexes = 's');
+         CREATE TABLE nat_bs(id INT PRIMARY KEY, s BLOB);
+         CREATE INDEX nat_bs_s ON nat_bs(s);
+         CREATE VIRTUAL TABLE ay_bu USING aydb(table_id = 3, columns = 'id INT PRIMARY KEY, s BLOB UNIQUE');
+         CREATE TABLE nat_bu(id INT PRIMARY KEY, s BLOB UNIQUE);
+
+         CREATE VIRTUAL TABLE ay_tp USING aydb(table_id = 4, columns = 'k TEXT PRIMARY KEY, v INT');
+         CREATE TABLE nat_tp(k TEXT PRIMARY KEY, v INT);
+         CREATE VIRTUAL TABLE ay_ts USING aydb(table_id = 5, columns = 'id INT PRIMARY KEY, s TEXT', indexes = 's');
+         CREATE TABLE nat_ts(id INT PRIMARY KEY, s TEXT);
+         CREATE INDEX nat_ts_s ON nat_ts(s);
+         CREATE VIRTUAL TABLE ay_tu USING aydb(table_id = 6, columns = 'id INT PRIMARY KEY, s TEXT UNIQUE');
+         CREATE TABLE nat_tu(id INT PRIMARY KEY, s TEXT UNIQUE);
+
+         CREATE TABLE q_num(qid INT PRIMARY KEY, x NUMERIC);
+         INSERT INTO q_num VALUES (1, 0), (2, 1), (3, 2), (4, '1'), (5, '1.0'), (6, '10');",
+    )
+    .unwrap();
+
+    for (i, val) in ["0", "1", "'0'", "'1'", "'01'", "x'30'", "x'31'", "'2'"]
+        .iter()
+        .enumerate()
+    {
+        let id = i + 1;
+        conn.execute_batch(&format!(
+            "INSERT INTO ay_bp VALUES ({val}, {id});
+             INSERT INTO nat_bp VALUES ({val}, {id});
+             INSERT INTO ay_bs VALUES ({id}, {val});
+             INSERT INTO nat_bs VALUES ({id}, {val});
+             INSERT INTO ay_bu VALUES ({id}, {val});
+             INSERT INTO nat_bu VALUES ({id}, {val});"
+        ))
+        .unwrap();
+    }
+
+    for (i, val) in ["'0'", "'1'", "'01'", "'1.0'", "'2'", "'10'", "'a'", "'z'"]
+        .iter()
+        .enumerate()
+    {
+        let id = i + 1;
+        conn.execute_batch(&format!(
+            "INSERT INTO ay_tp VALUES ({val}, {id});
+             INSERT INTO nat_tp VALUES ({val}, {id});
+             INSERT INTO ay_ts VALUES ({id}, {val});
+             INSERT INTO nat_ts VALUES ({id}, {val});
+             INSERT INTO ay_tu VALUES ({id}, {val});
+             INSERT INTO nat_tu VALUES ({id}, {val});"
+        ))
+        .unwrap();
+    }
+
+    for (ay, nat, col, ord) in [
+        ("ay_bp", "nat_bp", "k", "k"),
+        ("ay_bs", "nat_bs", "s", "id"),
+        ("ay_bu", "nat_bu", "s", "id"),
+    ] {
+        for tmpl in [
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} = CAST('1' AS TEXT) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} > CAST('0' AS TEXT) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} >= CAST('0' AS TEXT) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} < CAST('2' AS TEXT) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}), {ord} FROM {tbl} WHERE {col} <= CAST('1' AS TEXT) ORDER BY {ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} = q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} < q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} <= q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} > q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} >= q.x ORDER BY q.qid, a.{ord}",
+        ] {
+            let qa = tmpl
+                .replace("{tbl}", ay)
+                .replace("{col}", col)
+                .replace("{ord}", ord);
+            let qn = tmpl
+                .replace("{tbl}", nat)
+                .replace("{col}", col)
+                .replace("{ord}", ord);
+            assert_eq!(
+                conn.query_all(&qa, &[]).unwrap(),
+                conn.query_all(&qn, &[]).unwrap(),
+                "BLOB differential mismatch: `{qa}`"
+            );
+        }
+    }
+
+    for (ay, nat, col, ord) in [
+        ("ay_tp", "nat_tp", "k", "k"),
+        ("ay_ts", "nat_ts", "s", "id"),
+        ("ay_tu", "nat_tu", "s", "id"),
+    ] {
+        for tmpl in [
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} = q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} < q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} <= q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} > q.x ORDER BY q.qid, a.{ord}",
+            "SELECT q.qid, typeof(a.{col}), quote(a.{col}) FROM q_num q JOIN {tbl} a ON a.{col} >= q.x ORDER BY q.qid, a.{ord}",
+            "SELECT typeof({col}), quote({col}) FROM {tbl} WHERE {col} < CAST(10 AS INTEGER) ORDER BY {ord}",
+            "SELECT typeof({col}), quote({col}) FROM {tbl} WHERE {col} <= '1' ORDER BY {ord}",
+        ] {
+            let qa = tmpl
+                .replace("{tbl}", ay)
+                .replace("{col}", col)
+                .replace("{ord}", ord);
+            let qn = tmpl
+                .replace("{tbl}", nat)
+                .replace("{col}", col)
+                .replace("{ord}", ord);
+            assert_eq!(
+                conn.query_all(&qa, &[]).unwrap(),
+                conn.query_all(&qn, &[]).unwrap(),
+                "TEXT differential mismatch: `{qa}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn owner_lazy_xconnect_with_quota_change_preserves_state_and_rolls_back_cleanly() {
+    // R3-M4: Owner lazy xConnect on a persisted table with changed/unregistered `max_bytes`
+    // must keep live registration & runtime settings across ROLLBACK / ROLLBACK TO, and roll back
+    // partial `'l'`/`'t'` writes atomically via CREATE_SAVEPOINT if `register_capped_table` fails.
+    let schema_dir = TempTestDir::new("r3_m4_owner_xconnect_schema");
+    let engine_dir = TempTestDir::new("r3_m4_owner_xconnect_engine");
+    let schema_path = schema_dir.path.join("schema.db");
+
+    {
+        let fs = Arc::new(OsFs::open(&engine_dir.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let setup = SqliteConnection::open_file(&schema_path).unwrap();
+        setup
+            .register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+        setup
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t1 USING aydb(table_id = 1, columns = 'id INTEGER PRIMARY KEY, v TEXT');
+                 CREATE VIRTUAL TABLE t2 USING aydb(table_id = 2, max_bytes = 2000, on_corrupt = 'evict', inline_max = 128, columns = 'id INTEGER PRIMARY KEY, v TEXT');
+                 CREATE VIRTUAL TABLE t3 USING aydb(table_id = 3, columns = 'id INTEGER PRIMARY KEY, v TEXT');
+                 INSERT INTO t2 VALUES (1, 'one'), (2, 'two');",
+            )
+            .unwrap();
+        for i in 1..=20i64 {
+            setup
+                .execute_batch(&format!(
+                    "INSERT INTO t3 VALUES ({i}, 'row_{i}_padding_text');"
+                ))
+                .unwrap();
+        }
+        // Mutate sqlite_master DDL so the next connection lazily `xConnect`s t2 (changed max_bytes +
+        // inline_max) and t3 (newly capped large table) with quota_registered == false.
+        setup
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master SET sql = replace(sql, 'max_bytes = 2000, on_corrupt = ''evict'', inline_max = 128', 'max_bytes = 4000, on_corrupt = ''evict'', inline_max = 256') WHERE name = 't2';
+                 UPDATE sqlite_master SET sql = replace(sql, 'table_id = 3,', 'table_id = 3, max_bytes = 100000,') WHERE name = 't3';",
+            )
+            .unwrap();
+    }
+
+    // Part 1: Owner lazy xConnect of t2 with changed max_bytes preserves handle & settings across
+    // ROLLBACK and ROLLBACK TO SAVEPOINT.
+    {
+        let fs = Arc::new(OsFs::open(&engine_dir.path, false).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_file(&schema_path).unwrap();
+        conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+
+        conn.execute_batch(
+            "BEGIN;
+             SAVEPOINT sp1;
+             INSERT INTO t1 VALUES (10, 'tmp');",
+        )
+        .unwrap();
+        // Lazy xConnect t2 inside owner's savepoint.
+        assert_eq!(
+            conn.query_all("SELECT id FROM t2 ORDER BY id", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Integer(1)], vec![SqlValue::Integer(2)]]
+        );
+        conn.execute_batch("ROLLBACK TO sp1; RELEASE sp1; ROLLBACK;")
+            .unwrap();
+
+        // t2 handle must stay active and keep its newly applied runtime settings (`on_corrupt`,
+        // `inline_max`).
+        conn.execute_batch("INSERT INTO t2 VALUES (3, 'three');")
+            .unwrap();
+        assert_eq!(
+            conn.query_all("SELECT id FROM t2 ORDER BY id", &[])
+                .unwrap(),
+            vec![
+                vec![SqlValue::Integer(1)],
+                vec![SqlValue::Integer(2)],
+                vec![SqlValue::Integer(3)],
+            ]
+        );
+        assert_eq!(
+            engine.read().unwrap().corrupt_policy(2),
+            crate::engine::CorruptPolicy::Evict
+        );
+        assert_eq!(engine.read().unwrap().effective_inline_threshold(2), 256);
+    }
+
+    // Part 2: Mid-reconcile failure inside owner lazy xConnect of t3 rolls back partial `'l'`/`'t'`
+    // entries via CREATE_SAVEPOINT while keeping the outer owner transaction (`t1`) intact.
+    {
+        let mut cfg = EngineConfig::default();
+        cfg.max_transaction_bytes = 512;
+        let fs = Arc::new(OsFs::open(&engine_dir.path, false).unwrap());
+        let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+        let conn = SqliteConnection::open_file(&schema_path).unwrap();
+        conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+            .unwrap();
+
+        conn.execute_batch("BEGIN; INSERT INTO t1 VALUES (99, 'survives');")
+            .unwrap();
+        let err = conn.query_all("SELECT count(*) FROM t3", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("vtable constructor failed"),
+            "expected vtable constructor failure during t3 budget-exceeded reconcile, got: {err}"
+        );
+        conn.execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(
+            conn.query_all("SELECT id, v FROM t1 WHERE id = 99", &[])
+                .unwrap(),
+            vec![vec![
+                SqlValue::Integer(99),
+                SqlValue::Text("survives".into())
+            ]]
+        );
+        let eng = engine.read().unwrap();
+        assert!(
+            eng.test_live_keys(3, b'l').unwrap().is_empty(),
+            "CREATE_SAVEPOINT must roll back partial LRU queue records after failed reconcile"
+        );
+        assert!(
+            eng.test_live_keys(3, b't').unwrap().is_empty(),
+            "CREATE_SAVEPOINT must roll back partial row_meta records after failed reconcile"
+        );
+        assert!(eng.capped_table_state(3).is_none());
+    }
+}
+
+#[test]
+fn keys_only_zero_pk_falls_back_when_blob_corrupt_and_keeps_negative_zero() {
+    // R3-L1: When a REAL PRIMARY KEY equals +/-0.0 and its out-of-line blob is corrupt under
+    // `on_corrupt = 'error'`, full-row SELECT fails with SQLITE_CORRUPT, whereas keys_only
+    // (`SELECT k WHERE k = 0.0`, `DELETE WHERE k = 0.0`) falls back cleanly; intact `-0.0` still
+    // preserves its negative sign.
+    let tmp = TempTestDir::new("r3_l1_zero_pk_corrupt_fallback");
+    {
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+        ));
+        let conn = SqliteConnection::open_in_memory().unwrap();
+        conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING aydb(table_id = 91, inline_max = 64, columns = 'k REAL PRIMARY KEY, body BLOB');",
+        )
+        .unwrap();
+        let big = vec![0xABu8; 512];
+        conn.query_all(
+            "INSERT INTO docs VALUES (?1, ?2)",
+            &[SqlValue::Float(-0.0), SqlValue::Blob(big)],
+        )
+        .unwrap();
+
+        // Intact `-0.0` retains its negative sign even in keys-only lookup `WHERE k = 0.0`.
+        let rows = conn
+            .query_all("SELECT k FROM docs WHERE k = 0.0", &[])
+            .unwrap();
+        let SqlValue::Float(val) = rows[0][0] else {
+            panic!("expected float");
+        };
+        assert_eq!(val, 0.0);
+        assert!(val.is_sign_negative(), "intact -0.0 must stay negative");
+
+        engine.write().unwrap().flush_memtable().unwrap();
+    }
+
+    // Corrupt the single blob_std_*.db segment so loading the row returns ErrorKind::InvalidData.
+    let blob_files: Vec<_> = std::fs::read_dir(&tmp.path)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("blob_std_") && n.ends_with(".db")
+        })
+        .collect();
+    assert_eq!(blob_files.len(), 1);
+    let mut bytes = std::fs::read(blob_files[0].path()).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(blob_files[0].path(), &bytes).unwrap();
+
+    let fs = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE docs USING aydb(table_id = 91, inline_max = 64, columns = 'k REAL PRIMARY KEY, body BLOB');",
+    )
+    .unwrap();
+
+    assert!(
+        conn.query_all("SELECT k, body FROM docs WHERE k = 0.0", &[])
+            .is_err(),
+        "full-row read of corrupt row must still fail under on_corrupt='error'"
+    );
+    let key_rows = conn
+        .query_all("SELECT k FROM docs WHERE k = 0.0", &[])
+        .unwrap();
+    assert_eq!(key_rows, vec![vec![SqlValue::Float(0.0)]]);
+
+    conn.execute_batch("DELETE FROM docs WHERE k = 0.0;")
+        .unwrap();
+    assert_eq!(
+        conn.query_all("SELECT count(*) FROM docs", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(0)]]
+    );
+}
