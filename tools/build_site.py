@@ -452,9 +452,9 @@ def classify_fmt(text):
 def classify_clippy(text):
     if text is None:
         return "none", "no result"
-    if re.search(r"^(error|warning)\b", text, re.M):
-        count = len(re.findall(r"^(?:error|warning)(?:\[|:)", text, re.M))
-        return "bad", "{} diagnostic(s)".format(count)
+    matches = re.findall(r"^(?:error|warning)(?:\[|:|\b)", text, re.M)
+    if matches:
+        return "bad", "{} diagnostic(s)".format(len(matches))
     if "Finished" in text:
         return "ok", "no warnings"
     return "bad", "did not finish"
@@ -480,6 +480,18 @@ def parse_bench_status(text):
         match = re.match(r"^(\S+) exit=(\d+) seconds=(\d+)", line)
         if match:
             result[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+    return result
+
+
+def parse_test_status(text):
+    """Parse lines like `tests exit=0` from test-status.txt, or None if absent."""
+    if text is None:
+        return None
+    result = {}
+    for line in text.splitlines():
+        match = re.match(r"^(\S+) exit=(\d+)\s*$", line)
+        if match:
+            result[match.group(1)] = int(match.group(2))
     return result
 
 
@@ -555,6 +567,7 @@ def collect(artifacts):
             "clippy": read_text(test_dir / "clippy.txt"),
             "tests": read_text(test_dir / "tests.txt"),
             "reliability": read_text(test_dir / "reliability.txt"),
+            "test_status": parse_test_status(read_text(test_dir / "test-status.txt")),
             "status": parse_bench_status(read_text(bench_dir / "status.txt")),
             "bench": {},
         }
@@ -566,13 +579,26 @@ def collect(artifacts):
 
 def os_summary_table(os_name, entry):
     rows = []
-    for label, text, classify in (
-        ("cargo fmt --check", entry["fmt"], classify_fmt),
-        ("Clippy (-D warnings)", entry["clippy"], classify_clippy),
-        ("cargo test --all-targets", entry["tests"], classify_tests),
-        ("Reliability benchmark", entry["reliability"], classify_reliability),
+    test_status = entry.get("test_status")
+    for key, label, text, classify in (
+        ("fmt", "cargo fmt --check", entry["fmt"], classify_fmt),
+        ("clippy", "Clippy (-D warnings)", entry["clippy"], classify_clippy),
+        ("tests", "cargo test --all-targets", entry["tests"], classify_tests),
+        ("reliability", "Reliability benchmark", entry["reliability"], classify_reliability),
     ):
         state, detail = classify(text)
+        if test_status is not None:
+            if key in test_status:
+                exit_code = test_status[key]
+                if exit_code != 0:
+                    state = "bad"
+                    if detail == "no result":
+                        detail = "exit status {}".format(exit_code)
+                    else:
+                        detail = "exit status {} ({})".format(exit_code, detail)
+            elif text is not None:
+                state = "bad"
+                detail = "exit status not recorded ({})".format(detail)
         rows.append((label, state, detail))
     for name in BENCHES:
         text = entry["bench"][name]
@@ -1125,6 +1151,7 @@ def main(argv=None):
     cwd = Path.cwd().resolve()
     if (out == out.parent
             or out == cwd
+            or out in cwd.parents
             or out == repo_root
             or out in repo_root.parents
             or out == artifacts
@@ -1141,7 +1168,7 @@ def main(argv=None):
     build_markdown_pages(repo_root, out, repo_url, args.branch)
     meta = {"sha": args.sha, "run_url": args.run_url,
             "timestamp": args.timestamp}
-    build_results(args.artifacts, out, meta, repo_url)
+    build_results(artifacts, out, meta, repo_url)
     (out / ".nojekyll").write_text("", encoding="utf-8")
     print("site written to {}".format(out))
     return 0

@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: never
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
@@ -44,16 +47,40 @@ jobs:
         run: mkdir -p results
 
       - name: Format
-        run: cargo fmt --check 2>&1 | tee results/fmt.txt
+        run: |
+          set +e
+          cargo fmt --check 2>&1 | tee results/fmt.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "fmt exit=$status" >> results/test-status.txt
+          exit "$status"
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee results/clippy.txt
+        run: |
+          set +e
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee results/clippy.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "clippy exit=$status" >> results/test-status.txt
+          exit "$status"
 
       - name: Tests
-        run: cargo test --all-targets 2>&1 | tee results/tests.txt
+        run: |
+          set +e
+          cargo test --all-targets 2>&1 | tee results/tests.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "tests exit=$status" >> results/test-status.txt
+          exit "$status"
 
       - name: Reliability benchmark
-        run: cargo run --release --example reliability_bench 2>&1 | tee results/reliability.txt
+        run: |
+          set +e
+          cargo run --release --example reliability_bench 2>&1 | tee results/reliability.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "reliability exit=$status" >> results/test-status.txt
+          exit "$status"
 
       - name: Upload results
         if: always()
@@ -138,13 +165,14 @@ jobs:
           path: results/
           if-no-files-found: warn
 
-  # Publishes the report for pushes to main. "always()" makes the job run
-  # when a test or bench job failed, so a red state is published too. Pull
-  # requests and manual runs on other refs never deploy.
+  # Publishes the report for pushes to main. "!cancelled()" makes the job run
+  # when a test or bench job failed (so a red state is published too), while
+  # skipping manual or superseding cancellations. Pull requests and manual
+  # runs on other refs never deploy.
   pages:
     name: pages
     needs: [test, bench]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
