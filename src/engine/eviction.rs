@@ -178,11 +178,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 value: meta_bytes,
             });
         }
-        if let Err(e) = self.commit_wal_and_memtable_with_data_flag(
-            records,
-            WriteDurability::BufferedFast,
-            false,
-        ) {
+        if let Err(e) =
+            self.commit_wal_and_memtable_core(records, WriteDurability::BufferedFast, false, false)
+        {
             if let Some(p) = new_m_ptr {
                 self.record_dead_blob_bytes(&p);
             }
@@ -191,6 +189,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(m_ptr) = old_m_ptr {
             self.record_dead_blob_bytes(&m_ptr);
         }
+        self.maybe_auto_flush_and_compact();
         Ok(())
     }
 
@@ -287,6 +286,30 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         continue;
                     }
 
+                    // Check row existence BEFORE lazy promotion so an orphan `'l'` key whose row is
+                    // already absent is cleaned up immediately rather than promoted.
+                    let row_key = encode_primary_row_key(table_id, &pk);
+                    let existing = self.check_existing_row(&row_key)?;
+                    if existing == ExistingRowStatus::NotFound {
+                        let del = WalRecord::Delete { key: entry.key };
+                        let del_est = est_wal_record_bytes(&del);
+                        if !batch_records.is_empty()
+                            && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
+                        {
+                            break;
+                        }
+                        batch_est_bytes = batch_est_bytes.saturating_add(del_est);
+                        batch_records.push(del);
+                        last_scanned_tick = old_tick;
+                        window_next_cursor = Some(old_tick.saturating_add(1));
+                        consumed_hot_ticks.push((pk.clone(), u64::MAX));
+                        handled_pks.insert(pk, None);
+                        if batch_est_bytes >= max_window_wal_bytes {
+                            break;
+                        }
+                        continue;
+                    }
+
                     // Check if this key was accessed in RAM since `old_tick` was indexed!
                     if let Some(hot_tick) = self.access_tracker.peek_hot_tick(table_id, &pk) {
                         if hot_tick > old_tick {
@@ -364,27 +387,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
 
                     // Coldest candidate confirmed -> Cascade Evict (planned into the window batch)!
-                    let row_key = encode_primary_row_key(table_id, &pk);
-                    let existing = self.check_existing_row(&row_key)?;
-                    if existing == ExistingRowStatus::NotFound {
-                        // Stale LRU queue entry whose row was already gone; clean up the orphan `'l'` key.
-                        let del = WalRecord::Delete { key: entry.key };
-                        let del_est = est_wal_record_bytes(&del);
-                        if !batch_records.is_empty()
-                            && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
-                        {
-                            break;
-                        }
-                        batch_est_bytes = batch_est_bytes.saturating_add(del_est);
-                        batch_records.push(del);
-                        last_scanned_tick = old_tick;
-                        window_next_cursor = Some(old_tick.saturating_add(1));
-                        handled_pks.insert(pk, None);
-                        if batch_est_bytes >= max_window_wal_bytes {
-                            break;
-                        }
-                        continue;
-                    }
 
                     let mut cand_records = Vec::new();
                     let mut cand_dead_ptrs = Vec::new();
@@ -504,7 +506,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         return Err(e);
                     }
                 }
-                if let Err(e) = self.commit_wal_and_memtable(batch_records, durability) {
+                if let Err(e) =
+                    self.commit_wal_and_memtable_core(batch_records, durability, true, false)
+                {
                     for p in &new_meta_ptrs {
                         self.record_dead_blob_bytes(p);
                     }
@@ -535,6 +539,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         ct.eviction_cursor_tick = next_c;
                     }
                 }
+                self.maybe_auto_flush_and_compact();
                 progress = true;
             }
 
@@ -568,7 +573,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         let records = core::mem::take(missing_records);
-        if let Err(e) = self.commit_wal_and_memtable(records, WriteDurability::BufferedFast) {
+        if let Err(e) =
+            self.commit_wal_and_memtable_core(records, WriteDurability::BufferedFast, true, false)
+        {
             if self.tx_depth == 0 {
                 self.in_flight_autocommit_blob_starts.clear();
             }
@@ -824,6 +831,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         if let Some(ct) = self.capped_tables.get_mut(&tid) {
             ct.current_logical_bytes = total_bytes;
+        }
+        if apply_repairs {
+            self.maybe_auto_flush_and_compact();
         }
         Ok(needs_repair)
     }

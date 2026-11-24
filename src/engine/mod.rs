@@ -2470,8 +2470,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         records.extend(extra_records);
 
-        // 5. Append atomic batch to WAL and apply to MemTable
-        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+        // 5. Append atomic batch to WAL and apply to MemTable (deferring auto-flush until
+        //    dead-blob bytes and quota totals are updated below).
+        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
             if let Some(ref p) = new_row_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -2494,7 +2495,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.table_has_row_meta.insert(table_id, true);
         }
 
-        // 6. Apply dead blob byte accounting and update Capped Table logical byte counter after WAL succeeds
+        // 6. Apply dead blob byte accounting and update Capped Table logical byte counter before
+        //    any auto-flush so `boot_meta.db` never persists stale quotas or uncounted dead bytes.
         if let Some(old_ptr) = old_blob_ptr {
             self.record_dead_blob_bytes(&old_ptr);
         }
@@ -2507,6 +2509,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .saturating_sub(old_logical_size)
                 .saturating_add(logical_size as u64);
         }
+        self.maybe_auto_flush_and_compact();
         if is_capped && self.tx_depth == 0 {
             // The row is committed; an exceeded quota is re-evaluated by the next write.
             if let Err(e) = self.evict_until_within_quota(table_id, durability) {
@@ -2625,7 +2628,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged)?;
         let new_meta_blob_ptr =
             self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
-        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
             if let Some(ref p) = new_meta_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -2635,6 +2638,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(old_m_ptr) = old_meta_blob_ptr {
             self.record_dead_blob_bytes(&old_m_ptr);
         }
+        self.maybe_auto_flush_and_compact();
         Ok(true)
     }
 
@@ -3019,7 +3023,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let is_capped = self.capped_tables.contains_key(&table_id);
-        self.commit_wal_and_memtable(records, durability)?;
+        self.commit_wal_and_memtable_core(records, durability, true, false)?;
         if is_capped {
             if self.tx_depth == 0 {
                 self.access_tracker.remove_key(table_id, pk);
@@ -3038,6 +3042,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
             ct.current_logical_bytes = ct.current_logical_bytes.saturating_sub(old_logical_size);
         }
+        self.maybe_auto_flush_and_compact();
         Ok(true)
     }
 
@@ -4124,6 +4129,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(ok)
     }
 
+    pub(super) fn maybe_auto_flush_and_compact(&mut self) {
+        if self.tx_depth > 0 || self.is_poisoned() {
+            return;
+        }
+        // The batch is committed; a failed flush is retried because `should_flush` stays true.
+        if self.memtable.should_flush() {
+            if let Err(e) = self.flush_memtable() {
+                self.record_maintenance_failure(&e);
+            }
+        }
+        // Safe point: the batch is appended and `next_lsn` has advanced.
+        self.run_due_auto_compaction();
+    }
+
     pub(super) fn commit_wal_and_memtable(
         &mut self,
         records: Vec<WalRecord>,
@@ -4245,14 +4264,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.data_generation += 1;
         }
         if allow_auto_flush {
-            // The batch is committed; a failed flush is retried because `should_flush` stays true.
-            if self.memtable.should_flush() {
-                if let Err(e) = self.flush_memtable() {
-                    self.record_maintenance_failure(&e);
-                }
-            }
-            // Safe point: the batch is appended and `next_lsn` has advanced.
-            self.run_due_auto_compaction();
+            self.maybe_auto_flush_and_compact();
         }
         Ok(lsn)
     }

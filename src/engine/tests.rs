@@ -9716,3 +9716,165 @@ fn single_sector_wal_sub_batches_eviction_and_relocation_and_stops_on_flush_err(
     let relocated = engine2.relocate_fragmented_std_blobs(0.2).unwrap();
     assert!(relocated > 0);
 }
+
+#[test]
+fn tiny_memtable_autocommit_updates_persist_exact_quotas_and_dead_bytes() {
+    // R2-H1: with memtable_capacity_bytes = 1, every autocommit batch triggers an auto-flush.
+    // Quota totals and dead blob bytes must be updated before that auto-flush persists boot_meta.
+    let tmp = TempTestDir::new("r2_h1_tiny_memtable_quota_dead_bytes");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 1;
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 4096;
+
+    {
+        let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
+        engine.register_capped_table(1, 100_000).unwrap();
+
+        engine
+            .put_row(1, b"k1", &[0x11u8; 600], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let stored1 = engine
+            .meta_mgr
+            .state()
+            .table_quotas
+            .iter()
+            .find(|q| q.table_id == 1)
+            .unwrap()
+            .current_logical_bytes;
+        assert_eq!(stored1, 602);
+
+        // Overwrite with a 200B blob -> auto-flushes in put_row_with_extra_records.
+        engine
+            .put_row(1, b"k1", &[0x22u8; 200], &[], WriteDurability::BufferedFast)
+            .unwrap();
+        let stored2 = engine
+            .meta_mgr
+            .state()
+            .table_quotas
+            .iter()
+            .find(|q| q.table_id == 1)
+            .unwrap()
+            .current_logical_bytes;
+        assert_eq!(stored2, 202);
+        let stored_dead: u64 = engine
+            .meta_mgr
+            .state()
+            .lru_blob_segments
+            .iter()
+            .filter(|b| b.table_id == 1)
+            .map(|b| b.dead_bytes)
+            .sum();
+        assert!(
+            stored_dead > 600,
+            "old 600B blob dead bytes must be persisted by auto-flush (got {stored_dead})"
+        );
+
+        // Delete -> auto-flushes in delete_row_with_rowid_hint.
+        assert!(
+            engine
+                .delete_row(1, b"k1", WriteDurability::BufferedFast)
+                .unwrap()
+        );
+        let stored3 = engine
+            .meta_mgr
+            .state()
+            .table_quotas
+            .iter()
+            .find(|q| q.table_id == 1)
+            .unwrap()
+            .current_logical_bytes;
+        assert_eq!(stored3, 0);
+        engine.checkpoint().unwrap();
+    }
+
+    let reopened = StorageEngine::open(fs, cfg).unwrap();
+    assert_eq!(
+        reopened
+            .capped_table_state(1)
+            .unwrap()
+            .current_logical_bytes,
+        0
+    );
+}
+
+#[test]
+fn reconcile_capped_table_tiny_memtable_with_corrupt_meta_does_not_double_subtract() {
+    // R2-H1: corrupt rows evicted during post-reconcile auto-flush must not be overwritten or
+    // double-subtracted by `ct.current_logical_bytes = total_bytes`.
+    let tmp = TempTestDir::new("r2_h1_reconcile_corrupt_evict_bytes");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.memtable_capacity_bytes = 1;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+    engine.set_table_corrupt_policy(1, CorruptPolicy::Evict);
+
+    engine
+        .put_row(1, b"c_bad", b"vvvvvv", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .put_row(1, b"c_ok", b"good_val", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    // Corrupt c_bad's row metadata directly.
+    let bad_meta_key = crate::lru::encode_row_meta_key(1, b"c_bad");
+    engine
+        .commit_wal_and_memtable(
+            vec![crate::wal::WalRecord::PutInline {
+                key: bad_meta_key,
+                value: vec![0xFF, 0xFE, 0xFD],
+            }],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    assert!(engine.memtable.is_empty());
+
+    engine.register_capped_table(1, 100_000).unwrap();
+    assert!(engine.get_row(1, b"c_bad").unwrap().is_none());
+    let expected_ok_bytes = (b"c_ok".len() + b"good_val".len()) as u64;
+    assert_eq!(
+        engine.capped_table_state(1).unwrap().current_logical_bytes,
+        expected_ok_bytes
+    );
+}
+
+#[test]
+fn evict_until_within_quota_removes_orphan_lru_key_without_lazy_promotion() {
+    // R2-L6: orphan `'l'` entry with an in-memory hot tick must be deleted, not promoted.
+    let tmp = TempTestDir::new("r2_l6_orphan_lru_no_promote");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    engine.register_capped_table(1, 100_000).unwrap();
+    engine
+        .put_row(1, b"live", b"payload", &[], WriteDurability::BufferedFast)
+        .unwrap();
+
+    let orphan_tick = 1u64;
+    let orphan_key = crate::lru::encode_lru_queue_key(1, orphan_tick, b"ghost");
+    engine
+        .commit_wal_and_memtable(
+            vec![crate::wal::WalRecord::PutInline {
+                key: orphan_key.clone(),
+                value: Vec::new(),
+            }],
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    engine.access_tracker.record_read_hit(1, b"ghost");
+    assert!(
+        engine
+            .access_tracker
+            .peek_hot_tick(1, b"ghost")
+            .is_some_and(|t| t > orphan_tick)
+    );
+
+    // Trigger quota eviction: `"ghost"`'s `'l'` key sits at tick 1 (coldest), must be cleaned up
+    // without lazy promotion (`total_lazy_promotions == 0`).
+    engine.register_capped_table(1, 1).unwrap();
+    let st = engine.capped_table_state(1).unwrap();
+    assert_eq!(st.total_lazy_promotions, 0);
+    assert_eq!(st.current_logical_bytes, 0);
+    assert!(engine.access_tracker.peek_hot_tick(1, b"ghost").is_none());
+    let lru_prefix = crate::lru::encode_namespace_prefix(1, crate::lru::NS_LRU_QUEUE);
+    assert!(engine.scan_merged_prefix(&lru_prefix).unwrap().is_empty());
+}

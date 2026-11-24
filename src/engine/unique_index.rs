@@ -251,7 +251,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
         let batch = std::mem::take(&mut state.records);
-        if let Err(e) = self.commit_wal_and_memtable(batch, durability) {
+        if let Err(e) = self.commit_wal_and_memtable_core(batch, durability, true, false) {
             for p in state.new_meta_ptrs.drain(..) {
                 self.record_dead_blob_bytes(&p);
             }
@@ -266,6 +266,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         state.new_meta_ptrs.clear();
         state.wrote_any_meta = false;
         state.est_bytes = 0;
+        self.maybe_auto_flush_and_compact();
         Ok(())
     }
 
@@ -305,7 +306,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 )?;
             }
         }
-        if let Err(e) = self.commit_wal_and_memtable(records, durability) {
+        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
             if let Some(ref p) = new_meta_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -317,6 +318,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(old_m_ptr) = planned.old_meta_blob_ptr {
             self.record_dead_blob_bytes(&old_m_ptr);
         }
+        self.maybe_auto_flush_and_compact();
         Ok(true)
     }
 
