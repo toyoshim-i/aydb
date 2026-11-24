@@ -9348,3 +9348,72 @@ fn empty_pk_resume_key_and_mem_only_prepopulated_limit_behave_consistently() {
         assert_eq!(pks, vec![b"\x00".to_vec()]);
     }
 }
+
+#[test]
+fn group_gate_failure_and_awaiting_sync_abort_poison_and_block_compaction() {
+    // 1. commit_gate failure alone makes is_poisoned() true and suppresses run_due_auto_compaction,
+    //    while check_not_poisoned preserves explicit `self.poisoned` messages.
+    {
+        let tmp = TempTestDir::new("r2_h3_gate_poison");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine.auto_compaction_due = true;
+        engine
+            .commit_gate
+            .fail(&io::Error::other("simulated leader EIO"));
+        assert!(engine.is_poisoned());
+        engine.run_due_auto_compaction();
+        assert!(
+            engine.auto_compaction_due,
+            "run_due_auto_compaction must not run when commit_gate has failed"
+        );
+        let msg = engine.check_not_poisoned().unwrap_err().to_string();
+        assert!(
+            msg.contains("simulated leader EIO"),
+            "unexpected msg: {msg}"
+        );
+
+        let _ = engine.poison(io::Error::other("primary disk fault"));
+        let msg2 = engine.check_not_poisoned().unwrap_err().to_string();
+        assert!(
+            msg2.contains("primary disk fault"),
+            "explicit poison message must take precedence: {msg2}"
+        );
+    }
+
+    // 2. Rollback after CommitStep::AwaitingSync (before finish_commit_for_conn) must poison.
+    {
+        let tmp = TempTestDir::new("r2_m7_awaiting_sync_abort");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+        engine.register_capped_table(1, 1024 * 1024).unwrap(); // Non-groupable -> AwaitingSync
+        engine.begin_transaction_for_conn(1).unwrap();
+        engine
+            .put_row(
+                1,
+                b"k1",
+                &[0x11u8; 64],
+                &[],
+                WriteDurability::SyncTransactional,
+            )
+            .unwrap();
+        let lsn_before = engine.next_lsn;
+        engine
+            .prepare_commit_transaction(WriteDurability::SyncTransactional)
+            .unwrap();
+        let step = engine.begin_commit_for_conn(1).unwrap();
+        assert!(matches!(
+            step,
+            crate::engine::tx::CommitStep::AwaitingSync(_)
+        ));
+        assert!(engine.next_lsn > lsn_before);
+        // Simulate abort before finish_commit_for_conn runs.
+        engine.rollback_transaction().unwrap();
+        assert!(engine.is_poisoned());
+        assert!(
+            engine
+                .put_row(1, b"k2", b"v2", &[], WriteDurability::SyncTransactional)
+                .is_err()
+        );
+    }
+}

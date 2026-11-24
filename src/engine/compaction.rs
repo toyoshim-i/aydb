@@ -170,7 +170,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !self.auto_compaction_due
             || self.tx_depth > 0
             || !self.pending_group.is_empty()
-            || self.poisoned.is_some()
+            || self.is_poisoned()
         {
             return;
         }

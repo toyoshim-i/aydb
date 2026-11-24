@@ -581,3 +581,64 @@ fn mixed_tx_commit_busy_preserves_open_tx_for_rollback_and_retry() {
     );
     assert!(eng.active_vtab_name(3).is_none());
 }
+
+#[test]
+fn group_leader_sync_failure_blocks_concurrent_drain_until_gate_fails() {
+    let dir = TempTestDir::new("r2_c1_leader_drain_serialize");
+    let fs = Arc::new(OsFs::open(&dir.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn1 = SqliteConnection::open_in_memory().unwrap();
+    conn1
+        .register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+    conn1
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(durability='sync', columns='id INTEGER PRIMARY KEY, v TEXT');",
+        )
+        .unwrap();
+
+    // Stage a pending group-commit batch in `pending_group`.
+    let (lsn, gate) = {
+        let mut eng = engine.write().unwrap();
+        eng.begin_transaction_for_conn(11).unwrap();
+        eng.put_row(
+            1,
+            b"k1",
+            b"v1",
+            &[],
+            crate::engine::WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+        eng.prepare_commit_transaction(crate::engine::WriteDurability::SyncTransactional)
+            .unwrap();
+        match eng.begin_commit_for_conn(11).unwrap() {
+            crate::vtab::CommitStep::AwaitingGroup { lsn, gate, .. } => (lsn, gate),
+            _ => panic!("expected AwaitingGroup for plain sync commit"),
+        }
+    };
+    let crate::vtab::GroupRole::Lead(target) = gate.join_group(lsn).unwrap() else {
+        panic!("expected leader role");
+    };
+    assert_eq!(target, lsn);
+
+    // Hold `gate.lock_sync()` as a leader inside `sync_barrier()`, spawn `flush_memtable()` (which
+    // invokes `drain_pending_durable()`), then fail the gate before releasing `sync_mu` (as
+    // `complete_commit_step_for_engine` does). Even without a real EIO on disk, `flush_memtable`
+    // must observe the gate failure and MUST NOT mark the failed batch durable.
+    let sync_guard = gate.lock_sync().unwrap();
+    let engine_bg = Arc::clone(&engine);
+    let handle = std::thread::spawn(move || engine_bg.write().unwrap().flush_memtable());
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    gate.fail(&io::Error::other("simulated errseq-consuming EIO"));
+    drop(sync_guard);
+
+    let drain_res = handle.join().unwrap();
+    assert!(
+        drain_res.is_err(),
+        "drain_pending_durable must abort once leader records failure under sync_mu"
+    );
+    assert!(!gate.is_durable_through(target));
+    assert!(engine.read().unwrap().is_poisoned());
+}

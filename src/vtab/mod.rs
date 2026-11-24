@@ -4074,26 +4074,68 @@ fn complete_commit_step_for_engine(
     step.and_then(|step| match step {
         CommitStep::Done => Ok(()),
         CommitStep::AwaitingSync(file) => {
+            struct PendingSyncGuard<'a> {
+                engine: &'a Arc<RwLock<StorageEngine<OsFs>>>,
+                armed: bool,
+            }
+            impl Drop for PendingSyncGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        if let Ok(mut eng) = self.engine.write() {
+                            let _ = eng.finish_commit_for_conn(Err(io::Error::other(
+                                "WAL sync aborted before completion",
+                            )));
+                        }
+                    }
+                }
+            }
+            let mut guard = PendingSyncGuard {
+                engine,
+                armed: true,
+            };
             let flushed = run_commit_sync_barrier(
                 &file,
                 #[cfg(test)]
                 fail_sync.as_ref(),
             );
-            match engine.write() {
+            let res = match engine.write() {
                 Ok(mut eng) => eng.finish_commit_for_conn(flushed),
                 Err(_) => Err(io::Error::other("engine lock poisoned")),
-            }
+            };
+            guard.armed = false;
+            res
         }
         CommitStep::AwaitingGroup { lsn, file, gate } => loop {
             match gate.join_group(lsn)? {
                 GroupRole::Durable => break Ok(()),
                 GroupRole::Lead(target) => {
                     let mut leader_guard = gate.leader_guard();
-                    let flushed = run_commit_sync_barrier(
-                        &file,
-                        #[cfg(test)]
-                        fail_sync.as_ref(),
-                    );
+                    let flushed = match gate.lock_sync() {
+                        Ok(_sync_guard) => {
+                            if let Some(err) = gate.failed_error() {
+                                Err(err)
+                            } else if gate.is_durable_through(target) {
+                                Ok(())
+                            } else {
+                                let res = run_commit_sync_barrier(
+                                    &file,
+                                    #[cfg(test)]
+                                    fail_sync.as_ref(),
+                                );
+                                if let Err(ref e) = res {
+                                    // Record the failure before dropping `sync_mu` so a concurrent
+                                    // `drain_pending_durable` cannot issue a second `sync_barrier`
+                                    // after an `errseq_t`-clearing error.
+                                    gate.fail(e);
+                                }
+                                res
+                            }
+                        }
+                        Err(e) => {
+                            gate.fail(&e);
+                            Err(e)
+                        }
+                    };
                     match engine.write() {
                         Ok(mut eng) => {
                             let res = eng.finish_group_flush(target, flushed);

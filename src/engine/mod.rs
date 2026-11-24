@@ -369,6 +369,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) tx_prepared: bool,
     /// True while `prepare_commit_transaction()` is running internal quota eviction.
     pub(super) tx_preparing: bool,
+    /// True after a non-group `SyncTransactional` batch was appended to `sync_wal` and before
+    /// `finish_commit_for_conn()` receives its barrier outcome.
+    pub(super) tx_sync_in_flight: bool,
     pub(super) pending_tx_buf: Vec<u8>,
     pub(super) pending_tx_record_count: u32,
     pub(super) pending_tx_bytes: usize,
@@ -1240,6 +1243,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             compaction_hook_id: 0,
             tx_prepared: false,
             tx_preparing: false,
+            tx_sync_in_flight: false,
             pending_tx_buf: Vec::new(),
             pending_tx_record_count: 0,
             pending_tx_bytes: 0,
@@ -1330,10 +1334,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Returns the next LSN that will be assigned to a WAL batch.
-    /// Returns true if a WAL or metadata write/sync failure poisoned this engine. Reads keep working, but
-    /// all mutations fail until the engine is reopened.
+    /// Returns true if a WAL, metadata, or group-commit flush failure poisoned this engine. Reads keep
+    /// working, but all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.is_some() || self.meta_mgr.is_poisoned()
+        self.poisoned.is_some() || self.meta_mgr.is_poisoned() || self.commit_gate.is_failed()
     }
 
     /// Test seam: poisons the engine as a failed WAL write would.
@@ -1389,17 +1393,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Fails if a prior WAL, metadata, or group-commit leader failure left the on-disk state uncertain.
     pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
         self.meta_mgr.check_healthy()?;
+        if let Some(msg) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "engine is poisoned by an earlier WAL I/O failure and must be reopened: {msg}"
+            )));
+        }
+        if let Some(err) = self.commit_gate.failed_error() {
+            return Err(err);
+        }
         if self.commit_gate.is_failed() {
             return Err(io::Error::other(
                 "engine is poisoned after a group-commit leader failure and must be reopened",
             ));
         }
-        match &self.poisoned {
-            None => Ok(()),
-            Some(msg) => Err(io::Error::other(format!(
-                "engine is poisoned by an earlier WAL I/O failure and must be reopened: {msg}"
-            ))),
-        }
+        Ok(())
     }
 
     /// Records a WAL I/O failure (first one wins) and returns the original error.

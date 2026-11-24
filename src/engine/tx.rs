@@ -49,6 +49,10 @@ struct GateState {
 pub(crate) struct CommitGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    /// Serializes device flush calls (`sync_barrier`) between a group-commit leader and
+    /// `drain_pending_durable()` so two callers never run `fdatasync` on the same fd concurrently.
+    /// Lock ordering: always acquired before `state`, and NEVER held while acquiring `engine.write()`.
+    sync_mu: Mutex<()>,
     /// Latch set immediately inside `fail` / `abandon_flush` so `check_not_poisoned()` detects
     /// a dropped/unwound flush leader before entering engine writes.
     failed_flag: std::sync::atomic::AtomicBool,
@@ -87,7 +91,7 @@ impl CommitGate {
         self.changed.notify_all();
     }
 
-    pub(super) fn fail(&self, error: &io::Error) {
+    pub(crate) fn fail(&self, error: &io::Error) {
         self.failed_flag
             .store(true, std::sync::atomic::Ordering::Release);
         let mut state = self.lock();
@@ -100,6 +104,18 @@ impl CommitGate {
     #[inline]
     pub(crate) fn is_failed(&self) -> bool {
         self.failed_flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Acquires the mutex serializing `wal_sync.db` device barriers.
+    pub(crate) fn lock_sync(&self) -> io::Result<std::sync::MutexGuard<'_, ()>> {
+        self.sync_mu
+            .lock()
+            .map_err(|_| io::Error::other("WAL sync mutex poisoned"))
+    }
+
+    /// Returns the recorded group flush error, if the gate has failed.
+    pub(crate) fn failed_error(&self) -> Option<io::Error> {
+        self.lock().failed.as_deref().map(group_flush_error)
     }
 
     /// Count of ended transactions. Read it under the engine lock before waiting, so that a
@@ -777,6 +793,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Err(e);
         }
         if !groupable {
+            self.tx_sync_in_flight = true;
             return Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()));
         }
 
@@ -805,6 +822,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
     /// the transaction is discarded from memory.
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
+        self.tx_sync_in_flight = false;
         if let Err(e) = self.check_not_poisoned() {
             if self.tx_depth > 0 {
                 let _ = self.rollback_transaction();
@@ -839,7 +857,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.commit_gate.is_durable_through(target) {
             self.commit_gate.mark_durable(target, true);
             if let Err(e) = flushed {
-                if !self.is_poisoned() {
+                if self.poisoned.is_none() {
                     let _ = self.poison(e);
                 }
             } else if !self.is_poisoned() {
@@ -847,12 +865,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
             return Ok(());
         }
-        if let Err(e) = self.check_not_poisoned() {
-            self.commit_gate.fail(&e);
-            return Err(e);
-        }
         match flushed {
             Ok(()) => {
+                if let Err(e) = self.check_not_poisoned() {
+                    self.commit_gate.fail(&e);
+                    return Err(e);
+                }
                 // Only batches up to `target` were written when the flush started.
                 self.wal_links.sync_flushed(target);
                 self.absorb_durable_through(target);
@@ -873,14 +891,39 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// holding all earlier commits.
     pub(super) fn drain_pending_durable(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        let Some(&(target, _)) = self.pending_group.back() else {
+        if self.pending_group.is_empty() {
             return Ok(());
-        };
-        if let Err(e) = self.sync_wal.file_handle().sync_barrier() {
-            self.commit_gate.fail(&e);
-            return Err(self.poison(e));
         }
-        // The barrier ran under the engine lock, after every append to the file.
+        let gate = Arc::clone(&self.commit_gate);
+        let sync_res = {
+            let _sync_guard = match gate.lock_sync() {
+                Ok(g) => g,
+                Err(e) => {
+                    gate.fail(&e);
+                    return Err(self.poison(e));
+                }
+            };
+            // Re-check after acquiring `sync_mu` in case a concurrent group leader failed its
+            // `sync_barrier` right before releasing `sync_mu`.
+            self.check_not_poisoned()?;
+            let Some(&(target, _)) = self.pending_group.back() else {
+                return Ok(());
+            };
+            let res = if !gate.is_durable_through(target) {
+                self.sync_wal.file_handle().sync_barrier()
+            } else {
+                Ok(())
+            };
+            if let Err(ref e) = res {
+                gate.fail(e);
+            }
+            res.map(|()| target)
+        };
+        let target = match sync_res {
+            Ok(t) => t,
+            Err(e) => return Err(self.poison(e)),
+        };
+        // The barrier ran under both `engine` and `sync_mu`, after every append to the file.
         self.wal_links.sync_flushed_all();
         self.absorb_durable_through(target);
         self.commit_gate.mark_durable(target, false);
@@ -983,6 +1026,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_owner_conn = None;
         self.tx_prepared = false;
         self.tx_preparing = false;
+        self.tx_sync_in_flight = false;
         self.pending_tx_bytes = 0;
         self.savepoints.clear();
         self.statement_savepoint_active = false;
@@ -1142,6 +1186,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.deferred_compact_on_commit = false;
         self.tx_prepared = false;
         self.tx_preparing = false;
+        if self.tx_sync_in_flight {
+            self.tx_sync_in_flight = false;
+            let _ = self.poison(io::Error::other("WAL sync interrupted before completion"));
+        }
         self.savepoints.clear();
         self.statement_savepoint_active = false;
         self.statement_blob_undo.clear();
