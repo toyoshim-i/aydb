@@ -2158,6 +2158,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
+    /// Reverts a failed in-transaction virtual table rename without being blocked by the
+    /// transaction size budget.
+    pub(crate) fn revert_in_tx_rename_vtab(
+        &mut self,
+        table_id: u16,
+        new_name: &str,
+        old_name: &str,
+        durability: WriteDurability,
+    ) -> io::Result<()> {
+        let prev_bypass = core::mem::replace(&mut self.tx_bypass_size_limit, true);
+        let res = self.rename_vtab(table_id, new_name, old_name, durability);
+        self.tx_bypass_size_limit = prev_bypass;
+        res
+    }
+
     /// Drops a table (`xDestroy` / `DROP TABLE`), deleting all primary rows (`'r'`), secondary
     /// index entries (`'i'`), row metadata (`'t'`), LRU queue entries (`'l'`), capped table
     /// quota registrations, and system catalog entries synchronously
@@ -4306,7 +4321,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.pending_tx_buf.truncate(prev_buf_len);
                 return Err(e);
             }
-            if !self.tx_preparing {
+            if !self.tx_preparing && !self.tx_bypass_size_limit {
                 self.tx_prepared = false;
                 self.tx_synced_vtabs.clear();
                 self.tx_sync_durability_upgrade = false;

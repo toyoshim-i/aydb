@@ -474,38 +474,60 @@ impl PendingDdlSlot {
     /// Reconciles in-transaction `ALTER TABLE ... RENAME TO` operations whose schema change SQLite
     /// silently rolled back via its statement journal (for instance because a view or trigger was
     /// invalid), where SQLite invokes neither `xRollback` nor `xRollbackTo`.
-    pub(super) unsafe fn reconcile_in_tx_renames(&self, db: *mut sqlite3) {
+    pub(super) unsafe fn reconcile_in_tx_renames(&self, db: *mut sqlite3) -> io::Result<()> {
         let items: Vec<InTxRename> = {
             let Ok(mut queue) = self.in_tx_renames.lock() else {
-                return;
+                return Err(io::Error::other(
+                    "pending DDL rename queue mutex poisoned during reconcile",
+                ));
             };
             if queue.is_empty() {
-                return;
+                return Ok(());
             }
             core::mem::take(&mut *queue)
         };
         let mut retry = Vec::new();
+        let mut first_err: Option<io::Error> = None;
         for item in items.into_iter().rev() {
             let has_new = unsafe { schema_has_aydb_table_exact(db, &item.db_name, &item.new_name) };
             let has_old = unsafe { schema_has_aydb_table_exact(db, &item.db_name, &item.old_name) };
             match (has_new, has_old) {
                 (Some(false), Some(true)) => {
-                    if let Ok(mut eng) = item.engine.write() {
-                        let new_norm = crate::engine::normalize_vtab_ident(&item.new_name);
-                        if eng.conn_has_open_transaction(item.conn_id)
-                            && eng.active_vtab_name(item.table_id).as_deref()
-                                == Some(new_norm.as_str())
-                        {
-                            let _ = eng.rename_vtab(
-                                item.table_id,
-                                &item.new_name,
-                                &item.old_name,
-                                item.durability,
-                            );
+                    let revert_res = {
+                        match item.engine.write() {
+                            Ok(mut eng) => {
+                                let new_norm = crate::engine::normalize_vtab_ident(&item.new_name);
+                                if eng.conn_has_open_transaction(item.conn_id)
+                                    && eng.active_vtab_name(item.table_id).as_deref()
+                                        == Some(new_norm.as_str())
+                                {
+                                    eng.revert_in_tx_rename_vtab(
+                                        item.table_id,
+                                        &item.new_name,
+                                        &item.old_name,
+                                        item.durability,
+                                    )
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            Err(_) => Err(io::Error::other(
+                                "engine lock poisoned while reverting in-transaction table rename",
+                            )),
                         }
-                    }
-                    if let Ok(mut name) = item.table_name.lock() {
-                        *name = item.old_name;
+                    };
+                    match revert_res {
+                        Ok(()) => {
+                            if let Ok(mut name) = item.table_name.lock() {
+                                *name = item.old_name;
+                            }
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                            retry.push(item);
+                        }
                     }
                 }
                 (None, _) | (_, None) => {
@@ -520,6 +542,10 @@ impl PendingDdlSlot {
                 retry.extend(queue.drain(..));
                 *queue = retry;
             }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -1306,7 +1332,12 @@ unsafe fn vtab_create_or_connect(
         let mut deadline = None;
         let autocommit = sqlite3_get_autocommit(db) != 0;
         if is_create && !autocommit {
-            aux.pending_ddl.reconcile_in_tx_renames(db);
+            if let Err(e) = aux.pending_ddl.reconcile_in_tx_renames(db) {
+                if !pz_err.is_null() {
+                    *pz_err = sqlite_error_message(&e.to_string());
+                }
+                return io_err_to_sqlite_rc(&e);
+            }
         }
         let mut began_here = false;
         let (mut eng, connected) = loop {
@@ -1553,7 +1584,10 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
 
         if !autocommit {
             vtab.pending_ddl.clear_tx_commit();
-            vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
+            if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
+                set_vtab_err_msg(vtab.base.get(), &e.to_string());
+                return io_err_to_sqlite_rc(&e);
+            }
             let mut eng = match vtab.engine.write() {
                 Ok(g) => g,
                 Err(_) => return SQLITE_ERROR,
@@ -4408,7 +4442,10 @@ unsafe fn complete_commit_step(
 unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
+        if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
+            set_vtab_err_msg(vtab.base.get(), &e.to_string());
+            return io_err_to_sqlite_rc(&e);
+        }
         // Run prepare, WAL append, and device flush in `xSync` rather than `xCommit`: SQLite
         // discards `xCommit`'s return code, whereas returning an error from `xSync` aborts
         // `COMMIT` and rolls back any native SQLite tables updated in the same transaction.
@@ -4425,6 +4462,7 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             if !eng.mark_vtab_synced_ready_to_commit(p_vtab as usize, vtab.durability) {
                 return SQLITE_OK;
             }
+            let commit_durability = eng.effective_tx_durability(vtab.durability);
             // Tables this transaction created (even if later renamed) whose creation a `ROLLBACK TO`
             // has since undone in SQLite's schema must not be committed.
             eng = match prune_stale_created_vtabs_unlocked(
@@ -4442,12 +4480,12 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             if !eng.conn_has_open_transaction(vtab.db as usize) {
                 return SQLITE_OK;
             }
-            if let Err(e) = eng.prepare_commit_transaction(vtab.durability) {
+            if let Err(e) = eng.prepare_commit_transaction(commit_durability) {
                 set_vtab_err_msg(vtab.base.get(), &e.to_string());
                 return io_err_to_sqlite_rc(&e);
             }
             if sqlite3_txn_state(vtab.db, core::ptr::null()) == SQLITE_TXN_WRITE {
-                let durability = eng.effective_tx_durability(vtab.durability);
+                let durability = eng.effective_tx_durability(commit_durability);
                 if !vtab.pending_ddl.set_tx_commit(PendingDdl::TxCommit {
                     engine: Arc::clone(&vtab.engine),
                     conn_id: vtab.db as usize,
@@ -4580,7 +4618,10 @@ unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoin
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
         vtab.pending_ddl.clear_tx_commit();
-        vtab.pending_ddl.reconcile_in_tx_renames(vtab.db);
+        if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
+            set_vtab_err_msg(vtab.base.get(), &e.to_string());
+            return io_err_to_sqlite_rc(&e);
+        }
         let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,

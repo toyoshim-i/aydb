@@ -4723,3 +4723,154 @@ fn update_set_rowid_null_fails_with_datatype_mismatch() {
         ]]
     );
 }
+
+#[test]
+fn mixed_tx_prune_stale_savepoint_vtab_preserves_sync_durability_upgrade() {
+    // R3-H1: Pruning a savepoint-rolled-back vtab in `xSync` must not erase the
+    // `tx_sync_durability_upgrade` promoted by an empty-op `durability='sync'` participant.
+    let tmp = TempTestDir::new("r3_h1_prune_sync_upgrade");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE sync_t USING aydb(table_id = 1, durability = 'sync', columns = 'id INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIRTUAL TABLE buf_t USING aydb(table_id = 2, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+    // Checkpoint schema setup so wal_buf.db has no pre-transaction LSNs that would create a gap
+    // when wal_buf.db is discarded below to simulate buffered-WAL loss.
+    engine.write().unwrap().flush_memtable().unwrap();
+
+    conn.execute_batch(
+        "BEGIN;
+         SAVEPOINT sp1;
+         CREATE VIRTUAL TABLE tmp_t USING aydb(table_id = 3, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');
+         ROLLBACK TO sp1;
+         RELEASE sp1;
+         DELETE FROM sync_t WHERE id = 999;
+         INSERT INTO buf_t VALUES (1, 'keep');
+         COMMIT;",
+    )
+    .unwrap();
+
+    drop(conn);
+    drop(engine);
+    // Simulate losing all buffered WAL state after COMMIT: only a SyncTransactional
+    // commit written to wal_sync.db survives reopening with wal_buf.db removed.
+    std::fs::remove_file(tmp.path.join("wal_buf.db")).unwrap();
+
+    let fs2 = Arc::new(OsFs::open(&tmp.path, false).unwrap());
+    let engine2 = Arc::new(RwLock::new(
+        StorageEngine::open(fs2, EngineConfig::default()).unwrap(),
+    ));
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    conn2.register_aydb_module(engine2).unwrap();
+    conn2
+        .execute_batch(
+            "CREATE VIRTUAL TABLE buf_t USING aydb(table_id = 2, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');",
+        )
+        .unwrap();
+    assert_eq!(
+        conn2.query_all("SELECT id, v FROM buf_t", &[]).unwrap(),
+        vec![vec![SqlValue::Integer(1), SqlValue::Text("keep".into())]]
+    );
+}
+
+#[test]
+fn failed_in_tx_rename_near_tx_budget_reverts_cleanly_on_commit() {
+    // R3-H2: Reverting a statement-journal-rolled-back ALTER TABLE ... RENAME TO inside
+    // `reconcile_in_tx_renames` must bypass `max_transaction_bytes` for both pre-existing
+    // and same-transaction-created tables.
+    let tmp = TempTestDir::new("r3_h2_rename_revert_budget");
+    let mut cfg = EngineConfig::default();
+    cfg.max_transaction_bytes = 2048;
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_pre USING aydb(table_id = 1, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIEW bad_v AS SELECT * FROM missing_tbl;",
+    )
+    .unwrap();
+
+    let payload = "x".repeat(1600);
+    // Case 1: Pre-existing table near tx size budget.
+    conn.execute_batch(&format!(
+        "BEGIN;
+         INSERT INTO t_pre VALUES (1, '{payload}');"
+    ))
+    .unwrap();
+    assert!(
+        conn.execute_batch("ALTER TABLE t_pre RENAME TO u_pre;")
+            .is_err(),
+        "invalid view should force SQLite to roll back ALTER TABLE RENAME"
+    );
+    conn.execute_batch("COMMIT;").unwrap();
+
+    assert_eq!(
+        conn.query_all("SELECT id, length(v) FROM t_pre", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(1), SqlValue::Integer(1600)]]
+    );
+
+    // Case 2: Same-transaction-created table near tx size budget.
+    conn.execute_batch(&format!(
+        "BEGIN;
+         CREATE VIRTUAL TABLE t_new USING aydb(table_id = 2, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');
+         INSERT INTO t_new VALUES (7, '{payload}');"
+    ))
+    .unwrap();
+    assert!(
+        conn.execute_batch("ALTER TABLE t_new RENAME TO u_new;")
+            .is_err(),
+        "invalid view should force SQLite to roll back same-tx ALTER TABLE RENAME"
+    );
+    conn.execute_batch("COMMIT;").unwrap();
+
+    assert_eq!(
+        conn.query_all("SELECT id, length(v) FROM t_new", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(7), SqlValue::Integer(1600)]]
+    );
+}
+
+#[test]
+fn poisoned_in_tx_rename_revert_fails_commit_instead_of_silently_ignoring() {
+    // R3-H2: If reverting a rolled-back in-tx rename fails (e.g. engine poisoned),
+    // COMMIT must return an error rather than swallowing the revert failure.
+    let tmp = TempTestDir::new("r3_h2_rename_revert_poison");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_p USING aydb(table_id = 1, durability = 'buffered', columns = 'id INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIEW bad_v AS SELECT * FROM missing_tbl;
+         BEGIN;
+         INSERT INTO t_p VALUES (1, 'a');",
+    )
+    .unwrap();
+    assert!(
+        conn.execute_batch("ALTER TABLE t_p RENAME TO u_p;")
+            .is_err()
+    );
+
+    engine
+        .write()
+        .unwrap()
+        .debug_poison("injected poison before commit");
+    let commit_res = conn.execute_batch("COMMIT;");
+    assert!(
+        commit_res.is_err(),
+        "COMMIT must fail when reconcile_in_tx_renames encounters a poisoned engine"
+    );
+}

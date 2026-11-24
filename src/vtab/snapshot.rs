@@ -179,7 +179,7 @@ pub(super) unsafe extern "system" fn trace_reads(
             trace.abort_pending_ddl();
             trace.clear();
         } else if event == TRACE_PROFILE && !autocommit {
-            trace.pending_ddl.reconcile_in_tx_renames(trace.database);
+            let _ = trace.pending_ddl.reconcile_in_tx_renames(trace.database);
         }
     }));
     0
