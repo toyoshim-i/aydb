@@ -19,7 +19,7 @@ pub use self::recovery::{
 };
 pub(crate) use recovery::recover_two_streams_keyed;
 
-/// Fixed filename for the synchronous write-through WAL stream.
+/// Fixed filename for the synchronous device-flushed WAL stream.
 pub const WAL_SYNC_FILE_NAME: &str = "wal_sync.db";
 
 /// Fixed filename for the buffered high-throughput WAL stream.

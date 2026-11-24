@@ -33,7 +33,7 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 * **Workload:** Continuously inserting `2,000` HTTP cache responses of **`16 KB` each (`32.0 MB` total)** via SQL into a table capped at **`4.0 MB` (`~256` live blobs — an `8×` full cache turnover)**.
 * **Compared Configurations:**
   1. **Vanilla SQLite (`WAL`, `synchronous = NORMAL`):** Standard table `http_cache(url PRIMARY KEY, access_tick, body BLOB)` executing insert + LRU eviction inside a single transaction (`BEGIN ... COMMIT`) without an extra secondary index.
-  2. **`aydb` Virtual Table (`max_bytes = 4194304`, `durability = 'buffered'`, `WalStreamMode::BufferedImmediateOsCache`):** Automatic WiscKey separation (`16 KB` blobs routed to `blob_lru_0001_<SeqID>.db` via 256 KB buffered `BlobSegmentWriter` staging), lazy LRU eviction, and crash-safe $O(1)$ copy-less blob segment deletion (syncing `wal_buf.db` before unlinking 100% evicted sealed segments).
+  2. **`aydb` Virtual Table (`max_bytes = 4194304`, `durability = 'buffered'`, `WalStreamMode::BufferedImmediateOsCache`):** Automatic WiscKey separation (`16 KB` blobs routed to `blob_lru_0001_<SeqID>.db` via 256 KB buffered `BlobSegmentWriter` staging), lazy LRU eviction, and crash-safe $O(1)$ copy-less blob segment deletion (dropping 100%-dead sealed segments from `boot_meta.db` immediately and deferring physical unlink to the next WAL epoch rotation).
 
 | Engine & Cache Eviction Architecture | Sustained Write Speed | P50 Latency | P99 Latency | Final Data Footprint on Disk |
 | :--- | ---: | ---: | ---: | ---: |
@@ -43,7 +43,7 @@ To ensure an apples-to-apples comparison, **both engines execute identical param
 ### Architectural Root Cause Analysis
 1. **B-Tree Overflow Page Churn vs. WiscKey Separation:**
    * In Vanilla SQLite, a `16 KB` blob spans 4 linked B-Tree overflow pages (`4 × 4 KB`). Inserting and deleting blobs continuously fragments the B-Tree freelist, writes full `16 KB` page images into both the `-wal` file and the main `.sqlite` database during WAL checkpoints (`4.5 ms` P99 stalls), and leaves the database + WAL footprint bloated at **`8.15 MB`** (`2.04×` the `4.0 MB` logical cap).
-   * In `aydb`, `16 KB` blobs are staged and appended sequentially once to `blob_lru_0001_<SeqID>.db` via a 256 KB buffer, while the index and WAL store only a **23-byte `BlobPtr`**. When older `1.0 MB` `blob_lru` segments reach 100% evicted bytes, `aydb` ensures the eviction tombstones in `wal_buf.db` are durable and unlinks the segment file in $O(1)$ time with zero blob copying, keeping the physical data footprint at **`3.98 MB`**.
+   * In `aydb`, `16 KB` blobs are staged and appended sequentially once to `blob_lru_0001_<SeqID>.db` via a 256 KB buffer, while the index and WAL store only a **23-byte `BlobPtr`**. When older `1.0 MB` `blob_lru` segments reach 100% evicted bytes, `aydb` drops them from the catalog immediately and queues their unlink once the next commit rotates the WAL epochs (flush or checkpoint), reclaiming segments in $O(1)$ time with zero blob copying and keeping the physical data footprint bounded near **`3.98 MB`**.
 
 ---
 

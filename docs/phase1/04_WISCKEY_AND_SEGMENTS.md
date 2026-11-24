@@ -154,10 +154,10 @@ Inside each 4 KB Data Block, sorted entries grow **upward** from byte `0`, while
 
 ### 3.3 In-Heap Bloom Filter & Sparse Fence Pointers
 
-1. **Kirsch-Mitzenmacher Double-Hashing Bloom Filter:**
-   * Given `bits_per_key = 10` (default), the filter allocates $M = \max(64, N \times 10)$ bits ($1.25\text{ bytes/key}$) and uses $k = 7$ hash probes derived from two independent hardware CRC32C seeds:
-     $$h_i(x) = (h_1(x) + i \cdot h_2(x)) \bmod M \quad (i = 0 \dots 6)$$
-   * Before touching the disk or OS page cache for `idx_<SeqID>.db`, `bloom.may_contain(key)` checks 7 bits in RAM in **~10 nanoseconds**, rejecting **~99.1%** of point lookups for keys not present in that segment!
+1. **Double-Hashing Bloom Filter (`wyhash64` + `fastrange32`):**
+   * Given `bits_per_key = 10` (default), the filter allocates $M = \max(64, N \times 10)$ bits ($1.25\text{ bytes/key}$) and uses $k = 6$ hash probes derived from a single 64-bit `wyhash64` digest split into `(h1, h2)` with `fastrange32` mapping each probe into the bitset:
+     $$\text{bit\_idx}_i(x) = \text{fastrange32}(h_1(x) + i \cdot h_2(x)) \quad (i = 0 \dots 5)$$
+   * Before touching the disk or OS page cache for `idx_<SeqID>.db`, `bloom.may_contain(key)` checks 6 bits in RAM in **~10 nanoseconds**, rejecting **~99%** of point lookups for keys not present in that segment!
 2. **Sparse Fence Pointers:**
    * Maintains a sorted `Vec<FencePointer>` in RAM where entry $b$ holds the **first key (`Entry 0`)** of Data Block $b$.
    * When `bloom.may_contain(key)` returns `true`, the reader binary-searches `fence_pointers` (`partition_point(|fp| fp.first_key.as_slice() <= key)`):
@@ -174,7 +174,7 @@ While sparse fence pointers and Bloom filters in heap memory keep default memory
   * **Value:** The verified 4096-byte `idx` data block.
   * **Verification Skip:** Data enters the cache only after successfully passing `block_crc32c` validation. Cache hits skip the 4 KB CRC32C recalculation entirely, reducing lookup latency from microseconds to tens of nanoseconds.
 * **Small Blob Record Cache (`blob_cache_bytes`):**
-  * **Key:** `(kind: BlobKind, table_id: u16, seg_id: u64, offset: u32)`
+  * **Key:** `BlobCacheKey { kind: u8, table_id: u16, seg_id: u64, offset: u32, len: u32, crc32c: u32, key_hash: u64 }`
   * **Value:** Verified payload for small blobs ($\le 16\text{ KB}$).
   * **Independent Sub-Budget:** Small blobs are allocated from a separate memory pool so high-churn blob access cannot evict hot 4 KB index blocks.
   * **Active Segment Append Safety:** For the currently active, append-only blob segment, records are eligible for caching **only if they reside strictly below `flushed_offset()`**. Uncommitted or in-flight appends at the segment tail are never cached.
@@ -184,8 +184,8 @@ While sparse fence pointers and Bloom filters in heap memory keep default memory
 * **Automatic Invalidation on Segment Compaction/Reclamation:** When background compaction commits a replacement index segment, or when LRU reclamation deletes an obsolete `blob_lru` segment file, all cache entries corresponding to the retired `seq_id` are purged wholesale.
 * **Scan-Resistance (Bulk Scan Bypass):** Compaction readers (a streaming reader that fetches one block at a time; `OpenHint::BackgroundBulk` exists but is not used for these files) and unbounded full-table scans bypass insertion into the cache (read-through without caching), preventing bulk sequential operations from polluting or displacing the hot point-lookup cache working set.
 * **Heap Accounting:** The data-holding budgets are fixed and the remaining structures scale with the workload:
-  $$\text{Heap} \approx \text{memtable\_capacity\_bytes} + \text{block\_cache\_bytes} + \text{blob\_cache\_bytes} + \text{bloom\_and\_fence\_metadata} + \text{transaction\_overlay} + \text{access\_tracker} + \text{rowid\_map}$$
-  The Bloom filters and fence pointers grow with the database size, the transaction overlay is limited by `max_transaction_bytes` (default 64 MB), the access tracker by `max_in_memory_access_ticks` entries, and the SQLite adapter's rowid map retains at most 262,144 entries once cursors close. Both cache budgets default to 4 MB; setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` disables in-process block and blob caching, preserving the zero-cache footprint for memory-constrained environments.
+  $$\text{Heap} \approx \text{memtable\_capacity\_bytes} + \text{block\_cache\_bytes} + \text{blob\_cache\_bytes} + \text{bloom\_and\_fence\_metadata} + \text{transaction\_overlay} + \text{access\_tracker}$$
+  The Bloom filters and fence pointers grow with the database size, the transaction overlay is limited by `max_transaction_bytes` (default 64 MB), and the access tracker is capped by `max_in_memory_access_ticks` entries (while synthetic rowid mappings live persistently in the `'u'` / `'v'` storage namespaces rather than in an in-memory map). Both cache budgets default to 4 MB; setting `block_cache_bytes = 0` and `blob_cache_bytes = 0` disables in-process block and blob caching, preserving the zero-cache footprint for memory-constrained environments.
 
 ---
 

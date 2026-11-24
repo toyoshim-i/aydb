@@ -33,7 +33,7 @@ flowchart TB
     end
 
     subgraph Adapter["aydb sqlite3_module Adapter (src/vtab/)"]
-        BestIdx["xBestIndex:<br/>1. PK = ? -> Plan::PointLookup (Cost = 1.0, Unique)<br/>2. SecondaryCol = ? -> Plan::SecondaryEq (Cost = 5.0)<br/>3. PK Range + LIMIT + ORDER BY -> Plan::PkRange (Cost = 25.0)<br/>4. Full Scan + ORDER BY -> Plan::FullScan (Cost = 10,000.0)"]
+        BestIdx["xBestIndex:<br/>1. PK = ? -> PLAN_PK_POINT (Plan 1, Cost = 1.0, omit = 0)<br/>2. UNIQUE Col = ? -> PLAN_UNIQUE_EQ (Plan 5, Cost = 1.8/2.0, omit = 0)<br/>3. Secondary Col = ? -> PLAN_SECONDARY_EQ (Plan 2, Cost = 4.8/5.0, omit = 0)<br/>4. PK Range -> PLAN_PK_RANGE (Plan 3, Cost = 25.0, omit = 0)<br/>5. Secondary Range -> PLAN_SECONDARY_RANGE (Plan 4, Cost = 35.0, omit = 0)<br/>6. Full Scan -> PLAN_FULL_SCAN (Plan 0, Cost = 10,000.0)"]
         Filter["xFilter / xNext / xColumn:<br/>Reusable Cursor Slab + Zero-Copy Column Projection"]
         Update["xUpdate / xBegin / xCommit / xRollback:<br/>Direct Binary Row Encoding + Coalesced Batch Transactions"]
     end

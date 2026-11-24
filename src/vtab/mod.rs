@@ -3,7 +3,8 @@
 //! Exposes `aydb`'s [`StorageEngine`] as a first-class SQLite Virtual Table (`USING aydb(...)`)
 //! with automatic primary-key point lookups (`xBestIndex` Plan 1), secondary index equality
 //! lookups (Plan 2), primary-key range scans (Plan 3), secondary index range scans (Plan 4),
-//! and Capped Table (`MAX_BYTES`) LRU eviction.
+//! persistent `UNIQUE` index equality lookups (Plan 5), and Capped Table (`MAX_BYTES`) LRU
+//! eviction.
 
 #[cfg(test)]
 mod auto_rowid_tests;
@@ -838,10 +839,6 @@ struct AydbCursor {
 /// at an exact integer `q` adjusts inclusivity so both representations are included or excluded
 /// consistently!
 ///
-/// Returns `true` when searching a `TEXT` or `BLOB` column with an `INTEGER` or `REAL` SQLite
-/// value (e.g., `CAST(1 AS INTEGER)` or a join against an integer column).
-///
-/// Under SQLite's cross-affinity comparison rules, a single typed lookup key cannot match all
 /// Returns `true` when an equality probe `(col = rhs)` cannot map SQLite's comparison
 /// semantics onto a single stored key probe and must fall back to a scan with `omit = 0`:
 /// - `TEXT` column vs `INTEGER | FLOAT` rhs: numeric literals compare via text/numeric conversion.

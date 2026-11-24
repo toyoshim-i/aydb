@@ -17,7 +17,7 @@ The planned extension is to support a third application workload: local informat
   * **Cache Management:** Medium-to-large payloads (blobs ranging from a few KB to several MB), high churn rates, and automatic LRU purging governed by per-table logical size limits (`MAX_BYTES`).
 * **Zero-Allocation & Bounded Memory Footprint:**
   * The data-holding components have fixed budgets: the MemTable (`memtable_capacity_bytes`), the verified block cache (`block_cache_bytes`, default 4 MB) and the verified blob cache (`blob_cache_bytes`, default 4 MB). Their sum is the deterministic part of the private heap.
-  * Three further structures are bounded differently and are **not** included in that sum (synthetic rowid mappings for non-integer primary keys live in persistent `'r'` / `'k'` index namespaces in storage rather than in a bounded in-memory adapter map):
+  * Three further structures are bounded differently and are **not** included in that sum (synthetic rowid mappings for non-integer primary keys live in persistent `'u'` / `'v'` index namespaces in storage rather than in a bounded in-memory adapter map):
     * *Bloom filters and sparse fence pointers* are kept in memory for every `idx_*.db` segment. They are small relative to the data (about one fence pointer per 4 KB block and `bloom_bits_per_key` bits, default 10, per key) but grow in proportion to the size of the database.
     * *The transaction overlay* holds the uncommitted writes of the open transaction. It is limited by `max_transaction_bytes` (default 64 MB; `0` means unlimited), and a write that would exceed the limit fails. Commits waiting for a group flush (§4.5) are held in memory as well, at most one per connection.
     * *The `AccessTracker`* that coalesces read hits for LRU is capped by entry count (`max_in_memory_access_ticks`, default 65,536 keys), not by bytes.
@@ -481,7 +481,7 @@ Automatic eviction mechanism for tables declared with size bounds (e.g., a virtu
    When an `INSERT` or `UPDATE` causes `CurrentLogicalBytes > MAX_BYTES`, the engine iterates from the beginning of `[TableID | 'l' | ...]` (smallest `AccessTick` = oldest accessed rows) and executes cascading eviction:
    * Fetches the primary row `[TableID | 'r' | PK]` and deletes the primary row, all associated secondary index entries `[TableID | 'i' | ...]`, and the system LRU entry.
    * If the row contains blob pointers, increments the `DeadBytes` counter of the corresponding `blob_lru_<TblID>_<SeqID>.db` segment and decrements `CurrentLogicalBytes`.
-   * When the live data ratio of a `blob_lru` segment drops to 0% (all blobs in that generation have been evicted), the segment file is immediately closed and deleted without copying a single byte (Copy-less Eviction).
+   * When the live data ratio of a sealed `blob_lru` segment drops to 0% (all blobs in that generation have been evicted), the engine drops it from the catalog immediately and defers closing/queueing it for deletion in `pending_delete_files` until a commit rotates the WAL epochs (flush or empty-MemTable checkpoint), reclaiming disk space without copying a single byte (Copy-less Eviction).
 
 ### 5.3 Persistent `UNIQUE` Index
 
@@ -607,8 +607,9 @@ pub trait PlatformFile: Send + Sync {
     /// Write ordering barrier (guarantees ordering prior to metadata update)
     /// - Win: FlushFileBuffers
     /// - Linux: fdatasync
-    /// - macOS: same as sync_durable (F_FULLFSYNC) for MutableSyncLog
-    ///   handles, otherwise fsync. F_BARRIERFSYNC is not used.
+    /// - macOS: delegates to `sync_durable` (`fcntl(fd, F_FULLFSYNC)` with
+    ///   `EINTR` retry, falling back to `fsync` on `ENOTSUP`/`EOPNOTSUPP`/`ENOTTY`;
+    ///   `F_BARRIERFSYNC` is not used).
     fn sync_barrier(&self) -> io::Result<()>;
 
     /// Full durability flush to non-volatile physical media

@@ -1,14 +1,14 @@
 //! `aydb` (*All Your DataBase*) — Windows/SMB-optimized embedded storage engine.
 //!
-//! Currently implements Phase 1:
-//! - Step 1-1: Platform Abstraction Layer (`pal`)
-//! - Step 1-2: Atomic Boot Metadata, Hardware CRC32C, and Deferred GC (`meta`, `util`)
-//! - Step 1-3: Pre-Allocated Epoch WAL and Two-Stream Crash Recovery (`wal`)
-//! - Step 1-4: WiscKey KV Separation, 4 KB Block SSTables, Sparse Fence Pointers,
-//!   Bloom Filters, Bounded MemTable, and Merge Compaction (`blob`, `index`, `memtable`)
-//! - Step 1-5: Capped Tables (`MAX_BYTES`), Delayed LRU Eviction, Memcomparable Keys,
-//!   and Unified Coordinator Engine (`lru`, `engine`)
-//! - Phase 2: SQLite Virtual Table (`sqlite3_module`) Adapter (`vtab`)
+//! Phase 1 & Phase 2 modules:
+//! - PAL: Platform Abstraction Layer (`pal`)
+//! - Boot Metadata & Utilities: Atomic Boot Metadata, Hardware CRC32C, and Deferred GC (`meta`, `util`)
+//! - Epoch WAL: Pre-Allocated Two-Stream WAL and Crash Recovery (`wal`)
+//! - Storage & Caching: WiscKey Blob Segments, 4 KB Block SSTables, Bloom Filters,
+//!   Bounded Verified Block/Blob Caches, Bounded MemTable, and Compaction (`blob`, `cache`, `index`, `memtable`)
+//! - Coordinator Engine & Capped Tables: `MAX_BYTES` LRU Eviction, Memcomparable Keys,
+//!   and Unified Engine (`lru`, `engine`)
+//! - SQLite Adapter: `sqlite3_module` Virtual Table & Connection Wrapper (`vtab`)
 
 #![allow(
     clippy::collapsible_if,

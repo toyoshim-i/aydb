@@ -33,7 +33,7 @@ CREATE VIRTUAL TABLE http_cache USING aydb(
 
 ## 2. Multi-Column Binary Row Codec (`src/vtab/row_codec.rs`)
 
-While the primary key column is encoded using `src/index/key_codec.rs` (memcomparable format) to serve as the `StorageEngine` row key (`[TableID | 'r' | EncodedPK]`), the non-PK columns of a row are packed into a compact binary row payload with an $O(1)$ column-offset header so `xColumn` can project individual columns without decoding preceding variable-length blobs:
+While the primary key column is encoded using `src/index/key_codec.rs` (memcomparable format) to serve as the `StorageEngine` row key (`[TableID | 'r' | EncodedPK]`), all columns of the row are packed into a compact binary row payload with an $O(1)$ column-offset header so `xColumn` can project individual columns (and preserves exact stored values such as `-0.0`) without decoding preceding variable-length blobs:
 
 ```text
  0                   1                   2                   3
@@ -66,30 +66,38 @@ While the primary key column is encoded using `src/index/key_codec.rs` (memcompa
 
 ## 3. Query Planning & Constraint Pushdown (`xBestIndex` $\leftrightarrow$ `xFilter`)
 
-SQLite's query planner invokes `xBestIndex` one or more times with candidate `aConstraint[]` arrays representing `WHERE` clause predicates, `aOrderBy[]` terms, and optional `LIMIT` constraints (`SQLITE_INDEX_CONSTRAINT_LIMIT`). `aydb` evaluates the usable constraints and assigns one of four deterministic execution plans encoded in `idxNum`, along with optional `LIMIT` and `ORDER BY` pushdown flags:
+SQLite's query planner invokes `xBestIndex` one or more times with candidate `aConstraint[]` arrays representing `WHERE` clause predicates and `aOrderBy[]` terms. `aydb` evaluates usable constraints and assigns one of six execution plans (`Plan 0`–`Plan 5`) encoded in `idxNum`, along with point/range/keys-only flags and `orderByConsumed` (keeping `omit = 0` so SQLite's VDBE always validates cross-affinity comparisons, collations, and post-fallback filters; queries rely on chunked 256-row streaming rather than `LIMIT` pushdown):
 
 ```mermaid
 flowchart TD
     Start["xBestIndex(pVTab, pInfo)"] --> CheckPK_EQ{"Usable EQ ('=') on<br/>PK Column (or ROWID)?"}
-    CheckPK_EQ -->|"Yes"| PlanPoint["Plan 1: PK Point Lookup<br/>idxNum = 1<br/>idxFlags = SQLITE_INDEX_SCAN_UNIQUE<br/>estimatedCost = 1.0, estimatedRows = 1<br/>omit = 1"]
-    CheckPK_EQ -->|"No"| CheckSec_EQ{"Usable EQ ('=') on<br/>Indexed Secondary Column?"}
-    CheckSec_EQ -->|"Yes (Col C, IndexID I)"| PlanSec["Plan 2: Secondary Index Lookup<br/>idxNum = 2 | ((I as i32) << 8)<br/>estimatedCost = 5.0, estimatedRows = 4<br/>omit = 1"]
-    CheckSec_EQ -->|"No"| CheckPK_Range{"Usable GT/GE/LT/LE<br/>on PK Column?"}
-    CheckPK_Range -->|"Yes"| PlanRange["Plan 3: PK Range Scan<br/>idxNum = 3 | (bound_flags << 8)<br/>(+ 0x1000 if LIMIT pushed down)<br/>orderByConsumed = 1 if ORDER BY pk ASC"]
-    CheckPK_Range -->|"No"| PlanFull["Plan 0: Full Table Scan<br/>idxNum = 0 (+ 0x1000 if LIMIT)<br/>orderByConsumed = 1 if ORDER BY pk ASC"]
+    CheckPK_EQ -->|"Yes"| PlanPoint["Plan 1: PK Point Lookup<br/>idxNum = 1 | (pt_flags << 8)<br/>idxFlags = SQLITE_INDEX_SCAN_UNIQUE (if single-key)<br/>estimatedCost = 1.0, omit = 0"]
+    CheckPK_EQ -->|"No"| CheckUnique_EQ{"Usable EQ ('=') on<br/>Trusted UNIQUE Col?"}
+    CheckUnique_EQ -->|"Yes"| PlanUnique["Plan 5: UNIQUE Eq Lookup<br/>idxNum = 5 | ((col & 0xFFFF) << 8) | (eq_flags << 24)<br/>estimatedCost = 1.8 / 2.0, omit = 0"]
+    CheckUnique_EQ -->|"No"| CheckSec_EQ{"Usable EQ ('=') on<br/>Secondary Index Col?"}
+    CheckSec_EQ -->|"Yes (IndexID I)"| PlanSec["Plan 2: Secondary EQ Lookup<br/>idxNum = 2 | ((I & 0xFFFF) << 8) | (eq_flags << 24)<br/>estimatedCost = 4.8 / 5.0, omit = 0"]
+    CheckSec_EQ -->|"No"| CheckPK_Range{"Usable Range Bound(s)<br/>on PK Column?"}
+    CheckPK_Range -->|"Yes"| PlanRange["Plan 3: PK Range Scan<br/>idxNum = 3 | (range_flags << 8)<br/>orderByConsumed on ORDER BY pk [ASC|DESC], omit = 0"]
+    CheckPK_Range -->|"No"| CheckSec_Range{"Usable Range Bound(s)<br/>on Secondary Col?"}
+    CheckSec_Range -->|"Yes (IndexID I)"| PlanSecRange["Plan 4: Secondary Range Scan<br/>idxNum = 4 | ((I & 0xFFFF) << 8) | (range_flags << 24)<br/>orderByConsumed on col[, pk ASC], omit = 0"]
+    CheckSec_Range -->|"No"| PlanFull["Plan 0: Full Table Scan<br/>idxNum = 0 | ((range_flags & 0x7F) << 24)<br/>orderByConsumed on ORDER BY pk [ASC|DESC]"]
 ```
 
 ### 3.1 How `xFilter` Executes Each Plan (Reusable Contiguous Cursor Slab)
-To avoid allocating a new `Vec<(Vec<u8>, Vec<u8>)>` of heap-allocated rows on every `SELECT` or range scan, each `AydbCursor` owns a reusable contiguous byte slab (`slab: Vec<u8>`) and a lightweight offset span index (`spans: Vec<(u32, u32, u32, u32)>`). On each `xFilter` call, `slab.clear()` and `spans.clear()` reset the cursor in $O(1)$ without freeing capacity:
+To avoid allocating a new `Vec<(Vec<u8>, Vec<u8>)>` of heap-allocated rows on every `SELECT` or range scan, each `AydbCursor` owns a reusable contiguous byte slab (`slab: Vec<u8>`) and a lightweight offset span index (`spans: Vec<(usize, usize)>`). On each `xFilter` call, `clear_cursor_buffers` resets the cursor:
 
-* **Plan 1 (`PK Point Lookup`, `idxNum == 1`):**
-  Encodes `argv[0]` into stack-buffered `EncodedPK` (`[u8; 64]` fast path for `INT`/`REAL`), calls `engine.get_row_into(table_id, &encoded_pk, &mut cursor.slab, &mut cursor.spans)` directly (which hits the `MemTable` or a single Bloom-filtered `idx` 4 KB block + optional `blob` dereference, and updates the in-memory `AccessTracker` in $O(1)$), and pushes a single `(pk_start, pk_end, val_start, val_end)` span.
-* **Plan 2 (`Secondary Index Lookup`, `idxNum & 0xFF == 2`):**
-  Extracts `index_id = ((idxNum >> 8) & 0x0F) as u16`, encodes `argv[0]`, and streams matching rows into `cursor.slab` in bounded chunks with `scan_secondary_index_into_slab`.
+* **Plan 1 (`PK Point Lookup`, `idxNum & 0xFF == 1`):**
+  Encodes `argv[0]` (or resolves `POINT_FLAG_BY_ROWID`), calls `get_row_into` or `scan_range_into_slab` (honoring `POINT_FLAG_KEYS_ONLY`, and falling back to `start_pk_full_scan` for cross-affinity probes), hitting the `MemTable` or a Bloom-filtered `idx` 4 KB block + optional `blob` dereference while updating `AccessTracker` in $O(1)$.
+* **Plan 5 (`UNIQUE Eq Lookup`, `idxNum & 0xFF == 5`):**
+  Extracts `col_idx = ((idxNum >> 8) & 0xFFFF) as usize`, re-checks the `0xFFFF` completion marker against the cursor's active read view (`EngineReader::unique_marker`, falling back to `start_pk_full_scan` if invalidated), then probes `0x8000 | col_idx` (and handles cross-affinity fallbacks).
+* **Plan 2 (`Secondary Index EQ Lookup`, `idxNum & 0xFF == 2`):**
+  Extracts `index_id = ((idxNum >> 8) & 0xFFFF) as u16`, encodes `argv[0]`, and streams matching rows into `cursor.slab` in bounded 256-row chunks with `scan_secondary_index_into_slab` (or falls back to `start_pk_full_scan` on cross-affinity probes).
 * **Plan 3 (`PK Range Scan`, `idxNum & 0xFF == 3`):**
-  Extracts the lower/upper memcomparable key bounds (`GT`/`GE`/`LT`/`LE`) and optional pushed-down `LIMIT` (`(idxNum & 0x1000) != 0`), then calls `scan_range_into_slab`. Because `[TableID | 'r' | EncodedPK]` is stored in memcomparable order, the scan seeks directly to the lower bound in both the `MemTable` (`BTreeMap::range`) and on-disk `idx_<SeqID>.db` segments (via Sparse Fence Pointers), stopping at the upper bound or `LIMIT`. If the query specifies `ORDER BY pk`, ascending or descending, `xBestIndex` sets `orderByConsumed = 1` so SQLite skips its sorter.
+  Extracts the lower/upper memcomparable key bounds (`GT`/`GE`/`LT`/`LE`) and `RANGE_FLAG_REVERSE`/`RANGE_FLAG_KEYS_ONLY`, then streams via `scan_range_into_slab`. Because `[TableID | 'r' | EncodedPK]` is stored in memcomparable order, the scan seeks directly to the lower/upper bound in both the `MemTable` and on-disk `idx_<SeqID>.db` segments (via Sparse Fence Pointers). If the query specifies `ORDER BY pk` ascending or descending, `xBestIndex` sets `orderByConsumed = 1` so SQLite skips its sorter.
+* **Plan 4 (`Secondary Range Scan`, `idxNum & 0xFF == 4`):**
+  Extracts `index_id = ((idxNum >> 8) & 0xFFFF) as u16` and range/keys-only flags, builds encoded secondary index bounds (`sec_range_bound_to_key`), and streams in 256-row chunks via `scan_secondary_index_into_slab_with_cache`.
 * **Plan 0 (`Full Table Scan`, `idxNum & 0xFF == 0`):**
-  Calls `scan_range_into_slab` without key bounds, streaming live rows directly into the cursor's contiguous byte slab.
+  Calls `start_pk_full_scan`, streaming live rows in bounded chunks (forward or reverse when `ORDER BY pk DESC` matches `RANGE_FLAG_REVERSE`).
 
 ### 3.2 Chunked 256-Row Streaming & Lazy Per-Row Blob Dereference
 To prevent allocating unbounded memory when scanning large tables while keeping SQLite VDBE query plans fully expressive (e.g. queries with residual `WHERE` filters, `LIMIT`, or `ORDER BY`), `AydbCursor` streams records in bounded chunks of `CURSOR_STREAM_CHUNK_ROWS = 256` rows.
@@ -115,7 +123,7 @@ SQLite routes `INSERT`, `UPDATE`, and `DELETE` statements on a virtual table to 
 
 ### 4.2 Lock-Free Reversible Integer `ROWID` Mapping
 SQLite's Virtual Table bytecode sequences two-phase mutations (`DELETE` and `UPDATE`) by reading a 64-bit integer `rowid` via `xRowid` during cursor scan and passing that `rowid` back as `argv[0]` in `xUpdate`.
-* A stored integer key in an integer-affinity PK column maps bijectively to its `i64` value (`decode_i64_tagged_key` / `encode_i64_tagged_key`). Other storage classes in the same column use the persistent synthetic identity index. Synthetic allocation skips live integer keys, and an explicit integer insert applies rowid conflict handling if a synthetic row already owns that number. Automatic IDs skip both kinds of reservation. `ORDER BY rowid` is sorted by SQLite because PK byte order cannot order a mixed integer/synthetic identity space.
+* On an `INTEGER PRIMARY KEY` rowid-alias column (`pk_rowid_alias = true`), a stored `i64` key maps bijectively to its `rowid` value (`decode_i64_tagged_key` / `encode_i64_tagged_key`). Other storage classes in that column, as well as all primary keys on non-alias columns (including `INT PRIMARY KEY`), use the persistent synthetic identity index. Synthetic allocation skips live integer keys, and an explicit integer insert applies rowid conflict handling if a synthetic row already owns that number. Automatic IDs skip both kinds of reservation. `ORDER BY rowid` is sorted by SQLite because PK byte order cannot order a mixed integer/synthetic identity space.
 * For other primary keys, `aydb` uses `hash_pk_to_rowid` as the first candidate and resolves collisions against a persistent reverse index while holding the engine writer lock. The `[TableID | 'u' | PK] -> rowid` and `[TableID | 'v' | rowid] -> PK` records commit and roll back with the row. Connections read the same persisted identity, independently of cache contents or traversal order. Deletion, quota eviction and table drop remove both directions. The mapping marker (`[TableID | 'v']` with an empty suffix) is written in the same atomic WAL batch as the table's catalog entry, so a table is either absent or complete, and a `CREATE VIRTUAL TABLE` inside a transaction rolls back with it. There is no migration: a table that is in the catalog without the marker was written by an unsupported older format, and connecting it fails with `SQLITE_CORRUPT` ("table has no persistent rowid mapping"); nothing is repaired, and no scan or write re-checks the marker.
 
 ### 4.3 Transaction Lifecycle Callbacks (`xBegin`, `xSync`, `xCommit`, `xRollback`) & Multi-Sector WAL Coalescing

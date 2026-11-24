@@ -199,7 +199,7 @@ Thanks to our two-stream WAL separation (Design Decision 3), we get the best of 
 | `ImmutableSequential` | `blob_std_<SeqID>.db`,<br/>`blob_lru_<TblID>_<SeqID>.db` | `FILE_FLAG_OVERLAPPED` only (`FILE_FLAG_SEQUENTIAL_SCAN` is deliberately omitted) | none | none | Blob files serve random point reads, so no platform requests sequential read-ahead on them. |
 | `BackgroundBulk` | Compaction inputs & outputs | `FILE_FLAG_OVERLAPPED \| FILE_FLAG_SEQUENTIAL_SCAN` + `IoPriorityHintLow` | `POSIX_FADV_NOREUSE` | `F_NOCACHE(1)` | Prevents background compaction reads/writes from evicting hot foreground index blocks. |
 
-> **Implementation status.** All columns are implemented. On Unix (`src/pal/unix.rs`) the advice is applied when a descriptor is opened and again when a pooled handle is reopened, and a failure is ignored because it is only advice. The hint also decides whether a handle participates in the `HandlePool` (idx and blob handles do, the two WAL handles and `boot_meta.db` do not) and, on macOS, whether `sync_barrier` is promoted to `F_FULLFSYNC` (`MutableSyncLog` handles). `OpenHint::BackgroundBulk` is defined and handled by each PAL, but the engine never opens a file with it: compaction reads idx segments through the same `ImmutableRandom` handles, using a streaming reader that bypasses the block cache.
+> **Implementation status.** All columns are implemented. On Unix (`src/pal/unix.rs`) the advice is applied when a descriptor is opened and again when a pooled handle is reopened, and a failure is ignored because it is only advice. The hint also decides whether a handle participates in the `HandlePool` (idx and blob handles do, the two WAL handles and `boot_meta.db` do not). On macOS, every `sync_barrier` delegates to `sync_durable` (`fcntl(fd, F_FULLFSYNC)` with `EINTR` retry, falling back to `fsync` only on `ENOTSUP`, `EOPNOTSUPP`, or `ENOTTY`). `OpenHint::BackgroundBulk` is defined and handled by each PAL, but the engine never opens a file with it: compaction reads idx segments through the same `ImmutableRandom` handles, using a streaming reader that bypasses the block cache.
 
 ### 5.2 Extended-Length Path Normalization (`\\?\`) on Windows
 
@@ -283,8 +283,9 @@ pub trait PlatformFile: Send + Sync + 'static {
     /// before subsequent metadata updates.
     /// - Windows: `FlushFileBuffers`
     /// - Linux: `fdatasync`
-    /// - macOS: `F_FULLFSYNC` for `MutableSyncLog` handles, otherwise `fsync`
-    ///   (`F_BARRIERFSYNC` is not used)
+    /// - macOS: delegates to `sync_durable` (`fcntl(fd, F_FULLFSYNC)` with
+    ///   `EINTR` retry, falling back to `fsync` only on `ENOTSUP`,
+    ///   `EOPNOTSUPP`, or `ENOTTY`; `F_BARRIERFSYNC` is not used)
     fn sync_barrier(&self) -> io::Result<()>;
 
     /// Flushes all modified data and metadata to non-volatile physical media.

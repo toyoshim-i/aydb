@@ -129,6 +129,9 @@ WalRecord :=
         [blob_crc32c: u32 (4B LE)]
     - 3 = Delete (Tombstone):
         [key_len: u32 (4B LE)] [key: [u8; key_len]]
+    - 4 = TxBegin:    // First chunk of a multi-chunk transaction (> 512 KB)
+    - 5 = TxCommit:   // Final chunk of a multi-chunk transaction (> 512 KB)
+    - 6 = TxContinue: // Middle chunk of a multi-chunk transaction (> 512 KB)
 ```
 
 ---

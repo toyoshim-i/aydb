@@ -25,7 +25,7 @@ pub use unix::{UnixPlatformFile as OsFile, UnixPlatformFs as OsFs};
 /// Access pattern and durability hints passed to the OS kernel when opening a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenHint {
-    /// For `boot_meta.db` and `wal_sync.db` (Write-Through / Synchronous durability).
+    /// For `boot_meta.db` and `wal_sync.db` (synchronous device-flushed durability).
     MutableSyncLog,
     /// For `wal_buf.db` (Buffered sequential journal).
     MutableBufferedLog,
