@@ -415,6 +415,10 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
+    /// Monotonic generation bumped whenever any persisted UNIQUE completion marker changes.
+    pub(super) unique_marker_gen: u64,
+    /// True if the active transaction modified any UNIQUE completion marker (`0xFFFF`).
+    pub(super) unique_marker_modified_in_tx: bool,
     /// Monotonic registration token counter for live virtual table instances.
     next_vtab_token: u64,
     /// Live virtual table holder tokens per `table_id` (reference-counted across connections).
@@ -1279,6 +1283,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             tx_synced_vtabs: Vec::new(),
             quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
+            unique_marker_gen: 1,
+            unique_marker_modified_in_tx: false,
             next_vtab_token: 1,
             active_vtab_holders: HashMap::new(),
             mutation_epoch: 0,
@@ -1612,12 +1618,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 },
                 rowid::rowid_marker_record(chosen_id),
             ];
-            if let Some(marker_val) = initial_unique_marker {
+            let wrote_unique_marker = if let Some(marker_val) = initial_unique_marker {
                 if !self.table_has_any_primary_row(chosen_id)? {
                     records.push(unique_index::unique_marker_record(chosen_id, marker_val));
+                    true
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
             self.commit_wal_and_memtable(records, durability)?;
+            if wrote_unique_marker {
+                self.note_unique_marker_changed();
+            }
         }
         self.active_vtab_ids
             .insert(chosen_id, Arc::from(norm_name.as_str()));
@@ -2256,6 +2270,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 return Err(e);
             }
+            self.note_unique_marker_changed();
         }
         for ptr in dead_ptrs {
             self.record_dead_blob_bytes(&ptr);

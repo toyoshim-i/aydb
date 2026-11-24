@@ -62,7 +62,7 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -748,10 +748,11 @@ pub(super) struct AydbVTab {
     durability: WriteDurability,
     /// The UNIQUE columns with the collation and affinity that shape their index keys.
     unique_def: unique_key::UniqueDef,
-    /// Set once the UNIQUE index marker for `unique_def` has been observed in the committed
-    /// view (or at once for a table without UNIQUE columns). Only then may the conflict check
-    /// trust the index.
-    unique_ready: AtomicBool,
+    /// Non-zero committed `unique_marker_gen` at which the UNIQUE index marker for `unique_def`
+    /// was last verified (or that an empty `unique_def` had no stale marker); `0` means
+    /// unverified. Only when matching the engine's current uncommitted/committed state may readers
+    /// and conflict checks trust the UNIQUE index.
+    unique_ready_gen: AtomicU64,
     /// A migration attempt of this connection failed; it is not repeated until reconnect.
     unique_migration_failed: AtomicBool,
     /// Where the next `xBegin` resumes the UNIQUE index migration.
@@ -1064,7 +1065,7 @@ fn integer_rowid_occupied(
 struct Connected {
     table_id: u16,
     reg_token: u64,
-    unique_ready: bool,
+    unique_ready_gen: u64,
     /// The catalog had no entry for the table before this connect: it is a new table.
     newly_created: bool,
 }
@@ -1160,16 +1161,22 @@ fn connect_table(
             None => eng.reset_table_inline_threshold(table_id),
         }
     }
+    let marker_gen = eng.unique_marker_gen();
     let existing_marker = eng.unique_marker_view(crate::engine::ReadView::Committed, table_id);
-    let unique_ready = if unique_def.is_empty() {
+    let marker_matches = if unique_def.is_empty() {
         matches!(existing_marker, Ok(None))
     } else {
         matches!(existing_marker, Ok(Some(ref found)) if *found == unique_def.marker_value())
     };
+    let unique_ready_gen = if marker_matches && marker_gen != 0 {
+        marker_gen
+    } else {
+        0
+    };
     Ok(Some(Connected {
         table_id,
         reg_token,
-        unique_ready,
+        unique_ready_gen,
         newly_created,
     }))
 }
@@ -1478,7 +1485,7 @@ unsafe fn vtab_create_or_connect(
         let Connected {
             table_id,
             reg_token,
-            unique_ready,
+            unique_ready_gen,
             ..
         } = connected;
         let ddl_durability = ddl.durability;
@@ -1503,7 +1510,7 @@ unsafe fn vtab_create_or_connect(
                 &ddl.col_collations,
                 &ddl.col_affinities,
             ),
-            unique_ready: AtomicBool::new(unique_ready),
+            unique_ready_gen: AtomicU64::new(unique_ready_gen),
             unique_migration_failed: AtomicBool::new(false),
             unique_cursor: std::sync::Mutex::new(None),
             col_names: ddl.col_names,
@@ -1872,6 +1879,38 @@ struct SelectedBestIndexPlan {
     num_used: usize,
 }
 
+impl AydbVTab {
+    fn is_unique_index_ready_for_plan(&self) -> bool {
+        let want = self.unique_def.marker_value();
+        let Ok(eng) = self.engine.read() else {
+            return false;
+        };
+        if eng.conn_has_open_transaction(self.db as usize) && eng.unique_marker_modified_in_tx() {
+            return eng
+                .unique_marker_view(crate::engine::ReadView::Owner, self.table_id)
+                .ok()
+                .flatten()
+                .is_some_and(|found| found == want);
+        }
+        let marker_gen = eng.unique_marker_gen();
+        if marker_gen != 0 && self.unique_ready_gen.load(Ordering::Acquire) == marker_gen {
+            return true;
+        }
+        let marked = eng
+            .unique_marker_view(crate::engine::ReadView::Committed, self.table_id)
+            .ok()
+            .flatten()
+            .is_some_and(|found| found == want);
+        if marked && marker_gen != 0 {
+            self.unique_ready_gen.store(marker_gen, Ordering::Release);
+            true
+        } else {
+            self.unique_ready_gen.store(0, Ordering::Release);
+            false
+        }
+    }
+}
+
 unsafe extern "system" fn vtab_best_index(
     p_vtab: *mut sqlite3_vtab,
     p_info: *mut sqlite3_index_info,
@@ -1988,7 +2027,7 @@ unsafe fn select_best_index(
         }
 
         // 2. Check for usable equality constraint (`=`) on a trusted persistent UNIQUE column
-        if vtab.unique_ready.load(Ordering::Acquire) {
+        if !vtab.unique_def.is_empty() {
             let mut best_unique: Option<(usize, usize, bool)> = None;
             for i in 0..n {
                 if constraints[i].usable == 0 || constraints[i].op != SQLITE_INDEX_CONSTRAINT_EQ {
@@ -2019,23 +2058,25 @@ unsafe fn select_best_index(
                 }
             }
             if let Some((i, col_idx, ob_consumed)) = best_unique {
-                // Keep `omit = 0` so digest collisions and cross-affinity fallbacks filter exact values.
-                let eq_flags = if can_use_keys_only {
-                    RANGE_FLAG_KEYS_ONLY
-                } else {
-                    0
-                };
-                return SelectedBestIndexPlan {
-                    idx_num: PLAN_UNIQUE_EQ
-                        | (((col_idx as c_int) & 0xFFFF) << 8)
-                        | ((eq_flags & 0x7F) << 24),
-                    idx_flags: None,
-                    order_by_consumed: ob_consumed,
-                    estimated_cost: if ob_consumed { 1.8 } else { 2.0 },
-                    estimated_rows: 1,
-                    used_constraints: [i, 0],
-                    num_used: 1,
-                };
+                if vtab.is_unique_index_ready_for_plan() {
+                    // Keep `omit = 0` so digest collisions and cross-affinity fallbacks filter exact values.
+                    let eq_flags = if can_use_keys_only {
+                        RANGE_FLAG_KEYS_ONLY
+                    } else {
+                        0
+                    };
+                    return SelectedBestIndexPlan {
+                        idx_num: PLAN_UNIQUE_EQ
+                            | (((col_idx as c_int) & 0xFFFF) << 8)
+                            | ((eq_flags & 0x7F) << 24),
+                        idx_flags: None,
+                        order_by_consumed: ob_consumed,
+                        estimated_cost: if ob_consumed { 1.8 } else { 2.0 },
+                        estimated_rows: 1,
+                        used_constraints: [i, 0],
+                        num_used: 1,
+                    };
+                }
             }
         }
 
@@ -2553,19 +2594,32 @@ unsafe fn execute_vtab_filter(
                 let col_idx = ((idx_num >> 8) & 0xFFFF) as usize;
                 let flags = (idx_num >> 24) & 0x7F;
                 let keys_only = (flags & RANGE_FLAG_KEYS_ONLY) != 0;
-                let index_id = unique_key::unique_index_id(col_idx);
-                let rc = execute_exact_index_lookup(
-                    cursor,
-                    vtab,
-                    eng,
-                    col_idx,
-                    index_id,
-                    keys_only,
-                    *argv.offset(0),
-                    true,
-                );
-                if rc != SQLITE_OK {
-                    return rc;
+                let want = vtab.unique_def.marker_value();
+                let marker_ok = match eng.unique_marker(vtab.table_id) {
+                    Ok(found) => found.as_deref() == Some(want.as_slice()),
+                    Err(e) => return io_err_to_sqlite_rc(&e),
+                };
+                if !marker_ok {
+                    vtab.unique_ready_gen.store(0, Ordering::Release);
+                    if let Err(e) = start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false)
+                    {
+                        return io_err_to_sqlite_rc(&e);
+                    }
+                } else {
+                    let index_id = unique_key::unique_index_id(col_idx);
+                    let rc = execute_exact_index_lookup(
+                        cursor,
+                        vtab,
+                        eng,
+                        col_idx,
+                        index_id,
+                        keys_only,
+                        *argv.offset(0),
+                        true,
+                    );
+                    if rc != SQLITE_OK {
+                        return rc;
+                    }
                 }
             }
             PLAN_SECONDARY_RANGE => {
@@ -3293,7 +3347,11 @@ unsafe extern "system" fn vtab_rowid(
 }
 
 fn has_stale_unique_marker(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) -> io::Result<bool> {
-    if vtab.unique_ready.load(Ordering::Acquire) {
+    let marker_gen = eng.unique_marker_gen();
+    if !eng.unique_marker_modified_in_tx()
+        && marker_gen != 0
+        && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
+    {
         return Ok(false);
     }
     let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
@@ -3309,7 +3367,11 @@ fn invalidate_stale_unique_marker_if_needed(
     eng: &mut StorageEngine<OsFs>,
     vtab: &AydbVTab,
 ) -> io::Result<()> {
-    if vtab.unique_ready.load(Ordering::Acquire) {
+    let marker_gen = eng.unique_marker_gen();
+    if !eng.unique_marker_modified_in_tx()
+        && marker_gen != 0
+        && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
+    {
         return Ok(());
     }
     let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
@@ -3317,8 +3379,11 @@ fn invalidate_stale_unique_marker_if_needed(
         if existing.is_some() {
             eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
         }
-        if !eng.in_active_transaction() {
-            vtab.unique_ready.store(true, Ordering::Release);
+        if !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx() {
+            let post_gen = eng.unique_marker_gen();
+            if post_gen != 0 {
+                vtab.unique_ready_gen.store(post_gen, Ordering::Release);
+            }
         }
     } else {
         let want = vtab.unique_def.marker_value();
@@ -3891,10 +3956,20 @@ unsafe extern "system" fn vtab_update(
 /// connection: re-reading the table up to the bad row at every transaction would tax every
 /// write, and a reconnect tries again.
 fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
-    if vtab.unique_ready.load(Ordering::Acquire)
-        || vtab.unique_migration_failed.load(Ordering::Relaxed)
-    {
+    if vtab.unsupported.is_some() || vtab.unique_migration_failed.load(Ordering::Relaxed) {
         return;
+    }
+    {
+        let Ok(eng) = vtab.engine.read() else {
+            return;
+        };
+        let marker_gen = eng.unique_marker_gen();
+        if !eng.unique_marker_modified_in_tx()
+            && marker_gen != 0
+            && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
+        {
+            return;
+        }
     }
     #[cfg(test)]
     if UNIQUE_MIGRATION_DISABLED.with(|flag| flag.get()) {
@@ -3915,7 +3990,16 @@ fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
         budget_rows: unique_migration::ROWS_PER_BEGIN,
     };
     match unique_migration::migrate(&vtab.engine, &params, &mut cursor) {
-        unique_migration::Outcome::Complete => vtab.unique_ready.store(true, Ordering::Release),
+        unique_migration::Outcome::Complete => {
+            if let Ok(eng) = vtab.engine.read() {
+                if !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx() {
+                    let post_gen = eng.unique_marker_gen();
+                    if post_gen != 0 {
+                        vtab.unique_ready_gen.store(post_gen, Ordering::Release);
+                    }
+                }
+            }
+        }
         unique_migration::Outcome::Incomplete | unique_migration::Outcome::Skipped => {}
         unique_migration::Outcome::Failed(e) => {
             vtab.unique_migration_failed.store(true, Ordering::Relaxed);

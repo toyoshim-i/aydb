@@ -3087,7 +3087,7 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
         table_name: Arc::new(std::sync::Mutex::new("t".to_string())),
         durability: WriteDurability::BufferedFast,
         unique_def: unique_key::UniqueDef::from_columns(&[], &[], &[]),
-        unique_ready: AtomicBool::new(true),
+        unique_ready_gen: AtomicU64::new(1),
         unique_migration_failed: AtomicBool::new(false),
         unique_cursor: std::sync::Mutex::new(None),
         col_names: vec!["k".into(), "v".into()],

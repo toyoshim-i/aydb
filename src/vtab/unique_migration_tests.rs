@@ -589,10 +589,35 @@ fn another_connections_transaction_makes_the_migration_stand_aside() {
 
 #[test]
 fn the_latch_stops_all_further_work() {
+    use crate::index::encode_secondary_index_prefix;
+
     let fx = legacy_fixture("unique_mig_latch", "");
     legacy_table(&fx, 3);
     drive(&fx);
-    // Remove the marker behind the connection's back: it has latched and does not look again.
+
+    // Part A: While `unique_marker_gen` is unchanged, `fx.conn`'s latch stops repeated scans/work
+    // on subsequent writes. Inject an unindexed raw legacy row without changing `unique_marker_gen`
+    // and verify a write on `fx.conn` does not re-scan/index it.
+    put_indexed_legacy_row(&fx, "k_unindexed", "a_unindexed", 999, "n_unindexed", "c");
+    fx.conn
+        .execute_batch("DELETE FROM t WHERE k='-no-such-row-'")
+        .unwrap();
+    let prefix_b = encode_secondary_index_prefix(1, 0x8002);
+    let pk_unindexed = SqlValue::Text("k_unindexed".into()).to_key_bytes();
+    assert!(
+        !fx.engine
+            .write()
+            .unwrap()
+            .test_live_entry_keys(1)
+            .unwrap()
+            .iter()
+            .any(|k| k.starts_with(&prefix_b) && k.ends_with(&pk_unindexed)),
+        "unchanged unique_marker_gen must keep unique_ready_gen latched and skip re-migration"
+    );
+
+    // Part B (R3-H3): Removing the marker behind the connection's back bumps `unique_marker_gen`,
+    // so `fx.conn` detects the stale generation on its next write, invalidates its latch, and
+    // rebuilds the index including the unindexed row.
     fx.engine
         .write()
         .unwrap()
@@ -601,14 +626,8 @@ fn the_latch_stops_all_further_work() {
     fx.conn
         .execute_batch("DELETE FROM t WHERE k='-no-such-row-'")
         .unwrap();
-    assert!(marker(&fx).is_none());
-    // A new connection does not trust the missing marker and builds it again.
-    let fresh = connect(&fx.engine, 1, "");
-    fresh
-        .execute_batch("DELETE FROM t WHERE k='-no-such-row-'")
-        .unwrap();
     assert!(marker(&fx).is_some());
-    assert_index(&fx, "rebuilt");
+    assert_index(&fx, "rebuilt after marker removal");
 }
 
 #[test]
@@ -1330,14 +1349,325 @@ fn connect_table_does_not_latch_uncommitted_owner_marker() {
         let connected = super::connect_table(&mut eng, conn_id, &ddl, false)
             .unwrap()
             .expect("persisted table connects in active tx");
-        connected.unique_ready
+        connected.unique_ready_gen
     };
-    assert!(
-        !connected_ready,
-        "uncommitted owner-only UNIQUE marker must never latch unique_ready at connect"
+    assert_eq!(
+        connected_ready, 0,
+        "uncommitted owner-only UNIQUE marker must never latch unique_ready_gen at connect"
     );
     {
         let mut eng = engine.write().unwrap();
         eng.rollback_transaction().unwrap();
     }
+}
+
+#[test]
+fn cross_connection_stale_unique_latch_invalidates_reads_and_conflict_checks() {
+    // R3-H3 Case 1: conn1 latches UNIQUE(a) and pre-prepares a SELECT WHERE a = ?.
+    // conn2 connects without UNIQUE, invalidating the marker and inserting rows.
+    // conn1 must reject duplicates and return conn2's rows in both ad-hoc and pre-prepared queries.
+    use crate::engine::TABLE_SCAN_ENTRIES_COPIED;
+
+    let dir = TempTestDir::new("r3_h3_case1");
+    let engine = open_engine(&dir);
+
+    let conn1 = SqliteConnection::open_in_memory().unwrap();
+    conn1.register_aydb_module(Arc::clone(&engine)).unwrap();
+    conn1
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');
+             INSERT INTO t VALUES ('k1', 'dup');",
+        )
+        .unwrap();
+
+    // Confirm conn1 is currently using PLAN_UNIQUE_EQ on a prepared statement.
+    let mut prepared_sel = conn1.prepare("SELECT k FROM t WHERE a = ?1").unwrap();
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    assert_eq!(
+        prepared_sel.query(&[SqlValue::Text("dup".into())]).unwrap(),
+        vec![vec![SqlValue::Text("k1".into())]]
+    );
+    assert_eq!(TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()), 0);
+
+    // conn2 connects without UNIQUE, writes duplicate 'dup' and unique-to-conn2 'only_c2'.
+    let conn2 = SqliteConnection::open_in_memory().unwrap();
+    conn2.register_aydb_module(Arc::clone(&engine)).unwrap();
+    conn2
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT');
+             INSERT INTO t VALUES ('k2', 'dup');
+             INSERT INTO t VALUES ('k3', 'only_c2');",
+        )
+        .unwrap();
+    assert!(marker_of(&engine, 1).is_none());
+
+    // Pre-prepared PLAN_UNIQUE_EQ statement on conn1 must fall back to full scan at xFilter time.
+    assert_eq!(
+        prepared_sel
+            .query(&[SqlValue::Text("only_c2".into())])
+            .unwrap(),
+        vec![vec![SqlValue::Text("k3".into())]]
+    );
+    // Ad-hoc query on conn1 must also find conn2's row and both duplicates.
+    assert_eq!(
+        conn1
+            .query_all("SELECT k FROM t WHERE a = 'only_c2'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Text("k3".into())]]
+    );
+    assert_eq!(
+        conn1
+            .query_all("SELECT k FROM t WHERE a = 'dup' ORDER BY k", &[])
+            .unwrap(),
+        vec![
+            vec![SqlValue::Text("k1".into())],
+            vec![SqlValue::Text("k2".into())],
+        ]
+    );
+    // Disable migration briefly so conn1's conflict check must rely on scan rather than rebuilding
+    // a new marker on top of already-duplicated 'dup', and still catch the existing 'dup'.
+    let ins_err =
+        with_disabled_migration(|| conn1.execute_batch("INSERT INTO t VALUES ('k_bad', 'dup')"));
+    assert!(
+        ins_err.is_err(),
+        "conn1 must not trust stale latch and must reject duplicate 'dup'"
+    );
+}
+
+#[test]
+fn cross_connection_unique_migration_and_empty_schema_invalidation_stay_consistent() {
+    // R3-H3 Case 2: conn_nonuniq connects without UNIQUE (latched at initial gen), conn_uniq builds
+    // the UNIQUE(a) marker, then conn_nonuniq writes a new row and invalidates the marker.
+    // Both conn_uniq and fresh connections must detect the invalidation and see all rows.
+    let dir = TempTestDir::new("r3_h3_case2");
+    let engine = open_engine(&dir);
+
+    let conn_nonuniq = SqliteConnection::open_in_memory().unwrap();
+    conn_nonuniq
+        .register_aydb_module(Arc::clone(&engine))
+        .unwrap();
+    conn_nonuniq
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT');
+             INSERT INTO t VALUES ('k1', 'seed');",
+        )
+        .unwrap();
+    assert!(marker_of(&engine, 1).is_none());
+
+    // conn_uniq migrates and latches on UNIQUE(a).
+    let conn_uniq = SqliteConnection::open_in_memory().unwrap();
+    conn_uniq.register_aydb_module(Arc::clone(&engine)).unwrap();
+    conn_uniq
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');
+             DELETE FROM t WHERE k = '-no-such-row-';",
+        )
+        .unwrap();
+    assert!(marker_of(&engine, 1).is_some());
+
+    // conn_nonuniq inserts a second 'seed' row: must see the new marker generation and remove it!
+    conn_nonuniq
+        .execute_batch("INSERT INTO t VALUES ('k2', 'seed')")
+        .unwrap();
+    assert!(
+        marker_of(&engine, 1).is_none(),
+        "non-unique writer must remove UNIQUE marker built by another connection"
+    );
+
+    // conn_uniq must see both 'k1' and 'k2' and catch conflicts via scan.
+    assert_eq!(
+        conn_uniq
+            .query_all("SELECT k FROM t WHERE a = 'seed' ORDER BY k", &[])
+            .unwrap(),
+        vec![
+            vec![SqlValue::Text("k1".into())],
+            vec![SqlValue::Text("k2".into())],
+        ]
+    );
+    let err1 =
+        with_disabled_migration(|| conn_uniq.execute_batch("INSERT INTO t VALUES ('k3', 'seed')"));
+    assert!(err1.is_err());
+
+    let conn_fresh = SqliteConnection::open_in_memory().unwrap();
+    conn_fresh
+        .register_aydb_module(Arc::clone(&engine))
+        .unwrap();
+    conn_fresh
+        .execute_batch(
+            "CREATE VIRTUAL TABLE t USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');",
+        )
+        .unwrap();
+    assert_eq!(
+        conn_fresh
+            .query_all("SELECT k FROM t WHERE a = 'seed' ORDER BY k", &[])
+            .unwrap(),
+        vec![
+            vec![SqlValue::Text("k1".into())],
+            vec![SqlValue::Text("k2".into())],
+        ]
+    );
+    assert!(
+        with_disabled_migration(|| conn_fresh.execute_batch("INSERT INTO t VALUES ('k3', 'seed')"))
+            .is_err()
+    );
+}
+
+#[test]
+fn newly_created_unique_table_uses_unique_eq_immediately() {
+    // R3-M3: Both autocommit CREATE VIRTUAL TABLE and BEGIN; CREATE VIRTUAL TABLE ...; SELECT
+    // immediately use PLAN_UNIQUE_EQ on the same connection without needing a reconnect.
+    use crate::engine::TABLE_SCAN_ENTRIES_COPIED;
+
+    let dir = TempTestDir::new("r3_m3_immediate_plan");
+    let engine = open_engine(&dir);
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+
+    // 1. Autocommit CREATE VIRTUAL TABLE
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE u1 USING aydb(table_id = 1, columns = 'k INTEGER PRIMARY KEY, a TEXT UNIQUE');
+         INSERT INTO u1 VALUES (10, 'alpha');",
+    )
+    .unwrap();
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    assert_eq!(
+        conn.query_all("SELECT k FROM u1 WHERE a = 'alpha'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(10)]]
+    );
+    assert_eq!(
+        TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()),
+        0,
+        "autocommit newly created UNIQUE table must immediately use PLAN_UNIQUE_EQ"
+    );
+
+    // 2. Explicit BEGIN; CREATE VIRTUAL TABLE ...; INSERT; SELECT; COMMIT; SELECT
+    conn.execute_batch(
+        "BEGIN;
+         CREATE VIRTUAL TABLE u2 USING aydb(table_id = 2, columns = 'k INTEGER PRIMARY KEY, a TEXT UNIQUE');
+         INSERT INTO u2 VALUES (20, 'beta');",
+    )
+    .unwrap();
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    assert_eq!(
+        conn.query_all("SELECT k FROM u2 WHERE a = 'beta'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(20)]]
+    );
+    assert_eq!(
+        TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()),
+        0,
+        "in-tx newly created UNIQUE table must use PLAN_UNIQUE_EQ before COMMIT"
+    );
+    conn.execute_batch("COMMIT;").unwrap();
+    TABLE_SCAN_ENTRIES_COPIED.with(|c| c.set(0));
+    assert_eq!(
+        conn.query_all("SELECT k FROM u2 WHERE a = 'beta'", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(20)]]
+    );
+    assert_eq!(
+        TABLE_SCAN_ENTRIES_COPIED.with(|c| c.get()),
+        0,
+        "newly created UNIQUE table must use PLAN_UNIQUE_EQ after COMMIT"
+    );
+}
+
+#[test]
+fn unsupported_table_write_does_not_migrate_or_mutate_unique_marker() {
+    // R3-M7: Connect-only CHECK/DEFAULT/AUTOINCREMENT tables must not run UNIQUE migration
+    // in `migrate_unique_index_before_begin` before rejecting writes in autocommit or `BEGIN`.
+    let schema_dir = TempTestDir::new("r3_m7_unsupported_schema");
+    let engine_dir = TempTestDir::new("r3_m7_unsupported_engine");
+    let schema_path = schema_dir.path.join("schema.db");
+    let engine = open_engine(&engine_dir);
+
+    let setup = SqliteConnection::open_file(&schema_path).unwrap();
+    setup
+        .register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+    with_disabled_migration(|| {
+        setup
+            .execute_batch(
+                "CREATE VIRTUAL TABLE t_check USING aydb(table_id = 1, columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');
+                 CREATE VIRTUAL TABLE t_default USING aydb(table_id = 2, columns = 'k TEXT PRIMARY KEY, a TEXT UNIQUE');",
+            )
+            .unwrap();
+    });
+    setup
+        .execute_batch(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_master SET sql = replace(sql, 'a TEXT UNIQUE', 'a TEXT UNIQUE CHECK(a <> '''')') WHERE name = 't_check';
+             UPDATE sqlite_master SET sql = replace(sql, 'a TEXT UNIQUE', 'a TEXT DEFAULT ''d'' UNIQUE') WHERE name = 't_default';",
+        )
+        .unwrap();
+    drop(setup);
+
+    {
+        let mut eng = engine.write().unwrap();
+        for (tid, pk_str) in [(1u16, "k1"), (2u16, "k2")] {
+            let pk = SqlValue::Text(pk_str.into()).to_key_bytes();
+            let row = encode_row(&[SqlValue::Text(pk_str.into()), SqlValue::Text("v1".into())]);
+            eng.put_row(tid, &pk, &row, &[], WriteDurability::BufferedFast)
+                .unwrap();
+            rowid_map::assign_synthetic_rowid(
+                &mut eng,
+                tid,
+                &pk,
+                WriteDurability::BufferedFast,
+                false,
+            )
+            .unwrap();
+        }
+        eng.write_unique_marker(
+            2,
+            b"prior-unique-marker".to_vec(),
+            WriteDurability::BufferedFast,
+        )
+        .unwrap();
+    }
+
+    let conn = SqliteConnection::open_file(&schema_path).unwrap();
+    conn.register_aydb_module_with_options(Arc::clone(&engine), false)
+        .unwrap();
+
+    // Attempt direct writes without any preceding SELECT/snapshot.
+    assert!(
+        conn.execute_batch("INSERT INTO t_check VALUES ('x1', 'u1')")
+            .is_err()
+    );
+    assert!(
+        conn.execute_batch("BEGIN; INSERT INTO t_check VALUES ('x2', 'u2');")
+            .is_err()
+    );
+    let _ = conn.execute_batch("ROLLBACK;");
+
+    assert!(
+        conn.execute_batch("INSERT INTO t_default VALUES ('x3', 'u3')")
+            .is_err()
+    );
+    assert!(
+        conn.execute_batch("BEGIN; INSERT INTO t_default VALUES ('x4', 'u4');")
+            .is_err()
+    );
+    let _ = conn.execute_batch("ROLLBACK;");
+
+    assert!(
+        marker_of(&engine, 1).is_none(),
+        "unsupported table must never write a UNIQUE marker before refusing writes"
+    );
+    assert!(
+        engine
+            .write()
+            .unwrap()
+            .test_live_entry_keys(1)
+            .unwrap()
+            .is_empty(),
+        "unsupported table must never populate 'i' index entries during rejected writes"
+    );
+    assert_eq!(
+        marker_of(&engine, 2).as_deref(),
+        Some(b"prior-unique-marker".as_slice()),
+        "unsupported table must preserve any pre-existing UNIQUE marker"
+    );
 }

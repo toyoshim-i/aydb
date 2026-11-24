@@ -460,6 +460,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_vtabs.clear();
             self.tx_synced_vtabs.clear();
             self.quotas_modified_in_tx = false;
+            self.unique_marker_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = None;
             self.deferred_flush_on_commit = false;
@@ -494,6 +495,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.tx_vtabs.clear();
             self.tx_synced_vtabs.clear();
             self.quotas_modified_in_tx = false;
+            self.unique_marker_modified_in_tx = false;
             self.tx_start_meta = self.capture_tx_meta_snapshot();
             self.tx_owner_conn = Some(conn_id);
             self.deferred_flush_on_commit = false;
@@ -1062,6 +1064,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Clears the per-transaction state once the transaction no longer owns the writer slot.
     fn finalize_tx_state(&mut self) {
+        if core::mem::replace(&mut self.unique_marker_modified_in_tx, false) {
+            self.bump_unique_marker_gen();
+        }
         self.tx_owner_conn = None;
         self.tx_prepared = false;
         self.tx_preparing = false;
@@ -1233,6 +1238,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.bump_table_epochs_from_overlay_map();
         self.tx_depth = 0;
+        if core::mem::replace(&mut self.unique_marker_modified_in_tx, false) {
+            self.bump_unique_marker_gen();
+        }
         self.vtabs_created_in_tx.clear();
         self.tx_vtabs.clear();
         self.tx_synced_vtabs.clear();
@@ -1437,6 +1445,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// silently skipped.
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        if self.unique_marker_modified_in_tx {
+            self.bump_unique_marker_gen();
+        }
         self.tx_prepared = false;
         self.tx_synced_vtabs.clear();
         self.tx_sync_durability_upgrade = false;

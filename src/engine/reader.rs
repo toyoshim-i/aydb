@@ -202,6 +202,19 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
             != super::ExistingRowStatus::NotFound)
     }
 
+    /// Reads the `0xFFFF` UNIQUE completion marker visible in this view.
+    pub(crate) fn unique_marker(&self, table_id: u16) -> io::Result<Option<Vec<u8>>> {
+        Ok(
+            match self
+                .eng
+                .lookup_raw_entry_src(self.cx.src, &super::unique_index::marker_key(table_id))?
+            {
+                Some((_, crate::index::IndexValue::Inline(value))) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
     /// See [`StorageEngine::scan_keys_range`].
     pub fn scan_keys_range(
         &self,

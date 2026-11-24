@@ -26,27 +26,37 @@ pub(super) fn find_unique_conflicts(
     }
 }
 
-/// True when every row's UNIQUE entries are complete: the connection latched on the marker, or
-/// the marker for this definition is committed (another connection finished the migration).
-/// When an uncommitted table is created inside an active transaction, its empty-table marker is
-/// visible in `ReadView::Owner` and trusted for that transaction without latching `unique_ready`
-/// prematurely (so a `ROLLBACK` never leaves a stale latch). A connection whose own migration
-/// failed stays on the scan.
+/// True when every row's UNIQUE entries are complete: the connection latched on the current
+/// committed marker generation, or the marker for this definition is committed (another connection
+/// finished the migration). When an uncommitted table is created inside an active transaction, its
+/// empty-table marker is visible in `ReadView::Owner` and trusted for that transaction without
+/// latching `unique_ready_gen` prematurely (so a `ROLLBACK` never leaves a stale latch). A
+/// connection whose own migration failed stays on the scan.
 fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
-    if vtab.unique_ready.load(Ordering::Acquire) {
+    let want = vtab.unique_def.marker_value();
+    if engine.conn_has_open_transaction(vtab.db as usize) && engine.unique_marker_modified_in_tx() {
+        return engine
+            .unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)
+            .ok()
+            .flatten()
+            .is_some_and(|found| found == want);
+    }
+    let marker_gen = engine.unique_marker_gen();
+    if marker_gen != 0 && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen {
         return true;
     }
     if vtab.unique_migration_failed.load(Ordering::Relaxed) {
         return false;
     }
-    let want = vtab.unique_def.marker_value();
     let marked = engine
         .unique_marker_view(crate::engine::ReadView::Committed, vtab.table_id)
         .ok()
         .flatten()
         .is_some_and(|found| found == want);
     if marked {
-        vtab.unique_ready.store(true, Ordering::Release);
+        if !engine.unique_marker_modified_in_tx() && marker_gen != 0 {
+            vtab.unique_ready_gen.store(marker_gen, Ordering::Release);
+        }
         return true;
     }
     engine.in_active_transaction()

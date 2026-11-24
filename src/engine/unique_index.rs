@@ -60,6 +60,33 @@ pub(super) fn unique_marker_record(table_id: u16, value: Vec<u8>) -> WalRecord {
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
+    /// Current committed UNIQUE-marker generation (`>= 1`). Bumps whenever a marker is written or
+    /// removed outside a transaction, or when an inner transaction modifying markers finishes.
+    #[inline]
+    pub(crate) fn unique_marker_gen(&self) -> u64 {
+        self.unique_marker_gen
+    }
+
+    /// True when the active transaction has modified any UNIQUE completion marker (`0xFFFF`).
+    #[inline]
+    pub(crate) fn unique_marker_modified_in_tx(&self) -> bool {
+        self.unique_marker_modified_in_tx
+    }
+
+    #[inline]
+    pub(super) fn bump_unique_marker_gen(&mut self) {
+        self.unique_marker_gen = self.unique_marker_gen.wrapping_add(1).max(1);
+    }
+
+    #[inline]
+    pub(super) fn note_unique_marker_changed(&mut self) {
+        if self.tx_depth > 0 {
+            self.unique_marker_modified_in_tx = true;
+        } else {
+            self.bump_unique_marker_gen();
+        }
+    }
+
     /// The marker value visible in `view`, if any. A marker written in an open transaction is
     /// visible only to its owner.
     pub(crate) fn unique_marker_view(
@@ -90,6 +117,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }],
             durability,
         )?;
+        self.note_unique_marker_changed();
         Ok(())
     }
 
@@ -105,6 +133,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }],
             durability,
         )?;
+        self.note_unique_marker_changed();
         Ok(())
     }
 
