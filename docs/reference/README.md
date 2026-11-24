@@ -43,7 +43,7 @@ These are signature summaries, not a compilable program. Exact signatures and pe
 
 | Concern | Fields |
 | :--- | :--- |
-| WAL behavior | `sync_wal_size_bytes`, `buf_wal_size_bytes`, `buf_wal_mode` |
+| WAL behavior | `sync_wal_size_bytes`, `buf_wal_size_bytes`, `buf_wal_mode`, `wal_damage_policy` |
 | Memory and lookup cost | `memtable_capacity_bytes`, `block_cache_bytes`, `blob_cache_bytes`, `bloom_bits_per_key` |
 | Values and segments | `inline_threshold_bytes`, `max_blob_segment_bytes` |
 | LRU tracking | `lru_read_tracking`, `max_in_memory_access_ticks` |

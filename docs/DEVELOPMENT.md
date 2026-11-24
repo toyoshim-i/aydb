@@ -53,7 +53,7 @@ A core goal of the `aydb` project is to produce a **living, textbook-grade recor
 * Directory entries follow the platform. Unix: `open_file` (create) and `remove_file` flush the directory, so entries are durable on return. Windows (assumption): the directory log is flushed by any successful `FlushFileBuffers`, and operations after the last flush survive as a random prefix, so an unflushed creation may be missing and an unflushed removal may be undone. Under both modes a data write never reaches the device before the directory operations issued before it. The mode is chosen per seed.
 * Fault injection: a power cut at a global operation index (that operation and all later ones fail), or a one-shot failure of the n-th write, sync, pre-allocation, creation or removal on a chosen file kind (`boot_meta`, `wal_sync`, `wal_buf`, `idx`, blob, manifest). A failed sync may leave the writes pending, may have flushed them, or may drop them while later syncs succeed ("fsyncgate").
 
-Not modelled: torn writes below 512 bytes, reordering within one write other than by sector, corruption of synced data, rename, multi-process access, and the real timing of group commit (the engine API is driven single-threaded).
+Not modelled: torn writes below 512 bytes, reordering within one write other than by sector, corruption of synced `boot_meta`/index/blob data (synced WAL corruption is exercised by the media-damage modes below), rename, multi-process access, and the real timing of group commit (the engine API is driven single-threaded).
 
 **What the oracle checks** (ARCHITECTURE.md section 4)
 
