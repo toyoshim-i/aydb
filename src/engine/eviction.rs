@@ -254,6 +254,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 )
             })
         {
+            self.check_not_poisoned()?;
             let lru_prefix = encode_namespace_prefix(table_id, NS_LRU_QUEUE);
             let seek_key = encode_lru_queue_key(table_id, cursor_tick, &[]);
             let candidates =

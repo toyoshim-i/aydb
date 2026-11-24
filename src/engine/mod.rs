@@ -3845,6 +3845,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         key: &[u8],
         value: &[u8],
     ) -> io::Result<BlobPtr> {
+        self.check_not_poisoned()?;
         let needed = (16 + key.len() + value.len()) as u64;
         match kind {
             BlobKind::Standard => {
@@ -4013,6 +4014,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if let Some(b) = self.std_blobs.get_mut(&ptr.seg_id) {
                     let prev_dead = b.dead_bytes;
                     b.dead_bytes = b.dead_bytes.saturating_add(ptr.len as u64);
+                    if b.dead_bytes > prev_dead {
+                        self.unrelocatable_std_blobs.remove(&ptr.seg_id);
+                    }
                     if self.statement_savepoint_active {
                         let delta = b.dead_bytes.saturating_sub(prev_dead);
                         if delta > 0 {

@@ -311,7 +311,7 @@ fn run_drain_cycle<FS: PlatformFs>(
             return PassOutcome::IdleOrDone;
         }
 
-        let (poisoned, need_idx, need_blob) = {
+        let (poisoned, need_idx, need_blob, need_dead_std) = {
             let Ok(eng) = engine.read() else {
                 return PassOutcome::Poisoned;
             };
@@ -319,12 +319,13 @@ fn run_drain_cycle<FS: PlatformFs>(
                 eng.is_poisoned(),
                 eng.compaction_pending(),
                 blob_reloc_passes < 2 && eng.has_fragmented_std_blobs(0.5),
+                eng.has_fully_dead_std_blobs(),
             )
         };
         if poisoned {
             return PassOutcome::Poisoned;
         }
-        if !need_idx && !need_blob {
+        if !need_idx && !need_blob && !need_dead_std {
             return PassOutcome::IdleOrDone;
         }
 
@@ -371,7 +372,7 @@ fn run_drain_cycle<FS: PlatformFs>(
                 Ok(false) => {
                     contention_retries += 1;
                     if contention_retries >= MAX_INSTALL_CONTENTION_RETRIES {
-                        return PassOutcome::IdleOrDone;
+                        return PassOutcome::Deferred;
                     }
                 }
                 Err(e) => {
@@ -383,7 +384,7 @@ fn run_drain_cycle<FS: PlatformFs>(
                     };
                 }
             }
-        } else {
+        } else if need_blob {
             // Up to two passes: rolling over an already-fragmented active writer during pass 1
             // can seal one more fragmented segment that a bounded second pass immediately cleans.
             blob_reloc_passes += 1;
@@ -459,6 +460,7 @@ fn run_drain_cycle<FS: PlatformFs>(
                             if eng.is_poisoned() {
                                 return PassOutcome::Poisoned;
                             }
+                            let was_in_tx = eng.in_active_transaction();
                             if let Err(e) = eng.finish_std_blob_relocation(relocated) {
                                 eng.record_maintenance_failure(&e);
                                 return if eng.is_poisoned() {
@@ -467,10 +469,34 @@ fn run_drain_cycle<FS: PlatformFs>(
                                     PassOutcome::Error
                                 };
                             }
+                            if was_in_tx {
+                                return PassOutcome::Deferred;
+                            }
                         }
                         break;
                     }
                 }
+            }
+        } else {
+            let Ok(mut eng) = engine.write() else {
+                return PassOutcome::Poisoned;
+            };
+            if eng.is_poisoned() {
+                return PassOutcome::Poisoned;
+            }
+            if eng.in_active_transaction() {
+                return PassOutcome::Deferred;
+            }
+            if let Err(e) = eng.finish_std_blob_relocation(1) {
+                eng.record_maintenance_failure(&e);
+                return if eng.is_poisoned() {
+                    PassOutcome::Poisoned
+                } else {
+                    PassOutcome::Error
+                };
+            }
+            if eng.has_fully_dead_std_blobs() {
+                return PassOutcome::Deferred;
             }
         }
     }
@@ -931,5 +957,212 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(worker);
+    }
+
+    #[test]
+    fn compaction_worker_reclaims_fully_dead_std_blobs_after_rollback() {
+        // R3-M9: a 100%-dead sealed `blob_std` segment must still be reclaimed once an active
+        // transaction rolls back, and `rollback_transaction` must wake the hook when deferred
+        // maintenance was queued.
+        let tmp = TempTestDir::new("r3_m9_dead_std_after_rollback");
+        let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+        let mut cfg = EngineConfig::default();
+        cfg.memtable_capacity_bytes = 2048;
+        cfg.inline_threshold_bytes = 64;
+        cfg.max_blob_segment_bytes = 256;
+        cfg.auto_compact_segment_threshold = 64;
+        cfg.max_segments_before_inline_compaction = 10_000;
+        cfg.background_compaction = true;
+        let engine = Arc::new(RwLock::new(
+            StorageEngine::open(Arc::clone(&fs), cfg).unwrap(),
+        ));
+
+        {
+            let mut eng = engine.write().unwrap();
+            eng.put_row(1, b"k3", &[0x33u8; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.put_row(1, b"k4", &[0x44u8; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.put_row(1, b"k3", &[0x55u8; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
+            eng.flush_memtable().unwrap();
+            assert!(!eng.has_fully_dead_std_blobs());
+
+            eng.put_row(1, b"k4", b"tiny", &[], WriteDurability::BufferedFast)
+                .unwrap();
+            assert!(eng.has_fully_dead_std_blobs());
+            eng.begin_transaction_for_conn(7).unwrap();
+            eng.finish_std_blob_relocation(1).unwrap();
+        }
+        let worker = CompactionWorker::spawn(Arc::clone(&engine)).expect("spawn worker");
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(engine.read().unwrap().has_fully_dead_std_blobs());
+
+        engine
+            .write()
+            .unwrap()
+            .rollback_transaction_for_conn(7)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.read().unwrap().has_fully_dead_std_blobs() {
+            assert!(
+                Instant::now() < deadline,
+                "worker must reclaim 100%-dead std blob after intervening rollback"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        drop(worker);
+    }
+
+    #[test]
+    fn compaction_worker_returns_deferred_on_install_contention_exhaustion() {
+        // R3-L2: MAX_INSTALL_CONTENTION_RETRIES exhaustion returns PassOutcome::Deferred, not IdleOrDone.
+        type SharedContentionEngine = Arc<Mutex<Option<Arc<RwLock<StorageEngine<ContentionFs>>>>>>;
+        struct ContentionFs {
+            inner: OsFs,
+            engine: SharedContentionEngine,
+            races_left: Arc<AtomicUsize>,
+        }
+        struct ContentionFile {
+            inner: Arc<<OsFs as PlatformFs>::File>,
+            is_idx: bool,
+            engine: SharedContentionEngine,
+            races_left: Arc<AtomicUsize>,
+        }
+        impl ContentionFile {
+            fn maybe_race(&self) {
+                if !self.is_idx || self.races_left.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                let eng_arc = self.engine.lock().unwrap().clone();
+                if let Some(eng_arc) = eng_arc {
+                    if let Ok(mut eng) = eng_arc.try_write() {
+                        if let Ok(prev) =
+                            self.races_left
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                    n.checked_sub(1)
+                                })
+                        {
+                            let _ = eng.compact();
+                            for r in 0..3u32 {
+                                let _ = eng.put_row(
+                                    1,
+                                    format!("race_{r}_{prev}").as_bytes(),
+                                    &[0x66u8; 300],
+                                    &[],
+                                    WriteDurability::BufferedFast,
+                                );
+                                let _ = eng.flush_memtable();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        impl PlatformFile for ContentionFile {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.maybe_race();
+                self.inner.read_at(buf, offset)
+            }
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                self.maybe_race();
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+                self.maybe_race();
+                self.inner.read_many_at(requests)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.inner.write_all_at(buf, offset)
+            }
+            fn file_len(&self) -> io::Result<u64> {
+                self.inner.file_len()
+            }
+            fn preallocate(
+                &self,
+                target_len: u64,
+                strategy: crate::pal::PreallocStrategy,
+            ) -> io::Result<()> {
+                self.inner.preallocate(target_len, strategy)
+            }
+            fn sync_barrier(&self) -> io::Result<()> {
+                self.inner.sync_barrier()
+            }
+            fn sync_durable(&self) -> io::Result<()> {
+                self.inner.sync_durable()
+            }
+            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.inner.evict_os_cache(offset, len)
+            }
+        }
+        impl PlatformFs for ContentionFs {
+            type File = ContentionFile;
+            fn open_file(
+                &self,
+                rel_name: &str,
+                create: bool,
+                writable: bool,
+                hint: OpenHint,
+            ) -> io::Result<Arc<Self::File>> {
+                let inner = self.inner.open_file(rel_name, create, writable, hint)?;
+                Ok(Arc::new(ContentionFile {
+                    inner,
+                    is_idx: rel_name.starts_with("idx_"),
+                    engine: Arc::clone(&self.engine),
+                    races_left: Arc::clone(&self.races_left),
+                }))
+            }
+            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
+                self.inner.remove_file(rel_name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.inner.list_files()
+            }
+            fn root_path(&self) -> &Path {
+                self.inner.root_path()
+            }
+        }
+
+        let tmp2 = TempTestDir::new("r3_l2_contention_deferred");
+        let shared_engine = Arc::new(Mutex::new(None));
+        let races_left = Arc::new(AtomicUsize::new(0));
+        let cfs = Arc::new(ContentionFs {
+            inner: OsFs::open(&tmp2.path, true).unwrap(),
+            engine: Arc::clone(&shared_engine),
+            races_left: Arc::clone(&races_left),
+        });
+        let mut cfg2 = EngineConfig::default();
+        cfg2.memtable_capacity_bytes = 512;
+        cfg2.auto_compact_segment_threshold = 2;
+        cfg2.max_segments_before_inline_compaction = 10_000;
+        cfg2.background_compaction = true;
+        let ceng = Arc::new(RwLock::new(
+            StorageEngine::open(Arc::clone(&cfs), cfg2).unwrap(),
+        ));
+        *shared_engine.lock().unwrap() = Some(Arc::clone(&ceng));
+        {
+            let mut eng = ceng.write().unwrap();
+            for r in 0..3u32 {
+                eng.put_row(
+                    1,
+                    format!("init_{r}").as_bytes(),
+                    &[0x77u8; 300],
+                    &[],
+                    WriteDurability::BufferedFast,
+                )
+                .unwrap();
+                eng.flush_memtable().unwrap();
+            }
+            assert!(eng.compaction_pending());
+        }
+        races_left.store(MAX_INSTALL_CONTENTION_RETRIES * 8, Ordering::Release);
+        let sig = Signal::new();
+        let outcome = run_drain_cycle(&ceng, &sig);
+        races_left.store(0, Ordering::Release);
+        *shared_engine.lock().unwrap() = None;
+        assert!(
+            matches!(outcome, PassOutcome::Deferred),
+            "expected PassOutcome::Deferred on contention exhaustion, got {outcome:?}"
+        );
     }
 }

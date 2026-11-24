@@ -1237,6 +1237,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.tx_vtabs.clear();
         self.tx_synced_vtabs.clear();
         self.tx_owner_conn = None;
+        let had_deferred = self.deferred_flush_on_commit || self.deferred_compact_on_commit;
         self.deferred_flush_on_commit = false;
         self.deferred_compact_on_commit = false;
         self.tx_prepared = false;
@@ -1259,6 +1260,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let snap = core::mem::take(&mut self.tx_start_meta);
         self.restore_tx_state(0, &snap);
         self.commit_gate.tx_ended();
+        if had_deferred
+            && !self.is_poisoned()
+            && (self.compaction_pending()
+                || self.has_fragmented_std_blobs(0.5)
+                || self.has_fully_dead_std_blobs())
+        {
+            if let Some(hook) = &self.compaction_hook {
+                hook();
+            }
+        }
         Ok(())
     }
 

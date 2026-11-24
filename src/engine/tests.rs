@@ -10012,3 +10012,67 @@ fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
         "BufferedFast tx must not spill to wal_sync.db after an empty sync tx"
     );
 }
+
+#[test]
+fn empty_memtable_flush_reclaims_dead_std_blobs_poison_blocks_append_and_delete_clears_unrelocatable()
+ {
+    // Covers R3-M9 (empty-memtable flush reclaims 100%-dead std blobs), R3-L4 (record_dead_blob_bytes
+    // clears unrelocatable_std_blobs), and R3-L3 (append_to_blob_segment rejects poisoned engine).
+    let tmp = TempTestDir::new("r3_commit4_blob_invariants");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    cfg.max_blob_segment_bytes = 1024;
+    let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
+
+    engine
+        .put_row(1, b"b1", &[0x11u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let seg1 = *engine.std_blobs.keys().next().unwrap();
+    engine
+        .put_row(1, b"b2", &[0x22u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+
+    // Mark seg1 unrelocatable, then delete b1 (calls record_dead_blob_bytes).
+    engine.unrelocatable_std_blobs.insert(seg1);
+    engine
+        .delete_row(1, b"b1", WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(
+        !engine.unrelocatable_std_blobs.contains(&seg1),
+        "R3-L4: record_dead_blob_bytes must clear seg_id from unrelocatable_std_blobs"
+    );
+
+    // Flush the tombstone to idx and WAL, then simulate a 100%-dead sealed segment observed while
+    // `memtable` is empty and run `flush_memtable_no_auto_compact`.
+    engine.flush_memtable().unwrap();
+    engine
+        .put_row(1, b"b3", &[0x33u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let seg_new = *engine
+        .std_blobs
+        .keys()
+        .find(|&&s| s > seg1)
+        .expect("new blob segment");
+    // Flush b3 into idx, then mark the sealed intermediate segment dead while memtable is empty.
+    engine
+        .put_row(1, b"b4", &[0x44u8; 600], &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.flush_memtable().unwrap();
+    assert!(engine.memtable.is_empty());
+    let flen = engine.std_blobs.get(&seg_new).unwrap().file_len;
+    engine.std_blobs.get_mut(&seg_new).unwrap().dead_bytes = flen;
+    assert!(engine.has_fully_dead_std_blobs());
+    engine.flush_memtable_no_auto_compact().unwrap();
+    assert!(!engine.has_fully_dead_std_blobs());
+
+    // R3-L3: poisoned engine must refuse `append_to_blob_segment` before writing to disk.
+    let segs_before = engine.std_blobs.len();
+    engine.debug_poison("simulated poison before blob append");
+    let err = engine
+        .append_to_blob_segment(crate::wal::BlobKind::Standard, 0, b"k_p", &[0x55u8; 200])
+        .unwrap_err();
+    assert!(!err.to_string().is_empty());
+    assert_eq!(engine.std_blobs.len(), segs_before);
+}

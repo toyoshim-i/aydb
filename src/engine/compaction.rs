@@ -152,7 +152,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         } else if self.tx_depth == 0
             && self.config.background_compaction
             && !self.relocating_std_blobs
-            && self.has_fragmented_std_blobs(0.5)
+            && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
         {
             if let Some(hook) = &self.compaction_hook {
                 hook();
@@ -258,6 +258,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
+            self.reclaim_fully_dead_blob_segments()?;
             self.release_unlinkable_blob_files()?;
             if !self.meta_mgr.state().pending_delete_files.is_empty() {
                 self.meta_mgr.try_process_pending_deletes();
@@ -432,6 +433,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .is_some()
     }
 
+    /// Returns `true` when at least one sealed `blob_std` segment is 100% dead and awaiting
+    /// metadata reclamation.
+    pub fn has_fully_dead_std_blobs(&self) -> bool {
+        if self.is_poisoned() {
+            return false;
+        }
+        let active_std_seq = self.active_std_writer.as_ref().map(|w| w.seq_id());
+        self.std_blobs.iter().any(|(&seq, b)| {
+            Some(seq) != active_std_seq
+                && b.file_len > 0
+                && self.settled_std_dead_bytes(seq, b.dead_bytes) >= b.file_len
+        })
+    }
+
     /// Relocates live blobs out of fragmented sealed `blob_std_<SeqID>.db` segments whose
     /// `dead_bytes / file_len >= dead_ratio_threshold`, appending them to the active `blob_std`
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
@@ -571,6 +586,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Err(e) = self.flush_memtable_no_auto_compact() {
                 self.record_maintenance_failure(&e);
             }
+            self.check_not_poisoned()?;
         }
         Ok(())
     }
@@ -1039,7 +1055,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.meta_mgr.try_process_pending_deletes();
         if self.config.background_compaction
             && !self.relocating_std_blobs
-            && self.has_fragmented_std_blobs(0.5)
+            && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
         {
             if let Some(hook) = &self.compaction_hook {
                 hook();
