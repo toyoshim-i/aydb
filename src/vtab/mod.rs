@@ -388,24 +388,22 @@ pub(super) static AYDB_VTAB_MODULE: sqlite3_module = sqlite3_module {
     xIntegrity: None,
 };
 
-pub(super) enum PendingDdl {
+pub(super) struct TxCommitHook {
+    pub(super) engine: Arc<RwLock<StorageEngine<OsFs>>>,
+    pub(super) conn_id: usize,
+    pub(super) durability: WriteDurability,
+}
+
+pub(super) enum AutocommitDdl {
+    Create(TxCommitHook),
     Drop {
-        engine: Arc<RwLock<StorageEngine<OsFs>>>,
-        conn_id: usize,
-        durability: WriteDurability,
+        commit: TxCommitHook,
         destroyed_token: (u16, u64),
     },
     Rename {
-        engine: Arc<RwLock<StorageEngine<OsFs>>>,
-        conn_id: usize,
-        durability: WriteDurability,
+        commit: TxCommitHook,
         table_name: Arc<std::sync::Mutex<String>>,
         old_name: String,
-    },
-    TxCommit {
-        engine: Arc<RwLock<StorageEngine<OsFs>>>,
-        conn_id: usize,
-        durability: WriteDurability,
     },
 }
 
@@ -420,56 +418,170 @@ pub(super) struct InTxRename {
     durability: WriteDurability,
 }
 
-pub(super) struct PendingDdlSlot {
-    pending: std::sync::Mutex<Option<PendingDdl>>,
-    last_error: std::sync::Mutex<Option<String>>,
-    in_tx_renames: std::sync::Mutex<Vec<InTxRename>>,
-    tx_renamed_handles: std::sync::Mutex<Vec<(u16, Arc<std::sync::Mutex<String>>)>>,
+enum ConnDdlPhase {
+    Idle,
+    StagedAutocommit(AutocommitDdl),
+    ExplicitTx {
+        commit_hook: Option<TxCommitHook>,
+        renames: Vec<InTxRename>,
+        renamed_handles: Vec<(u16, Arc<std::sync::Mutex<String>>)>,
+    },
 }
 
-impl PendingDdlSlot {
+struct ConnDdlInner {
+    phase: ConnDdlPhase,
+    last_error: Option<String>,
+}
+
+enum PendingCommit {
+    Autocommit(AutocommitDdl),
+    ExplicitTx(TxCommitHook),
+}
+
+/// Per-connection DDL and commit-hook state protected by a single leaf mutex.
+///
+/// Lock-ordering invariant: `self.inner` MUST remain a leaf lock and is NEVER held across
+/// `engine.write()`, `table_name.lock()`, or SQLite C API calls.
+pub(super) struct ConnDdlSlot {
+    inner: std::sync::Mutex<ConnDdlInner>,
+}
+
+impl ConnDdlSlot {
     pub(super) fn new() -> Self {
         Self {
-            pending: std::sync::Mutex::new(None),
-            last_error: std::sync::Mutex::new(None),
-            in_tx_renames: std::sync::Mutex::new(Vec::new()),
-            tx_renamed_handles: std::sync::Mutex::new(Vec::new()),
+            inner: std::sync::Mutex::new(ConnDdlInner {
+                phase: ConnDdlPhase::Idle,
+                last_error: None,
+            }),
         }
     }
 
-    fn record_in_tx_rename(&self, item: InTxRename) {
-        if let Ok(mut handles) = self.tx_renamed_handles.lock() {
-            if !handles
-                .iter()
-                .any(|(tid, h)| *tid == item.table_id && Arc::ptr_eq(h, &item.table_name))
-            {
-                handles.push((item.table_id, Arc::clone(&item.table_name)));
+    pub(super) fn stage_autocommit(&self, ddl: AutocommitDdl) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        inner.last_error = None;
+        if !matches!(inner.phase, ConnDdlPhase::Idle) {
+            return false;
+        }
+        inner.phase = ConnDdlPhase::StagedAutocommit(ddl);
+        true
+    }
+
+    pub(super) fn arm_tx_commit(&self, hook: TxCommitHook) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        inner.last_error = None;
+        match &mut inner.phase {
+            ConnDdlPhase::Idle => {
+                inner.phase = ConnDdlPhase::ExplicitTx {
+                    commit_hook: Some(hook),
+                    renames: Vec::new(),
+                    renamed_handles: Vec::new(),
+                };
+                true
             }
-        }
-        if let Ok(mut queue) = self.in_tx_renames.lock() {
-            queue.push(item);
+            ConnDdlPhase::ExplicitTx { commit_hook, .. } => {
+                *commit_hook = Some(hook);
+                true
+            }
+            // SQLite invokes `xSync` on a newly created virtual table before `sqlite3_commit_hook`
+            // for autocommit `CREATE VIRTUAL TABLE`. Allow refreshing the staged `Create` hook for
+            // the same connection while still rejecting staged `Drop` and `Rename`.
+            ConnDdlPhase::StagedAutocommit(AutocommitDdl::Create(existing))
+                if existing.conn_id == hook.conn_id =>
+            {
+                *existing = hook;
+                true
+            }
+            ConnDdlPhase::StagedAutocommit(_) => false,
         }
     }
 
-    pub(super) fn clear_tx_renames(&self) {
-        if let Ok(mut queue) = self.in_tx_renames.lock() {
-            queue.clear();
-        }
-        if let Ok(mut handles) = self.tx_renamed_handles.lock() {
-            handles.clear();
-        }
-    }
-
-    fn sync_tx_renamed_handles(&self, eng: &StorageEngine<OsFs>) {
-        if let Ok(handles) = self.tx_renamed_handles.lock() {
-            for (tid, handle) in handles.iter() {
-                if let Some(actual) = eng.active_vtab_name(*tid) {
-                    if let Ok(mut name) = handle.lock() {
-                        *name = actual;
-                    }
+    pub(super) fn disarm_tx_commit(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let ConnDdlPhase::ExplicitTx {
+                commit_hook,
+                renames,
+                renamed_handles,
+            } = &mut inner.phase
+            {
+                *commit_hook = None;
+                if renames.is_empty() && renamed_handles.is_empty() {
+                    inner.phase = ConnDdlPhase::Idle;
                 }
             }
         }
+    }
+
+    pub(super) fn record_in_tx_rename(&self, item: InTxRename) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let handle_entry = (item.table_id, Arc::clone(&item.table_name));
+        match &mut inner.phase {
+            ConnDdlPhase::Idle => {
+                inner.phase = ConnDdlPhase::ExplicitTx {
+                    commit_hook: None,
+                    renames: vec![item],
+                    renamed_handles: vec![handle_entry],
+                };
+                true
+            }
+            ConnDdlPhase::ExplicitTx {
+                renames,
+                renamed_handles,
+                ..
+            } => {
+                if !renamed_handles
+                    .iter()
+                    .any(|(tid, h)| *tid == handle_entry.0 && Arc::ptr_eq(h, &handle_entry.1))
+                {
+                    renamed_handles.push(handle_entry);
+                }
+                renames.push(item);
+                true
+            }
+            ConnDdlPhase::StagedAutocommit(_) => false,
+        }
+    }
+
+    pub(super) fn clear_explicit_tx(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if matches!(inner.phase, ConnDdlPhase::ExplicitTx { .. }) {
+                inner.phase = ConnDdlPhase::Idle;
+            }
+        }
+    }
+
+    fn apply_renamed_handles(
+        eng: &StorageEngine<OsFs>,
+        handles: &[(u16, Arc<std::sync::Mutex<String>>)],
+    ) {
+        for (tid, handle) in handles {
+            if let Some(actual) = eng.active_vtab_name(*tid) {
+                if let Ok(mut name) = handle.lock() {
+                    *name = actual;
+                }
+            }
+        }
+    }
+
+    pub(super) fn sync_tx_renamed_handles(&self, eng: &StorageEngine<OsFs>) {
+        let handles = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            let ConnDdlPhase::ExplicitTx {
+                renamed_handles, ..
+            } = &inner.phase
+            else {
+                return;
+            };
+            renamed_handles.clone()
+        };
+        Self::apply_renamed_handles(eng, &handles);
     }
 
     /// Reconciles in-transaction `ALTER TABLE ... RENAME TO` operations whose schema change SQLite
@@ -477,15 +589,18 @@ impl PendingDdlSlot {
     /// invalid), where SQLite invokes neither `xRollback` nor `xRollbackTo`.
     pub(super) unsafe fn reconcile_in_tx_renames(&self, db: *mut sqlite3) -> io::Result<()> {
         let items: Vec<InTxRename> = {
-            let Ok(mut queue) = self.in_tx_renames.lock() else {
+            let Ok(mut inner) = self.inner.lock() else {
                 return Err(io::Error::other(
                     "pending DDL rename queue mutex poisoned during reconcile",
                 ));
             };
-            if queue.is_empty() {
+            let ConnDdlPhase::ExplicitTx { renames, .. } = &mut inner.phase else {
+                return Ok(());
+            };
+            if renames.is_empty() {
                 return Ok(());
             }
-            core::mem::take(&mut *queue)
+            core::mem::take(renames)
         };
         let mut retry = Vec::new();
         let mut first_err: Option<io::Error> = None;
@@ -539,9 +654,11 @@ impl PendingDdlSlot {
         }
         if !retry.is_empty() {
             retry.reverse();
-            if let Ok(mut queue) = self.in_tx_renames.lock() {
-                retry.extend(queue.drain(..));
-                *queue = retry;
+            if let Ok(mut inner) = self.inner.lock() {
+                if let ConnDdlPhase::ExplicitTx { renames, .. } = &mut inner.phase {
+                    retry.append(renames);
+                    *renames = retry;
+                }
             }
         }
         match first_err {
@@ -550,89 +667,62 @@ impl PendingDdlSlot {
         }
     }
 
-    fn set(&self, ddl: PendingDdl) -> bool {
-        self.clear_error();
-        let Ok(mut slot) = self.pending.lock() else {
-            return false;
-        };
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(ddl);
-        true
-    }
-
-    fn set_tx_commit(&self, ddl: PendingDdl) -> bool {
-        self.clear_error();
-        let Ok(mut slot) = self.pending.lock() else {
-            return false;
-        };
-        if matches!(*slot, None | Some(PendingDdl::TxCommit { .. })) {
-            *slot = Some(ddl);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn clear_tx_commit(&self) {
-        if let Ok(mut slot) = self.pending.lock() {
-            if matches!(*slot, Some(PendingDdl::TxCommit { .. })) {
-                *slot = None;
-            }
-        }
-    }
-
-    fn take(&self) -> Option<PendingDdl> {
-        self.pending.lock().ok().and_then(|mut s| s.take())
-    }
-
-    fn is_occupied(&self) -> bool {
-        self.pending.lock().map_or(true, |s| s.is_some())
+    pub(super) fn is_occupied(&self) -> bool {
+        self.inner
+            .lock()
+            .map_or(true, |inner| !matches!(inner.phase, ConnDdlPhase::Idle))
     }
 
     pub(super) fn clear_error(&self) {
-        if let Ok(mut err) = self.last_error.lock() {
-            *err = None;
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_error = None;
         }
     }
 
     fn set_error(&self, msg: String) {
-        if let Ok(mut err) = self.last_error.lock() {
-            *err = Some(msg);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_error = Some(msg);
         }
     }
 
     pub(super) fn take_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|mut err| err.take())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut inner| inner.last_error.take())
     }
 
-    fn cleanup_aborted(ddl: PendingDdl, rollback: bool) {
+    fn cleanup_aborted_autocommit(ddl: AutocommitDdl, rollback: bool) {
         match ddl {
-            PendingDdl::Drop {
-                engine,
-                conn_id,
+            AutocommitDdl::Create(commit) => {
+                if rollback {
+                    if let Ok(mut eng) = commit.engine.write() {
+                        if eng.conn_has_open_transaction(commit.conn_id) {
+                            let _ = eng.rollback_transaction_for_conn(commit.conn_id);
+                        }
+                    }
+                }
+            }
+            AutocommitDdl::Drop {
+                commit,
                 destroyed_token: (tid, tok),
-                ..
             } => {
-                if let Ok(mut eng) = engine.write() {
-                    if rollback && eng.conn_has_open_transaction(conn_id) {
-                        let _ = eng.rollback_transaction_for_conn(conn_id);
+                if let Ok(mut eng) = commit.engine.write() {
+                    if rollback && eng.conn_has_open_transaction(commit.conn_id) {
+                        let _ = eng.rollback_transaction_for_conn(commit.conn_id);
                     }
                     eng.unregister_vtab_token(tid, tok);
                 }
             }
-            PendingDdl::Rename {
-                engine,
-                conn_id,
+            AutocommitDdl::Rename {
+                commit,
                 table_name,
                 old_name,
-                ..
             } => {
                 if rollback {
-                    if let Ok(mut eng) = engine.write() {
-                        if eng.conn_has_open_transaction(conn_id) {
-                            let _ = eng.rollback_transaction_for_conn(conn_id);
+                    if let Ok(mut eng) = commit.engine.write() {
+                        if eng.conn_has_open_transaction(commit.conn_id) {
+                            let _ = eng.rollback_transaction_for_conn(commit.conn_id);
                         }
                     }
                 }
@@ -640,13 +730,19 @@ impl PendingDdlSlot {
                     *name = old_name;
                 }
             }
-            PendingDdl::TxCommit {
-                engine, conn_id, ..
-            } => {
+        }
+    }
+
+    fn cleanup_aborted_commit(pending: PendingCommit, rollback: bool) {
+        match pending {
+            PendingCommit::Autocommit(ddl) => Self::cleanup_aborted_autocommit(ddl, rollback),
+            PendingCommit::ExplicitTx(hook) => {
+                // Keep `ExplicitTx::renamed_handles` intact so SQLite's immediate `xRollback` can
+                // synchronize any remaining `AydbVTab::table_name` handles.
                 if rollback {
-                    if let Ok(mut eng) = engine.write() {
-                        if eng.conn_has_open_transaction(conn_id) {
-                            let _ = eng.rollback_transaction_for_conn(conn_id);
+                    if let Ok(mut eng) = hook.engine.write() {
+                        if eng.conn_has_open_transaction(hook.conn_id) {
+                            let _ = eng.rollback_transaction_for_conn(hook.conn_id);
                         }
                     }
                 }
@@ -655,28 +751,35 @@ impl PendingDdlSlot {
     }
 
     pub(super) fn commit_pending(&self) -> c_int {
-        let Some(ddl) = self.take() else {
-            return 0;
+        let pending = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return 1;
+            };
+            inner.last_error = None;
+            match &mut inner.phase {
+                ConnDdlPhase::Idle => return 0,
+                ConnDdlPhase::StagedAutocommit(_) => {
+                    let prev = core::mem::replace(&mut inner.phase, ConnDdlPhase::Idle);
+                    let ConnDdlPhase::StagedAutocommit(ddl) = prev else {
+                        unreachable!();
+                    };
+                    PendingCommit::Autocommit(ddl)
+                }
+                ConnDdlPhase::ExplicitTx { commit_hook, .. } => {
+                    let Some(hook) = commit_hook.take() else {
+                        return 0;
+                    };
+                    PendingCommit::ExplicitTx(hook)
+                }
+            }
         };
-        self.clear_error();
-        let (engine, conn_id, durability) = match &ddl {
-            PendingDdl::Drop {
-                engine,
-                conn_id,
-                durability,
-                ..
-            }
-            | PendingDdl::Rename {
-                engine,
-                conn_id,
-                durability,
-                ..
-            }
-            | PendingDdl::TxCommit {
-                engine,
-                conn_id,
-                durability,
-            } => (Arc::clone(engine), *conn_id, *durability),
+        let (engine, conn_id, durability) = match &pending {
+            PendingCommit::Autocommit(
+                AutocommitDdl::Create(h)
+                | AutocommitDdl::Drop { commit: h, .. }
+                | AutocommitDdl::Rename { commit: h, .. },
+            )
+            | PendingCommit::ExplicitTx(h) => (Arc::clone(&h.engine), h.conn_id, h.durability),
         };
         #[cfg(test)]
         let fail_sync: Option<Arc<AtomicBool>>;
@@ -684,17 +787,21 @@ impl PendingDdlSlot {
             let mut eng = match engine.write() {
                 Ok(g) => g,
                 Err(_) => {
-                    Self::cleanup_aborted(ddl, false);
+                    Self::cleanup_aborted_commit(pending, false);
                     self.set_error("engine lock poisoned".to_string());
                     return 1;
                 }
             };
             if !eng.conn_has_open_transaction(conn_id) {
+                drop(eng);
+                if matches!(pending, PendingCommit::ExplicitTx(_)) {
+                    self.clear_explicit_tx();
+                }
                 return 0;
             }
             if let Err(e) = eng.prepare_commit_transaction(durability) {
                 drop(eng);
-                Self::cleanup_aborted(ddl, true);
+                Self::cleanup_aborted_commit(pending, true);
                 self.set_error(e.to_string());
                 return 1;
             }
@@ -710,26 +817,98 @@ impl PendingDdlSlot {
             #[cfg(test)]
             fail_sync,
         ) {
-            Self::cleanup_aborted(ddl, true);
+            Self::cleanup_aborted_commit(pending, true);
             self.set_error(e.to_string());
             return 1;
         }
-        self.clear_tx_renames();
+        if matches!(pending, PendingCommit::ExplicitTx(_)) {
+            self.clear_explicit_tx();
+        }
         0
     }
 
     pub(super) fn rollback_pending(&self) {
-        self.clear_tx_renames();
-        if let Some(ddl) = self.take() {
-            Self::cleanup_aborted(ddl, true);
+        let prev = match self.inner.lock() {
+            Ok(mut inner) => core::mem::replace(&mut inner.phase, ConnDdlPhase::Idle),
+            Err(_) => return,
+        };
+        match prev {
+            ConnDdlPhase::Idle => {}
+            ConnDdlPhase::StagedAutocommit(ddl) => Self::cleanup_aborted_autocommit(ddl, true),
+            ConnDdlPhase::ExplicitTx {
+                commit_hook,
+                renamed_handles,
+                ..
+            } => {
+                if let Some(hook) = commit_hook {
+                    if let Ok(mut eng) = hook.engine.write() {
+                        if eng.conn_has_open_transaction(hook.conn_id) {
+                            let _ = eng.rollback_transaction_for_conn(hook.conn_id);
+                        }
+                        Self::apply_renamed_handles(&eng, &renamed_handles);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Monotonic generation latch recording the committed `unique_marker_gen` at which this virtual
+/// table's UNIQUE index (or absence of stale markers when `unique_def.is_empty()`) was verified.
+///
+/// Storing `0` or an uncommitted in-transaction marker generation is forbidden, ensuring `0`
+/// always means unverified and uncommitted schema changes never poison later plans or writes.
+pub(super) struct UniqueReadyLatch {
+    verified_gen: AtomicU64,
+}
+
+impl UniqueReadyLatch {
+    #[cfg(test)]
+    #[inline]
+    pub(super) const fn unlatched() -> Self {
+        Self {
+            verified_gen: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub(super) const fn from_verified_gen(marker_gen: u64) -> Self {
+        Self {
+            verified_gen: AtomicU64::new(marker_gen),
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_ready_for(&self, marker_gen: u64) -> bool {
+        marker_gen != 0 && self.verified_gen.load(Ordering::Acquire) == marker_gen
+    }
+
+    #[inline]
+    pub(super) fn latch_if_committed(&self, marker_gen: u64, allow_latch: bool) -> bool {
+        if allow_latch && marker_gen != 0 {
+            self.verified_gen.store(marker_gen, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(super) fn invalidate(&self) {
+        self.verified_gen.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn raw_gen(&self) -> u64 {
+        self.verified_gen.load(Ordering::Acquire)
     }
 }
 
 pub(super) struct ModuleAuxContext {
     pub(super) engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
-    pub(super) pending_ddl: Arc<PendingDdlSlot>,
+    pub(super) pending_ddl: Arc<ConnDdlSlot>,
     /// Background compaction worker; joined when the module (and thus this context) is dropped.
     pub(super) _compaction_worker: Option<compaction_worker::CompactionWorker>,
 }
@@ -740,7 +919,7 @@ pub(super) struct AydbVTab {
     db: *mut sqlite3,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
     read_session: Arc<snapshot::ReadSession>,
-    pending_ddl: Arc<PendingDdlSlot>,
+    pending_ddl: Arc<ConnDdlSlot>,
     table_id: u16,
     reg_token: u64,
     db_name: String,
@@ -749,11 +928,8 @@ pub(super) struct AydbVTab {
     durability: WriteDurability,
     /// The UNIQUE columns with the collation and affinity that shape their index keys.
     unique_def: unique_key::UniqueDef,
-    /// Non-zero committed `unique_marker_gen` at which the UNIQUE index marker for `unique_def`
-    /// was last verified (or that an empty `unique_def` had no stale marker); `0` means
-    /// unverified. Only when matching the engine's current uncommitted/committed state may readers
-    /// and conflict checks trust the UNIQUE index.
-    unique_ready_gen: AtomicU64,
+    /// Committed `unique_marker_gen` latch guarded by [`UniqueReadyLatch`].
+    unique_ready: UniqueReadyLatch,
     /// A migration attempt of this connection failed; it is not repeated until reconnect.
     unique_migration_failed: AtomicBool,
     /// Where the next `xBegin` resumes the UNIQUE index migration.
@@ -1385,7 +1561,7 @@ unsafe fn vtab_create_or_connect(
                 Err(_) => return SQLITE_ERROR,
             };
             if !autocommit {
-                aux.pending_ddl.clear_tx_commit();
+                aux.pending_ddl.disarm_tx_commit();
             }
             if is_create && !eng.conn_has_open_transaction(db as usize) {
                 let need_tx = if !autocommit {
@@ -1543,7 +1719,7 @@ unsafe fn vtab_create_or_connect(
                 &ddl.col_collations,
                 &ddl.col_affinities,
             ),
-            unique_ready_gen: AtomicU64::new(unique_ready_gen),
+            unique_ready: UniqueReadyLatch::from_verified_gen(unique_ready_gen),
             unique_migration_failed: AtomicBool::new(false),
             unique_cursor: std::sync::Mutex::new(None),
             col_names: ddl.col_names,
@@ -1565,11 +1741,13 @@ unsafe fn vtab_create_or_connect(
             eng.attach_vtab_to_tx(db as usize, raw_vtab as usize);
             if autocommit
                 && began_here
-                && !aux.pending_ddl.set_tx_commit(PendingDdl::TxCommit {
-                    engine: Arc::clone(&aux.engine),
-                    conn_id: db as usize,
-                    durability: ddl_durability,
-                })
+                && !aux
+                    .pending_ddl
+                    .stage_autocommit(AutocommitDdl::Create(TxCommitHook {
+                        engine: Arc::clone(&aux.engine),
+                        conn_id: db as usize,
+                        durability: ddl_durability,
+                    }))
             {
                 let _ = eng.rollback_transaction_for_conn(db as usize);
                 eng.unregister_vtab_token(table_id, reg_token);
@@ -1623,7 +1801,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
         let autocommit = sqlite3_get_autocommit(vtab.db) != 0;
 
         if !autocommit {
-            vtab.pending_ddl.clear_tx_commit();
+            vtab.pending_ddl.disarm_tx_commit();
             if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
                 set_vtab_err_msg(vtab.base.get(), &e.to_string());
                 return io_err_to_sqlite_rc(&e);
@@ -1682,7 +1860,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
             if crate::engine::normalize_vtab_ident(&old_effective)
                 != crate::engine::normalize_vtab_ident(&new_name)
             {
-                vtab.pending_ddl.record_in_tx_rename(InTxRename {
+                let recorded = vtab.pending_ddl.record_in_tx_rename(InTxRename {
                     engine: Arc::clone(&vtab.engine),
                     conn_id,
                     table_id: vtab.table_id,
@@ -1692,6 +1870,7 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
                     table_name: Arc::clone(&vtab.table_name),
                     durability: vtab.durability,
                 });
+                debug_assert!(recorded);
             }
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = new_name;
@@ -1742,10 +1921,12 @@ unsafe extern "system" fn vtab_rename(p_vtab: *mut sqlite3_vtab, z_new: *const c
         if let Ok(mut name) = vtab.table_name.lock() {
             *name = new_name;
         }
-        if !vtab.pending_ddl.set(PendingDdl::Rename {
-            engine: Arc::clone(&vtab.engine),
-            conn_id,
-            durability: vtab.durability,
+        if !vtab.pending_ddl.stage_autocommit(AutocommitDdl::Rename {
+            commit: TxCommitHook {
+                engine: Arc::clone(&vtab.engine),
+                conn_id,
+                durability: vtab.durability,
+            },
             table_name: Arc::clone(&vtab.table_name),
             old_name: prev_table_name.clone(),
         }) {
@@ -1808,10 +1989,12 @@ unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
                     let _ = eng.rollback_transaction_for_conn(conn_id);
                     return io_err_to_sqlite_rc(&e);
                 }
-                if !vtab_ref.pending_ddl.set(PendingDdl::Drop {
-                    engine: Arc::clone(&vtab_ref.engine),
-                    conn_id,
-                    durability: vtab_ref.durability,
+                if !vtab_ref.pending_ddl.stage_autocommit(AutocommitDdl::Drop {
+                    commit: TxCommitHook {
+                        engine: Arc::clone(&vtab_ref.engine),
+                        conn_id,
+                        durability: vtab_ref.durability,
+                    },
                     destroyed_token: (vtab_ref.table_id, vtab_ref.reg_token),
                 }) {
                     let _ = eng.rollback_transaction_for_conn(conn_id);
@@ -1926,7 +2109,7 @@ impl AydbVTab {
                 .is_some_and(|found| found == want);
         }
         let marker_gen = eng.unique_marker_gen();
-        if marker_gen != 0 && self.unique_ready_gen.load(Ordering::Acquire) == marker_gen {
+        if self.unique_ready.is_ready_for(marker_gen) {
             return true;
         }
         let marked = eng
@@ -1935,10 +2118,11 @@ impl AydbVTab {
             .flatten()
             .is_some_and(|found| found == want);
         if marked && marker_gen != 0 {
-            self.unique_ready_gen.store(marker_gen, Ordering::Release);
+            self.unique_ready
+                .latch_if_committed(marker_gen, !eng.unique_marker_modified_in_tx());
             true
         } else {
-            self.unique_ready_gen.store(0, Ordering::Release);
+            self.unique_ready.invalidate();
             false
         }
     }
@@ -2633,7 +2817,7 @@ unsafe fn execute_vtab_filter(
                     Err(e) => return io_err_to_sqlite_rc(&e),
                 };
                 if !marker_ok {
-                    vtab.unique_ready_gen.store(0, Ordering::Release);
+                    vtab.unique_ready.invalidate();
                     if let Err(e) = start_pk_full_scan(cursor, eng, vtab.table_id, keys_only, false)
                     {
                         return io_err_to_sqlite_rc(&e);
@@ -3384,10 +3568,7 @@ unsafe extern "system" fn vtab_rowid(
 
 fn has_stale_unique_marker(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) -> io::Result<bool> {
     let marker_gen = eng.unique_marker_gen();
-    if !eng.unique_marker_modified_in_tx()
-        && marker_gen != 0
-        && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
-    {
+    if !eng.unique_marker_modified_in_tx() && vtab.unique_ready.is_ready_for(marker_gen) {
         return Ok(false);
     }
     let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
@@ -3404,10 +3585,7 @@ fn invalidate_stale_unique_marker_if_needed(
     vtab: &AydbVTab,
 ) -> io::Result<()> {
     let marker_gen = eng.unique_marker_gen();
-    if !eng.unique_marker_modified_in_tx()
-        && marker_gen != 0
-        && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
-    {
+    if !eng.unique_marker_modified_in_tx() && vtab.unique_ready.is_ready_for(marker_gen) {
         return Ok(());
     }
     let existing = eng.unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)?;
@@ -3415,12 +3593,10 @@ fn invalidate_stale_unique_marker_if_needed(
         if existing.is_some() {
             eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
         }
-        if !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx() {
-            let post_gen = eng.unique_marker_gen();
-            if post_gen != 0 {
-                vtab.unique_ready_gen.store(post_gen, Ordering::Release);
-            }
-        }
+        vtab.unique_ready.latch_if_committed(
+            eng.unique_marker_gen(),
+            !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx(),
+        );
     } else {
         let want = vtab.unique_def.marker_value();
         if existing.is_some_and(|found| found != want) {
@@ -3449,7 +3625,7 @@ unsafe extern "system" fn vtab_update(
             set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
             return SQLITE_ERROR;
         }
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
 
         let needs_synthetic_delete_check =
             |pk: &[u8]| -> bool { !(vtab.pk_rowid_alias && decode_i64_tagged_key(pk).is_some()) };
@@ -4000,10 +4176,7 @@ fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
             return;
         };
         let marker_gen = eng.unique_marker_gen();
-        if !eng.unique_marker_modified_in_tx()
-            && marker_gen != 0
-            && vtab.unique_ready_gen.load(Ordering::Acquire) == marker_gen
-        {
+        if !eng.unique_marker_modified_in_tx() && vtab.unique_ready.is_ready_for(marker_gen) {
             return;
         }
     }
@@ -4028,12 +4201,10 @@ fn migrate_unique_index_before_begin(vtab: &AydbVTab) {
     match unique_migration::migrate(&vtab.engine, &params, &mut cursor) {
         unique_migration::Outcome::Complete => {
             if let Ok(eng) = vtab.engine.read() {
-                if !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx() {
-                    let post_gen = eng.unique_marker_gen();
-                    if post_gen != 0 {
-                        vtab.unique_ready_gen.store(post_gen, Ordering::Release);
-                    }
-                }
+                vtab.unique_ready.latch_if_committed(
+                    eng.unique_marker_gen(),
+                    !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx(),
+                );
             }
         }
         unique_migration::Outcome::Incomplete | unique_migration::Outcome::Skipped => {}
@@ -4055,7 +4226,7 @@ thread_local! {
 unsafe extern "system" fn vtab_begin_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
         {
             let eng = match vtab.engine.read() {
                 Ok(g) => g,
@@ -4606,7 +4777,7 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             }
             if sqlite3_txn_state(vtab.db, core::ptr::null()) == SQLITE_TXN_WRITE {
                 let durability = eng.effective_tx_durability(commit_durability);
-                if !vtab.pending_ddl.set_tx_commit(PendingDdl::TxCommit {
+                if !vtab.pending_ddl.arm_tx_commit(TxCommitHook {
                     engine: Arc::clone(&vtab.engine),
                     conn_id: vtab.db as usize,
                     durability,
@@ -4634,8 +4805,7 @@ unsafe extern "system" fn vtab_sync_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
-        vtab.pending_ddl.clear_tx_renames();
+        vtab.pending_ddl.clear_explicit_tx();
         // SQLite invokes `xCommit` once per virtual table in `aVTrans`. Normal transactions
         // already appended, flushed, and published in `xSync` or `ddl_commit_hook`, so
         // `conn_has_open_transaction` is false here; keep prepare+commit as a fallback only if an
@@ -4674,7 +4844,7 @@ unsafe extern "system" fn vtab_commit_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
         let restored_name = {
             let mut eng = match vtab.engine.write() {
                 Ok(g) => g,
@@ -4688,7 +4858,7 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
             vtab.pending_ddl.sync_tx_renamed_handles(&eng);
             eng.active_vtab_name(vtab.table_id)
         };
-        vtab.pending_ddl.clear_tx_renames();
+        vtab.pending_ddl.clear_explicit_tx();
         if let Some(actual) = restored_name {
             if let Ok(mut name) = vtab.table_name.lock() {
                 *name = actual;
@@ -4702,7 +4872,7 @@ unsafe extern "system" fn vtab_rollback_tx(p_vtab: *mut sqlite3_vtab) -> c_int {
 unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
         let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
@@ -4718,7 +4888,7 @@ unsafe extern "system" fn vtab_savepoint(p_vtab: *mut sqlite3_vtab, i_savepoint:
 unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
         let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
@@ -4737,7 +4907,7 @@ unsafe extern "system" fn vtab_release(p_vtab: *mut sqlite3_vtab, i_savepoint: c
 unsafe extern "system" fn vtab_rollback_to(p_vtab: *mut sqlite3_vtab, i_savepoint: c_int) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let vtab = &*(p_vtab as *const AydbVTab);
-        vtab.pending_ddl.clear_tx_commit();
+        vtab.pending_ddl.disarm_tx_commit();
         if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
             set_vtab_err_msg(vtab.base.get(), &e.to_string());
             return io_err_to_sqlite_rc(&e);

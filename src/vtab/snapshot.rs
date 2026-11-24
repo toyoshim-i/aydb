@@ -106,7 +106,7 @@ pub(super) struct ReadTrace {
     sessions: RefCell<Vec<Weak<ReadSession>>>,
     statements: RefCell<HashSet<usize>>,
     autocommit: Cell<bool>,
-    pending_ddl: Arc<super::PendingDdlSlot>,
+    pending_ddl: Arc<super::ConnDdlSlot>,
 }
 
 impl ReadTrace {
@@ -116,7 +116,7 @@ impl ReadTrace {
             sessions: RefCell::new(Vec::new()),
             statements: RefCell::new(HashSet::new()),
             autocommit: Cell::new(true),
-            pending_ddl: Arc::new(super::PendingDdlSlot::new()),
+            pending_ddl: Arc::new(super::ConnDdlSlot::new()),
         }
     }
 
@@ -124,7 +124,7 @@ impl ReadTrace {
         self.sessions.borrow_mut().push(Arc::downgrade(session));
     }
 
-    pub(super) fn pending_ddl(&self) -> Arc<super::PendingDdlSlot> {
+    pub(super) fn pending_ddl(&self) -> Arc<super::ConnDdlSlot> {
         Arc::clone(&self.pending_ddl)
     }
 
@@ -175,7 +175,6 @@ pub(super) unsafe extern "system" fn trace_reads(
             statements.is_empty()
         };
         if transaction_ended || (autocommit && idle) {
-            trace.pending_ddl.clear_tx_renames();
             trace.abort_pending_ddl();
             trace.clear();
         } else if event == TRACE_PROFILE && !autocommit {

@@ -3080,14 +3080,14 @@ fn vtab_best_index_handles_zero_constraints_with_null_pointers() {
         db: core::ptr::null_mut(),
         engine: Arc::clone(&engine),
         read_session: Arc::new(snapshot::ReadSession::new(engine)),
-        pending_ddl: Arc::new(PendingDdlSlot::new()),
+        pending_ddl: Arc::new(ConnDdlSlot::new()),
         table_id: 1,
         reg_token: 1,
         db_name: "main".to_string(),
         table_name: Arc::new(std::sync::Mutex::new("t".to_string())),
         durability: WriteDurability::BufferedFast,
         unique_def: unique_key::UniqueDef::from_columns(&[], &[], &[]),
-        unique_ready_gen: AtomicU64::new(1),
+        unique_ready: UniqueReadyLatch::from_verified_gen(1),
         unique_migration_failed: AtomicBool::new(false),
         unique_cursor: std::sync::Mutex::new(None),
         col_names: vec!["k".into(), "v".into()],
@@ -5217,4 +5217,217 @@ fn keys_only_zero_pk_falls_back_when_blob_corrupt_and_keeps_negative_zero() {
         conn.query_all("SELECT count(*) FROM docs", &[]).unwrap(),
         vec![vec![SqlValue::Integer(0)]]
     );
+}
+
+#[test]
+fn conn_ddl_slot_rejects_overlapping_autocommit_and_explicit_tx_transitions() {
+    let tmp = TempTestDir::new("m2_conn_ddl_slot_transitions");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let slot = ConnDdlSlot::new();
+    let table_name = Arc::new(std::sync::Mutex::new("t".to_string()));
+    let mk_hook = |conn_id| TxCommitHook {
+        engine: Arc::clone(&engine),
+        conn_id,
+        durability: WriteDurability::BufferedFast,
+    };
+
+    assert!(!slot.is_occupied());
+    assert!(slot.stage_autocommit(AutocommitDdl::Create(mk_hook(1))));
+    assert!(slot.is_occupied());
+    assert!(
+        !slot.stage_autocommit(AutocommitDdl::Create(mk_hook(1))),
+        "overlapping autocommit staging must be rejected"
+    );
+    assert!(
+        slot.arm_tx_commit(mk_hook(1)),
+        "same-connection xCreate -> xSync hook refresh on staged Create must be allowed"
+    );
+    assert!(
+        !slot.arm_tx_commit(mk_hook(99)),
+        "mismatched conn_id cannot overwrite staged Create hook"
+    );
+    assert!(
+        !slot.record_in_tx_rename(InTxRename {
+            engine: Arc::clone(&engine),
+            conn_id: 1,
+            table_id: 1,
+            db_name: "main".to_string(),
+            old_name: "t".to_string(),
+            new_name: "t2".to_string(),
+            table_name: Arc::clone(&table_name),
+            durability: WriteDurability::BufferedFast,
+        }),
+        "explicit-tx rename cannot enter while autocommit DDL is staged"
+    );
+
+    slot.rollback_pending();
+    assert!(!slot.is_occupied());
+
+    assert!(slot.stage_autocommit(AutocommitDdl::Drop {
+        commit: mk_hook(1),
+        destroyed_token: (1, 1),
+    }));
+    assert!(
+        !slot.stage_autocommit(AutocommitDdl::Create(mk_hook(1))),
+        "overlapping autocommit staging while Drop is staged must be rejected"
+    );
+    assert!(
+        !slot.arm_tx_commit(mk_hook(1)),
+        "explicit-tx commit hook cannot overwrite staged Drop even for same conn_id"
+    );
+    assert!(
+        !slot.record_in_tx_rename(InTxRename {
+            engine: Arc::clone(&engine),
+            conn_id: 1,
+            table_id: 1,
+            db_name: "main".to_string(),
+            old_name: "t".to_string(),
+            new_name: "t2".to_string(),
+            table_name: Arc::clone(&table_name),
+            durability: WriteDurability::BufferedFast,
+        }),
+        "explicit-tx rename cannot enter while autocommit Drop is staged"
+    );
+
+    slot.rollback_pending();
+    assert!(!slot.is_occupied());
+
+    assert!(slot.record_in_tx_rename(InTxRename {
+        engine: Arc::clone(&engine),
+        conn_id: 2,
+        table_id: 1,
+        db_name: "main".to_string(),
+        old_name: "t".to_string(),
+        new_name: "t2".to_string(),
+        table_name: Arc::clone(&table_name),
+        durability: WriteDurability::BufferedFast,
+    }));
+    assert!(slot.is_occupied());
+    assert!(
+        !slot.stage_autocommit(AutocommitDdl::Create(mk_hook(2))),
+        "staged autocommit DDL cannot enter while explicit-tx phase is active"
+    );
+    assert!(slot.arm_tx_commit(mk_hook(2)));
+    assert!(
+        slot.arm_tx_commit(mk_hook(2)),
+        "re-arming explicit-tx hook across multiple vtabs must succeed"
+    );
+    assert!(slot.record_in_tx_rename(InTxRename {
+        engine: Arc::clone(&engine),
+        conn_id: 2,
+        table_id: 1,
+        db_name: "main".to_string(),
+        old_name: "t2".to_string(),
+        new_name: "t3".to_string(),
+        table_name,
+        durability: WriteDurability::BufferedFast,
+    }));
+
+    slot.clear_explicit_tx();
+    assert!(!slot.is_occupied());
+}
+
+#[test]
+fn conn_ddl_slot_disarm_and_failed_commit_preserve_renamed_handles() {
+    let tmp = TempTestDir::new("m2_conn_ddl_slot_disarm_failed_commit");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(engine.clone()).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_old USING aydb(table_id = 10, max_bytes = 65536, columns = 'id INT PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+
+    let conn_id = 0xBEEF_usize;
+    {
+        let mut eng = engine.write().unwrap();
+        eng.begin_transaction_for_conn(conn_id).unwrap();
+        eng.rename_vtab(10, "t_old", "t_new", WriteDurability::SyncTransactional)
+            .unwrap();
+    }
+
+    let table_name = Arc::new(std::sync::Mutex::new("t_new".to_string()));
+    let slot = ConnDdlSlot::new();
+    assert!(slot.record_in_tx_rename(InTxRename {
+        engine: Arc::clone(&engine),
+        conn_id,
+        table_id: 10,
+        db_name: "main".to_string(),
+        old_name: "t_old".to_string(),
+        new_name: "t_new".to_string(),
+        table_name: Arc::clone(&table_name),
+        durability: WriteDurability::SyncTransactional,
+    }));
+    assert!(slot.arm_tx_commit(TxCommitHook {
+        engine: Arc::clone(&engine),
+        conn_id,
+        durability: WriteDurability::SyncTransactional,
+    }));
+
+    slot.disarm_tx_commit();
+    assert!(
+        slot.is_occupied(),
+        "disarming TxCommit must preserve renamed_handles in ExplicitTx"
+    );
+    assert_eq!(slot.commit_pending(), 0);
+    assert!(
+        engine.read().unwrap().conn_has_open_transaction(conn_id),
+        "disarmed slot must leave engine tx open"
+    );
+
+    assert!(slot.arm_tx_commit(TxCommitHook {
+        engine: Arc::clone(&engine),
+        conn_id,
+        durability: WriteDurability::SyncTransactional,
+    }));
+    engine
+        .read()
+        .unwrap()
+        .debug_fail_wal_sync_flag()
+        .store(true, Ordering::SeqCst);
+    assert_eq!(slot.commit_pending(), 1);
+    assert!(
+        slot.take_error().is_some(),
+        "failed WAL sync must record error in ConnDdlSlot"
+    );
+    assert!(
+        slot.is_occupied(),
+        "failed ExplicitTx commit must keep renamed_handles so xRollback can restore table_name"
+    );
+
+    let eng = engine.read().unwrap();
+    assert!(!eng.conn_has_open_transaction(conn_id));
+    slot.sync_tx_renamed_handles(&eng);
+    drop(eng);
+    assert_eq!(table_name.lock().unwrap().as_str(), "t_old");
+
+    slot.clear_explicit_tx();
+    assert!(!slot.is_occupied());
+}
+
+#[test]
+fn unique_ready_latch_rejects_zero_and_uncommitted_latches() {
+    let latch = UniqueReadyLatch::unlatched();
+    assert!(!latch.is_ready_for(0));
+    assert!(!latch.is_ready_for(1));
+    assert_eq!(latch.raw_gen(), 0);
+
+    assert!(!latch.latch_if_committed(0, true));
+    assert!(!latch.latch_if_committed(5, false));
+    assert_eq!(latch.raw_gen(), 0);
+
+    assert!(latch.latch_if_committed(5, true));
+    assert!(latch.is_ready_for(5));
+    assert!(!latch.is_ready_for(6));
+    assert!(!latch.is_ready_for(0));
+
+    latch.invalidate();
+    assert_eq!(latch.raw_gen(), 0);
+    assert!(!latch.is_ready_for(5));
 }
