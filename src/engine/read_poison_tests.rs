@@ -257,11 +257,16 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
         )
         .unwrap();
 
-    let rec_count = engine.pending_tx_record_count;
-    let tx_bytes = engine.pending_tx_bytes;
+    let (rec_count, tx_bytes, overlay_len, undo_len) = {
+        let tx = engine.tx_state.active_tx().expect("active tx");
+        (
+            tx.pending_record_count,
+            tx.pending_bytes,
+            tx.overlay.map.len(),
+            tx.overlay.undo.len(),
+        )
+    };
     let epoch = engine.mutation_epoch;
-    let overlay_len = engine.tx_overlay.map.len();
-    let undo_len = engine.tx_overlay.undo.len();
 
     for _ in 0..20 {
         for k in 0..5u8 {
@@ -271,11 +276,12 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
             );
         }
     }
-    assert_eq!(engine.pending_tx_record_count, rec_count);
-    assert_eq!(engine.pending_tx_bytes, tx_bytes);
+    let tx = engine.tx_state.active_tx().expect("active tx");
+    assert_eq!(tx.pending_record_count, rec_count);
+    assert_eq!(tx.pending_bytes, tx_bytes);
     assert_eq!(engine.mutation_epoch, epoch);
-    assert_eq!(engine.tx_overlay.map.len(), overlay_len);
-    assert_eq!(engine.tx_overlay.undo.len(), undo_len);
+    assert_eq!(tx.overlay.map.len(), overlay_len);
+    assert_eq!(tx.overlay.undo.len(), undo_len);
 
     engine.rollback_to_savepoint_for_conn(1, 1).unwrap();
     assert_eq!(engine.get_row(UNCAPPED, b"tx_k").unwrap(), None);
@@ -320,7 +326,8 @@ fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
         .unwrap();
     assert!(engine.any_blob_unflushed());
     engine.rollback_transaction().unwrap();
-    assert_eq!(engine.tx_depth, 0);
+    assert!(!engine.in_active_transaction());
+    assert!(!engine.tx_state.is_in_tx());
     assert!(engine.any_blob_unflushed());
 
     let verify_scans = |eng: &mut StorageEngine<FaultFs>| {

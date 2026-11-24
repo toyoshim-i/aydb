@@ -70,7 +70,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// True when the active transaction has modified any UNIQUE completion marker (`0xFFFF`).
     #[inline]
     pub(crate) fn unique_marker_modified_in_tx(&self) -> bool {
-        self.unique_marker_modified_in_tx
+        self.tx_state
+            .any_tx()
+            .is_some_and(|tx| tx.unique_marker_modified)
     }
 
     #[inline]
@@ -80,8 +82,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     #[inline]
     pub(super) fn note_unique_marker_changed(&mut self) {
-        if self.tx_depth > 0 {
-            self.unique_marker_modified_in_tx = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.unique_marker_modified = true;
         } else {
             self.bump_unique_marker_gen();
         }
@@ -270,7 +272,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         if !state.new_meta_ptrs.is_empty()
             && durability == WriteDurability::SyncTransactional
-            && self.tx_depth == 0
+            && !self.tx_state.is_active()
         {
             if let Err(e) = self.sync_active_std_writer() {
                 for p in state.new_meta_ptrs.drain(..) {
@@ -280,7 +282,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
         let batch = std::mem::take(&mut state.records);
-        if let Err(e) = self.commit_wal_and_memtable_core(batch, durability, true, false) {
+        if let Err(e) = self.commit_wal_and_memtable_core(
+            batch,
+            durability,
+            true,
+            false,
+            super::tx::WriteScope::Normal,
+        ) {
             for p in state.new_meta_ptrs.drain(..) {
                 self.record_dead_blob_bytes(&p);
             }
@@ -335,7 +343,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 )?;
             }
         }
-        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
+        if let Err(e) = self.commit_wal_and_memtable_core(
+            records,
+            durability,
+            true,
+            false,
+            super::tx::WriteScope::Normal,
+        ) {
             if let Some(ref p) = new_meta_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -368,7 +382,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         let drained_for_table =
-            self.tx_depth == 0 && self.has_pending_corrupt_evictions_for_table(table_id);
+            !self.tx_state.is_active() && self.has_pending_corrupt_evictions_for_table(table_id);
         self.drain_corrupt_evictions()?;
         if rows.is_empty() {
             return Ok(0);
@@ -376,7 +390,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let may_have_meta = self.may_have_row_meta(table_id)?;
         let is_capped = self.capped_tables.contains_key(&table_id);
-        let max_batch_wal_bytes = if self.tx_depth == 0 {
+        let max_batch_wal_bytes = if !self.tx_state.is_active() {
             let sectors = match durability {
                 WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
                 WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
@@ -468,7 +482,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         })();
 
         if let Err(e) = res {
-            if self.tx_depth == 0 {
+            if !self.tx_state.is_active() {
                 self.in_flight_autocommit_blob_starts.clear();
             }
             for p in state.new_meta_ptrs.drain(..) {

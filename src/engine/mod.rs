@@ -73,8 +73,109 @@ pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport
 
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx, ReadSource};
 pub use self::reader::{EngineReader, ReadView};
-use self::tx::{SavepointMarker, TxMetaSnapshot};
+use self::scoped_guards::{
+    ReconcilingCappedGuard, RelocatingBlobsGuard, ScopedReconcilingTable, ScopedRelocatingFlag,
+};
+use self::tx::WriteScope;
 use self::wal_links::LogStream;
+
+/// Type-enforced RAII guards for engine-scoped re-entrancy/phase latches.
+mod scoped_guards {
+    use std::ops::{Deref, DerefMut};
+
+    use super::StorageEngine;
+    use crate::pal::PlatformFs;
+
+    #[derive(Default)]
+    pub(super) struct ScopedRelocatingFlag {
+        active: bool,
+    }
+
+    impl ScopedRelocatingFlag {
+        #[inline]
+        pub(super) fn is_active(&self) -> bool {
+            self.active
+        }
+    }
+
+    #[must_use = "RelocatingBlobsGuard clears relocating_std_blobs on drop"]
+    pub(super) struct RelocatingBlobsGuard<'a, FS: PlatformFs> {
+        engine: &'a mut StorageEngine<FS>,
+    }
+
+    impl<'a, FS: PlatformFs> RelocatingBlobsGuard<'a, FS> {
+        #[inline]
+        pub(super) fn enter(engine: &'a mut StorageEngine<FS>) -> Self {
+            debug_assert!(!engine.relocating_std_blobs.active);
+            engine.relocating_std_blobs.active = true;
+            Self { engine }
+        }
+    }
+
+    impl<FS: PlatformFs> Deref for RelocatingBlobsGuard<'_, FS> {
+        type Target = StorageEngine<FS>;
+        fn deref(&self) -> &Self::Target {
+            self.engine
+        }
+    }
+
+    impl<FS: PlatformFs> DerefMut for RelocatingBlobsGuard<'_, FS> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.engine
+        }
+    }
+
+    impl<FS: PlatformFs> Drop for RelocatingBlobsGuard<'_, FS> {
+        fn drop(&mut self) {
+            self.engine.relocating_std_blobs.active = false;
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct ScopedReconcilingTable {
+        table_id: Option<u16>,
+    }
+
+    impl ScopedReconcilingTable {
+        #[inline]
+        pub(super) fn get(&self) -> Option<u16> {
+            self.table_id
+        }
+    }
+
+    #[must_use = "ReconcilingCappedGuard clears reconciling_capped_table on drop"]
+    pub(super) struct ReconcilingCappedGuard<'a, FS: PlatformFs> {
+        engine: &'a mut StorageEngine<FS>,
+    }
+
+    impl<'a, FS: PlatformFs> ReconcilingCappedGuard<'a, FS> {
+        #[inline]
+        pub(super) fn enter(engine: &'a mut StorageEngine<FS>, table_id: u16) -> Self {
+            debug_assert!(engine.reconciling_capped_table.table_id.is_none());
+            engine.reconciling_capped_table.table_id = Some(table_id);
+            Self { engine }
+        }
+    }
+
+    impl<FS: PlatformFs> Deref for ReconcilingCappedGuard<'_, FS> {
+        type Target = StorageEngine<FS>;
+        fn deref(&self) -> &Self::Target {
+            self.engine
+        }
+    }
+
+    impl<FS: PlatformFs> DerefMut for ReconcilingCappedGuard<'_, FS> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.engine
+        }
+    }
+
+    impl<FS: PlatformFs> Drop for ReconcilingCappedGuard<'_, FS> {
+        fn drop(&mut self) {
+            self.engine.reconciling_capped_table.table_id = None;
+        }
+    }
+}
 
 /// Result of a policy-free `'t'` row-meta lookup.
 pub(super) enum MetaLookup {
@@ -327,12 +428,12 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(super) capped_tables: HashMap<u16, CappedTableState>,
     /// Bounded in-memory `AccessTick` tracker.
     pub(super) access_tracker: AccessTracker,
-    /// Transaction nesting depth (`xBegin` / `xCommit`). While `tx_depth > 0`, serialized
-    /// `WalRecord` bytes are accumulated directly into `pending_tx_buf` and committed as a
+    /// Transaction state machine (`Idle` or `InTx { phase, tx }`). While active, serialized
+    /// `WalRecord` bytes are accumulated inside `ActiveTx::pending_buf` and committed as a
     /// single atomic `WalBatch` on `commit_transaction`!
-    pub(super) tx_depth: usize,
-    /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction.
-    pub(super) tx_owner_conn: Option<usize>,
+    tx_state: tx::TxState,
+    /// Capacity-only reusable buffer recycled from completed/aborted transactions.
+    scratch_tx_buf: Vec<u8>,
     /// Coordinates writers waiting for their turn and commits sharing a device flush.
     pub(super) commit_gate: Arc<tx::CommitGate>,
     /// Committed batches written to `wal_sync.db` whose device flush has not finished, in LSN
@@ -346,19 +447,17 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// [`Self::release_unlinkable_blob_files`]). A crash before that leaves them as uncataloged
     /// files, which recovery adopts if a batch references them and sweeps otherwise.
     pub(super) unlink_after_wal_rotation: Vec<String>,
-    /// True if `flush_memtable()` was requested during an active transaction.
-    pub(super) deferred_flush_on_commit: bool,
-    /// True if `compact()` was requested during an active transaction.
-    pub(super) deferred_compact_on_commit: bool,
     /// Set when a full-WAL rotation flushed the MemTable without auto compaction; consumed by
     /// `run_due_auto_compaction` at the next point where no batch holds an unappended LSN.
     pub(super) auto_compaction_due: bool,
     /// Re-entrancy guard preventing `relocate_fragmented_std_blobs` from triggering another
-    /// relocation pass if its internal MemTable flush invokes auto-compaction.
-    pub(super) relocating_std_blobs: bool,
+    /// relocation pass if its internal MemTable flush invokes auto-compaction. Mutated only via
+    /// [`RelocatingBlobsGuard`].
+    relocating_std_blobs: ScopedRelocatingFlag,
     /// Table currently executing initial `register_capped_table` reconciliation; excluded from
-    /// checkpointed `table_quotas` until reconciliation completes.
-    pub(super) reconciling_capped_table: Option<u16>,
+    /// checkpointed `table_quotas` until reconciliation completes. Mutated only via
+    /// [`ReconcilingCappedGuard`].
+    reconciling_capped_table: ScopedReconcilingTable,
     /// Sealed `blob_std` segment IDs containing an unreadable corrupt blob under lenient
     /// relocation, skipped on subsequent relocation passes until reclaimed by compaction/drop.
     pub(super) unrelocatable_std_blobs: std::collections::HashSet<u64>,
@@ -368,57 +467,15 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Generation id of the worker that owns [`Self::compaction_hook`] so an older worker's teardown
     /// cannot clear a newly registered worker's hook.
     pub(super) compaction_hook_id: u64,
-    /// True if `prepare_commit_transaction()` (`xSync`) has already run for the current commit.
-    pub(super) tx_prepared: bool,
-    /// True while `prepare_commit_transaction()` is running internal quota eviction.
-    pub(super) tx_preparing: bool,
-    /// True while `drop_table_with_durability()` is appending internal drop deletes, bypassing
-    /// `max_transaction_bytes` without pretending to be inside `prepare_commit_transaction()`.
-    pub(super) tx_bypass_size_limit: bool,
-    /// True after a participating sync vtab reached `xSync`, so a later buffered vtab preparing
-    /// the commit upgrades `pending_tx_sync` inside `prepare_commit_transaction()`.
-    pub(super) tx_sync_durability_upgrade: bool,
-    /// True after a non-group `SyncTransactional` batch was appended to `sync_wal` and before
-    /// `finish_commit_for_conn()` receives its barrier outcome.
-    pub(super) tx_sync_in_flight: bool,
-    pub(super) pending_tx_buf: Vec<u8>,
-    pub(super) pending_tx_record_count: u32,
-    pub(super) pending_tx_bytes: usize,
-    pub(super) pending_tx_sync: bool,
-    /// Uncommitted writes of the active explicit transaction (see [`tx::TxOverlay`]).
-    pub(super) tx_overlay: tx::TxOverlay,
-    pub(super) tx_start_meta: TxMetaSnapshot,
-    pub(super) savepoints: Vec<SavepointMarker>,
-    pub(super) statement_savepoint_active: bool,
-    pub(super) statement_blob_undo: Vec<tx::BlobUndo>,
-    /// Deferred `(table_id, pk, max_tick)` access-tracker clears recorded by in-transaction
-    /// writes/evictions and applied only once the transaction commits.
-    pub(super) pending_tx_lru_clears: Vec<(u16, Vec<u8>, u64)>,
-    /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
-    pub(super) dropped_tables_in_tx: Vec<(u16, bool)>,
-    /// Virtual tables created (`xCreate`) inside the currently active transaction, as
-    /// `(table_id, normalised name, normalised sqlite schema name)`.
-    pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
-    /// Initial `(kind, tid_key, seq_id, prev_file_len)` recorded for autocommit (`tx_depth == 0`)
-    /// blob appends not yet appended to the WAL (`tid_key = 0` for `BlobKind::Standard`), so a
-    /// `RingFull` WAL rotation checkpoint never catalogs uncommitted blob lengths ahead of the
-    /// batch.
+    /// Initial `(kind, tid_key, seq_id, prev_file_len)` recorded for autocommit (`Idle` /
+    /// non-tx) blob appends not yet appended to the WAL (`tid_key = 0` for
+    /// `BlobKind::Standard`), so a `RingFull` WAL rotation checkpoint never catalogs uncommitted
+    /// blob lengths ahead of the batch.
     pub(super) in_flight_autocommit_blob_starts: Vec<(BlobKind, u16, u64, u64)>,
-    /// Virtual-table pointers (`p_vtab as usize`) participating in the active SQLite transaction
-    /// (`xBegin` or `xCreate`). Kept for the duration of the transaction so a `SQLITE_BUSY` retry
-    /// on `COMMIT` waits for all participating tables to reach `xSync` again.
-    pub(super) tx_vtabs: Vec<usize>,
-    /// Subset of [`Self::tx_vtabs`] that have already reached `xSync` during the current commit
-    /// attempt; cleared when all participating tables have synced or on new in-tx writes.
-    pub(super) tx_synced_vtabs: Vec<usize>,
-    /// True if any capped-table quota was registered or modified inside the active transaction.
-    pub(super) quotas_modified_in_tx: bool,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
     pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
     /// Monotonic generation bumped whenever any persisted UNIQUE completion marker changes.
     pub(super) unique_marker_gen: u64,
-    /// True if the active transaction modified any UNIQUE completion marker (`0xFFFF`).
-    pub(super) unique_marker_modified_in_tx: bool,
     /// Monotonic registration token counter for live virtual table instances.
     next_vtab_token: u64,
     /// Live virtual table holder tokens per `table_id` (reference-counted across connections).
@@ -1248,43 +1305,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             active_lru_writers: HashMap::new(),
             capped_tables,
             access_tracker: AccessTracker::new(1, 65_536),
-            tx_depth: 0,
-            tx_owner_conn: None,
+            tx_state: tx::TxState::Idle,
+            scratch_tx_buf: Vec::new(),
             commit_gate: Arc::new(tx::CommitGate::default()),
             pending_group: std::collections::VecDeque::new(),
             unlink_after_wal_rotation: Vec::new(),
-            deferred_flush_on_commit: false,
-            deferred_compact_on_commit: false,
             auto_compaction_due: false,
-            relocating_std_blobs: false,
-            reconciling_capped_table: None,
+            relocating_std_blobs: ScopedRelocatingFlag::default(),
+            reconciling_capped_table: ScopedReconcilingTable::default(),
             unrelocatable_std_blobs: std::collections::HashSet::new(),
             compaction_hook: None,
             compaction_hook_id: 0,
-            tx_prepared: false,
-            tx_preparing: false,
-            tx_bypass_size_limit: false,
-            tx_sync_durability_upgrade: false,
-            tx_sync_in_flight: false,
-            pending_tx_buf: Vec::new(),
-            pending_tx_record_count: 0,
-            pending_tx_bytes: 0,
-            pending_tx_sync: false,
-            tx_overlay: tx::TxOverlay::default(),
-            tx_start_meta: TxMetaSnapshot::default(),
-            savepoints: Vec::new(),
-            statement_savepoint_active: false,
-            statement_blob_undo: Vec::new(),
-            pending_tx_lru_clears: Vec::new(),
-            dropped_tables_in_tx: Vec::new(),
-            vtabs_created_in_tx: Vec::new(),
             in_flight_autocommit_blob_starts: Vec::new(),
-            tx_vtabs: Vec::new(),
-            tx_synced_vtabs: Vec::new(),
-            quotas_modified_in_tx: false,
             active_vtab_ids: HashMap::new(),
             unique_marker_gen: 1,
-            unique_marker_modified_in_tx: false,
             next_vtab_token: 1,
             active_vtab_holders: HashMap::new(),
             mutation_epoch: 0,
@@ -1357,7 +1391,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok((engine, salvaged))
     }
 
-    /// Returns the next LSN that will be assigned to a WAL batch.
+    #[inline]
+    pub(super) fn take_scratch_tx_buf(&mut self) -> Vec<u8> {
+        let mut buf = core::mem::take(&mut self.scratch_tx_buf);
+        buf.clear();
+        buf
+    }
+
+    #[inline]
+    pub(super) fn recycle_tx_buf(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        if buf.capacity() > self.scratch_tx_buf.capacity() {
+            self.scratch_tx_buf = buf;
+        }
+    }
+
+    #[inline]
+    pub(super) fn reconciling_capped_table(&self) -> Option<u16> {
+        self.reconciling_capped_table.get()
+    }
+
+    #[inline]
+    pub(crate) fn is_relocating_std_blobs(&self) -> bool {
+        self.relocating_std_blobs.is_active()
+    }
+
     /// Returns true if a WAL, metadata, or group-commit flush failure poisoned this engine. Reads keep
     /// working, but all mutations fail until the engine is reopened.
     pub fn is_poisoned(&self) -> bool {
@@ -1652,7 +1710,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// View-scoped variant of [`Self::plan_vtab_registration`]. A connection that does not own
     /// the active transaction uses [`ReadView::Committed`] so uncommitted `CREATE`/`RENAME`
-    /// mutations are hidden and live registrations come from `tx_start_meta`.
+    /// mutations are hidden and live registrations come from `tx_state.start_meta()`.
     pub(crate) fn plan_vtab_registration_view(
         &mut self,
         view: ReadView,
@@ -1685,8 +1743,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        let active_vtab_ids = if view == ReadView::Committed && self.tx_start_meta.active {
-            &self.tx_start_meta.active_vtab_ids
+        let active_vtab_ids = if view == ReadView::Committed {
+            self.tx_state
+                .start_meta()
+                .map_or(&self.active_vtab_ids, |s| &s.active_vtab_ids)
         } else {
             &self.active_vtab_ids
         };
@@ -1762,16 +1822,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Registers an already persisted virtual table as live for a connection that does not own
     /// the active transaction (or for the owner lazily reconnecting an existing persisted table).
     /// Unlike a registration made for a newly created table, it must survive transaction and
-    /// savepoint rollbacks, so it is recorded in `tx_start_meta` and savepoint snapshots without
+    /// savepoint rollbacks, so it is recorded in `start_meta` and savepoint snapshots without
     /// clobbering any existing committed or renamed table name already captured there.
     pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
         let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
         let tok = self.alloc_vtab_token();
-        if self.tx_start_meta.active {
-            let dropped_in_tx = self
-                .dropped_tables_in_tx
-                .iter()
-                .any(|&(tid, _)| tid == table_id);
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            let dropped_in_tx = tx.dropped_tables.iter().any(|&(tid, _)| tid == table_id);
             if !dropped_in_tx {
                 self.active_vtab_ids
                     .entry(table_id)
@@ -1781,10 +1838,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .or_default()
                     .push(tok);
             }
-            for marker in &mut self.savepoints {
+            for marker in &mut tx.savepoints {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
-                    let prefix_len = snap.dropped_tables_len.min(self.dropped_tables_in_tx.len());
-                    let dropped_before_sp = self.dropped_tables_in_tx[..prefix_len]
+                    let prefix_len = snap.dropped_tables_len.min(tx.dropped_tables.len());
+                    let dropped_before_sp = tx.dropped_tables[..prefix_len]
                         .iter()
                         .any(|&(tid, _)| tid == table_id);
                     if !dropped_before_sp {
@@ -1798,11 +1855,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                 }
             }
-            self.tx_start_meta
+            tx.start_meta
                 .active_vtab_ids
                 .entry(table_id)
                 .or_insert(name);
-            self.tx_start_meta
+            tx.start_meta
                 .active_vtab_holders
                 .entry(table_id)
                 .or_default()
@@ -1818,7 +1875,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Applies runtime-only DDL options (`on_corrupt`, `inline_max`) for an existing persisted
-    /// table without letting a transaction rollback wipe them from `tx_start_meta` or savepoints.
+    /// table without letting a transaction rollback wipe them from `start_meta` or savepoints.
     pub(crate) fn apply_persisted_vtab_runtime_settings(
         &mut self,
         table_id: u16,
@@ -1845,21 +1902,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
 
-        if self.tx_start_meta.active {
-            let dropped_in_tx = self
-                .dropped_tables_in_tx
-                .iter()
-                .any(|&(tid, _)| tid == table_id);
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            let dropped_in_tx = tx.dropped_tables.iter().any(|&(tid, _)| tid == table_id);
             if !dropped_in_tx {
                 apply_to(
                     &mut self.corrupt_policies,
                     &mut self.table_inline_thresholds,
                 );
             }
-            for marker in &mut self.savepoints {
+            for marker in &mut tx.savepoints {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
-                    let prefix_len = snap.dropped_tables_len.min(self.dropped_tables_in_tx.len());
-                    let dropped_before_sp = self.dropped_tables_in_tx[..prefix_len]
+                    let prefix_len = snap.dropped_tables_len.min(tx.dropped_tables.len());
+                    let dropped_before_sp = tx.dropped_tables[..prefix_len]
                         .iter()
                         .any(|&(tid, _)| tid == table_id);
                     if !dropped_before_sp {
@@ -1871,8 +1925,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
             apply_to(
-                &mut self.tx_start_meta.corrupt_policies,
-                &mut self.tx_start_meta.table_inline_thresholds,
+                &mut tx.start_meta.corrupt_policies,
+                &mut tx.start_meta.table_inline_thresholds,
             );
         } else {
             apply_to(
@@ -1884,9 +1938,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Returns `true` if `table_id` was created (`xCreate`) inside the active transaction.
     pub(crate) fn is_vtab_created_in_tx(&self, table_id: u16) -> bool {
-        self.vtabs_created_in_tx
-            .iter()
-            .any(|(id, _, _)| *id == table_id)
+        self.tx_state
+            .active_tx()
+            .is_some_and(|tx| tx.vtabs_created.iter().any(|(id, _, _)| *id == table_id))
     }
 
     /// Notes that the active transaction created virtual table `(table_id, table_name)` in `db_name`.
@@ -1896,8 +1950,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_name: &str,
         db_name: &str,
     ) {
-        if self.tx_depth > 0 {
-            self.vtabs_created_in_tx.push((
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.vtabs_created.push((
                 table_id,
                 normalize_vtab_ident(table_name),
                 normalize_vtab_ident(db_name),
@@ -1940,20 +1994,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         table_name: &str,
         mut is_stale: impl FnMut(u16, &str, &str) -> bool,
     ) -> Vec<(u16, String)> {
+        let Some(tx) = self.tx_state.active_tx_mut() else {
+            return Vec::new();
+        };
         let norm = normalize_vtab_ident(table_name);
-        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
+        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut tx.vtabs_created)
             .into_iter()
             .partition(|(id, name, db)| {
                 (*name == norm || Some(*id) == table_id) && is_stale(*id, db, name)
             });
-        self.vtabs_created_in_tx = kept;
+        tx.vtabs_created = kept;
         stale.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
     /// Returns a snapshot of `(table_id, table_name, db_name)` entries created in the active
     /// transaction so callers can probe SQLite's schema without holding the engine lock.
     pub(crate) fn vtabs_created_in_tx_snapshot(&self) -> Vec<(u16, String, String)> {
-        self.vtabs_created_in_tx.clone()
+        self.tx_state
+            .active_tx()
+            .map_or_else(Vec::new, |tx| tx.vtabs_created.clone())
     }
 
     /// Removes any tables created in the active transaction for which `is_stale(db, name)` holds,
@@ -1963,10 +2022,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         &mut self,
         mut is_stale: impl FnMut(&str, &str) -> bool,
     ) -> Vec<(u16, String)> {
-        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.vtabs_created_in_tx)
+        let Some(tx) = self.tx_state.active_tx_mut() else {
+            return Vec::new();
+        };
+        let (stale, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut tx.vtabs_created)
             .into_iter()
             .partition(|(_, name, db)| is_stale(db, name));
-        self.vtabs_created_in_tx = kept;
+        tx.vtabs_created = kept;
         stale.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
@@ -2032,10 +2094,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Returns `true` if `(table_id, token)` still refers to a live virtual table incarnation in
     /// the view visible to `conn_id`.
     pub(crate) fn is_vtab_token_active(&self, table_id: u16, token: u64, conn_id: usize) -> bool {
-        let holders = if self.read_view_for_conn(conn_id) == ReadView::Committed
-            && self.tx_start_meta.active
-        {
-            &self.tx_start_meta.active_vtab_holders
+        let holders = if self.read_view_for_conn(conn_id) == ReadView::Committed {
+            self.tx_state
+                .start_meta()
+                .map_or(&self.active_vtab_holders, |s| &s.active_vtab_holders)
         } else {
             &self.active_vtab_holders
         };
@@ -2062,12 +2124,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
         remove_from(&mut self.active_vtab_holders, &mut self.active_vtab_ids);
-        if self.tx_start_meta.active {
+        if let Some(tx) = self.tx_state.any_tx_mut() {
             remove_from(
-                &mut self.tx_start_meta.active_vtab_holders,
-                &mut self.tx_start_meta.active_vtab_ids,
+                &mut tx.start_meta.active_vtab_holders,
+                &mut tx.start_meta.active_vtab_ids,
             );
-            for marker in &mut self.savepoints {
+            for marker in &mut tx.savepoints {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
                     remove_from(&mut snap.active_vtab_holders, &mut snap.active_vtab_ids);
                 }
@@ -2085,6 +2147,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         old_name: &str,
         new_name: &str,
         durability: WriteDurability,
+    ) -> io::Result<()> {
+        self.rename_vtab_with_scope(table_id, old_name, new_name, durability, WriteScope::Normal)
+    }
+
+    fn rename_vtab_with_scope(
+        &mut self,
+        table_id: u16,
+        old_name: &str,
+        new_name: &str,
+        durability: WriteDurability,
+        scope: WriteScope,
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
@@ -2140,9 +2213,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if effective_old == new_norm {
             self.active_vtab_ids
                 .insert(table_id, Arc::from(new_norm.as_str()));
-            for (id, name, _) in &mut self.vtabs_created_in_tx {
-                if *id == table_id {
-                    *name = new_norm.clone();
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                for (id, name, _) in &mut tx.vtabs_created {
+                    if *id == table_id {
+                        *name = new_norm.clone();
+                    }
                 }
             }
             return Ok(());
@@ -2161,12 +2236,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             key: new_key,
             value: table_id.to_be_bytes().to_vec(),
         });
-        self.commit_wal_and_memtable(records, durability)?;
+        self.commit_wal_and_memtable_scoped(records, durability, scope)?;
         self.active_vtab_ids
             .insert(table_id, Arc::from(new_norm.as_str()));
-        for (id, name, _) in &mut self.vtabs_created_in_tx {
-            if *id == table_id {
-                *name = new_norm.clone();
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            for (id, name, _) in &mut tx.vtabs_created {
+                if *id == table_id {
+                    *name = new_norm.clone();
+                }
             }
         }
         Ok(())
@@ -2181,10 +2258,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         old_name: &str,
         durability: WriteDurability,
     ) -> io::Result<()> {
-        let prev_bypass = core::mem::replace(&mut self.tx_bypass_size_limit, true);
-        let res = self.rename_vtab(table_id, new_name, old_name, durability);
-        self.tx_bypass_size_limit = prev_bypass;
-        res
+        self.rename_vtab_with_scope(
+            table_id,
+            new_name,
+            old_name,
+            durability,
+            WriteScope::InternalBypass,
+        )
     }
 
     /// Drops a table (`xDestroy` / `DROP TABLE`), deleting all primary rows (`'r'`), secondary
@@ -2256,15 +2336,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // TxBegin/TxCommit framing and WAL growth let a table larger than the WAL be dropped
         // atomically. Dropping a table is exempt from `max_transaction_bytes` both standalone and
         // inside a staged DDL transaction.
-        let internal_tx = self.tx_depth == 0;
+        let internal_tx = !self.tx_state.is_active();
         if internal_tx {
             self.begin_transaction();
         }
         if !records.is_empty() {
-            let prev_bypass = core::mem::replace(&mut self.tx_bypass_size_limit, true);
-            let res = self.commit_wal_and_memtable(records, durability);
-            self.tx_bypass_size_limit = prev_bypass;
-            if let Err(e) = res {
+            if let Err(e) =
+                self.commit_wal_and_memtable_scoped(records, durability, WriteScope::InternalBypass)
+            {
                 if internal_tx {
                     let _ = self.rollback_transaction();
                 }
@@ -2284,8 +2363,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        self.vtabs_created_in_tx
-            .retain(|(id, _, _)| *id != table_id);
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.vtabs_created.retain(|(id, _, _)| *id != table_id);
+        }
         self.active_vtab_ids.remove(&table_id);
         self.active_vtab_holders.remove(&table_id);
         self.corrupt_policies.remove(&table_id);
@@ -2299,9 +2379,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         // Blob reclaim, LRU writer/segment disposal, and quota commit happen once on commit in
-        // `publish_committed_transaction` via `dropped_tables_in_tx` so rolling back an enclosing
-        // transaction leaves `active_lru_writers` and `lru_blobs` intact.
-        self.dropped_tables_in_tx.push((table_id, was_capped));
+        // `publish_committed_transaction` via `ActiveTx::dropped_tables` so rolling back an
+        // enclosing transaction leaves `active_lru_writers` and `lru_blobs` intact.
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.dropped_tables.push((table_id, was_capped));
+        }
         if internal_tx {
             self.commit_transaction()?;
             self.table_has_synthetic_rowids.insert(table_id, false);
@@ -2484,17 +2566,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
             })
             .sum();
-        if self.tx_depth > 0 && !self.tx_preparing && self.config.max_transaction_bytes > 0 {
-            let est_row_bytes =
-                ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
-                    .saturating_add(extra_bytes);
-            if self.pending_tx_bytes.saturating_add(est_row_bytes)
-                > self.config.max_transaction_bytes
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "transaction exceeds max_transaction_bytes budget",
-                ));
+        if self.config.max_transaction_bytes > 0 && !self.tx_state.is_preparing() {
+            if let Some(tx) = self.tx_state.active_tx() {
+                let est_row_bytes =
+                    ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
+                        .saturating_add(extra_bytes);
+                if tx.pending_bytes.saturating_add(est_row_bytes)
+                    > self.config.max_transaction_bytes
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "transaction exceeds max_transaction_bytes budget",
+                    ));
+                }
             }
         }
         let mut new_row_blob_ptr = None;
@@ -2506,7 +2590,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             };
             let ptr = self.append_to_blob_segment(blob_kind, table_id, &row_key, &value)?;
             new_row_blob_ptr = Some(ptr);
-            if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
+            if durability == WriteDurability::SyncTransactional && !self.tx_state.is_active() {
                 let sync_res = match blob_kind {
                     BlobKind::Standard => self.sync_active_std_writer(),
                     BlobKind::Lru => self.sync_active_lru_writer(table_id),
@@ -2557,7 +2641,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 match RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        if self.tx_depth == 0 {
+                        if !self.tx_state.is_active() {
                             self.in_flight_autocommit_blob_starts.clear();
                         }
                         if let Some(ref p) = new_row_blob_ptr {
@@ -2570,7 +2654,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 match self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records) {
                     Ok(ptr_opt) => ptr_opt,
                     Err(e) => {
-                        if self.tx_depth == 0 {
+                        if !self.tx_state.is_active() {
                             self.in_flight_autocommit_blob_starts.clear();
                         }
                         if let Some(ref p) = new_row_blob_ptr {
@@ -2587,7 +2671,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 5. Append atomic batch to WAL and apply to MemTable (deferring auto-flush until
         //    dead-blob bytes and quota totals are updated below).
-        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
+        if let Err(e) =
+            self.commit_wal_and_memtable_core(records, durability, true, false, WriteScope::Normal)
+        {
             if let Some(ref p) = new_row_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -2598,12 +2684,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         if is_capped {
             let stale_max_tick = assigned_tick.saturating_sub(1);
-            if self.tx_depth == 0 {
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                tx.pending_lru_clears
+                    .push((table_id, pk.to_vec(), stale_max_tick));
+            } else {
                 self.access_tracker
                     .clear_if_tick_le(table_id, pk, stale_max_tick);
-            } else {
-                self.pending_tx_lru_clears
-                    .push((table_id, pk.to_vec(), stale_max_tick));
             }
         }
         if need_meta {
@@ -2625,7 +2711,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .saturating_add(logical_size as u64);
         }
         self.maybe_auto_flush_and_compact();
-        if is_capped && self.tx_depth == 0 {
+        if is_capped && !self.tx_state.is_active() {
             // The row is committed; an exceeded quota is re-evaluated by the next write.
             if let Err(e) = self.evict_until_within_quota(table_id, durability) {
                 self.record_maintenance_failure(&e);
@@ -2743,7 +2829,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let meta_bytes = RowMetaRecord::encode_slice(recorded_tick, logical_size, &merged)?;
         let new_meta_blob_ptr =
             self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records)?;
-        if let Err(e) = self.commit_wal_and_memtable_core(records, durability, true, false) {
+        if let Err(e) =
+            self.commit_wal_and_memtable_core(records, durability, true, false, WriteScope::Normal)
+        {
             if let Some(ref p) = new_meta_blob_ptr {
                 self.record_dead_blob_bytes(p);
             }
@@ -2769,7 +2857,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<Option<BlobPtr>> {
         if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
-            if durability == WriteDurability::SyncTransactional && self.tx_depth == 0 {
+            if durability == WriteDurability::SyncTransactional && !self.tx_state.is_active() {
                 if let Err(e) = self.sync_active_std_writer() {
                     self.in_flight_autocommit_blob_starts.clear();
                     self.record_dead_blob_bytes(&ptr);
@@ -2850,7 +2938,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return;
         }
         if cx.eager_ok
-            && self.tx_depth == 0
+            && !self.tx_state.is_active()
             && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
             && matches!(cx.src, ReadSource::Owner | ReadSource::Snapshot(_))
         {
@@ -2911,7 +2999,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Owner-view scans that read blob payloads need every buffered byte on the OS handle.
     pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx<'_, FS::File>) -> io::Result<()> {
-        if cx.src.is_owner() && self.tx_depth > 0 && self.any_blob_unflushed() {
+        if cx.src.is_owner() && self.tx_state.is_active() && self.any_blob_unflushed() {
             cx.need_flush.set(true);
             return Err(io::Error::other(NEED_FLUSH_MSG));
         }
@@ -2923,11 +3011,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// connection sees committed data only.
     #[inline]
     pub fn read_view_for_conn(&self, conn_id: usize) -> ReadView {
-        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
-            ReadView::Committed
-        } else {
-            ReadView::Owner
+        if let Some(tx) = self.tx_state.active_tx() {
+            if tx.owner_conn != Some(conn_id) {
+                return ReadView::Committed;
+            }
         }
+        ReadView::Owner
     }
 
     /// True if reads of `table_id` by `conn_id` need `&mut` access (exclusive lock): the
@@ -2938,7 +3027,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.read_view_for_conn(conn_id) == ReadView::Committed {
             return false;
         }
-        self.tx_depth > 0
+        self.tx_state.is_active()
             || (self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
                 && self.capped_tables.contains_key(&table_id))
     }
@@ -2952,8 +3041,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.read_view_for_conn(conn_id) == ReadView::Committed {
             return false;
         }
-        (self.tx_depth > 0 && self.any_blob_unflushed())
-            || (self.tx_depth == 0
+        let active = self.tx_state.is_active();
+        (active && self.any_blob_unflushed())
+            || (!active
                 && !self.is_poisoned()
                 && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
                 && self.capped_tables.contains_key(&table_id))
@@ -2963,7 +3053,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `EagerWriteOnRead` can persist LRU promotions outside active transactions.
     #[inline]
     pub(crate) fn snapshot_read_needs_exclusive(&self, table_id: u16) -> bool {
-        self.tx_depth == 0
+        !self.tx_state.is_active()
             && !self.is_poisoned()
             && self.config.lru_read_tracking == LruReadTrackingMode::EagerWriteOnRead
             && self.capped_tables.contains_key(&table_id)
@@ -3011,11 +3101,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             // The promotions are an optimisation of the read, never part of its result: a
             // poisoned engine cannot write them, and a write that fails must not fail the read,
             // though a failure on a non-poisoned engine is recorded via `record_maintenance_failure`.
-            // Inside an active transaction (`tx_depth > 0`) eager promotions must never mutate the
+            // Inside an active transaction (`tx_state.is_active()`) eager promotions must never mutate the
             // transaction overlay/budget. A hit that is not written is still noted in RAM, so the
             // LRU order learns it lazily as for any coalesced read.
             let hits = cx.eager_hits.take();
-            let mut write_failed = self.is_poisoned() || self.tx_depth > 0;
+            let mut write_failed = self.is_poisoned() || self.tx_state.is_active();
             for (table_id, pk) in hits {
                 if !write_failed {
                     if let Err(e) = self.eager_promote_lru_on_read(table_id, &pk) {
@@ -3138,13 +3228,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let is_capped = self.capped_tables.contains_key(&table_id);
-        self.commit_wal_and_memtable_core(records, durability, true, false)?;
+        self.commit_wal_and_memtable_core(records, durability, true, false, WriteScope::Normal)?;
         if is_capped {
-            if self.tx_depth == 0 {
-                self.access_tracker.remove_key(table_id, pk);
-            } else {
-                self.pending_tx_lru_clears
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                tx.pending_lru_clears
                     .push((table_id, pk.to_vec(), u64::MAX));
+            } else {
+                self.access_tracker.remove_key(table_id, pk);
             }
         }
 
@@ -3480,7 +3570,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the write's own commit would run first anyway (`commit_wal_and_memtable` drains too), so
     /// the write waits for the group's flush exactly as it did, only before its reads.
     pub(crate) fn drain_group_for_autocommit(&mut self) -> io::Result<()> {
-        if self.tx_depth == 0 {
+        if !self.tx_state.is_active() {
             self.drain_pending_durable()?;
         }
         Ok(())
@@ -3496,7 +3586,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// only deleted if its record still has the observed bytes or blob pointer (it may have been
     /// overwritten or deleted since). Deletes use `BufferedFast` durability.
     pub(super) fn drain_corrupt_evictions(&mut self) -> io::Result<()> {
-        if self.tx_depth > 0 || self.is_poisoned() || !self.has_pending_corrupt_evictions() {
+        if self.tx_state.is_active() || self.is_poisoned() || !self.has_pending_corrupt_evictions()
+        {
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -3857,7 +3948,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         seg_id: u64,
         prev_len: u64,
     ) {
-        if self.tx_depth == 0
+        if !self.tx_state.is_active()
             && !self
                 .in_flight_autocommit_blob_starts
                 .iter()
@@ -3932,7 +4023,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     b.file_len = new_len;
                     prev
                 }) {
-                    if self.tx_depth == 0 {
+                    if !self.tx_state.is_active() {
                         self.note_in_flight_autocommit_blob(
                             BlobKind::Standard,
                             0,
@@ -3940,10 +4031,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             prev_len,
                         );
                     }
-                    if self.statement_savepoint_active {
+                    if let Some(tx) = self
+                        .tx_state
+                        .active_tx_mut()
+                        .filter(|t| t.statement_savepoint_active)
+                    {
                         let delta = new_len.saturating_sub(prev_len);
                         if delta > 0 {
-                            self.statement_blob_undo.push(tx::BlobUndo::Appended {
+                            tx.statement_blob_undo.push(tx::BlobUndo::Appended {
                                 kind: BlobKind::Standard,
                                 table_id: 0,
                                 seg_id,
@@ -4013,7 +4108,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     b.file_len = new_len;
                     prev
                 }) {
-                    if self.tx_depth == 0 {
+                    if !self.tx_state.is_active() {
                         self.note_in_flight_autocommit_blob(
                             BlobKind::Lru,
                             table_id,
@@ -4021,10 +4116,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             prev_len,
                         );
                     }
-                    if self.statement_savepoint_active {
+                    if let Some(tx) = self
+                        .tx_state
+                        .active_tx_mut()
+                        .filter(|t| t.statement_savepoint_active)
+                    {
                         let delta = new_len.saturating_sub(prev_len);
                         if delta > 0 {
-                            self.statement_blob_undo.push(tx::BlobUndo::Appended {
+                            tx.statement_blob_undo.push(tx::BlobUndo::Appended {
                                 kind: BlobKind::Lru,
                                 table_id,
                                 seg_id,
@@ -4047,10 +4146,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if b.dead_bytes > prev_dead {
                         self.unrelocatable_std_blobs.remove(&ptr.seg_id);
                     }
-                    if self.statement_savepoint_active {
+                    if let Some(tx) = self
+                        .tx_state
+                        .active_tx_mut()
+                        .filter(|t| t.statement_savepoint_active)
+                    {
                         let delta = b.dead_bytes.saturating_sub(prev_dead);
                         if delta > 0 {
-                            self.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                            tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
                                 kind: BlobKind::Standard,
                                 table_id: 0,
                                 seg_id: ptr.seg_id,
@@ -4064,10 +4167,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if let Some(b) = self.lru_blobs.get_mut(&(ptr.table_id, ptr.seg_id)) {
                     let prev_dead = b.dead_bytes;
                     b.dead_bytes = b.dead_bytes.saturating_add(ptr.len as u64);
-                    if self.statement_savepoint_active {
+                    if let Some(tx) = self
+                        .tx_state
+                        .active_tx_mut()
+                        .filter(|t| t.statement_savepoint_active)
+                    {
                         let delta = b.dead_bytes.saturating_sub(prev_dead);
                         if delta > 0 {
-                            self.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                            tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
                                 kind: BlobKind::Lru,
                                 table_id: ptr.table_id,
                                 seg_id: ptr.seg_id,
@@ -4249,7 +4356,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     pub(super) fn maybe_auto_flush_and_compact(&mut self) {
-        if self.tx_depth > 0 || self.is_poisoned() {
+        if self.tx_state.is_active() || self.is_poisoned() {
             return;
         }
         // The batch is committed; a failed flush is retried because `should_flush` stays true.
@@ -4267,33 +4374,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         records: Vec<WalRecord>,
         durability: WriteDurability,
     ) -> io::Result<u64> {
-        self.commit_wal_and_memtable_with_data_flag(records, durability, true)
+        self.commit_wal_and_memtable_scoped(records, durability, WriteScope::Normal)
     }
 
-    pub(super) fn commit_wal_and_memtable_with_data_flag(
+    fn commit_wal_and_memtable_scoped(
         &mut self,
         records: Vec<WalRecord>,
         durability: WriteDurability,
-        count_as_data_write: bool,
+        scope: WriteScope,
     ) -> io::Result<u64> {
-        self.commit_wal_and_memtable_core(records, durability, count_as_data_write, true)
+        self.commit_wal_and_memtable_core(records, durability, true, true, scope)
     }
 
-    pub(super) fn commit_wal_and_memtable_core(
+    fn commit_wal_and_memtable_core(
         &mut self,
         records: Vec<WalRecord>,
         durability: WriteDurability,
         count_as_data_write: bool,
         allow_auto_flush: bool,
+        scope: WriteScope,
     ) -> io::Result<u64> {
-        if count_as_data_write || self.tx_depth > 0 {
+        if count_as_data_write || self.tx_state.is_active() {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         }
         self.check_not_poisoned()?;
         let lsn = self.next_lsn;
         let successor = self.lsn_after_batches(1)?;
 
-        if self.tx_depth > 0 {
+        if self.tx_state.is_active() {
             let batch_bytes: usize = records
                 .iter()
                 .map(|r| match r {
@@ -4305,52 +4413,54 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
                 })
                 .sum();
-            let next_tx_bytes = self.pending_tx_bytes.saturating_add(batch_bytes);
-            if !self.tx_preparing
-                && !self.tx_bypass_size_limit
-                && self.config.max_transaction_bytes > 0
-                && next_tx_bytes > self.config.max_transaction_bytes
+            let bypass = scope == WriteScope::InternalBypass || self.tx_state.is_preparing();
+            let max_transaction_bytes = self.config.max_transaction_bytes;
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "transaction exceeds max_transaction_bytes budget",
-                ));
-            }
-            let record_count = u32::try_from(records.len())
-                .ok()
-                .and_then(|n| self.pending_tx_record_count.checked_add(n))
-                .ok_or_else(|| {
-                    io::Error::new(
+                let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() else {
+                    unreachable!("checked self.tx_state.is_active()");
+                };
+                let next_tx_bytes = tx.pending_bytes.saturating_add(batch_bytes);
+                if !bypass && max_transaction_bytes > 0 && next_tx_bytes > max_transaction_bytes {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "too many records in transaction",
-                    )
-                })?;
-            if self.pending_tx_record_count == 0 {
-                self.pending_tx_buf.clear();
-                self.pending_tx_buf
-                    .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
+                        "transaction exceeds max_transaction_bytes budget",
+                    ));
+                }
+                let record_count = u32::try_from(records.len())
+                    .ok()
+                    .and_then(|n| tx.pending_record_count.checked_add(n))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "too many records in transaction",
+                        )
+                    })?;
+                if tx.pending_record_count == 0 {
+                    tx.pending_buf.clear();
+                    tx.pending_buf
+                        .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
+                }
+                let prev_buf_len = tx.pending_buf.len();
+                if let Err(e) = WalBatch::try_append_records_to_buf(&records, &mut tx.pending_buf) {
+                    tx.pending_buf.truncate(prev_buf_len);
+                    return Err(e);
+                }
+                if !bypass {
+                    tx.invalidate_prepare(phase);
+                }
+                tx.pending_bytes = next_tx_bytes;
+                if durability == WriteDurability::SyncTransactional {
+                    tx.pending_sync = true;
+                }
+                tx.pending_record_count = record_count;
             }
-            let prev_buf_len = self.pending_tx_buf.len();
-            if let Err(e) = WalBatch::try_append_records_to_buf(&records, &mut self.pending_tx_buf)
-            {
-                self.pending_tx_buf.truncate(prev_buf_len);
-                return Err(e);
-            }
-            if !self.tx_preparing && !self.tx_bypass_size_limit {
-                self.tx_prepared = false;
-                self.tx_synced_vtabs.clear();
-                self.tx_sync_durability_upgrade = false;
-            }
-            self.pending_tx_bytes = next_tx_bytes;
             self.next_lsn = successor;
-            if durability == WriteDurability::SyncTransactional {
-                self.pending_tx_sync = true;
-            }
-            self.pending_tx_record_count = record_count;
             self.note_records_table_mutations(&records);
-            let record_undo = !self.savepoints.is_empty();
-            for rec in records {
-                self.tx_overlay.apply(lsn, rec, record_undo);
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                let record_undo = !tx.savepoints.is_empty();
+                for rec in records {
+                    tx.overlay.apply(lsn, rec, record_undo);
+                }
             }
             return Ok(lsn);
         }
@@ -4662,15 +4772,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         key: &[u8],
     ) -> Option<&'a crate::memtable::MemEntry> {
         if src.is_owner() {
-            if self.tx_overlay.may_contain_key(key) {
-                if let Some(e) = self.tx_overlay.map.get(key) {
-                    return Some(e);
-                }
-            }
-            if self.tx_depth > 0 && !self.pending_group.is_empty() && !self.is_poisoned() {
-                for (_, entries) in self.pending_group.iter().rev() {
-                    if let Some(e) = entries.get(key) {
+            if let Some(tx) = self.tx_state.active_tx() {
+                if tx.overlay.may_contain_key(key) {
+                    if let Some(e) = tx.overlay.map.get(key) {
                         return Some(e);
+                    }
+                }
+                if !self.pending_group.is_empty() && !self.is_poisoned() {
+                    for (_, entries) in self.pending_group.iter().rev() {
+                        if let Some(e) = entries.get(key) {
+                            return Some(e);
+                        }
                     }
                 }
             }

@@ -1601,24 +1601,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> MemView<'a> {
         static EMPTY: std::collections::BTreeMap<Vec<u8>, crate::memtable::MemEntry> =
             std::collections::BTreeMap::new();
-        let ov_range = if !src.is_owner() || !self.tx_overlay.overlaps_range(lo, hi) {
-            EMPTY.range::<[u8], _>((lo, hi))
+        let owner_tx = if src.is_owner() {
+            self.tx_state.active_tx()
         } else {
-            self.tx_overlay.map.range::<[u8], _>((lo, hi))
+            None
         };
-        let pending_ranges = if src.is_owner()
-            && self.tx_depth > 0
-            && !self.pending_group.is_empty()
-            && !self.is_poisoned()
-        {
-            let mut ranges = Vec::with_capacity(self.pending_group.len());
-            for (_, entries) in self.pending_group.iter().rev() {
-                ranges.push(entries.range::<[u8], _>((lo, hi)));
+        let ov_range = match owner_tx {
+            Some(tx) if tx.overlay.overlaps_range(lo, hi) => {
+                tx.overlay.map.range::<[u8], _>((lo, hi))
             }
-            ranges
-        } else {
-            Vec::new()
+            _ => EMPTY.range::<[u8], _>((lo, hi)),
         };
+        let pending_ranges =
+            if owner_tx.is_some() && !self.pending_group.is_empty() && !self.is_poisoned() {
+                let mut ranges = Vec::with_capacity(self.pending_group.len());
+                for (_, entries) in self.pending_group.iter().rev() {
+                    ranges.push(entries.range::<[u8], _>((lo, hi)));
+                }
+                ranges
+            } else {
+                Vec::new()
+            };
         MemView::new(
             self.memtable_for(src).iter_range(lo, hi),
             ov_range,

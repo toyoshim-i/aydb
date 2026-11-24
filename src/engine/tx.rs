@@ -221,10 +221,28 @@ pub(crate) enum CommitStep<F: PlatformFile> {
     },
 }
 
-#[derive(Clone, Default)]
+/// Explicit write scope for `StorageEngine::commit_wal_and_memtable_core` and internal helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteScope {
+    /// Normal user writes obeying `max_transaction_bytes` and invalidating prior commit preparation.
+    Normal,
+    /// Internal recovery/reconcile/drop/eviction writes bypassing `max_transaction_bytes`
+    /// without resetting outer commit preparation or durability upgrade state.
+    InternalBypass,
+}
+
+/// Phase of an active explicit or savepoint-backed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TxPhase {
+    Active,
+    Preparing,
+    Prepared,
+    FlushingWal,
+    SyncInFlight,
+}
+
+#[derive(Clone)]
 pub(crate) struct TxMetaSnapshot {
-    /// `true` for a captured snapshot, `false` for the default (no transaction in flight).
-    pub(super) active: bool,
     pub(super) next_lsn: u64,
     pub(super) std_blobs: BTreeMap<u64, (u64, u64)>,
     pub(super) lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
@@ -239,6 +257,264 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) lru_clears_len: usize,
     pub(super) vtabs_created_in_tx: Vec<(u16, String, String)>,
     pub(super) quotas_modified_in_tx: bool,
+}
+
+/// Per-transaction state owned by [`TxState::InTx`] and dropped atomically on return to [`TxState::Idle`].
+pub(super) struct ActiveTx {
+    pub(super) depth: core::num::NonZeroUsize,
+    /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction.
+    pub(super) owner_conn: Option<usize>,
+    /// True after a participating sync vtab reached `xSync`, so a later buffered vtab preparing
+    /// the commit upgrades `pending_sync` inside `prepare_commit_transaction()`.
+    pub(super) sync_durability_upgrade: bool,
+    pub(super) pending_buf: Vec<u8>,
+    pub(super) pending_record_count: u32,
+    pub(super) pending_bytes: usize,
+    pub(super) pending_sync: bool,
+    /// Uncommitted writes of the active explicit transaction (see [`TxOverlay`]).
+    pub(super) overlay: TxOverlay,
+    pub(super) start_meta: TxMetaSnapshot,
+    pub(super) savepoints: Vec<SavepointMarker>,
+    pub(super) statement_savepoint_active: bool,
+    pub(super) statement_blob_undo: Vec<BlobUndo>,
+    /// Deferred `(table_id, pk, max_tick)` access-tracker clears recorded by in-transaction
+    /// writes/evictions and applied only once the transaction commits.
+    pub(super) pending_lru_clears: Vec<(u16, Vec<u8>, u64)>,
+    /// Tables dropped inside the currently active transaction (`(table_id, was_capped)`).
+    pub(super) dropped_tables: Vec<(u16, bool)>,
+    /// Virtual tables created (`xCreate`) inside the currently active transaction, as
+    /// `(table_id, normalised name, normalised sqlite schema name)`.
+    pub(super) vtabs_created: Vec<(u16, String, String)>,
+    /// Virtual-table pointers (`p_vtab as usize`) participating in the active SQLite transaction
+    /// (`xBegin` or `xCreate`). Kept for the duration of the transaction so a `SQLITE_BUSY` retry
+    /// on `COMMIT` waits for all participating tables to reach `xSync` again.
+    pub(super) vtabs: Vec<usize>,
+    /// Subset of [`Self::vtabs`] that have already reached `xSync` during the current commit
+    /// attempt; cleared when all participating tables have synced or on new in-tx writes.
+    pub(super) synced_vtabs: Vec<usize>,
+    /// True if any capped-table quota was registered or modified inside the active transaction.
+    pub(super) quotas_modified: bool,
+    /// True if the active transaction modified any UNIQUE completion marker (`0xFFFF`).
+    pub(super) unique_marker_modified: bool,
+    /// True if `flush_memtable()` was requested during an active transaction.
+    pub(super) deferred_flush: bool,
+    /// True if `compact()` was requested during an active transaction.
+    pub(super) deferred_compact: bool,
+}
+
+impl ActiveTx {
+    pub(super) fn new(
+        owner_conn: Option<usize>,
+        start_meta: TxMetaSnapshot,
+        mut pending_buf: Vec<u8>,
+    ) -> Self {
+        pending_buf.clear();
+        Self {
+            depth: core::num::NonZeroUsize::MIN,
+            owner_conn,
+            sync_durability_upgrade: false,
+            pending_buf,
+            pending_record_count: 0,
+            pending_bytes: 0,
+            pending_sync: false,
+            overlay: TxOverlay::default(),
+            start_meta,
+            savepoints: Vec::new(),
+            statement_savepoint_active: false,
+            statement_blob_undo: Vec::new(),
+            pending_lru_clears: Vec::new(),
+            dropped_tables: Vec::new(),
+            vtabs_created: Vec::new(),
+            vtabs: Vec::new(),
+            synced_vtabs: Vec::new(),
+            quotas_modified: false,
+            unique_marker_modified: false,
+            deferred_flush: false,
+            deferred_compact: false,
+        }
+    }
+
+    #[inline]
+    pub(super) fn invalidate_prepare(&mut self, phase: &mut TxPhase) {
+        *phase = TxPhase::Active;
+        self.synced_vtabs.clear();
+        self.sync_durability_upgrade = false;
+    }
+
+    pub(super) fn refresh_statement_savepoint_active(&mut self) {
+        let active = self
+            .savepoints
+            .iter()
+            .any(|s| matches!(s.meta, SavepointMeta::Statement(_)));
+        self.statement_savepoint_active = active;
+        if !active {
+            self.statement_blob_undo.clear();
+        }
+    }
+}
+
+/// Top-level transaction state machine on [`StorageEngine`].
+#[derive(Default)]
+pub(super) enum TxState {
+    #[default]
+    Idle,
+    InTx {
+        phase: TxPhase,
+        tx: Box<ActiveTx>,
+    },
+}
+
+impl TxState {
+    /// True while a transaction owns the writer slot and has not entered `FlushingWal`.
+    /// During `FlushingWal`, `RingFull` WAL rotations must execute without deferring while still
+    /// observing [`Self::start_meta`].
+    #[inline]
+    pub(super) fn is_active(&self) -> bool {
+        matches!(
+            self,
+            TxState::InTx {
+                phase: TxPhase::Active
+                    | TxPhase::Preparing
+                    | TxPhase::Prepared
+                    | TxPhase::SyncInFlight,
+                ..
+            }
+        )
+    }
+
+    /// True whenever a transaction is present, including [`TxPhase::FlushingWal`].
+    #[inline]
+    pub(super) fn is_in_tx(&self) -> bool {
+        !matches!(self, TxState::Idle)
+    }
+
+    #[inline]
+    pub(super) fn active_tx(&self) -> Option<&ActiveTx> {
+        match self {
+            TxState::InTx {
+                phase:
+                    TxPhase::Active | TxPhase::Preparing | TxPhase::Prepared | TxPhase::SyncInFlight,
+                tx,
+            } => Some(tx),
+            TxState::Idle | TxState::InTx { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn active_tx_mut(&mut self) -> Option<&mut ActiveTx> {
+        match self {
+            TxState::InTx {
+                phase:
+                    TxPhase::Active | TxPhase::Preparing | TxPhase::Prepared | TxPhase::SyncInFlight,
+                tx,
+            } => Some(tx),
+            TxState::Idle | TxState::InTx { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn any_tx(&self) -> Option<&ActiveTx> {
+        match self {
+            TxState::InTx { tx, .. } => Some(tx),
+            TxState::Idle => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn any_tx_mut(&mut self) -> Option<&mut ActiveTx> {
+        match self {
+            TxState::InTx { tx, .. } => Some(tx),
+            TxState::Idle => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn active_phase_and_tx_mut(&mut self) -> Option<(&mut TxPhase, &mut ActiveTx)> {
+        match self {
+            TxState::InTx {
+                phase:
+                    phase @ (TxPhase::Active
+                    | TxPhase::Preparing
+                    | TxPhase::Prepared
+                    | TxPhase::SyncInFlight),
+                tx,
+            } => Some((phase, tx)),
+            TxState::Idle | TxState::InTx { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn start_meta(&self) -> Option<&TxMetaSnapshot> {
+        self.any_tx().map(|tx| &tx.start_meta)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn phase(&self) -> Option<TxPhase> {
+        match self {
+            TxState::InTx { phase, .. } => Some(*phase),
+            TxState::Idle => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_phase(&mut self, next: TxPhase) {
+        if let TxState::InTx { phase, .. } = self {
+            *phase = next;
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_preparing(&self) -> bool {
+        matches!(
+            self,
+            TxState::InTx {
+                phase: TxPhase::Preparing,
+                ..
+            }
+        )
+    }
+
+    #[inline]
+    pub(super) fn is_prepared(&self) -> bool {
+        matches!(
+            self,
+            TxState::InTx {
+                phase: TxPhase::Prepared,
+                ..
+            }
+        )
+    }
+
+    #[inline]
+    pub(super) fn is_sync_in_flight(&self) -> bool {
+        matches!(
+            self,
+            TxState::InTx {
+                phase: TxPhase::SyncInFlight,
+                ..
+            }
+        )
+    }
+
+    #[inline]
+    pub(super) fn pending_record_count(&self) -> u32 {
+        self.any_tx().map_or(0, |tx| tx.pending_record_count)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn pending_sync(&self) -> bool {
+        self.any_tx().is_some_and(|tx| tx.pending_sync)
+    }
+
+    #[inline]
+    pub(super) fn take_to_idle(&mut self) -> Option<(TxPhase, Box<ActiveTx>)> {
+        match core::mem::take(self) {
+            TxState::Idle => None,
+            TxState::InTx { phase, tx } => Some((phase, tx)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -276,7 +552,7 @@ pub(crate) enum SavepointMeta {
 
 /// Private, ordered write set of the active explicit transaction.
 ///
-/// While `tx_depth > 0` every mutation lands here instead of in the shared `MemTable`, so the
+/// While a transaction is active, every mutation lands here instead of in the shared `MemTable`, so the
 /// `MemTable` only ever holds committed data and non-owner readers never need to hide anything.
 /// Owner reads treat the overlay as the highest-precedence source (overlay > memtable > segments).
 ///
@@ -444,7 +720,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Returns `true` if an explicit or savepoint-backed transaction is currently active.
     #[inline]
     pub fn in_active_transaction(&self) -> bool {
-        self.tx_depth > 0
+        self.tx_state.is_active()
     }
 
     /// Begins an explicit batch transaction (`BEGIN`). Subsequent mutations apply immediately to
@@ -452,27 +728,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        if self.tx_depth == 0 {
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            tx.depth = tx.depth.checked_add(1).expect("transaction depth overflow");
+        } else {
             self.in_flight_autocommit_blob_starts.clear();
-            self.tx_overlay.clear();
-            self.dropped_tables_in_tx.clear();
-            self.vtabs_created_in_tx.clear();
-            self.tx_vtabs.clear();
-            self.tx_synced_vtabs.clear();
-            self.quotas_modified_in_tx = false;
-            self.unique_marker_modified_in_tx = false;
-            self.tx_start_meta = self.capture_tx_meta_snapshot();
-            self.tx_owner_conn = None;
-            self.deferred_flush_on_commit = false;
-            self.deferred_compact_on_commit = false;
-            self.tx_prepared = false;
-            self.tx_preparing = false;
-            self.tx_bypass_size_limit = false;
-            self.tx_sync_durability_upgrade = false;
-            self.pending_tx_bytes = 0;
-            self.pending_tx_sync = false;
+            let start_meta = self.capture_initial_tx_meta_snapshot();
+            let buf = self.take_scratch_tx_buf();
+            self.tx_state = TxState::InTx {
+                phase: TxPhase::Active,
+                tx: Box::new(ActiveTx::new(None, start_meta, buf)),
+            };
         }
-        self.tx_depth += 1;
     }
 
     /// Begins an explicit transaction owned by SQLite connection `conn_id`.
@@ -481,38 +747,28 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "database is locked by another connection's active transaction",
-            ));
-        }
-        if self.tx_depth == 0 {
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            if tx.owner_conn != Some(conn_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "database is locked by another connection's active transaction",
+                ));
+            }
+            tx.depth = tx.depth.checked_add(1).expect("transaction depth overflow");
+        } else {
             self.in_flight_autocommit_blob_starts.clear();
-            self.tx_overlay.clear();
-            self.dropped_tables_in_tx.clear();
-            self.vtabs_created_in_tx.clear();
-            self.tx_vtabs.clear();
-            self.tx_synced_vtabs.clear();
-            self.quotas_modified_in_tx = false;
-            self.unique_marker_modified_in_tx = false;
-            self.tx_start_meta = self.capture_tx_meta_snapshot();
-            self.tx_owner_conn = Some(conn_id);
-            self.deferred_flush_on_commit = false;
-            self.deferred_compact_on_commit = false;
-            self.tx_prepared = false;
-            self.tx_preparing = false;
-            self.tx_bypass_size_limit = false;
-            self.tx_sync_durability_upgrade = false;
-            self.pending_tx_bytes = 0;
-            self.pending_tx_sync = false;
+            let start_meta = self.capture_initial_tx_meta_snapshot();
+            let buf = self.take_scratch_tx_buf();
+            self.tx_state = TxState::InTx {
+                phase: TxPhase::Active,
+                tx: Box::new(ActiveTx::new(Some(conn_id), start_meta, buf)),
+            };
         }
-        self.tx_depth += 1;
         Ok(())
     }
 
     /// Begins (or joins) the engine transaction for SQLite connection `conn_id` on behalf of
-    /// virtual table `vtab_id`, keeping `tx_depth == 1` across multiple tables in one transaction
+    /// virtual table `vtab_id`, keeping `tx.depth == 1` across multiple tables in one transaction
     /// and tracking `vtab_id` for `xSync`.
     pub(crate) fn begin_vtab_transaction(
         &mut self,
@@ -521,15 +777,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.check_write_allowed_for_conn(conn_id)?;
-        if self.tx_depth == 0 {
+        if !self.tx_state.is_active() {
             self.begin_transaction_for_conn(conn_id)?;
         } else {
             self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         }
-        if !self.tx_vtabs.contains(&vtab_id) {
-            self.tx_vtabs.push(vtab_id);
-            self.tx_synced_vtabs.clear();
-            self.tx_sync_durability_upgrade = false;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            if !tx.vtabs.contains(&vtab_id) {
+                tx.vtabs.push(vtab_id);
+                tx.synced_vtabs.clear();
+                tx.sync_durability_upgrade = false;
+            }
         }
         Ok(())
     }
@@ -537,25 +795,39 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Registers an already-created `vtab_id` (`p_vtab as usize`) with the active transaction
     /// owned by `conn_id` (used when `xCreate` adds a table without SQLite invoking `xBegin`).
     pub(crate) fn attach_vtab_to_tx(&mut self, conn_id: usize, vtab_id: usize) {
-        if self.conn_has_open_transaction(conn_id) && !self.tx_vtabs.contains(&vtab_id) {
-            self.tx_vtabs.push(vtab_id);
-            self.tx_synced_vtabs.clear();
-            self.tx_sync_durability_upgrade = false;
+        if let Some(tx) = self
+            .tx_state
+            .active_tx_mut()
+            .filter(|tx| tx.owner_conn == Some(conn_id))
+        {
+            if !tx.vtabs.contains(&vtab_id) {
+                tx.vtabs.push(vtab_id);
+                tx.synced_vtabs.clear();
+                tx.sync_durability_upgrade = false;
+            }
         }
     }
 
     /// Removes `vtab_id` from the active transaction's participating tables on disconnect.
     pub(crate) fn detach_vtab_from_tx(&mut self, conn_id: usize, vtab_id: usize) {
-        if self.conn_has_open_transaction(conn_id) {
-            self.tx_vtabs.retain(|&id| id != vtab_id);
-            self.tx_synced_vtabs.retain(|&id| id != vtab_id);
+        if let Some(tx) = self
+            .tx_state
+            .active_tx_mut()
+            .filter(|tx| tx.owner_conn == Some(conn_id))
+        {
+            tx.vtabs.retain(|&id| id != vtab_id);
+            tx.synced_vtabs.retain(|&id| id != vtab_id);
         }
     }
 
     /// Returns the effective durability of the active transaction, upgrading `fallback` if any
     /// participating table requested synchronous durability.
     pub(crate) fn effective_tx_durability(&self, fallback: WriteDurability) -> WriteDurability {
-        if self.pending_tx_sync || self.tx_sync_durability_upgrade {
+        if self
+            .tx_state
+            .any_tx()
+            .is_some_and(|tx| tx.pending_sync || tx.sync_durability_upgrade)
+        {
             WriteDurability::SyncTransactional
         } else {
             fallback
@@ -570,36 +842,40 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         vtab_id: usize,
         durability: WriteDurability,
     ) -> bool {
+        let Some(tx) = self.tx_state.active_tx_mut() else {
+            return true;
+        };
         if durability == WriteDurability::SyncTransactional {
-            self.tx_sync_durability_upgrade = true;
+            tx.sync_durability_upgrade = true;
         }
-        if !self.tx_synced_vtabs.contains(&vtab_id) {
-            self.tx_synced_vtabs.push(vtab_id);
+        if !tx.synced_vtabs.contains(&vtab_id) {
+            tx.synced_vtabs.push(vtab_id);
         }
-        let all_synced = self
-            .tx_vtabs
-            .iter()
-            .all(|id| self.tx_synced_vtabs.contains(id));
+        let all_synced = tx.vtabs.iter().all(|id| tx.synced_vtabs.contains(id));
         if all_synced {
-            self.tx_synced_vtabs.clear();
+            tx.synced_vtabs.clear();
         }
         all_synced
     }
 
     /// Whether `conn_id` has a transaction open in the engine (it has written since `BEGIN`).
     pub(crate) fn conn_has_open_transaction(&self, conn_id: usize) -> bool {
-        self.tx_depth > 0 && self.tx_owner_conn == Some(conn_id)
+        self.tx_state
+            .active_tx()
+            .is_some_and(|tx| tx.owner_conn == Some(conn_id))
     }
 
     /// Checks whether `conn_id` is permitted to mutate this `StorageEngine`.
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection holds an active transaction.
     #[inline]
     pub fn check_write_allowed_for_conn(&self, conn_id: usize) -> io::Result<()> {
-        if self.tx_depth > 0 && self.tx_owner_conn != Some(conn_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "database is locked by another connection's active transaction",
-            ));
+        if let Some(tx) = self.tx_state.active_tx() {
+            if tx.owner_conn != Some(conn_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "database is locked by another connection's active transaction",
+                ));
+            }
         }
         Ok(())
     }
@@ -653,89 +929,112 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// flushes/syncs out-of-line blob segments, and pre-checks WAL capacity so any fallible I/O
     /// or space errors surface during `xSync` while `xRollback` can still cleanly undo all state.
     pub fn prepare_commit_transaction(&mut self, durability: WriteDurability) -> io::Result<()> {
-        if self.tx_depth == 0 {
+        if !self.tx_state.is_active() {
             return Ok(());
         }
         self.check_not_poisoned()?;
-        let requested_sync =
-            durability == WriteDurability::SyncTransactional || self.tx_sync_durability_upgrade;
-        let need_sync_upgrade = requested_sync && !self.pending_tx_sync;
-        if self.tx_prepared && !need_sync_upgrade {
-            return Ok(());
-        }
-        if requested_sync {
-            self.pending_tx_sync = true;
-        }
-        let effective_durability = if self.pending_tx_sync {
-            WriteDurability::SyncTransactional
-        } else {
-            WriteDurability::BufferedFast
-        };
-
-        // 1. Run capped-table quota evictions while `tx_depth > 0` so eviction mutations are
-        //    recorded in `pending_tx_buf` and `tx_overlay` (fully undoable on `xRollback`!).
-        self.tx_preparing = true;
-        let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
-        for tid in capped_table_ids {
-            if let Err(e) = self.evict_until_within_quota(tid, effective_durability) {
-                self.tx_preparing = false;
-                return Err(e);
+        let effective_durability = {
+            let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() else {
+                return Ok(());
+            };
+            let requested_sync =
+                durability == WriteDurability::SyncTransactional || tx.sync_durability_upgrade;
+            let need_sync_upgrade = requested_sync && !tx.pending_sync;
+            if *phase == TxPhase::Prepared && !need_sync_upgrade {
+                return Ok(());
             }
-        }
-        self.tx_preparing = false;
-
-        // 2. Flush/sync active blob writers (`Write-Blob-Before-WAL` & prefix durability).
-        self.flush_active_blob_buffers()?;
-        if effective_durability == WriteDurability::SyncTransactional {
-            if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                // Syncs the active blob writers before the buffered log.
-                self.make_buf_wal_durable(true)?;
+            if requested_sync {
+                tx.pending_sync = true;
+            }
+            let effective = if tx.pending_sync {
+                WriteDurability::SyncTransactional
             } else {
-                self.sync_active_blob_writers()?;
-            }
-        }
-
-        // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB) or a
-        //    single batch that cannot fit even in an empty WAL file.
-        let wal_total_sectors = match effective_durability {
-            WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
-            WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+                WriteDurability::BufferedFast
+            };
+            *phase = TxPhase::Preparing;
+            effective
         };
-        let exceeds_wal = self.pending_tx_buf.len() / 4070 + 2 > wal_total_sectors;
-        if self.pending_tx_buf.len() > MAX_WAL_CHUNK_BYTES || exceeds_wal {
-            let required_sectors = (self.pending_tx_buf.len() / 4070) + 8;
-            match effective_durability {
-                WriteDurability::SyncTransactional => {
-                    let target_sectors = self
-                        .sync_wal
-                        .current_sector_idx()
-                        .checked_add(required_sectors)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                        })?;
-                    if target_sectors > self.sync_wal.total_sectors() {
-                        self.sync_wal
-                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                    }
+
+        let res: io::Result<()> = (|| {
+            // 1. Run capped-table quota evictions while active so eviction mutations are
+            //    recorded in `pending_buf` and `overlay` (fully undoable on `xRollback`!).
+            let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
+            for tid in capped_table_ids {
+                self.evict_until_within_quota(tid, effective_durability)?;
+            }
+
+            // 2. Flush/sync active blob writers (`Write-Blob-Before-WAL` & prefix durability).
+            self.flush_active_blob_buffers()?;
+            if effective_durability == WriteDurability::SyncTransactional {
+                if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+                    // Syncs the active blob writers before the buffered log.
+                    self.make_buf_wal_durable(true)?;
+                } else {
+                    self.sync_active_blob_writers()?;
                 }
-                WriteDurability::BufferedFast => {
-                    let target_sectors = self
-                        .buf_wal
-                        .current_sector_idx()
-                        .checked_add(required_sectors)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                        })?;
-                    if target_sectors > self.buf_wal.total_sectors() {
-                        self.buf_wal
-                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
+            }
+
+            // 3. Pre-verify/grow WAL capacity if this is a multi-chunk transaction (> 512 KB) or a
+            //    single batch that cannot fit even in an empty WAL file.
+            let pending_buf_len = self
+                .tx_state
+                .active_tx()
+                .map_or(0, |tx| tx.pending_buf.len());
+            let wal_total_sectors = match effective_durability {
+                WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
+            };
+            let exceeds_wal = pending_buf_len / 4070 + 2 > wal_total_sectors;
+            if pending_buf_len > MAX_WAL_CHUNK_BYTES || exceeds_wal {
+                let required_sectors = (pending_buf_len / 4070) + 8;
+                match effective_durability {
+                    WriteDurability::SyncTransactional => {
+                        let target_sectors = self
+                            .sync_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
+                        if target_sectors > self.sync_wal.total_sectors() {
+                            self.sync_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
+                        }
+                    }
+                    WriteDurability::BufferedFast => {
+                        let target_sectors = self
+                            .buf_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
+                        if target_sectors > self.buf_wal.total_sectors() {
+                            self.buf_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        self.tx_prepared = true;
-        Ok(())
+        match res {
+            Ok(()) => {
+                self.tx_state.set_phase(TxPhase::Prepared);
+                Ok(())
+            }
+            Err(e) => {
+                self.tx_state.set_phase(TxPhase::Active);
+                Err(e)
+            }
+        }
     }
 
     /// Commits an explicit batch transaction (`COMMIT`), writing all coalesced [`crate::wal::WalRecord`]
@@ -747,43 +1046,53 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// persistence, compaction, flush) fails; such failures are counted in
     /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
-        if self.tx_depth == 0 {
+        let Some(tx) = self.tx_state.active_tx_mut() else {
+            return Ok(());
+        };
+        if tx.depth.get() > 1 {
+            tx.depth = core::num::NonZeroUsize::new(tx.depth.get() - 1).unwrap();
             return Ok(());
         }
-        if self.tx_depth == 1 {
-            if let Err(e) = self.check_not_poisoned() {
+        if let Err(e) = self.check_not_poisoned() {
+            let _ = self.rollback_transaction();
+            return Err(e);
+        }
+        if !self.tx_state.is_prepared() {
+            let durability = self.effective_tx_durability(WriteDurability::BufferedFast);
+            if let Err(e) = self.prepare_commit_transaction(durability) {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
-            if !self.tx_prepared {
-                let durability = self.effective_tx_durability(WriteDurability::BufferedFast);
-                if let Err(e) = self.prepare_commit_transaction(durability) {
-                    let _ = self.rollback_transaction();
-                    return Err(e);
-                }
-            }
-            let has_metadata_changes = self.quotas_modified_in_tx
-                || !self.dropped_tables_in_tx.is_empty()
-                || self.deferred_flush_on_commit
-                || self.deferred_compact_on_commit
-                || self.memtable.should_flush();
-            if self.pending_tx_record_count == 0 && !has_metadata_changes {
+        }
+        let mem_should_flush = self.memtable.should_flush();
+        let need_drain = if let Some(tx) = self.tx_state.active_tx_mut() {
+            let has_metadata_changes = tx.quotas_modified
+                || !tx.dropped_tables.is_empty()
+                || tx.deferred_flush
+                || tx.deferred_compact
+                || mem_should_flush;
+            if tx.pending_record_count == 0 && !has_metadata_changes {
                 // Nothing of its own to publish: drop what it saw from earlier, undurable commits.
-                self.tx_overlay.clear();
-            } else if let Err(e) = self.drain_pending_durable() {
+                tx.overlay.clear();
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if need_drain {
+            if let Err(e) = self.drain_pending_durable() {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
         }
-        self.tx_depth -= 1;
-        if self.tx_depth == 0 {
-            if let Err(e) = self.flush_pending_tx_records() {
-                self.tx_depth = 1;
-                let _ = self.rollback_transaction();
-                return Err(e);
-            }
-            self.publish_committed_transaction();
+        self.tx_state.set_phase(TxPhase::FlushingWal);
+        if let Err(e) = self.flush_pending_tx_records() {
+            let _ = self.rollback_transaction();
+            return Err(e);
         }
+        self.publish_committed_transaction();
         Ok(())
     }
 
@@ -799,22 +1108,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         conn_id: usize,
     ) -> io::Result<CommitStep<FS::File>> {
         self.check_write_allowed_for_conn(conn_id)?;
-        let deferrable = self.tx_depth == 1
-            && self.tx_prepared
-            && self.pending_tx_sync
-            && self.pending_tx_record_count > 0
-            && self.pending_tx_buf.len() <= MAX_WAL_CHUNK_BYTES;
+        let deferrable = matches!(
+            &self.tx_state,
+            TxState::InTx {
+                phase: TxPhase::Prepared,
+                tx,
+            } if tx.depth.get() == 1
+                && tx.pending_sync
+                && tx.pending_record_count > 0
+                && tx.pending_buf.len() <= MAX_WAL_CHUNK_BYTES
+        );
         if !deferrable {
             self.commit_transaction()?;
             return Ok(CommitStep::Done);
         }
         let groupable = self.capped_tables.is_empty()
-            && self.dropped_tables_in_tx.is_empty()
-            && !self.quotas_modified_in_tx
-            && !self.deferred_flush_on_commit
-            && !self.deferred_compact_on_commit
             && !self.memtable.should_flush()
-            && !self.has_pending_corrupt_evictions();
+            && !self.has_pending_corrupt_evictions()
+            && self.tx_state.active_tx().is_some_and(|tx| {
+                tx.dropped_tables.is_empty()
+                    && !tx.quotas_modified
+                    && !tx.deferred_flush
+                    && !tx.deferred_compact
+            });
         if !groupable {
             if let Err(e) = self.drain_pending_durable() {
                 let _ = self.rollback_transaction();
@@ -822,35 +1138,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        // The depth is zero during the append so that a full WAL can rotate, as in
-        // `commit_transaction`.
-        self.tx_depth = 0;
+        // Move to `FlushingWal` during the append so a full WAL can rotate without deferring
+        // while still retaining the pre-transaction `start_meta` snapshot.
+        self.tx_state.set_phase(TxPhase::FlushingWal);
         self.sync_wal.set_defer_barrier(true);
         let appended = self.flush_pending_tx_records();
         self.sync_wal.set_defer_barrier(false);
-        self.tx_depth = 1;
         if let Err(e) = appended {
             let _ = self.rollback_transaction();
             return Err(e);
         }
         if !groupable {
-            self.tx_sync_in_flight = true;
+            self.tx_state.set_phase(TxPhase::SyncInFlight);
             return Ok(CommitStep::AwaitingSync(self.sync_wal.file_handle()));
         }
 
         let lsn = self.next_lsn - 1;
-        let own_entries = core::mem::take(&mut self.tx_overlay.map);
-        self.tx_overlay.clear();
+        let Some((_, mut tx)) = self.tx_state.take_to_idle() else {
+            unreachable!("FlushingWal tx disappeared before group handoff");
+        };
+        let own_entries = core::mem::take(&mut tx.overlay.map);
         debug_assert!(
-            !self.tx_start_meta.active
-                || own_entries
-                    .values()
-                    .all(|entry| entry.lsn >= self.tx_start_meta.next_lsn)
+            own_entries
+                .values()
+                .all(|entry| entry.lsn >= tx.start_meta.next_lsn)
         );
         self.pending_group.push_back((lsn, own_entries));
         self.commit_gate.note_appended(lsn);
-        self.tx_depth = 0;
-        self.finalize_tx_state();
+        self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
         Ok(CommitStep::AwaitingGroup {
             lsn,
             file: self.sync_wal.file_handle(),
@@ -863,9 +1178,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
     /// the transaction is discarded from memory.
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
-        self.tx_sync_in_flight = false;
+        if self.tx_state.is_sync_in_flight() {
+            self.tx_state.set_phase(TxPhase::FlushingWal);
+        }
         if let Err(e) = self.check_not_poisoned() {
-            if self.tx_depth > 0 {
+            if self.tx_state.is_in_tx() {
                 let _ = self.rollback_transaction();
             }
             return Err(e);
@@ -875,7 +1192,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 // The flush ran after the batch was written and no other append can have
                 // followed it, because the transaction held the writer slot.
                 self.wal_links.sync_flushed_all();
-                self.tx_depth = 0;
                 self.publish_committed_transaction();
                 Ok(())
             }
@@ -971,10 +1287,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    fn bump_table_epochs_from_overlay_map(&mut self) {
+    fn bump_table_epochs_from_overlay_map(
+        &mut self,
+        map: &BTreeMap<Vec<u8>, crate::memtable::MemEntry>,
+    ) {
         let mut tids: Vec<u16> = Vec::new();
         let mut last_tid: Option<u16> = None;
-        for key in self.tx_overlay.map.keys() {
+        for key in map.keys() {
             if key.len() < 3 {
                 continue;
             }
@@ -997,10 +1316,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    fn bump_table_epochs_from_undo_suffix(&mut self, undo_target_len: usize) {
+    fn bump_table_epochs_from_undo_suffix(
+        &mut self,
+        undo: &[(Vec<u8>, Option<MemEntry>)],
+        undo_target_len: usize,
+    ) {
         let mut tids: Vec<u16> = Vec::new();
         let mut last_tid: Option<u16> = None;
-        for (key, _) in &self.tx_overlay.undo[undo_target_len..] {
+        for (key, _) in &undo[undo_target_len..] {
             if key.len() < 3 {
                 continue;
             }
@@ -1062,27 +1385,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    /// Clears the per-transaction state once the transaction no longer owns the writer slot.
-    fn finalize_tx_state(&mut self) {
-        if core::mem::replace(&mut self.unique_marker_modified_in_tx, false) {
+    /// Releases buffer capacity, updates the UNIQUE marker generation if modified, and notifies
+    /// waiting writers after transitioning `tx_state` to `TxState::Idle`.
+    fn release_tx_slot(&mut self, pending_buf: Vec<u8>, unique_marker_modified: bool) {
+        self.recycle_tx_buf(pending_buf);
+        if unique_marker_modified {
             self.bump_unique_marker_gen();
         }
-        self.tx_owner_conn = None;
-        self.tx_prepared = false;
-        self.tx_preparing = false;
-        self.tx_bypass_size_limit = false;
-        self.tx_sync_durability_upgrade = false;
-        self.tx_sync_in_flight = false;
-        self.pending_tx_bytes = 0;
-        self.pending_tx_sync = false;
-        self.savepoints.clear();
-        self.statement_savepoint_active = false;
-        self.statement_blob_undo.clear();
-        self.pending_tx_lru_clears.clear();
-        self.vtabs_created_in_tx.clear();
-        self.tx_vtabs.clear();
-        self.tx_synced_vtabs.clear();
-        self.tx_start_meta = TxMetaSnapshot::default();
         self.commit_gate.tx_ended();
     }
 
@@ -1094,27 +1403,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Makes a durably logged transaction visible and runs the post-commit maintenance.
     fn publish_committed_transaction(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let Some((_, mut tx)) = self.tx_state.take_to_idle() else {
+            return;
+        };
         // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
-        self.vtabs_created_in_tx.clear();
-        let overlay = core::mem::take(&mut self.tx_overlay.map);
-        self.tx_overlay.clear();
+        let overlay = core::mem::take(&mut tx.overlay.map);
         debug_assert!(
-            !self.tx_start_meta.active
-                || overlay
-                    .values()
-                    .all(|entry| entry.lsn >= self.tx_start_meta.next_lsn)
+            overlay
+                .values()
+                .all(|entry| entry.lsn >= tx.start_meta.next_lsn)
         );
         if !overlay.is_empty() {
             self.data_generation += 1;
         }
         self.invalidate_snapshot_memtable();
         self.memtable.absorb(overlay);
-        for (tid, pk, max_tick) in core::mem::take(&mut self.pending_tx_lru_clears) {
+        for (tid, pk, max_tick) in tx.pending_lru_clears {
             self.access_tracker.clear_if_tick_le(tid, &pk, max_tick);
         }
-        self.finalize_tx_state();
+        let dropped_tables = tx.dropped_tables;
+        let quotas_modified = tx.quotas_modified;
+        let do_compact = tx.deferred_compact;
+        let do_flush = tx.deferred_flush;
+        self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
 
         let capped_table_ids: Vec<u16> = self.capped_tables.keys().copied().collect();
         for tid in capped_table_ids {
@@ -1126,8 +1439,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        let dropped_tables = core::mem::take(&mut self.dropped_tables_in_tx);
-        let quotas_modified = core::mem::replace(&mut self.quotas_modified_in_tx, false);
         let mut dropped_any_capped = false;
         for (tid, was_capped) in dropped_tables {
             if self.is_poisoned() {
@@ -1169,8 +1480,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 dropped_any_capped = true;
             }
         }
-        let do_compact = core::mem::replace(&mut self.deferred_compact_on_commit, false);
-        let do_flush = core::mem::replace(&mut self.deferred_flush_on_commit, false);
         if !self.is_poisoned() {
             let maintenance = if do_compact {
                 self.auto_compaction_due = false;
@@ -1225,7 +1534,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.commit_transaction()
     }
 
-    /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_tx_buf`
+    /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_buf`
     /// mutations and restoring `MemTable`, `capped_tables`, and blob `dead_bytes` in
     /// $O(\text{tx mutations})$ time via the in-memory undo log.
     ///
@@ -1233,41 +1542,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// rollback with no active transaction is a no-op: there is no start snapshot to restore.
     pub fn rollback_transaction(&mut self) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        if self.tx_depth == 0 {
+        let Some((phase, tx)) = self.tx_state.take_to_idle() else {
             return Ok(());
-        }
-        self.bump_table_epochs_from_overlay_map();
-        self.tx_depth = 0;
-        if core::mem::replace(&mut self.unique_marker_modified_in_tx, false) {
-            self.bump_unique_marker_gen();
-        }
-        self.vtabs_created_in_tx.clear();
-        self.tx_vtabs.clear();
-        self.tx_synced_vtabs.clear();
-        self.tx_owner_conn = None;
-        let had_deferred = self.deferred_flush_on_commit || self.deferred_compact_on_commit;
-        self.deferred_flush_on_commit = false;
-        self.deferred_compact_on_commit = false;
-        self.tx_prepared = false;
-        self.tx_preparing = false;
-        self.tx_bypass_size_limit = false;
-        self.tx_sync_durability_upgrade = false;
-        if self.tx_sync_in_flight {
-            self.tx_sync_in_flight = false;
+        };
+        self.bump_table_epochs_from_overlay_map(&tx.overlay.map);
+        if phase == TxPhase::SyncInFlight {
             let _ = self.poison(io::Error::other("WAL sync interrupted before completion"));
         }
-        self.savepoints.clear();
-        self.statement_savepoint_active = false;
-        self.statement_blob_undo.clear();
-        self.pending_tx_lru_clears.clear();
-        self.pending_tx_record_count = 0;
-        self.pending_tx_bytes = 0;
-        self.pending_tx_buf.clear();
-        self.pending_tx_sync = false;
-        self.tx_overlay.clear();
-        let snap = core::mem::take(&mut self.tx_start_meta);
-        self.restore_tx_state(0, &snap);
-        self.commit_gate.tx_ended();
+        self.restore_engine_meta_from_snapshot(&tx.start_meta);
+        let had_deferred = tx.deferred_flush || tx.deferred_compact;
+        self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
         if had_deferred
             && !self.is_poisoned()
             && (self.compaction_pending()
@@ -1287,17 +1571,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.rollback_transaction()
     }
 
-    fn refresh_statement_savepoint_active(&mut self) {
-        let active = self
-            .savepoints
-            .iter()
-            .any(|s| matches!(s.meta, SavepointMeta::Statement(_)));
-        self.statement_savepoint_active = active;
-        if !active {
-            self.statement_blob_undo.clear();
-        }
-    }
-
     /// Opens a transaction savepoint (`xSavepoint`).
     ///
     /// SQLite announces a savepoint to a virtual table only once the table has joined the
@@ -1306,36 +1579,44 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// before the table had any state in the transaction, so each of them stands for the
     /// transaction's start (see [`Self::rollback_to_savepoint`]).
     pub fn savepoint(&mut self, sp_id: i32) {
-        self.tx_prepared = false;
-        self.tx_synced_vtabs.clear();
-        self.tx_sync_durability_upgrade = false;
         let mut implicit_tx = false;
-        if self.tx_depth == 0 {
+        if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
+            tx.invalidate_prepare(phase);
+        } else {
             self.begin_transaction();
             implicit_tx = true;
         }
-        // Every table of the engine that joins the transaction is announced the innermost open
-        // savepoint, so a savepoint can arrive again, now with the changes other tables made
-        // since it was opened. The marker taken when it first arrived is the right one.
-        if self.savepoints.iter().any(|s| s.sp_id == sp_id) {
-            return;
-        }
-        let buf_offset = if self.pending_tx_record_count == 0 {
-            0
-        } else {
-            self.pending_tx_buf.len()
+        let marker = {
+            let tx = self
+                .tx_state
+                .active_tx()
+                .expect("savepoint must have an active transaction");
+            // Every table of the engine that joins the transaction is announced the innermost open
+            // savepoint, so a savepoint can arrive again, now with the changes other tables made
+            // since it was opened. The marker taken when it first arrived is the right one.
+            if tx.savepoints.iter().any(|s| s.sp_id == sp_id) {
+                return;
+            }
+            let buf_offset = if tx.pending_record_count == 0 {
+                0
+            } else {
+                tx.pending_buf.len()
+            };
+            let meta_snapshot = self.capture_savepoint_tx_meta_snapshot(tx);
+            SavepointMarker {
+                sp_id,
+                buf_offset,
+                record_count: tx.pending_record_count,
+                pending_tx_bytes: tx.pending_bytes,
+                pending_tx_sync: tx.pending_sync,
+                implicit_tx,
+                undo_len: tx.overlay.undo.len(),
+                meta: SavepointMeta::Full(Box::new(meta_snapshot)),
+            }
         };
-        let meta_snapshot = self.capture_tx_meta_snapshot();
-        self.savepoints.push(SavepointMarker {
-            sp_id,
-            buf_offset,
-            record_count: self.pending_tx_record_count,
-            pending_tx_bytes: self.pending_tx_bytes,
-            pending_tx_sync: self.pending_tx_sync,
-            implicit_tx,
-            undo_len: self.tx_overlay.undo.len(),
-            meta: SavepointMeta::Full(Box::new(meta_snapshot)),
-        });
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.savepoints.push(marker);
+        }
     }
 
     /// Opens a lightweight statement-scoped savepoint for a single `vtab_update` call on
@@ -1347,47 +1628,53 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.check_write_allowed_for_conn(conn_id)?;
-        self.tx_prepared = false;
-        self.tx_synced_vtabs.clear();
-        self.tx_sync_durability_upgrade = false;
         let mut implicit_tx = false;
-        if self.tx_depth == 0 {
+        if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
+            tx.invalidate_prepare(phase);
+        } else {
             self.begin_transaction();
-            self.tx_owner_conn = Some(conn_id);
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                tx.owner_conn = Some(conn_id);
+            }
             implicit_tx = true;
         }
-        if self
-            .savepoints
-            .iter()
-            .any(|s| s.sp_id == STATEMENT_SAVEPOINT)
-        {
-            return Ok(());
+        let marker = {
+            let tx = self
+                .tx_state
+                .active_tx()
+                .expect("statement savepoint must have an active transaction");
+            if tx.savepoints.iter().any(|s| s.sp_id == STATEMENT_SAVEPOINT) {
+                return Ok(());
+            }
+            let buf_offset = if tx.pending_record_count == 0 {
+                0
+            } else {
+                tx.pending_buf.len()
+            };
+            let stmt_meta = StatementMetaSnapshot {
+                next_lsn: self.next_lsn,
+                table_id,
+                capped_table: self.capped_tables.get(&table_id).cloned(),
+                table_has_synthetic_rowids: self.table_has_synthetic_rowids.get(&table_id).copied(),
+                table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
+                blob_undo_len: tx.statement_blob_undo.len(),
+                lru_clears_len: tx.pending_lru_clears.len(),
+            };
+            SavepointMarker {
+                sp_id: STATEMENT_SAVEPOINT,
+                buf_offset,
+                record_count: tx.pending_record_count,
+                pending_tx_bytes: tx.pending_bytes,
+                pending_tx_sync: tx.pending_sync,
+                implicit_tx,
+                undo_len: tx.overlay.undo.len(),
+                meta: SavepointMeta::Statement(stmt_meta),
+            }
+        };
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.savepoints.push(marker);
+            tx.statement_savepoint_active = true;
         }
-        let buf_offset = if self.pending_tx_record_count == 0 {
-            0
-        } else {
-            self.pending_tx_buf.len()
-        };
-        let stmt_meta = StatementMetaSnapshot {
-            next_lsn: self.next_lsn,
-            table_id,
-            capped_table: self.capped_tables.get(&table_id).cloned(),
-            table_has_synthetic_rowids: self.table_has_synthetic_rowids.get(&table_id).copied(),
-            table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
-            blob_undo_len: self.statement_blob_undo.len(),
-            lru_clears_len: self.pending_tx_lru_clears.len(),
-        };
-        self.savepoints.push(SavepointMarker {
-            sp_id: STATEMENT_SAVEPOINT,
-            buf_offset,
-            record_count: self.pending_tx_record_count,
-            pending_tx_bytes: self.pending_tx_bytes,
-            pending_tx_sync: self.pending_tx_sync,
-            implicit_tx,
-            undo_len: self.tx_overlay.undo.len(),
-            meta: SavepointMeta::Statement(stmt_meta),
-        });
-        self.statement_savepoint_active = true;
         Ok(())
     }
 
@@ -1395,10 +1682,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     pub fn savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.check_write_allowed_for_conn(conn_id)?;
-        let was_zero = self.tx_depth == 0;
+        let was_idle = !self.tx_state.is_active();
         self.savepoint(sp_id);
-        if was_zero {
-            self.tx_owner_conn = Some(conn_id);
+        if was_idle {
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                tx.owner_conn = Some(conn_id);
+            }
         }
         Ok(())
     }
@@ -1408,21 +1697,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A release of an id the engine never saw (a savepoint opened before the table joined the
     /// transaction) removes every savepoint it knows with a higher id.
     pub fn release_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
-        let pos = self
-            .savepoints
-            .iter()
-            .position(|s| s.sp_id == sp_id)
-            .or_else(|| self.savepoints.iter().position(|s| s.sp_id > sp_id));
-        if let Some(pos) = pos {
-            let implicit_tx = self.savepoints[pos].implicit_tx;
-            self.savepoints.truncate(pos);
-            self.refresh_statement_savepoint_active();
-            if self.savepoints.is_empty() {
-                self.tx_overlay.undo.clear();
+        let should_commit_implicit = {
+            let Some(tx) = self.tx_state.active_tx_mut() else {
+                return Ok(());
+            };
+            let pos = tx
+                .savepoints
+                .iter()
+                .position(|s| s.sp_id == sp_id)
+                .or_else(|| tx.savepoints.iter().position(|s| s.sp_id > sp_id));
+            if let Some(pos) = pos {
+                let implicit_tx = tx.savepoints[pos].implicit_tx;
+                tx.savepoints.truncate(pos);
+                tx.refresh_statement_savepoint_active();
+                if tx.savepoints.is_empty() {
+                    tx.overlay.undo.clear();
+                }
+                implicit_tx && tx.depth.get() == 1
+            } else {
+                false
             }
-            if implicit_tx && self.tx_depth == 1 {
-                self.commit_transaction()?;
-            }
+        };
+        if should_commit_implicit {
+            self.commit_transaction()?;
         }
         Ok(())
     }
@@ -1445,74 +1742,98 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// silently skipped.
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        if self.unique_marker_modified_in_tx {
+        let Some((_phase, mut tx)) = self.tx_state.take_to_idle() else {
+            return Ok(());
+        };
+        if tx.unique_marker_modified {
             self.bump_unique_marker_gen();
         }
-        self.tx_prepared = false;
-        self.tx_synced_vtabs.clear();
-        self.tx_sync_durability_upgrade = false;
-        let Some(pos) = self.savepoints.iter().position(|s| s.sp_id == sp_id) else {
-            if self.savepoints.iter().any(|s| s.sp_id < sp_id) {
+        tx.synced_vtabs.clear();
+        tx.sync_durability_upgrade = false;
+        let Some(pos) = tx.savepoints.iter().position(|s| s.sp_id == sp_id) else {
+            if tx.savepoints.iter().any(|s| s.sp_id < sp_id) {
+                self.tx_state = TxState::InTx {
+                    phase: TxPhase::Active,
+                    tx,
+                };
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("cannot roll back to unknown savepoint {sp_id}"),
                 ));
             }
-            if self.tx_depth > 0 {
-                self.rollback_to_transaction_start();
-            }
+            self.rollback_taken_tx_to_start(&mut tx);
+            self.tx_state = TxState::InTx {
+                phase: TxPhase::Active,
+                tx,
+            };
             return Ok(());
         };
-        self.savepoints.truncate(pos + 1);
-        let marker = self.savepoints.pop().unwrap();
+        tx.savepoints.truncate(pos + 1);
+        let marker = tx.savepoints.pop().unwrap();
         if marker.record_count == 0 {
-            self.pending_tx_buf.clear();
+            tx.pending_buf.clear();
         } else {
-            self.pending_tx_buf.truncate(marker.buf_offset);
+            tx.pending_buf.truncate(marker.buf_offset);
         }
-        self.pending_tx_record_count = marker.record_count;
-        self.pending_tx_bytes = marker.pending_tx_bytes;
-        self.pending_tx_sync = marker.pending_tx_sync;
+        tx.pending_record_count = marker.record_count;
+        tx.pending_bytes = marker.pending_tx_bytes;
+        tx.pending_sync = marker.pending_tx_sync;
         match &marker.meta {
             SavepointMeta::Statement(st) => {
-                self.restore_statement_tx_state(marker.undo_len, st);
+                self.restore_statement_on_tx(&mut tx, marker.undo_len, st);
             }
             SavepointMeta::Full(snap) => {
-                self.restore_tx_state(marker.undo_len, snap);
+                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+                self.bump_table_epochs_from_undo_suffix(&tx.overlay.undo, marker.undo_len);
+                tx.overlay.rollback_to(marker.undo_len);
+                self.restore_engine_meta_from_snapshot(snap);
+                tx.dropped_tables.truncate(snap.dropped_tables_len);
+                tx.pending_lru_clears.truncate(snap.lru_clears_len);
+                tx.vtabs_created = snap.vtabs_created_in_tx.clone();
+                tx.quotas_modified = snap.quotas_modified_in_tx;
             }
         }
-        self.savepoints.push(marker);
-        self.refresh_statement_savepoint_active();
+        tx.savepoints.push(marker);
+        tx.refresh_statement_savepoint_active();
+        self.tx_state = TxState::InTx {
+            phase: TxPhase::Active,
+            tx,
+        };
         Ok(())
     }
 
-    /// Undoes everything the active transaction did while keeping it open. No undo log is
-    /// needed: the overlay only contains this transaction's own writes and clears cleanly.
-    fn rollback_to_transaction_start(&mut self) {
+    /// Undoes everything a taken transaction did while keeping it open.
+    fn rollback_taken_tx_to_start(&mut self, tx: &mut ActiveTx) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.bump_table_epochs_from_overlay_map();
-        self.savepoints.clear();
-        self.statement_savepoint_active = false;
-        self.statement_blob_undo.clear();
-        self.pending_tx_lru_clears.clear();
-        self.pending_tx_record_count = 0;
-        self.pending_tx_bytes = 0;
-        self.pending_tx_buf.clear();
-        self.pending_tx_sync = false;
-        self.tx_overlay.clear();
-        let snap = core::mem::take(&mut self.tx_start_meta);
-        self.restore_tx_state(0, &snap);
-        self.tx_start_meta = snap;
+        self.bump_table_epochs_from_overlay_map(&tx.overlay.map);
+        tx.savepoints.clear();
+        tx.statement_savepoint_active = false;
+        tx.statement_blob_undo.clear();
+        tx.pending_lru_clears.clear();
+        tx.pending_record_count = 0;
+        tx.pending_bytes = 0;
+        tx.pending_buf.clear();
+        tx.pending_sync = false;
+        tx.overlay.clear();
+        tx.dropped_tables.truncate(tx.start_meta.dropped_tables_len);
+        tx.vtabs_created = tx.start_meta.vtabs_created_in_tx.clone();
+        tx.quotas_modified = tx.start_meta.quotas_modified_in_tx;
+        self.restore_engine_meta_from_snapshot(&tx.start_meta);
     }
 
-    fn restore_statement_tx_state(&mut self, undo_target_len: usize, st: &StatementMetaSnapshot) {
+    fn restore_statement_on_tx(
+        &mut self,
+        tx: &mut ActiveTx,
+        undo_target_len: usize,
+        st: &StatementMetaSnapshot,
+    ) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.bump_table_epochs_from_undo_suffix(undo_target_len);
-        self.tx_overlay.rollback_to(undo_target_len);
+        self.bump_table_epochs_from_undo_suffix(&tx.overlay.undo, undo_target_len);
+        tx.overlay.rollback_to(undo_target_len);
         self.next_lsn = st.next_lsn;
-        self.pending_tx_lru_clears.truncate(st.lru_clears_len);
-        while self.statement_blob_undo.len() > st.blob_undo_len {
-            let entry = self.statement_blob_undo.pop().unwrap();
+        tx.pending_lru_clears.truncate(st.lru_clears_len);
+        while tx.statement_blob_undo.len() > st.blob_undo_len {
+            let entry = tx.statement_blob_undo.pop().unwrap();
             match entry {
                 BlobUndo::Appended {
                     kind: crate::wal::BlobKind::Standard,
@@ -1583,9 +1904,27 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.rollback_to_savepoint(sp_id)
     }
 
-    pub(super) fn capture_tx_meta_snapshot(&self) -> TxMetaSnapshot {
+    fn capture_initial_tx_meta_snapshot(&self) -> TxMetaSnapshot {
+        self.capture_tx_meta_snapshot_fields(0, 0, Vec::new(), false)
+    }
+
+    fn capture_savepoint_tx_meta_snapshot(&self, tx: &ActiveTx) -> TxMetaSnapshot {
+        self.capture_tx_meta_snapshot_fields(
+            tx.dropped_tables.len(),
+            tx.pending_lru_clears.len(),
+            tx.vtabs_created.clone(),
+            tx.quotas_modified,
+        )
+    }
+
+    fn capture_tx_meta_snapshot_fields(
+        &self,
+        dropped_tables_len: usize,
+        lru_clears_len: usize,
+        vtabs_created_in_tx: Vec<(u16, String, String)>,
+        quotas_modified_in_tx: bool,
+    ) -> TxMetaSnapshot {
         TxMetaSnapshot {
-            active: true,
             next_lsn: self.next_lsn,
             std_blobs: self
                 .std_blobs
@@ -1604,20 +1943,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_inline_thresholds: self.table_inline_thresholds.clone(),
             table_has_synthetic_rowids: self.table_has_synthetic_rowids.clone(),
             table_has_row_meta: self.table_has_row_meta.clone(),
-            dropped_tables_len: self.dropped_tables_in_tx.len(),
-            lru_clears_len: self.pending_tx_lru_clears.len(),
-            vtabs_created_in_tx: self.vtabs_created_in_tx.clone(),
-            quotas_modified_in_tx: self.quotas_modified_in_tx,
+            dropped_tables_len,
+            lru_clears_len,
+            vtabs_created_in_tx,
+            quotas_modified_in_tx,
         }
     }
 
-    pub(super) fn restore_tx_state(&mut self, undo_target_len: usize, snap: &TxMetaSnapshot) {
-        if !snap.active {
-            return;
-        }
+    pub(super) fn restore_engine_meta_from_snapshot(&mut self, snap: &TxMetaSnapshot) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.bump_table_epochs_from_undo_suffix(undo_target_len);
-        self.tx_overlay.rollback_to(undo_target_len);
         self.next_lsn = snap.next_lsn;
         for (&seq, b) in &mut self.std_blobs {
             let (snap_len, snap_dead) = snap.std_blobs.get(&seq).copied().unwrap_or((0, 0));
@@ -1636,115 +1970,111 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_inline_thresholds = snap.table_inline_thresholds.clone();
         self.table_has_synthetic_rowids = snap.table_has_synthetic_rowids.clone();
         self.table_has_row_meta = snap.table_has_row_meta.clone();
-        self.dropped_tables_in_tx.truncate(snap.dropped_tables_len);
-        self.pending_tx_lru_clears.truncate(snap.lru_clears_len);
-        self.vtabs_created_in_tx = snap.vtabs_created_in_tx.clone();
-        self.quotas_modified_in_tx = snap.quotas_modified_in_tx;
     }
 
     pub(super) fn flush_pending_tx_records(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.pending_tx_record_count == 0 {
-            self.pending_tx_sync = false;
-            return Ok(());
+        match self.tx_state.any_tx_mut() {
+            None => return Ok(()),
+            Some(tx) if tx.pending_record_count == 0 => {
+                tx.pending_sync = false;
+                return Ok(());
+            }
+            Some(_) => {}
         }
         self.lsn_after_batches(1)?;
-        let record_count = self.pending_tx_record_count;
-        self.pending_tx_record_count = 0;
-        let durability = if self.pending_tx_sync {
-            WriteDurability::SyncTransactional
-        } else {
-            WriteDurability::BufferedFast
+        let (record_count, durability, mut raw_buf) = {
+            let tx = self.tx_state.any_tx_mut().unwrap();
+            let count = tx.pending_record_count;
+            let dur = if tx.pending_sync {
+                WriteDurability::SyncTransactional
+            } else {
+                WriteDurability::BufferedFast
+            };
+            tx.pending_record_count = 0;
+            tx.pending_sync = false;
+            (count, dur, core::mem::take(&mut tx.pending_buf))
         };
-        self.pending_tx_sync = false;
 
-        if durability == WriteDurability::SyncTransactional {
-            self.sync_active_blob_writers()?;
-        } else {
-            self.flush_active_blob_buffers()?;
-        }
+        let res = (|| -> io::Result<()> {
+            if durability == WriteDurability::SyncTransactional {
+                self.sync_active_blob_writers()?;
+            } else {
+                self.flush_active_blob_buffers()?;
+            }
 
-        if self.pending_tx_buf.len() <= MAX_WAL_CHUNK_BYTES {
-            // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
-            // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
-            let lsn = self.next_lsn;
-            let (prev, durable) = self.wal_links_for_append(durability)?;
-            WalBatch::finalize_encoded_buf(
-                lsn,
-                prev,
-                durable,
-                record_count,
-                &mut self.pending_tx_buf,
-            );
-            let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
-            let res = self.append_raw_wal_batch_with_rotation(&raw_buf, durability);
-            raw_buf.clear();
-            self.pending_tx_buf = raw_buf;
-            if res.is_ok() {
+            if raw_buf.len() <= MAX_WAL_CHUNK_BYTES {
+                // `next_lsn` advances only after the append: a ring-full rotation or flush derives
+                // the checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
+                let lsn = self.next_lsn;
+                let (prev, durable) = self.wal_links_for_append(durability)?;
+                WalBatch::finalize_encoded_buf(lsn, prev, durable, record_count, &mut raw_buf);
+                self.append_raw_wal_batch_with_rotation(&raw_buf, durability)?;
                 self.next_lsn = lsn + 1;
+                return Ok(());
             }
-            return res;
-        }
 
-        // Large transaction buffer (> 512 KB): scan record boundaries in-place and slice into
-        // <= 512 KB WAL batches framed by `WalRecord::TxBegin` (`4u8`) in the first chunk,
-        // `WalRecord::TxContinue` (`6u8`) in each middle chunk, and `WalRecord::TxCommit` (`5u8`)
-        // in the last chunk. Ensure the target WAL file has enough capacity so all chunks remain
-        // in the same WAL epoch without flushing uncommitted `MemTable` state, and defer the
-        // device barrier until the terminal `TxCommit` chunk.
-        let mut raw_buf = core::mem::take(&mut self.pending_tx_buf);
-        let mut cursor = crate::wal::WAL_BATCH_HEADER_SIZE;
-        let total_len = raw_buf.len();
-        let mut chunk_spans: Vec<(usize, usize, u32)> = Vec::new();
-        let mut cur_start = cursor;
-        let mut cur_records = 0u32;
+            // Large transaction buffer (> 512 KB): scan record boundaries in-place and slice into
+            // <= 512 KB WAL batches framed by `WalRecord::TxBegin` (`4u8`) in the first chunk,
+            // `WalRecord::TxContinue` (`6u8`) in each middle chunk, and `WalRecord::TxCommit`
+            // (`5u8`) in the last chunk. Ensure the target WAL file has enough capacity so all
+            // chunks remain in the same WAL epoch without flushing uncommitted `MemTable` state,
+            // and defer the device barrier until the terminal `TxCommit` chunk.
+            let mut cursor = crate::wal::WAL_BATCH_HEADER_SIZE;
+            let total_len = raw_buf.len();
+            let mut chunk_spans: Vec<(usize, usize, u32)> = Vec::new();
+            let mut cur_start = cursor;
+            let mut cur_records = 0u32;
 
-        while cursor < total_len {
-            let rec_start = cursor;
-            let op = raw_buf[cursor];
-            cursor += 1;
-            match op {
-                1 => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + klen;
-                    let vlen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + vlen;
+            while cursor < total_len {
+                let rec_start = cursor;
+                let op = raw_buf[cursor];
+                cursor += 1;
+                match op {
+                    1 => {
+                        let klen =
+                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        cursor += 4 + klen;
+                        let vlen =
+                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        cursor += 4 + vlen;
+                    }
+                    2 => {
+                        let klen =
+                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        cursor += 4 + klen + 23;
+                    }
+                    3 => {
+                        let klen =
+                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        cursor += 4 + klen;
+                    }
+                    4..=6 => {}
+                    _ => unreachable!("invalid op in pending_buf"),
                 }
-                2 => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + klen + 23;
+                if cur_records > 0
+                    && crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (cursor - cur_start)
+                        > MAX_WAL_CHUNK_BYTES
+                {
+                    chunk_spans.push((cur_start, rec_start, cur_records));
+                    cur_start = rec_start;
+                    cur_records = 0;
                 }
-                3 => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + klen;
-                }
-                4..=6 => {}
-                _ => unreachable!("invalid op in pending_tx_buf"),
+                cur_records += 1;
             }
-            if cur_records > 0
-                && crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (cursor - cur_start)
-                    > MAX_WAL_CHUNK_BYTES
-            {
-                chunk_spans.push((cur_start, rec_start, cur_records));
-                cur_start = rec_start;
-                cur_records = 0;
+            if cur_records > 0 {
+                chunk_spans.push((cur_start, total_len, cur_records));
             }
-            cur_records += 1;
-        }
-        if cur_records > 0 {
-            chunk_spans.push((cur_start, total_len, cur_records));
-        }
 
-        if chunk_spans.len() <= 1 {
-            // Single oversized record: `raw_buf` already holds the 32-byte header space with no
-            // transaction framing byte, so finalize and write it in-place with zero copies.
-            debug_assert_eq!(chunk_spans.first().map_or(0, |&(_, _, n)| n), record_count);
-            let required_sectors = (raw_buf.len() / 4070) + 2;
-            let res = (|| -> io::Result<()> {
+            if chunk_spans.len() <= 1 {
+                // Single oversized record: `raw_buf` already holds the 32-byte header space with
+                // no transaction framing byte, so finalize and write it in-place with zero copies.
+                debug_assert_eq!(chunk_spans.first().map_or(0, |&(_, _, n)| n), record_count);
+                let required_sectors = (raw_buf.len() / 4070) + 2;
                 match durability {
                     WriteDurability::SyncTransactional => {
                         let target_sectors = self
@@ -1784,91 +2114,101 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 WalBatch::finalize_encoded_buf(lsn, prev, durable, record_count, &mut raw_buf);
                 self.append_raw_wal_batch_with_rotation(&raw_buf, durability)?;
                 self.next_lsn = lsn + 1;
+                return Ok(());
+            }
+
+            let mut required_sectors = 0usize;
+            // Refuse the entire transaction before the first chunk reaches either log.
+            self.lsn_after_batches(chunk_spans.len())?;
+            let mut max_chunk_len = 0usize;
+            for &(start, end, _) in &chunk_spans {
+                let chunk_len = crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (end - start);
+                required_sectors += (chunk_len / 4070) + 2;
+                max_chunk_len = max_chunk_len.max(chunk_len);
+            }
+
+            let caller_deferred = self.sync_wal.barrier_deferred();
+            let chunked_res = (|| -> io::Result<()> {
+                match durability {
+                    WriteDurability::SyncTransactional => {
+                        let target_sectors = self
+                            .sync_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
+                        if target_sectors > self.sync_wal.total_sectors() {
+                            self.sync_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
+                        }
+                    }
+                    WriteDurability::BufferedFast => {
+                        let target_sectors = self
+                            .buf_wal
+                            .current_sector_idx()
+                            .checked_add(required_sectors)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "WAL sector count overflow",
+                                )
+                            })?;
+                        if target_sectors > self.buf_wal.total_sectors() {
+                            self.buf_wal
+                                .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
+                        }
+                    }
+                }
+
+                let mut chunk_buf = Vec::with_capacity(max_chunk_len);
+                let last_idx = chunk_spans.len() - 1;
+                for (idx, &(start, end, user_records)) in chunk_spans.iter().enumerate() {
+                    chunk_buf.clear();
+                    chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
+                    if idx == 0 {
+                        // Prepend `WalRecord::TxBegin` (`4u8`) to the first chunk.
+                        chunk_buf.push(4u8);
+                    } else if idx < last_idx {
+                        // Prepend `WalRecord::TxContinue` (`6u8`) to every middle chunk.
+                        chunk_buf.push(6u8);
+                    }
+                    chunk_buf.extend_from_slice(&raw_buf[start..end]);
+                    if idx == last_idx {
+                        // Append `WalRecord::TxCommit` (`5u8`) to the final chunk.
+                        chunk_buf.push(5u8);
+                    }
+                    let chunk_records = user_records + 1;
+                    if durability == WriteDurability::SyncTransactional {
+                        self.sync_wal.set_defer_barrier(if idx < last_idx {
+                            true
+                        } else {
+                            caller_deferred
+                        });
+                    }
+                    let lsn = self.next_lsn;
+                    let (prev, durable) = self.wal_links_for_append(durability)?;
+                    WalBatch::finalize_encoded_buf(
+                        lsn,
+                        prev,
+                        durable,
+                        chunk_records,
+                        &mut chunk_buf,
+                    );
+                    self.append_raw_wal_batch_with_rotation(&chunk_buf, durability)?;
+                    self.next_lsn = lsn + 1;
+                }
                 Ok(())
             })();
-            raw_buf.clear();
-            self.pending_tx_buf = raw_buf;
-            return res;
-        }
 
-        let mut required_sectors = 0usize;
-        // Refuse the entire transaction before the first chunk reaches either log.
-        self.lsn_after_batches(chunk_spans.len())?;
-        let mut max_chunk_len = 0usize;
-        for &(start, end, _) in &chunk_spans {
-            let chunk_len = crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (end - start);
-            required_sectors += (chunk_len / 4070) + 2;
-            max_chunk_len = max_chunk_len.max(chunk_len);
-        }
-
-        let caller_deferred = self.sync_wal.barrier_deferred();
-        let res = (|| -> io::Result<()> {
-            match durability {
-                WriteDurability::SyncTransactional => {
-                    let target_sectors = self
-                        .sync_wal
-                        .current_sector_idx()
-                        .checked_add(required_sectors)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                        })?;
-                    if target_sectors > self.sync_wal.total_sectors() {
-                        self.sync_wal
-                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                    }
-                }
-                WriteDurability::BufferedFast => {
-                    let target_sectors = self
-                        .buf_wal
-                        .current_sector_idx()
-                        .checked_add(required_sectors)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                        })?;
-                    if target_sectors > self.buf_wal.total_sectors() {
-                        self.buf_wal
-                            .ensure_min_size(checked_wal_bytes(target_sectors)?)?;
-                    }
-                }
-            }
-
-            let mut chunk_buf = Vec::with_capacity(max_chunk_len);
-            let last_idx = chunk_spans.len() - 1;
-            for (idx, &(start, end, user_records)) in chunk_spans.iter().enumerate() {
-                chunk_buf.clear();
-                chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
-                if idx == 0 {
-                    // Prepend `WalRecord::TxBegin` (`4u8`) to the first chunk.
-                    chunk_buf.push(4u8);
-                } else if idx < last_idx {
-                    // Prepend `WalRecord::TxContinue` (`6u8`) to every middle chunk.
-                    chunk_buf.push(6u8);
-                }
-                chunk_buf.extend_from_slice(&raw_buf[start..end]);
-                if idx == last_idx {
-                    // Append `WalRecord::TxCommit` (`5u8`) to the final chunk.
-                    chunk_buf.push(5u8);
-                }
-                let chunk_records = user_records + 1;
-                if durability == WriteDurability::SyncTransactional {
-                    self.sync_wal.set_defer_barrier(if idx < last_idx {
-                        true
-                    } else {
-                        caller_deferred
-                    });
-                }
-                let lsn = self.next_lsn;
-                let (prev, durable) = self.wal_links_for_append(durability)?;
-                WalBatch::finalize_encoded_buf(lsn, prev, durable, chunk_records, &mut chunk_buf);
-                self.append_raw_wal_batch_with_rotation(&chunk_buf, durability)?;
-                self.next_lsn = lsn + 1;
-            }
-            Ok(())
+            self.sync_wal.set_defer_barrier(caller_deferred);
+            chunked_res
         })();
 
-        self.sync_wal.set_defer_barrier(caller_deferred);
-        raw_buf.clear();
-        self.pending_tx_buf = raw_buf;
+        self.recycle_tx_buf(raw_buf);
         res
     }
 }

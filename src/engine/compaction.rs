@@ -115,12 +115,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Flushes the current `MemTable` to a new immutable `idx_<SeqID>.db` segment, rotates both
     /// WAL streams to `epoch + 1` in $O(1)$ without zero-filling, atomically commits `boot_meta.db`,
     /// and triggers automatic compaction if `auto_compact_segment_threshold` is reached.
-    /// If called while an explicit transaction is active (`tx_depth > 0`), defers checkpointing
+    /// If called while an explicit transaction is active, defers checkpointing
     /// until `commit_transaction` so provisional state is never published to SSTables.
     pub fn flush_memtable(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
-            self.deferred_flush_on_commit = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.deferred_flush = true;
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -132,10 +132,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Runs or schedules automatic compaction when the segment count calls for it (see
-    /// [`Self::flush_memtable`]). Callers guarantee `tx_depth == 0` and that no batch holds an
+    /// [`Self::flush_memtable`]). Callers guarantee no transaction is active and no batch holds an
     /// unappended LSN, because compaction may relocate blobs and so write to the WAL.
     fn run_auto_compaction(&mut self) -> io::Result<()> {
-        if self.tx_depth == 0 && self.compaction_pending() {
+        if !self.tx_state.is_active() && self.compaction_pending() {
             // Background mode only marks compaction as pending (observable through
             // `compaction_pending()`); the merge runs outside the engine. The inline fallback
             // bounds segment growth (and read amplification) if the worker falls behind.
@@ -149,9 +149,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some(hook) = &self.compaction_hook {
                 hook();
             }
-        } else if self.tx_depth == 0
+        } else if !self.tx_state.is_active()
             && self.config.background_compaction
-            && !self.relocating_std_blobs
+            && !self.is_relocating_std_blobs()
             && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
         {
             if let Some(hook) = &self.compaction_hook {
@@ -168,7 +168,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// is recorded as maintenance failure and never fails the write that triggered it.
     pub(super) fn run_due_auto_compaction(&mut self) {
         if !self.auto_compaction_due
-            || self.tx_depth > 0
+            || self.tx_state.is_active()
             || !self.pending_group.is_empty()
             || self.is_poisoned()
         {
@@ -193,7 +193,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// call this; a drop without `checkpoint` is treated as a crash by the next `open`.
     pub fn checkpoint(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
+        if self.tx_state.is_active() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "checkpoint is not allowed while a transaction is active",
@@ -250,12 +250,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     pub(super) fn flush_memtable_no_auto_compact(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
-            self.deferred_flush_on_commit = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.deferred_flush = true;
             return Ok(());
         }
         self.drain_pending_durable()?;
-        self.flush_pending_tx_records()?;
         self.buf_wal.flush_buffered_to_os()?;
         if self.memtable.is_empty() {
             self.reclaim_fully_dead_blob_segments()?;
@@ -349,8 +348,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if self.unlink_after_wal_rotation.is_empty()
             || !self.memtable.is_empty()
             || !self.pending_group.is_empty()
-            || self.tx_depth > 0
-            || self.pending_tx_record_count > 0
+            || self.tx_state.is_active()
+            || self.tx_state.pending_record_count() > 0
         {
             return Ok(());
         }
@@ -451,11 +450,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `dead_bytes / file_len >= dead_ratio_threshold`, appending them to the active `blob_std`
     /// segment and marking the old `BlobPtr`s dead so the fragmented segments reach 100% dead
     /// and can be reclaimed in $O(1)$.
-    #[cfg(test)]
-    pub(crate) fn is_relocating_std_blobs(&self) -> bool {
-        self.relocating_std_blobs
-    }
-
     pub fn relocate_fragmented_std_blobs(
         &mut self,
         dead_ratio_threshold: f64,
@@ -463,10 +457,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let Some(mut session) = self.start_std_blob_relocation(dead_ratio_threshold)? else {
             return Ok(0);
         };
-        self.relocating_std_blobs = true;
-        let res = self.relocate_fragmented_std_blobs_session(&mut session);
-        self.relocating_std_blobs = false;
-        res
+        let mut guard = super::RelocatingBlobsGuard::enter(self);
+        guard.relocate_fragmented_std_blobs_session(&mut session)
     }
 
     /// Starts an incremental std-blob relocation session if fragmented segments exist and no
@@ -476,7 +468,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         dead_ratio_threshold: f64,
     ) -> io::Result<Option<StdBlobRelocationSession>> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 || self.relocating_std_blobs {
+        if self.tx_state.is_active() || self.is_relocating_std_blobs() {
             return Ok(None);
         }
         self.drain_pending_durable()?;
@@ -499,7 +491,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Advances an incremental std-blob relocation session by at most `max_scan_keys` keys and
     /// `max_reloc_bytes` relocated payload bytes (at least one matching blob per chunk when any
-    /// match is encountered), releasing `relocating_std_blobs` on every exit so callers can drop
+    /// match is encountered), releasing the relocating guard on every exit so callers can drop
     /// `engine.write()` between chunks.
     pub(crate) fn step_std_blob_relocation(
         &mut self,
@@ -513,13 +505,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 relocated: session.relocated,
             });
         }
-        if self.tx_depth > 0 || self.relocating_std_blobs {
+        if self.tx_state.is_active() || self.is_relocating_std_blobs() {
             return Ok(StdBlobRelocStep::Deferred);
         }
-        self.relocating_std_blobs = true;
-        let res = self.step_std_blob_relocation_inner(session, max_scan_keys, max_reloc_bytes);
-        self.relocating_std_blobs = false;
-        res
+        let mut guard = super::RelocatingBlobsGuard::enter(self);
+        guard.step_std_blob_relocation_inner(session, max_scan_keys, max_reloc_bytes)
     }
 
     /// Flushes or reclaims newly dead sealed std-blob segments after a chunked relocation finishes.
@@ -528,8 +518,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if relocated == 0 {
             return Ok(());
         }
-        if self.tx_depth > 0 {
-            self.deferred_flush_on_commit = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.deferred_flush = true;
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -572,9 +562,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         let recs = core::mem::take(wal_records);
-        if let Err(e) =
-            self.commit_wal_and_memtable_core(recs, WriteDurability::BufferedFast, false, false)
-        {
+        if let Err(e) = self.commit_wal_and_memtable_core(
+            recs,
+            WriteDurability::BufferedFast,
+            false,
+            false,
+            super::tx::WriteScope::Normal,
+        ) {
             self.abort_relocation_batch(core::mem::take(new_ptrs));
             return Err(e);
         }
@@ -602,7 +596,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 relocated: session.relocated,
             });
         }
-        if self.tx_depth > 0 {
+        if self.tx_state.is_active() {
             return Ok(StdBlobRelocStep::Deferred);
         }
         self.drain_pending_durable()?;
@@ -739,12 +733,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// dead blob bytes from overwritten keys, relocates fragmented standard blob segments,
     /// commits the compacted segment to `boot_meta.db`, and deletes superseded `idx` and
     /// 100%-dead blob segments via Deferred GC.
-    /// If called while an explicit transaction is active (`tx_depth > 0`), defers compaction
+    /// If called while an explicit transaction is active, defers compaction
     /// until `commit_transaction`.
     pub fn compact(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
-            self.deferred_compact_on_commit = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.deferred_compact = true;
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -775,8 +769,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ///   segments `0..start_idx`) and skips whole-database blob relocation.
     pub fn compact_auto_tiered(&mut self) -> io::Result<()> {
         self.check_not_poisoned()?;
-        if self.tx_depth > 0 {
-            self.deferred_compact_on_commit = true;
+        if let Some(tx) = self.tx_state.active_tx_mut() {
+            tx.deferred_compact = true;
             return Ok(());
         }
         self.drain_pending_durable()?;
@@ -952,7 +946,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // Commits still waiting in `pending_group` are logged but maybe not durable, and their
         // overlay is not in the memtable, so they count as well.
         let persist_blob_state =
-            self.tx_depth == 0 && self.memtable.is_empty() && self.pending_group.is_empty();
+            !self.tx_state.is_active() && self.memtable.is_empty() && self.pending_group.is_empty();
         if persist_blob_state {
             // The catalog records each segment's length. Bytes beyond the durable length (for
             // example from a rolled-back transaction) would otherwise be cataloged as present and
@@ -1054,7 +1048,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         drop(inputs);
         self.meta_mgr.try_process_pending_deletes();
         if self.config.background_compaction
-            && !self.relocating_std_blobs
+            && !self.is_relocating_std_blobs()
             && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
         {
             if let Some(hook) = &self.compaction_hook {
@@ -1080,8 +1074,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// the start of the transaction are reported. They are counted again in memory and become
     /// effective at the first flush after the transaction has been published.
     pub(super) fn settled_std_dead_bytes(&self, seq: u64, dead_bytes: u64) -> u64 {
-        if self.tx_start_meta.active {
-            let at_start = self.tx_start_meta.std_blobs.get(&seq).map_or(0, |s| s.1);
+        if let Some(snap) = self.tx_state.start_meta() {
+            let at_start = snap.std_blobs.get(&seq).map_or(0, |s| s.1);
             at_start.min(dead_bytes)
         } else {
             dead_bytes
@@ -1090,8 +1084,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// `blob_lru` counterpart of [`Self::settled_std_dead_bytes`].
     pub(super) fn settled_lru_dead_bytes(&self, key: (u16, u64), dead_bytes: u64) -> u64 {
-        if self.tx_start_meta.active {
-            let at_start = self.tx_start_meta.lru_blobs.get(&key).map_or(0, |s| s.1);
+        if let Some(snap) = self.tx_state.start_meta() {
+            let at_start = snap.lru_blobs.get(&key).map_or(0, |s| s.1);
             at_start.min(dead_bytes)
         } else {
             dead_bytes
@@ -1101,8 +1095,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Transaction-start counterpart for `blob_std` segment lengths so uncommitted appends inside an
     /// active transaction or in-flight autocommit op are not cataloged ahead of commit/checkpoint.
     pub(super) fn settled_std_file_len(&self, seq: u64, file_len: u64) -> u64 {
-        if self.tx_start_meta.active {
-            let at_start = self.tx_start_meta.std_blobs.get(&seq).map_or(0, |s| s.0);
+        if let Some(snap) = self.tx_state.start_meta() {
+            let at_start = snap.std_blobs.get(&seq).map_or(0, |s| s.0);
             at_start.min(file_len)
         } else if let Some(&(_, _, _, prev_len)) = self
             .in_flight_autocommit_blob_starts
@@ -1117,8 +1111,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// `blob_lru` counterpart of [`Self::settled_std_file_len`].
     pub(super) fn settled_lru_file_len(&self, key: (u16, u64), file_len: u64) -> u64 {
-        if self.tx_start_meta.active {
-            let at_start = self.tx_start_meta.lru_blobs.get(&key).map_or(0, |s| s.0);
+        if let Some(snap) = self.tx_state.start_meta() {
+            let at_start = snap.lru_blobs.get(&key).map_or(0, |s| s.0);
             at_start.min(file_len)
         } else if let Some(&(_, _, _, prev_len)) = self
             .in_flight_autocommit_blob_starts

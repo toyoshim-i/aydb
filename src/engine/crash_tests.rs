@@ -2091,7 +2091,7 @@ impl<'a> Harness<'a> {
             }
             return Ok(!dead);
         }
-        let logged = e.pending_tx_record_count > 0;
+        let logged = e.tx_state.pending_record_count() > 0;
         let before_commit = e.next_lsn();
         let r = e.commit_transaction();
         self.note_op(lsn0, e.next_lsn().max(before_commit), touched);

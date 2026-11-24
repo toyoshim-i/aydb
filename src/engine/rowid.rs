@@ -103,12 +103,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> bool {
         match src {
             ReadSource::Snapshot(_) => false,
-            ReadSource::Committed if self.tx_start_meta.active => {
-                self.tx_start_meta.table_has_synthetic_rowids.get(&table_id) == Some(&false)
+            ReadSource::Committed => {
+                let map = self
+                    .tx_state
+                    .start_meta()
+                    .map_or(&self.table_has_synthetic_rowids, |s| {
+                        &s.table_has_synthetic_rowids
+                    });
+                map.get(&table_id) == Some(&false)
             }
-            ReadSource::Committed | ReadSource::Owner => {
-                self.table_has_synthetic_rowids.get(&table_id) == Some(&false)
-            }
+            ReadSource::Owner => self.table_has_synthetic_rowids.get(&table_id) == Some(&false),
         }
     }
 

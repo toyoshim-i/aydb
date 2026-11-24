@@ -1901,7 +1901,7 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
                 WriteDurability::BufferedFast,
             )
             .unwrap();
-        let undo_len_before = engine.tx_overlay.undo.len();
+        let undo_len_before = engine.tx_state.active_tx().unwrap().overlay.undo.len();
 
         // Connection 2 reads `shared_k` via `with_committed_read_for_conn(202, ...)`
         let conn2_val = engine
@@ -1909,9 +1909,9 @@ fn uncataloged_blob_recovery_inline_bounds_and_committed_read_isolation() {
             .unwrap();
         assert_eq!(conn2_val, Some(b"committed_v1".to_vec()));
         assert_eq!(
-            engine.tx_overlay.undo.len(),
+            engine.tx_state.active_tx().unwrap().overlay.undo.len(),
             undo_len_before,
-            "concurrent committed read under EagerWriteOnRead must not append to Connection 1's tx_overlay undo log"
+            "concurrent committed read under EagerWriteOnRead must not append to Connection 1's overlay undo log"
         );
 
         // Connection 1 must still see its uncommitted write `uncommitted_v2`, and rolling back
@@ -3430,7 +3430,7 @@ fn non_owner_read_with_large_uncommitted_tx_sees_nothing_and_does_not_touch_engi
 
     engine.commit_transaction_for_conn(1).unwrap();
     assert_eq!(engine.memtable.len(), mem_len + 10_000);
-    assert!(engine.tx_overlay.map.is_empty());
+    assert!(!engine.tx_state.is_in_tx());
     assert_eq!(
         engine
             .with_committed_read_for_conn(2, |e| e.get_row(1, b"u000123"))
@@ -3654,7 +3654,7 @@ fn commit_wal_failure_leaves_memtable_without_tx_data_and_poisons_engine() {
         mem_len,
         "MemTable must hold no tx data"
     );
-    assert!(engine.tx_overlay.map.is_empty());
+    assert!(!engine.tx_state.is_in_tx());
     assert!(!engine.in_active_transaction());
     assert_eq!(engine.get_row(1, b"tx000").unwrap(), None);
     assert_eq!(
@@ -5131,7 +5131,13 @@ fn publish_committed_transaction_does_not_reabsorb_flushed_pending_group_entries
         let ticket = commit_into_group(&mut engine, 1, b"seeded_k", b"v1");
         engine.begin_transaction_for_conn(2).unwrap();
         assert!(
-            !engine.tx_overlay.map.contains_key(&seeded_row_key),
+            !engine
+                .tx_state
+                .active_tx()
+                .unwrap()
+                .overlay
+                .map
+                .contains_key(&seeded_row_key),
             "pending_group entries must be shared directly without cloning into tx_overlay"
         );
         assert_eq!(
@@ -5241,7 +5247,7 @@ fn commit_needing_maintenance_flushes_with_the_transaction_still_active() {
     engine.begin_transaction_for_conn(1).unwrap();
     engine.put_row(1, b"k", b"v", &[], GROUP_SYNC).unwrap();
     engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
-    engine.deferred_flush_on_commit = true;
+    engine.tx_state.active_tx_mut().unwrap().deferred_flush = true;
 
     let CommitStep::AwaitingSync(file) = engine.begin_commit_for_conn(1).unwrap() else {
         panic!("a commit with deferred maintenance cannot join the group");
@@ -5264,7 +5270,7 @@ fn failed_deferred_flush_poisons_the_engine_and_discards_the_transaction() {
     engine.begin_transaction_for_conn(1).unwrap();
     engine.put_row(1, b"k", b"v", &[], GROUP_SYNC).unwrap();
     engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
-    engine.deferred_flush_on_commit = true;
+    engine.tx_state.active_tx_mut().unwrap().deferred_flush = true;
     assert!(matches!(
         engine.begin_commit_for_conn(1).unwrap(),
         CommitStep::AwaitingSync(_)
@@ -5931,9 +5937,9 @@ fn rolled_back_transaction_leaves_dead_bytes_and_snapshot_consistent() {
     e.begin_transaction();
     e.put_row(1, b"r1", b"new-inline", &[], WriteDurability::BufferedFast)
         .unwrap();
-    assert!(e.tx_start_meta.active);
+    assert!(e.tx_state.start_meta().is_some());
     e.rollback_transaction().unwrap();
-    assert!(!e.tx_start_meta.active);
+    assert!(e.tx_state.start_meta().is_none());
     let dead_after: Vec<u64> = e.std_blobs.values().map(|b| b.dead_bytes).collect();
     assert_eq!(dead_before, dead_after);
     e.put_row(2, b"k", b"v", &[], WriteDurability::BufferedFast)
@@ -8154,7 +8160,7 @@ fn pending_group_visible_to_next_writer_without_cloning_into_overlay() {
 
     // tx3 begins: overlay must stay empty (zero clones from pending_group).
     engine.begin_transaction_for_conn(3).unwrap();
-    assert!(engine.tx_overlay.map.is_empty());
+    assert!(engine.tx_state.active_tx().unwrap().overlay.map.is_empty());
     assert_eq!(engine.get_row(1, b"k1").unwrap(), None);
     assert_eq!(engine.get_row(1, b"k2").unwrap(), Some(b"c".to_vec()));
     assert_eq!(engine.get_row(1, b"k3").unwrap(), Some(b"d".to_vec()));
@@ -8284,11 +8290,14 @@ fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without
     let initial_row_meta = engine.table_has_row_meta.clone();
 
     engine.statement_savepoint_for_conn(1, 7).unwrap();
-    assert!(engine.statement_savepoint_active);
-    assert!(matches!(
-        engine.savepoints.last().unwrap().meta,
-        tx::SavepointMeta::Statement(_)
-    ));
+    {
+        let tx = engine.tx_state.active_tx().unwrap();
+        assert!(tx.statement_savepoint_active);
+        assert!(matches!(
+            tx.savepoints.last().unwrap().meta,
+            tx::SavepointMeta::Statement(_)
+        ));
+    }
 
     // Delete k1 (marks k1 blob dead) and insert k2 (appends new blob).
     assert!(
@@ -8340,8 +8349,11 @@ fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without
     assert_eq!(engine.table_has_row_meta, initial_row_meta);
     assert_eq!(engine.get_row(7, b"k1").unwrap(), Some(payload1));
     assert_eq!(engine.get_row(7, b"k2").unwrap(), None);
-    assert!(!engine.statement_savepoint_active);
-    assert!(engine.statement_blob_undo.is_empty());
+    {
+        let tx = engine.tx_state.active_tx().unwrap();
+        assert!(!tx.statement_savepoint_active);
+        assert!(tx.statement_blob_undo.is_empty());
+    }
 
     engine.rollback_transaction_for_conn(1).unwrap();
 }
@@ -9420,9 +9432,9 @@ fn group_gate_failure_and_awaiting_sync_abort_poison_and_block_compaction() {
 
 #[test]
 fn commit_at_zero_depth_preserves_state_and_one_depth_rolls_back_on_poison() {
-    // R2-H2: commit_transaction at tx_depth == 0 on a poisoned engine is a no-op that never
-    // invokes restore_tx_state with an inactive TxMetaSnapshot; at tx_depth == 1 it rolls back
-    // the active transaction overlay and fails cleanly.
+    // R2-H2: commit_transaction when TxState::Idle on a poisoned engine is a no-op that never
+    // modifies committed state; at depth == 1 it rolls back the active transaction overlay and
+    // fails cleanly.
     let tmp = TempTestDir::new("r2_h2_commit_poison_depth");
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
@@ -9459,20 +9471,15 @@ fn commit_at_zero_depth_preserves_state_and_one_depth_rolls_back_on_poison() {
         .unwrap();
     engine.debug_poison("simulated poison at depth 1");
     assert!(engine.commit_transaction().is_err());
-    assert_eq!(engine.tx_depth, 0);
+    assert!(!engine.tx_state.is_in_tx());
     assert!(engine.get_row(tid, b"k2").unwrap().is_none());
 
-    // Calling commit_transaction again at tx_depth == 0 must NOT zero out state.
+    // Calling commit_transaction again while TxState::Idle must NOT zero out state.
     engine.commit_transaction().unwrap();
     assert_eq!(engine.next_lsn(), next_lsn_before);
     assert_eq!(engine.std_blobs.len(), std_blob_cnt);
     assert_eq!(engine.lru_blobs.len(), lru_blob_cnt);
     assert_eq!(engine.capped_tables.len(), capped_cnt);
-    assert_eq!(engine.active_vtab_ids.len(), active_cnt);
-
-    // Defensive check on restore_tx_state with an inactive default snapshot.
-    engine.restore_tx_state(0, &crate::engine::tx::TxMetaSnapshot::default());
-    assert_eq!(engine.next_lsn(), next_lsn_before);
     assert_eq!(engine.active_vtab_ids.len(), active_cnt);
 }
 
@@ -9504,8 +9511,8 @@ fn quota_only_tx_drains_pending_group_before_persisting_boot_meta() {
 
     engine.begin_transaction_for_conn(2).unwrap();
     engine.register_capped_table(2, 4096).unwrap();
-    assert_eq!(engine.pending_tx_record_count, 0);
-    assert!(engine.quotas_modified_in_tx);
+    assert_eq!(engine.tx_state.pending_record_count(), 0);
+    assert!(engine.tx_state.active_tx().unwrap().quotas_modified);
 
     engine.commit_transaction_for_conn(2).unwrap();
     assert!(engine.pending_group.is_empty());
@@ -9548,14 +9555,14 @@ fn mixed_durability_sync_vtab_before_buffered_vtab_keeps_sync_upgrade() {
     engine
         .prepare_commit_transaction(WriteDurability::BufferedFast)
         .unwrap();
-    assert!(engine.tx_prepared);
-    assert!(!engine.pending_tx_sync);
+    assert!(engine.tx_state.is_prepared());
+    assert!(!engine.tx_state.pending_sync());
 
     // Now vtab 1001 (SyncTransactional) enters xSync first, followed by vtab 1002 (BufferedFast).
     assert!(!engine.mark_vtab_synced_ready_to_commit(1001, WriteDurability::SyncTransactional));
     assert!(
-        !engine.pending_tx_sync,
-        "mark_vtab_synced_ready_to_commit must not prematurely flip pending_tx_sync"
+        !engine.tx_state.pending_sync(),
+        "mark_vtab_synced_ready_to_commit must not prematurely flip pending_sync"
     );
     assert!(engine.mark_vtab_synced_ready_to_commit(1002, WriteDurability::BufferedFast));
 
@@ -9563,7 +9570,7 @@ fn mixed_durability_sync_vtab_before_buffered_vtab_keeps_sync_upgrade() {
     engine
         .prepare_commit_transaction(WriteDurability::BufferedFast)
         .unwrap();
-    assert!(engine.pending_tx_sync);
+    assert!(engine.tx_state.pending_sync());
     assert_eq!(engine.last_buf_synced_lsn, engine.last_buf_append_lsn);
 
     let step = engine.begin_commit_for_conn(7).unwrap();
@@ -9625,7 +9632,7 @@ fn reclaim_dead_blobs_defers_unlink_until_wal_rotation_and_finish_reloc_drains_g
 
     engine.begin_transaction_for_conn(9).unwrap();
     engine.finish_std_blob_relocation(1).unwrap();
-    assert!(engine.deferred_flush_on_commit);
+    assert!(engine.tx_state.active_tx().unwrap().deferred_flush);
     engine.rollback_transaction().unwrap();
 }
 
@@ -9994,7 +10001,7 @@ fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
         .prepare_commit_transaction(WriteDurability::SyncTransactional)
         .unwrap();
     engine.commit_transaction().unwrap();
-    assert!(!engine.pending_tx_sync);
+    assert!(!engine.tx_state.pending_sync());
     assert_eq!(engine.sync_wal.current_sector_idx(), sync_sector_before);
 
     engine.begin_transaction();
@@ -10004,7 +10011,7 @@ fn empty_sync_tx_does_not_leak_pending_tx_sync_to_subsequent_buffered_tx() {
     engine
         .prepare_commit_transaction(WriteDurability::BufferedFast)
         .unwrap();
-    assert!(!engine.pending_tx_sync);
+    assert!(!engine.tx_state.pending_sync());
     engine.commit_transaction().unwrap();
     assert_eq!(
         engine.sync_wal.current_sector_idx(),
@@ -10075,4 +10082,270 @@ fn empty_memtable_flush_reclaims_dead_std_blobs_poison_blocks_append_and_delete_
         .unwrap_err();
     assert!(!err.to_string().is_empty());
     assert_eq!(engine.std_blobs.len(), segs_before);
+}
+
+#[test]
+fn tx_state_idle_clears_all_state_across_commit_group_and_rollback() {
+    // INV-TX-1: Moving back to TxState::Idle on regular commit, group-commit handoff, or rollback
+    // drops ActiveTx atomically and leaves zero residual flags for subsequent transactions.
+    let tmp = TempTestDir::new("m1_tx_state_idle_clean");
+    let mut engine = open_group_engine(&tmp);
+
+    let assert_idle = |eng: &StorageEngine<OsFs>| {
+        assert!(!eng.in_active_transaction());
+        assert!(!eng.tx_state.is_in_tx());
+        assert!(eng.tx_state.phase().is_none());
+        assert!(eng.tx_state.start_meta().is_none());
+        assert_eq!(eng.tx_state.pending_record_count(), 0);
+        assert!(!eng.tx_state.pending_sync());
+    };
+
+    assert_idle(&engine);
+
+    // 1. Synchronous commit with savepoint, vtab attachment, and deferred flag.
+    engine.begin_vtab_transaction(1, 1001).unwrap();
+    engine.savepoint_for_conn(1, 1).unwrap();
+    engine
+        .put_row(1, b"k1", b"v1", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    engine.tx_state.active_tx_mut().unwrap().deferred_flush = true;
+    engine.prepare_commit_transaction(GROUP_SYNC).unwrap();
+    engine.commit_transaction_for_conn(1).unwrap();
+    assert_idle(&engine);
+
+    // 2. Subsequent buffered transaction must not inherit prior sync state.
+    let sync_sector_before = engine.sync_wal.current_sector_idx();
+    engine.begin_transaction_for_conn(1).unwrap();
+    engine
+        .put_row(1, b"k2", b"v2", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert!(!engine.tx_state.pending_sync());
+    engine.commit_transaction_for_conn(1).unwrap();
+    assert_idle(&engine);
+    assert_eq!(engine.sync_wal.current_sector_idx(), sync_sector_before);
+
+    // 3. Group-commit handoff moves `tx_state` to `Idle` while awaiting barrier completion.
+    let ticket = commit_into_group(&mut engine, 2, b"k_grp", b"v_grp");
+    assert_idle(&engine);
+    flush_group(&mut engine, &ticket);
+    assert_idle(&engine);
+    assert_eq!(
+        engine.get_row(1, b"k_grp").unwrap(),
+        Some(b"v_grp".to_vec())
+    );
+
+    // 4. Explicit rollback also transitions cleanly to `Idle`.
+    engine.begin_vtab_transaction(3, 2001).unwrap();
+    engine.savepoint_for_conn(3, 10).unwrap();
+    engine
+        .put_row(1, b"k_abort", b"v_abort", &[], GROUP_SYNC)
+        .unwrap();
+    engine.rollback_transaction_for_conn(3).unwrap();
+    assert_idle(&engine);
+    assert_eq!(engine.get_row(1, b"k_abort").unwrap(), None);
+}
+
+#[test]
+fn write_scope_internal_bypass_preserves_prepare_while_normal_invalidates() {
+    // INV-TX-2 & INV-TX-3: WriteScope::InternalBypass bypasses `max_transaction_bytes` and keeps
+    // `TxPhase::Prepared` + `sync_durability_upgrade` + `synced_vtabs`, while `WriteScope::Normal`
+    // enforces the transaction byte budget and invalidates back to `TxPhase::Active`.
+    let tmp = TempTestDir::new("m1_write_scope_prepare");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.max_transaction_bytes = 256;
+    let mut engine = StorageEngine::open(fs, cfg).unwrap();
+
+    engine.begin_vtab_transaction(1, 1001).unwrap();
+    engine.begin_vtab_transaction(1, 1002).unwrap();
+    engine
+        .put_row(1, b"k_init", b"v1", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Prepared));
+
+    // Simulate table 1001 (SyncTransactional) reaching `xSync` before table 1002.
+    assert!(!engine.mark_vtab_synced_ready_to_commit(1001, WriteDurability::SyncTransactional));
+    {
+        let tx = engine.tx_state.active_tx().unwrap();
+        assert!(tx.sync_durability_upgrade);
+        assert_eq!(tx.synced_vtabs, vec![1001]);
+    }
+
+    // InternalBypass succeeds past the 256-byte limit and leaves preparation/durability intact.
+    engine
+        .commit_wal_and_memtable_core(
+            vec![crate::wal::WalRecord::PutInline {
+                key: crate::lru::encode_primary_row_key(1, b"k_bypass"),
+                value: vec![b'b'; 400],
+            }],
+            WriteDurability::BufferedFast,
+            true,
+            false,
+            tx::WriteScope::InternalBypass,
+        )
+        .unwrap();
+    assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Prepared));
+    {
+        let tx = engine.tx_state.active_tx().unwrap();
+        assert!(tx.sync_durability_upgrade);
+        assert_eq!(tx.synced_vtabs, vec![1001]);
+    }
+
+    // Normal scope rejects writes exceeding `max_transaction_bytes` while leaving `Prepared` intact.
+    let err = engine
+        .commit_wal_and_memtable_core(
+            vec![crate::wal::WalRecord::PutInline {
+                key: crate::lru::encode_primary_row_key(1, b"k_too_big"),
+                value: vec![b'x'; 64],
+            }],
+            WriteDurability::BufferedFast,
+            true,
+            false,
+            tx::WriteScope::Normal,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Prepared));
+
+    // Lower budget check with Normal scope via resetting config budget above `pending_bytes`:
+    // a small Normal write invalidates `Prepared` -> `Active` and clears `synced_vtabs` + upgrade.
+    engine.config.max_transaction_bytes = 4096;
+    engine
+        .put_row(1, b"k_normal", b"ok", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Active));
+    {
+        let tx = engine.tx_state.active_tx().unwrap();
+        assert!(!tx.sync_durability_upgrade);
+        assert!(tx.synced_vtabs.is_empty());
+    }
+    engine.rollback_transaction_for_conn(1).unwrap();
+}
+
+#[test]
+fn scoped_raii_guards_clear_on_early_return_and_unwind() {
+    // INV-TX-6: Both `ReconcilingCappedGuard` and `RelocatingBlobsGuard` restore their latches on
+    // early `?` error returns as well as during panic unwinds.
+    let tmp = TempTestDir::new("m1_scoped_raii_guards");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+
+    assert_eq!(engine.reconciling_capped_table(), None);
+    assert!(!engine.is_relocating_std_blobs());
+
+    fn enter_reconcile_then_err(engine: &mut StorageEngine<OsFs>) -> io::Result<()> {
+        let guard = scoped_guards::ReconcilingCappedGuard::enter(engine, 42);
+        assert_eq!(guard.reconciling_capped_table(), Some(42));
+        if guard.reconciling_capped_table() == Some(42) {
+            return Err(io::Error::other("early return"));
+        }
+        Ok(())
+    }
+
+    fn enter_reloc_then_err(engine: &mut StorageEngine<OsFs>) -> io::Result<()> {
+        let guard = scoped_guards::RelocatingBlobsGuard::enter(engine);
+        assert!(guard.is_relocating_std_blobs());
+        if guard.is_relocating_std_blobs() {
+            return Err(io::Error::other("early return"));
+        }
+        Ok(())
+    }
+
+    let early_reconcile = enter_reconcile_then_err(&mut engine);
+    assert!(early_reconcile.is_err());
+    assert_eq!(engine.reconciling_capped_table(), None);
+
+    let early_reloc = enter_reloc_then_err(&mut engine);
+    assert!(early_reloc.is_err());
+    assert!(!engine.is_relocating_std_blobs());
+
+    let panic_reconcile = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let guard = scoped_guards::ReconcilingCappedGuard::enter(&mut engine, 7);
+        assert_eq!(guard.reconciling_capped_table(), Some(7));
+        panic!("simulated unwind during reconcile");
+    }));
+    assert!(panic_reconcile.is_err());
+    assert_eq!(engine.reconciling_capped_table(), None);
+
+    let panic_reloc = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let guard = scoped_guards::RelocatingBlobsGuard::enter(&mut engine);
+        assert!(guard.is_relocating_std_blobs());
+        panic!("simulated unwind during relocation");
+    }));
+    assert!(panic_reloc.is_err());
+    assert!(!engine.is_relocating_std_blobs());
+}
+
+#[test]
+fn flushing_wal_phase_keeps_start_meta_settled_during_ring_full_rotation() {
+    // 1. RingFull WAL rotation inside `TxPhase::FlushingWal` keeps `start_meta` authoritative so
+    //    the checkpoint does not persist uncommitted `dead_bytes`, then finishes cleanly in `Idle`.
+    let durability = WriteDurability::BufferedFast;
+    let (fs, mut e) = dead_blob_setup(durability, false, true);
+    let snap_dead: u64 = {
+        e.begin_transaction();
+        e.put_row(1, b"r1", b"new-inline", &[], durability).unwrap();
+        for i in 0..12 {
+            let k = format!("tx{i:04}");
+            e.put_row(3, k.as_bytes(), &[9u8; 900], &[], durability)
+                .unwrap();
+        }
+        assert_eq!(e.tx_state.phase(), Some(tx::TxPhase::Active));
+        e.tx_state
+            .start_meta()
+            .expect("start_meta present")
+            .std_blobs
+            .values()
+            .map(|&(_, dead)| dead)
+            .sum()
+    };
+    assert_eq!(snap_dead, 0);
+
+    let epoch_before = wal_epoch(&e, durability);
+    e.commit_transaction().unwrap();
+    assert!(wal_epoch(&e, durability) > epoch_before);
+    assert!(!e.tx_state.is_in_tx());
+    assert!(e.tx_state.start_meta().is_none());
+    assert_eq!(persisted_dead_bytes(&e), 0);
+
+    fs.power_loss();
+    std::mem::forget(e);
+    let mut reopened = StorageEngine::open(fs, ring_full_config()).unwrap();
+    assert_eq!(reopened.get_row(1, b"r1").unwrap(), Some(OLD_BLOB.to_vec()));
+    drop(reopened);
+
+    // 2. A WAL write failure during `TxPhase::FlushingWal` cleanly rolls back to `TxState::Idle`,
+    //    restoring `start_meta` (`next_lsn` and `dead_bytes`) without SyncInFlight false poison.
+    let tmp = TempTestDir::new("m1_flushing_wal_fail_rollback");
+    let os_fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut cfg = EngineConfig::default();
+    cfg.inline_threshold_bytes = 64;
+    let mut eng = StorageEngine::open(os_fs, cfg).unwrap();
+    eng.put_row(1, b"base", &OLD_BLOB, &[], WriteDurability::BufferedFast)
+        .unwrap();
+    let base_lsn = eng.next_lsn();
+    let base_dead: u64 = eng.std_blobs.values().map(|b| b.dead_bytes).sum();
+
+    eng.begin_transaction_for_conn(1).unwrap();
+    eng.put_row(
+        1,
+        b"base",
+        b"overwritten",
+        &[],
+        WriteDurability::BufferedFast,
+    )
+    .unwrap();
+    eng.debug_fail_next_wal_append();
+    let err = eng.commit_transaction_for_conn(1).unwrap_err();
+    assert!(err.to_string().contains("injected WAL append failure"));
+    assert!(eng.is_poisoned());
+    assert!(!eng.tx_state.is_in_tx());
+    assert!(eng.tx_state.start_meta().is_none());
+    assert_eq!(eng.next_lsn(), base_lsn);
+    let restored_dead: u64 = eng.std_blobs.values().map(|b| b.dead_bytes).sum();
+    assert_eq!(restored_dead, base_dead);
+    assert_eq!(eng.get_row(1, b"base").unwrap(), Some(OLD_BLOB.to_vec()));
 }

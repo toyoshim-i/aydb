@@ -80,15 +80,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
         if prev_max.is_none() {
-            self.reconciling_capped_table = Some(table_id);
-            let res = self.reconcile_single_capped_table(table_id);
-            self.reconciling_capped_table = None;
+            let res = {
+                let mut guard = super::ReconcilingCappedGuard::enter(self, table_id);
+                guard.reconcile_single_capped_table(table_id)
+            };
             if let Err(e) = res {
                 restore_on_err(self);
                 return Err(e);
             }
         }
-        if self.tx_depth == 0 {
+        if !self.tx_state.is_active() {
             let bytes_before = self
                 .capped_tables
                 .get(&table_id)
@@ -143,10 +144,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
         } else if prev_max != Some(max_bytes) {
-            self.quotas_modified_in_tx = true;
-            self.tx_prepared = false;
-            self.tx_synced_vtabs.clear();
-            self.tx_sync_durability_upgrade = false;
+            if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
+                tx.quotas_modified = true;
+                tx.invalidate_prepare(phase);
+            }
         }
         Ok(())
     }
@@ -162,15 +163,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         view: ReadView,
         table_id: u16,
     ) -> Option<&CappedTableState> {
-        if view == ReadView::Committed && self.tx_start_meta.active {
-            self.tx_start_meta.capped_tables.get(&table_id)
-        } else {
-            self.capped_tables.get(&table_id)
+        match (view, self.tx_state.start_meta()) {
+            (ReadView::Committed, Some(snap)) => snap.capped_tables.get(&table_id),
+            _ => self.capped_tables.get(&table_id),
         }
     }
 
     pub(super) fn eager_promote_lru_on_read(&mut self, table_id: u16, pk: &[u8]) -> io::Result<()> {
-        if self.tx_depth > 0 {
+        if self.tx_state.is_active() {
             self.access_tracker.record_read_hit(table_id, pk);
             return Ok(());
         }
@@ -208,9 +208,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 value: meta_bytes,
             });
         }
-        if let Err(e) =
-            self.commit_wal_and_memtable_core(records, WriteDurability::BufferedFast, false, false)
-        {
+        if let Err(e) = self.commit_wal_and_memtable_core(
+            records,
+            WriteDurability::BufferedFast,
+            false,
+            false,
+            super::tx::WriteScope::Normal,
+        ) {
             if let Some(p) = new_m_ptr {
                 self.record_dead_blob_bytes(&p);
             }
@@ -232,7 +236,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
 
-        let max_window_wal_bytes = if self.tx_depth == 0 {
+        let max_window_wal_bytes = if !self.tx_state.is_active() {
             let sectors = match durability {
                 WriteDurability::SyncTransactional => self.sync_wal.total_sectors(),
                 WriteDurability::BufferedFast => self.buf_wal.total_sectors(),
@@ -512,7 +516,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             })();
 
             if let Err(e) = plan_res {
-                if self.tx_depth == 0 {
+                if !self.tx_state.is_active() {
                     self.in_flight_autocommit_blob_starts.clear();
                 }
                 for p in &new_meta_ptrs {
@@ -527,7 +531,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 // promotions in this window are synced before committing the single WAL batch.
                 if !new_meta_ptrs.is_empty()
                     && durability == WriteDurability::SyncTransactional
-                    && self.tx_depth == 0
+                    && !self.tx_state.is_active()
                 {
                     if let Err(e) = self.sync_active_std_writer() {
                         self.in_flight_autocommit_blob_starts.clear();
@@ -537,9 +541,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         return Err(e);
                     }
                 }
-                if let Err(e) =
-                    self.commit_wal_and_memtable_core(batch_records, durability, true, false)
-                {
+                if let Err(e) = self.commit_wal_and_memtable_core(
+                    batch_records,
+                    durability,
+                    true,
+                    false,
+                    super::tx::WriteScope::Normal,
+                ) {
                     for p in &new_meta_ptrs {
                         self.record_dead_blob_bytes(p);
                     }
@@ -548,14 +556,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 for p in &old_dead_ptrs {
                     self.record_dead_blob_bytes(p);
                 }
-                if self.tx_depth == 0 {
+                if let Some(tx) = self.tx_state.active_tx_mut() {
                     for (pk, max_tick) in consumed_hot_ticks {
-                        self.access_tracker
-                            .clear_if_tick_le(table_id, &pk, max_tick);
+                        tx.pending_lru_clears.push((table_id, pk, max_tick));
                     }
                 } else {
                     for (pk, max_tick) in consumed_hot_ticks {
-                        self.pending_tx_lru_clears.push((table_id, pk, max_tick));
+                        self.access_tracker
+                            .clear_if_tick_le(table_id, &pk, max_tick);
                     }
                 }
                 let advanced_cursor =
@@ -588,7 +596,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        if self.tx_depth == 0 {
+        if !self.tx_state.is_active() {
             self.reclaim_fully_dead_lru_blob_segments(table_id)?;
         }
         Ok(())
@@ -604,10 +612,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         let records = core::mem::take(missing_records);
-        if let Err(e) =
-            self.commit_wal_and_memtable_core(records, WriteDurability::BufferedFast, true, false)
-        {
-            if self.tx_depth == 0 {
+        if let Err(e) = self.commit_wal_and_memtable_core(
+            records,
+            WriteDurability::BufferedFast,
+            true,
+            false,
+            super::tx::WriteScope::Normal,
+        ) {
+            if !self.tx_state.is_active() {
                 self.in_flight_autocommit_blob_starts.clear();
             }
             for p in new_meta_ptrs.drain(..) {
@@ -728,7 +740,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             ) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
-                                    if self.tx_depth == 0 {
+                                    if !self.tx_state.is_active() {
                                         self.in_flight_autocommit_blob_starts.clear();
                                     }
                                     for p in &new_meta_ptrs {
@@ -767,7 +779,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 Ok(Some(ptr)) => new_meta_ptrs.push(ptr),
                                 Ok(None) => {}
                                 Err(e) => {
-                                    if self.tx_depth == 0 {
+                                    if !self.tx_state.is_active() {
                                         self.in_flight_autocommit_blob_starts.clear();
                                     }
                                     for p in &new_meta_ptrs {
@@ -815,7 +827,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             match RowMetaRecord::encode_slice(tick, logical_size, &[]) {
                                 Ok(bytes) => bytes,
                                 Err(e) => {
-                                    if self.tx_depth == 0 {
+                                    if !self.tx_state.is_active() {
                                         self.in_flight_autocommit_blob_starts.clear();
                                     }
                                     for p in &new_meta_ptrs {
@@ -934,14 +946,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Quotas safe to persist on a MemTable flush: during a `RingFull` rotation inside an
-    /// uncommitted transaction commit (`tx_start_meta.active == true`), only the pre-transaction
+    /// uncommitted transaction commit (`tx_state.start_meta().is_some()`), only the pre-transaction
     /// settled quotas match the flushed MemTable.
     pub(super) fn settled_quota_metas(&self) -> Vec<TableQuotaMeta> {
-        if self.tx_start_meta.active {
-            Self::quota_metas_from_map(&self.tx_start_meta.capped_tables)
+        if let Some(snap) = self.tx_state.start_meta() {
+            Self::quota_metas_from_map(&snap.capped_tables)
         } else {
             let mut metas = Self::quota_metas_from_map(&self.capped_tables);
-            if let Some(tid) = self.reconciling_capped_table {
+            if let Some(tid) = self.reconciling_capped_table() {
                 metas.retain(|q| q.table_id != tid);
             }
             metas
