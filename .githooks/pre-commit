@@ -1,20 +1,35 @@
 #!/bin/sh
-# Rejects a commit that fails rustfmt or clippy. Enable it once per clone with:
+# Rejects a commit that fails rustfmt or clippy, and optionally runs Lean 4 verification when
+# `lake` is installed locally and files under `formal/lean/` are staged. Enable once per clone:
 #   git config core.hooksPath .githooks
 #
-# The checks run on the working tree, so unstaged Rust changes count too. A commit that touches
-# no Rust source or Cargo manifest is not checked.
+# The Rust checks run on the working tree, so unstaged Rust changes count too. Commits that touch
+# neither Rust/Cargo nor `formal/lean/` are skipped.
 set -e
 
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
-    exit 0
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if printf '%s\n' "$STAGED" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
+    echo "pre-commit: cargo fmt --check"
+    if ! cargo fmt --check; then
+        echo "pre-commit: formatting differs. Run cargo fmt and stage the result." >&2
+        exit 1
+    fi
+
+    echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+    cargo clippy --all-targets --quiet -- -D warnings
 fi
 
-echo "pre-commit: cargo fmt --check"
-if ! cargo fmt --check; then
-    echo "pre-commit: formatting differs. Run cargo fmt and stage the result." >&2
-    exit 1
+if printf '%s\n' "$STAGED" | grep -Eq '^formal/lean/'; then
+    if command -v lake >/dev/null 2>&1; then
+        PYTHON_BIN=$(command -v python3 || command -v python || true)
+        if [ -z "$PYTHON_BIN" ]; then
+            echo "pre-commit: python3/python not found; skipping optional Lean axiom check."
+            exit 0
+        fi
+        echo "pre-commit: verifying Lean 4 proofs, axioms, and trace fixtures"
+        (cd formal/lean && lake build && "$PYTHON_BIN" -B check_axioms.py && lake exe aydb-trace-check fixtures/*.ndjson)
+    else
+        echo "pre-commit: 'lake' not installed locally; skipping optional Lean 4 check (enforced by CI 'formal' job)."
+    fi
 fi
-
-echo "pre-commit: cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets --quiet -- -D warnings
