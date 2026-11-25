@@ -242,13 +242,13 @@ unsafe impl Sync for sqlite3_module {}
 
 // `sqlite3_vtab_config` is variadic, which only the C calling convention can express.
 #[cfg_attr(windows, link(name = "winsqlite3"))]
-#[cfg_attr(unix, link(name = "sqlite3"))]
+#[cfg_attr(all(unix, not(kani)), link(name = "sqlite3"))]
 unsafe extern "C" {
     pub fn sqlite3_vtab_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
 }
 
 #[cfg_attr(windows, link(name = "winsqlite3"))]
-#[cfg_attr(unix, link(name = "sqlite3"))]
+#[cfg_attr(all(unix, not(kani)), link(name = "sqlite3"))]
 unsafe extern "system" {
     pub fn sqlite3_open(filename: *const c_char, ppDb: *mut *mut sqlite3) -> c_int;
     pub fn sqlite3_close(db: *mut sqlite3) -> c_int;

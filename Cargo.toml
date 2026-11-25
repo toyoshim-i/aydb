@@ -10,3 +10,6 @@ license = "MIT OR Apache-2.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

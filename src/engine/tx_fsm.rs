@@ -398,6 +398,16 @@ fn check_active_conn(core: &TxCore, conn_id: Option<usize>) -> Result<(), TxErro
     Ok(())
 }
 
+#[inline]
+fn slice_contains_usize(xs: &[usize], needle: usize) -> bool {
+    for &x in xs {
+        if x == needle {
+            return true;
+        }
+    }
+    false
+}
+
 /// Pure transition function `(TxMachine, TxEvent) -> (TxMachine, Result<TxEffects, TxError>)`.
 pub(super) fn step(
     mut machine: TxMachine,
@@ -450,7 +460,7 @@ pub(super) fn step(
                     if core.owner_conn != Some(conn_id) {
                         return (machine, Err(TxError::Busy));
                     }
-                    if !core.vtabs.contains(&vtab_id) {
+                    if !slice_contains_usize(&core.vtabs, vtab_id) {
                         core.vtabs.push(vtab_id);
                         core.synced_vtabs.clear();
                         core.sync_durability_upgrade = false;
@@ -466,7 +476,7 @@ pub(super) fn step(
             if let TxCoreState::InTx(ref mut core) = machine.state {
                 if core.is_active()
                     && core.owner_conn == Some(conn_id)
-                    && !core.vtabs.contains(&vtab_id)
+                    && !slice_contains_usize(&core.vtabs, vtab_id)
                 {
                     core.vtabs.push(vtab_id);
                     core.synced_vtabs.clear();
@@ -507,10 +517,16 @@ pub(super) fn step(
             if durability == WriteDurability::SyncTransactional {
                 core.sync_durability_upgrade = true;
             }
-            if !core.synced_vtabs.contains(&vtab_id) {
+            if !slice_contains_usize(&core.synced_vtabs, vtab_id) {
                 core.synced_vtabs.push(vtab_id);
             }
-            let all_synced = core.vtabs.iter().all(|id| core.synced_vtabs.contains(id));
+            let mut all_synced = true;
+            for &id in &core.vtabs {
+                if !slice_contains_usize(&core.synced_vtabs, id) {
+                    all_synced = false;
+                    break;
+                }
+            }
             if all_synced {
                 core.synced_vtabs.clear();
             }
@@ -2017,5 +2033,608 @@ mod tests {
         let mut tampered_chain = n1;
         tampered_chain.steps[4].pre.state = TxCoreState::Idle;
         assert!(tampered_chain.replay_verify().is_err());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_health() -> HealthState {
+        if kani::any() {
+            HealthState::Healthy
+        } else {
+            HealthState::Poisoned
+        }
+    }
+
+    fn any_phase() -> TxPhase {
+        let idx: u8 = kani::any();
+        kani::assume(idx < 5);
+        match idx {
+            0 => TxPhase::Active,
+            1 => TxPhase::Preparing,
+            2 => TxPhase::Prepared,
+            3 => TxPhase::FlushingWal,
+            _ => TxPhase::SyncInFlight,
+        }
+    }
+
+    fn any_durability() -> WriteDurability {
+        if kani::any() {
+            WriteDurability::BufferedFast
+        } else {
+            WriteDurability::SyncTransactional
+        }
+    }
+
+    fn any_scope() -> WriteScope {
+        if kani::any() {
+            WriteScope::Normal
+        } else {
+            WriteScope::InternalBypass
+        }
+    }
+
+    fn any_flush_mode() -> FlushCompleteMode {
+        let idx: u8 = kani::any();
+        kani::assume(idx < 3);
+        match idx {
+            0 => FlushCompleteMode::PublishImmediate,
+            1 => FlushCompleteMode::AwaitSync,
+            _ => FlushCompleteMode::HandOffGroup,
+        }
+    }
+
+    fn any_opt_usize() -> Option<usize> {
+        if kani::any() { Some(kani::any()) } else { None }
+    }
+
+    fn any_bounded_vec_usize(max_len: u8) -> Vec<usize> {
+        match max_len {
+            0 => Vec::new(),
+            1 => {
+                let mut v = Vec::with_capacity(2);
+                if kani::any() {
+                    v.push(kani::any());
+                }
+                v
+            }
+            _ => {
+                let mut v = Vec::with_capacity(3);
+                if kani::any() {
+                    v.push(kani::any());
+                    if kani::any() {
+                        v.push(kani::any());
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    fn any_savepoint_frame() -> SavepointFrame {
+        SavepointFrame {
+            sp_id: kani::any(),
+            is_statement: kani::any(),
+            record_count: kani::any(),
+            pending_bytes: kani::any(),
+            pending_sync: kani::any(),
+            implicit_tx: kani::any(),
+        }
+    }
+
+    fn any_bounded_savepoints(max_len: u8) -> Vec<SavepointFrame> {
+        match max_len {
+            0 => Vec::new(),
+            1 => {
+                let mut v = Vec::with_capacity(2);
+                if kani::any() {
+                    v.push(any_savepoint_frame());
+                }
+                v
+            }
+            _ => {
+                let mut v = Vec::with_capacity(3);
+                if kani::any() {
+                    v.push(any_savepoint_frame());
+                    if kani::any() {
+                        v.push(any_savepoint_frame());
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    fn has_statement_sp(sps: &[SavepointFrame]) -> bool {
+        let mut i = 0;
+        while i < sps.len() {
+            if sps[i].is_statement {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn any_bounded_core(max_vtabs: u8, max_savepoints: u8) -> TxCore {
+        let depth_raw: usize = kani::any();
+        kani::assume((1..=3).contains(&depth_raw));
+        let savepoints = any_bounded_savepoints(max_savepoints);
+        let stmt_active = has_statement_sp(&savepoints);
+        TxCore {
+            phase: any_phase(),
+            depth: NonZeroUsize::new(depth_raw).unwrap(),
+            owner_conn: any_opt_usize(),
+            pending_record_count: kani::any(),
+            pending_bytes: kani::any(),
+            pending_sync: kani::any(),
+            sync_durability_upgrade: kani::any(),
+            vtabs: any_bounded_vec_usize(max_vtabs),
+            synced_vtabs: any_bounded_vec_usize(max_vtabs),
+            savepoints,
+            statement_savepoint_active: stmt_active,
+        }
+    }
+
+    fn any_bounded_machine(max_vtabs: u8, max_savepoints: u8) -> TxMachine {
+        let state = if kani::any() {
+            TxCoreState::Idle
+        } else {
+            TxCoreState::InTx(any_bounded_core(max_vtabs, max_savepoints))
+        };
+        TxMachine::from_parts(any_health(), state)
+    }
+
+    fn is_storage_mutating_effect(eff: TxEffect) -> bool {
+        matches!(
+            eff,
+            TxEffect::AppendTxBatch { .. }
+                | TxEffect::RunPrepare { .. }
+                | TxEffect::EnsurePreparedBeforeCommit { .. }
+                | TxEffect::FlushWal { .. }
+                | TxEffect::PublishCommittedTx
+                | TxEffect::HandOffPendingGroup
+                | TxEffect::ReturnAwaitingSync
+        )
+    }
+
+    fn assert_no_mutating_effect(effects: &TxEffects) {
+        if effects.len > 0 {
+            if let Some(eff) = effects.items[0] {
+                assert!(!is_storage_mutating_effect(eff));
+            }
+        }
+        if effects.len > 1 {
+            if let Some(eff) = effects.items[1] {
+                assert!(!is_storage_mutating_effect(eff));
+            }
+        }
+        if effects.len > 2 {
+            if let Some(eff) = effects.items[2] {
+                assert!(!is_storage_mutating_effect(eff));
+            }
+        }
+        if effects.len > 3 {
+            if let Some(eff) = effects.items[3] {
+                assert!(!is_storage_mutating_effect(eff));
+            }
+        }
+    }
+
+    fn assert_usize_vec_eq(a: &[usize], b: &[usize]) {
+        assert_eq!(a.len(), b.len());
+        let mut i = 0;
+        while i < a.len() {
+            assert_eq!(a[i], b[i]);
+            i += 1;
+        }
+    }
+
+    fn assert_savepoint_eq(a: &SavepointFrame, b: &SavepointFrame) {
+        assert_eq!(a.sp_id, b.sp_id);
+        assert_eq!(a.is_statement, b.is_statement);
+        assert_eq!(a.record_count, b.record_count);
+        assert_eq!(a.pending_bytes, b.pending_bytes);
+        assert_eq!(a.pending_sync, b.pending_sync);
+        assert_eq!(a.implicit_tx, b.implicit_tx);
+    }
+
+    fn assert_core_eq(a: &TxCore, b: &TxCore) {
+        assert_eq!(a.phase, b.phase);
+        assert_eq!(a.depth, b.depth);
+        assert_eq!(a.owner_conn, b.owner_conn);
+        assert_eq!(a.pending_record_count, b.pending_record_count);
+        assert_eq!(a.pending_bytes, b.pending_bytes);
+        assert_eq!(a.pending_sync, b.pending_sync);
+        assert_eq!(a.sync_durability_upgrade, b.sync_durability_upgrade);
+        assert_eq!(a.statement_savepoint_active, b.statement_savepoint_active);
+        assert_usize_vec_eq(&a.vtabs, &b.vtabs);
+        assert_usize_vec_eq(&a.synced_vtabs, &b.synced_vtabs);
+        assert_eq!(a.savepoints.len(), b.savepoints.len());
+        let mut i = 0;
+        while i < a.savepoints.len() {
+            assert_savepoint_eq(&a.savepoints[i], &b.savepoints[i]);
+            i += 1;
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_tx_fsm_write_scope_budget_and_prepare() {
+        let mut core = any_bounded_core(2, 2);
+        core.phase = TxPhase::Prepared;
+        kani::assume(core.pending_record_count <= 1000);
+        let orig = core.clone();
+        let m = TxMachine::from_parts(HealthState::Healthy, TxCoreState::InTx(core));
+
+        let dur = any_durability();
+        let rc: usize = kani::any();
+        kani::assume(rc <= 1000);
+        let bb: usize = kani::any();
+        let max_b: usize = kani::any();
+
+        let (post_norm, res_norm) = step(
+            m.clone(),
+            TxEvent::RecordWrite {
+                scope: WriteScope::Normal,
+                durability: dur,
+                record_count: rc,
+                batch_bytes: bb,
+                max_transaction_bytes: max_b,
+            },
+        );
+        if max_b > 0 && orig.pending_bytes.saturating_add(bb) > max_b {
+            assert_eq!(res_norm, Err(TxError::TxBudgetExceeded));
+            assert_eq!(post_norm.health, HealthState::Healthy);
+            let TxCoreState::InTx(c_norm) = post_norm.state else {
+                panic!("must remain InTx");
+            };
+            assert_core_eq(&c_norm, &orig);
+        } else {
+            assert!(res_norm.is_ok());
+            let TxCoreState::InTx(c) = post_norm.state else {
+                panic!("must remain InTx");
+            };
+            assert_eq!(c.phase, TxPhase::Active);
+            assert!(c.synced_vtabs.is_empty());
+            assert!(!c.sync_durability_upgrade);
+        }
+
+        let (post_bypass, res_bypass) = step(
+            m,
+            TxEvent::RecordWrite {
+                scope: WriteScope::InternalBypass,
+                durability: dur,
+                record_count: rc,
+                batch_bytes: bb,
+                max_transaction_bytes: max_b,
+            },
+        );
+        assert!(res_bypass.is_ok());
+        let TxCoreState::InTx(c_byp) = post_bypass.state else {
+            panic!("must remain InTx");
+        };
+        assert_eq!(c_byp.phase, TxPhase::Prepared);
+        assert_usize_vec_eq(&c_byp.synced_vtabs, &orig.synced_vtabs);
+        assert_eq!(c_byp.sync_durability_upgrade, orig.sync_durability_upgrade);
+    }
+
+    #[inline(always)]
+    fn check_step_invariants(
+        machine: TxMachine,
+        event: TxEvent,
+    ) -> (TxMachine, Result<TxEffects, TxError>) {
+        let pre_health = machine.health;
+        let was_flushing_wal = matches!(
+            &machine.state,
+            TxCoreState::InTx(c) if c.phase == TxPhase::FlushingWal
+        );
+        let (post, res) = step(machine, event);
+        if pre_health == HealthState::Poisoned {
+            assert_eq!(post.health, HealthState::Poisoned);
+            if !was_flushing_wal {
+                if let Ok(ref effects) = res {
+                    assert_no_mutating_effect(effects);
+                }
+            }
+        }
+        if let TxCoreState::InTx(ref core) = post.state {
+            assert_eq!(
+                core.statement_savepoint_active(),
+                has_statement_sp(core.savepoints())
+            );
+        }
+        (post, res)
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_tx_fsm_begin_invariants() {
+        let machine = any_bounded_machine(0, 0);
+        if kani::any() {
+            let _ = check_step_invariants(machine, TxEvent::Begin);
+        } else {
+            let _ = check_step_invariants(
+                machine,
+                TxEvent::BeginForConn {
+                    conn_id: kani::any(),
+                },
+            );
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_tx_fsm_vtab_attach_invariants() {
+        let machine = any_bounded_machine(1, 0);
+        if kani::any() {
+            let _ = check_step_invariants(
+                machine,
+                TxEvent::BeginVtab {
+                    conn_id: kani::any(),
+                    vtab_id: kani::any(),
+                },
+            );
+        } else {
+            let _ = check_step_invariants(
+                machine,
+                TxEvent::AttachVtab {
+                    conn_id: kani::any(),
+                    vtab_id: kani::any(),
+                },
+            );
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_tx_fsm_detach_vtab_invariants() {
+        let machine = any_bounded_machine(1, 0);
+        let _ = check_step_invariants(
+            machine,
+            TxEvent::DetachVtab {
+                conn_id: kani::any(),
+                vtab_id: kani::any(),
+            },
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn verify_tx_fsm_vtab_sync_empty_and_inactive() {
+        let machine = any_bounded_machine(0, 0);
+        let dur = any_durability();
+        let was_active_in_tx = matches!(
+            &machine.state,
+            TxCoreState::InTx(c) if c.is_active()
+        );
+        let (post, res) = check_step_invariants(
+            machine,
+            TxEvent::VtabSync {
+                vtab_id: kani::any(),
+                durability: dur,
+            },
+        );
+        let Ok(eff) = res else {
+            panic!("VtabSync must succeed");
+        };
+        assert_eq!(eff.len, 1);
+        assert!(matches!(
+            eff.items[0],
+            Some(TxEffect::VtabSyncOutcome { all_synced: true })
+        ));
+        if was_active_in_tx && dur == WriteDurability::SyncTransactional {
+            assert!(matches!(
+                &post.state,
+                TxCoreState::InTx(c) if c.sync_durability_upgrade
+            ));
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_tx_fsm_vtab_sync_active_vtab() {
+        let phase_tag: u8 = kani::any();
+        kani::assume(phase_tag < 4);
+        let phase = match phase_tag {
+            0 => TxPhase::Active,
+            1 => TxPhase::Preparing,
+            2 => TxPhase::Prepared,
+            _ => TxPhase::SyncInFlight,
+        };
+        let depth_raw: usize = kani::any();
+        kani::assume((1..=3).contains(&depth_raw));
+        let v0: usize = kani::any();
+        let mut vtabs = Vec::with_capacity(1);
+        vtabs.push(v0);
+        let synced_vtabs = any_bounded_vec_usize(1);
+        let prev_synced_has_v0 = slice_contains_usize(&synced_vtabs, v0);
+        let core = TxCore {
+            phase,
+            depth: NonZeroUsize::new(depth_raw).unwrap(),
+            owner_conn: any_opt_usize(),
+            pending_record_count: kani::any(),
+            pending_bytes: kani::any(),
+            pending_sync: kani::any(),
+            sync_durability_upgrade: kani::any(),
+            vtabs,
+            synced_vtabs,
+            savepoints: Vec::new(),
+            statement_savepoint_active: false,
+        };
+        let machine = TxMachine::from_parts(any_health(), TxCoreState::InTx(core));
+        let vtab_id: usize = kani::any();
+        let dur = any_durability();
+        let (post, res) = check_step_invariants(
+            machine,
+            TxEvent::VtabSync {
+                vtab_id,
+                durability: dur,
+            },
+        );
+        if dur == WriteDurability::SyncTransactional {
+            assert!(matches!(
+                &post.state,
+                TxCoreState::InTx(c) if c.sync_durability_upgrade
+            ));
+        }
+        let expected_all_synced = vtab_id == v0 || prev_synced_has_v0;
+        let Ok(eff) = res else {
+            panic!("VtabSync must succeed");
+        };
+        assert_eq!(eff.len, 1);
+        assert!(matches!(
+            eff.items[0],
+            Some(TxEffect::VtabSyncOutcome { all_synced }) if all_synced == expected_all_synced
+        ));
+        if expected_all_synced {
+            assert!(matches!(
+                &post.state,
+                TxCoreState::InTx(c) if c.synced_vtabs.is_empty()
+            ));
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_tx_fsm_write_prepare_invariants() {
+        let machine = any_bounded_machine(1, 1);
+        let tag: u8 = kani::any();
+        kani::assume(tag < 4);
+        match tag {
+            0 => {
+                let _ = check_step_invariants(
+                    machine,
+                    TxEvent::RecordWrite {
+                        scope: any_scope(),
+                        durability: any_durability(),
+                        record_count: kani::any(),
+                        batch_bytes: kani::any(),
+                        max_transaction_bytes: kani::any(),
+                    },
+                );
+            }
+            1 => {
+                let _ = check_step_invariants(machine, TxEvent::InvalidatePrepare);
+            }
+            2 => {
+                let _ = check_step_invariants(
+                    machine,
+                    TxEvent::BeginPrepare {
+                        durability: any_durability(),
+                    },
+                );
+            }
+            _ => {
+                let _ = check_step_invariants(machine, TxEvent::FinishPrepare { ok: kani::any() });
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_tx_fsm_savepoint_push_invariants() {
+        let machine = any_bounded_machine(0, 1);
+        let _ = check_step_invariants(
+            machine,
+            TxEvent::Savepoint {
+                owner_conn: any_opt_usize(),
+                sp_id: kani::any(),
+                is_statement: kani::any(),
+                check_poison: kani::any(),
+            },
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_tx_fsm_savepoint_release_and_rollback_invariants() {
+        let machine = any_bounded_machine(0, 2);
+        if kani::any() {
+            let _ = check_step_invariants(
+                machine,
+                TxEvent::ReleaseSavepoint {
+                    conn_id: any_opt_usize(),
+                    sp_id: kani::any(),
+                },
+            );
+        } else {
+            let _ = check_step_invariants(
+                machine,
+                TxEvent::RollbackToSavepoint {
+                    conn_id: any_opt_usize(),
+                    sp_id: kani::any(),
+                },
+            );
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_tx_fsm_commit_rollback_poison_invariants() {
+        let machine = any_bounded_machine(1, 1);
+        let tag: u8 = kani::any();
+        kani::assume(tag < 6);
+        match tag {
+            0 => {
+                let _ = check_step_invariants(
+                    machine,
+                    TxEvent::PlanCommit {
+                        conn_id: any_opt_usize(),
+                        defer_sync_allowed: kani::any(),
+                        can_group: kani::any(),
+                        has_metadata_changes: kani::any(),
+                        buf_len_exceeds_chunk: kani::any(),
+                    },
+                );
+            }
+            1 => {
+                let _ = check_step_invariants(
+                    machine,
+                    TxEvent::EnterWalFlush {
+                        defer_sync_barrier: kani::any(),
+                    },
+                );
+            }
+            2 => {
+                let _ = check_step_invariants(
+                    machine,
+                    TxEvent::CompleteWalFlush {
+                        mode: any_flush_mode(),
+                    },
+                );
+            }
+            3 => {
+                let ok: bool = kani::any();
+                let was_healthy_in_tx =
+                    machine.health == HealthState::Healthy && machine.state.is_in_tx();
+                let (post, res) = check_step_invariants(machine, TxEvent::FinishSyncCommit { ok });
+                if was_healthy_in_tx && !ok {
+                    assert!(res.is_ok());
+                    assert_eq!(post.health, HealthState::Poisoned);
+                    assert!(matches!(post.state, TxCoreState::Idle));
+                }
+            }
+            4 => {
+                let conn_id = any_opt_usize();
+                let was_sync_in_flight = matches!(
+                    &machine.state,
+                    TxCoreState::InTx(c)
+                        if c.phase == TxPhase::SyncInFlight
+                            && conn_id.is_none_or(|cid| c.owner_conn == Some(cid))
+                );
+                let (post, res) = check_step_invariants(machine, TxEvent::Rollback { conn_id });
+                if was_sync_in_flight {
+                    assert!(res.is_ok());
+                    assert_eq!(post.health, HealthState::Poisoned);
+                    assert!(matches!(post.state, TxCoreState::Idle));
+                }
+            }
+            _ => {
+                let _ = check_step_invariants(machine, TxEvent::MarkPoisoned);
+            }
+        }
     }
 }

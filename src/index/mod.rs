@@ -24,6 +24,7 @@ use crate::cache::VerifiedBlockCache;
 use crate::meta::format_idx_file_name;
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
 use crate::util::crc32c::crc32c;
+use crate::util::{io_err, io_err_with_tag};
 use crate::wal::{BlobKind, BlobPtr};
 
 /// Size of an index data block (4096 bytes).
@@ -237,19 +238,18 @@ impl IdxBlockBuilder {
         val_type: u8,
         val_len: usize,
     ) -> io::Result<(u16, u16)> {
-        let klen = u16::try_from(key_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX")
-        })?;
+        let klen = u16::try_from(key_len)
+            .map_err(|_| io_err(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX"))?;
         let (vlen, payload_len) = match val_type {
             1 => {
                 let vlen = u16::try_from(val_len).map_err(|_| {
-                    io::Error::new(
+                    io_err(
                         io::ErrorKind::InvalidInput,
                         "inline value length exceeds u16::MAX",
                     )
                 })?;
                 let payload_len = val_len.checked_add(2).ok_or_else(|| {
-                    io::Error::new(
+                    io_err(
                         io::ErrorKind::InvalidInput,
                         "inline value footprint overflow",
                     )
@@ -258,7 +258,7 @@ impl IdxBlockBuilder {
             }
             2 => {
                 if val_len != BLOB_PTR_ENCODED_LEN {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidInput,
                         "BlobPtr raw value must be 23 bytes",
                     ));
@@ -267,7 +267,7 @@ impl IdxBlockBuilder {
             }
             3 => {
                 if val_len != 0 {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidInput,
                         "Tombstone raw value must be empty",
                     ));
@@ -275,9 +275,10 @@ impl IdxBlockBuilder {
                 (0, 0)
             }
             other => {
-                return Err(io::Error::new(
+                return Err(io_err_with_tag(
                     io::ErrorKind::InvalidInput,
-                    format!("unknown IndexValue type_tag: {other}"),
+                    "unknown IndexValue type_tag",
+                    other,
                 ));
             }
         };
@@ -287,7 +288,7 @@ impl IdxBlockBuilder {
             .and_then(|n| n.checked_add(2))
             .is_some_and(|total| total <= IDX_BLOCK_USABLE_SIZE);
         if !fits_single_block {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidInput,
                 "IndexEntry exceeds single 4 KB block capacity",
             ));
@@ -466,17 +467,27 @@ impl<'a> RawIdxEntry<'a> {
     #[inline]
     pub fn decode_blob_ptr(val_bytes: &[u8]) -> io::Result<BlobPtr> {
         if val_bytes.len() != BLOB_PTR_ENCODED_LEN {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted BlobPtr slice length in RawIdxEntry",
             ));
         }
         let kind = BlobKind::from_u8(val_bytes[0])?;
         let table_id = u16::from_le_bytes([val_bytes[1], val_bytes[2]]);
-        let seg_id = u64::from_le_bytes(val_bytes[3..11].try_into().unwrap());
-        let offset = u32::from_le_bytes(val_bytes[11..15].try_into().unwrap());
-        let len = u32::from_le_bytes(val_bytes[15..19].try_into().unwrap());
-        let crc = u32::from_le_bytes(val_bytes[19..23].try_into().unwrap());
+        let seg_id = u64::from_le_bytes([
+            val_bytes[3],
+            val_bytes[4],
+            val_bytes[5],
+            val_bytes[6],
+            val_bytes[7],
+            val_bytes[8],
+            val_bytes[9],
+            val_bytes[10],
+        ]);
+        let offset =
+            u32::from_le_bytes([val_bytes[11], val_bytes[12], val_bytes[13], val_bytes[14]]);
+        let len = u32::from_le_bytes([val_bytes[15], val_bytes[16], val_bytes[17], val_bytes[18]]);
+        let crc = u32::from_le_bytes([val_bytes[19], val_bytes[20], val_bytes[21], val_bytes[22]]);
         Ok(BlobPtr {
             kind,
             table_id,
@@ -493,9 +504,10 @@ impl<'a> RawIdxEntry<'a> {
             1 => Ok(IndexValue::Inline(self.val_bytes.to_vec())),
             2 => Ok(IndexValue::Blob(Self::decode_blob_ptr(self.val_bytes)?)),
             3 => Ok(IndexValue::Tombstone),
-            other => Err(io::Error::new(
+            other => Err(io_err_with_tag(
                 io::ErrorKind::InvalidData,
-                format!("unknown IndexValue type_tag: {other}"),
+                "unknown IndexValue type_tag",
+                other,
             )),
         }
     }
@@ -527,35 +539,31 @@ const MAX_IDX_BLOCK_ENTRIES: usize = IDX_BLOCK_USABLE_SIZE / (MIN_IDX_ENTRY_BYTE
 
 /// Zero-copy reader for a single 4096-byte index data block.
 pub struct IdxBlockReader<'a> {
-    buf: &'a [u8; IDX_BLOCK_SIZE],
+    buf: &'a [u8],
     num_entries: usize,
     dir_start: usize,
 }
 
-fn validate_block_entry_layout(
-    buf: &[u8; IDX_BLOCK_SIZE],
-    num_entries: usize,
-    dir_start: usize,
-) -> io::Result<()> {
+fn validate_block_entry_layout(buf: &[u8], num_entries: usize, dir_start: usize) -> io::Result<()> {
     let mut prev_end = 0usize;
     let mut prev_key: Option<&[u8]> = None;
     for i in 0..num_entries {
         let dir_pos = dir_start + (i * 2);
         let off = u16::from_le_bytes([buf[dir_pos], buf[dir_pos + 1]]) as usize;
         if off < prev_end {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "overlapping or out-of-order entry offsets in 4 KB index block",
             ));
         }
         let Some(kstart) = off.checked_add(MIN_IDX_ENTRY_BYTES) else {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted entry offset in 4 KB index block",
             ));
         };
         if kstart > dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted entry offset in 4 KB index block",
             ));
@@ -563,20 +571,20 @@ fn validate_block_entry_layout(
         let klen = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
         let val_type = buf[off + 2];
         let Some(kend) = kstart.checked_add(klen) else {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted key length in 4 KB index block",
             ));
         };
         if kend > dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted key slice in 4 KB index block",
             ));
         }
         let key = &buf[kstart..kend];
         if prev_key.is_some_and(|prev| key <= prev) {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "unsorted or duplicate keys in 4 KB index block",
             ));
@@ -585,20 +593,20 @@ fn validate_block_entry_layout(
         let vend = match val_type {
             1 => {
                 let Some(vstart) = kend.checked_add(2) else {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated inline value length",
                     ));
                 };
                 if vstart > dir_start {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated inline value length",
                     ));
                 }
                 let vlen = u16::from_le_bytes([buf[kend], buf[kend + 1]]) as usize;
                 let Some(vend) = vstart.checked_add(vlen) else {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated inline value payload",
                     ));
@@ -607,7 +615,7 @@ fn validate_block_entry_layout(
             }
             2 => {
                 let Some(vend) = kend.checked_add(BLOB_PTR_ENCODED_LEN) else {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated BlobPtr in 4 KB index block",
                     ));
@@ -619,14 +627,15 @@ fn validate_block_entry_layout(
             }
             3 => kend,
             other => {
-                return Err(io::Error::new(
+                return Err(io_err_with_tag(
                     io::ErrorKind::InvalidData,
-                    format!("unknown IndexValue type_tag: {other}"),
+                    "unknown IndexValue type_tag",
+                    other,
                 ));
             }
         };
         if vend > dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "entry extends past 4 KB index block directory",
             ));
@@ -642,7 +651,7 @@ impl<'a> IdxBlockReader<'a> {
         let expected_crc = u32::from_le_bytes([buf[4092], buf[4093], buf[4094], buf[4095]]);
         let actual_crc = crc32c(&buf[0..4092]);
         if actual_crc != expected_crc {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "4 KB index data block CRC32C mismatch",
             ));
@@ -650,7 +659,7 @@ impl<'a> IdxBlockReader<'a> {
 
         let num_entries = u16::from_le_bytes([buf[4088], buf[4089]]) as usize;
         if num_entries > MAX_IDX_BLOCK_ENTRIES {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted num_entries in 4 KB index data block",
             ));
@@ -668,7 +677,7 @@ impl<'a> IdxBlockReader<'a> {
     pub fn open_preverified(buf: &'a [u8; IDX_BLOCK_SIZE]) -> io::Result<Self> {
         let num_entries = u16::from_le_bytes([buf[4088], buf[4089]]) as usize;
         if num_entries > MAX_IDX_BLOCK_ENTRIES {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted num_entries in 4 KB index data block",
             ));
@@ -691,6 +700,16 @@ impl<'a> IdxBlockReader<'a> {
         }
     }
 
+    #[cfg(kani)]
+    fn from_slice_for_kani(buf: &'a [u8], num_entries: usize, dir_start: usize) -> Self {
+        assert!(dir_start + num_entries * 2 <= buf.len());
+        Self {
+            buf,
+            num_entries,
+            dir_start,
+        }
+    }
+
     #[inline]
     pub fn num_entries(&self) -> usize {
         self.num_entries
@@ -699,7 +718,7 @@ impl<'a> IdxBlockReader<'a> {
     #[inline]
     fn entry_offset(&self, index: usize) -> io::Result<usize> {
         if index >= self.num_entries {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidInput,
                 "entry index out of bounds in 4 KB index block",
             ));
@@ -713,7 +732,7 @@ impl<'a> IdxBlockReader<'a> {
     fn key_at(&self, index: usize) -> io::Result<&'a [u8]> {
         let off = self.entry_offset(index)?;
         if off + 11 > self.dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted entry offset in 4 KB index block",
             ));
@@ -721,7 +740,7 @@ impl<'a> IdxBlockReader<'a> {
         let klen = u16::from_le_bytes([self.buf[off], self.buf[off + 1]]) as usize;
         let kstart = off + 11;
         if kstart + klen > self.dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted key_len in 4 KB index block",
             ));
@@ -734,18 +753,27 @@ impl<'a> IdxBlockReader<'a> {
     fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
         let off = self.entry_offset(index)?;
         if off + 11 > self.dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted entry offset in 4 KB index block",
             ));
         }
         let klen = u16::from_le_bytes([self.buf[off], self.buf[off + 1]]) as usize;
         let val_type = self.buf[off + 2];
-        let lsn = u64::from_le_bytes(self.buf[off + 3..off + 11].try_into().unwrap());
+        let lsn = u64::from_le_bytes([
+            self.buf[off + 3],
+            self.buf[off + 4],
+            self.buf[off + 5],
+            self.buf[off + 6],
+            self.buf[off + 7],
+            self.buf[off + 8],
+            self.buf[off + 9],
+            self.buf[off + 10],
+        ]);
         let kstart = off + 11;
         let kend = kstart + klen;
         if kend > self.dir_start {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "corrupted key slice in 4 KB index block",
             ));
@@ -753,7 +781,7 @@ impl<'a> IdxBlockReader<'a> {
         let val_range = match val_type {
             1 => {
                 if kend + 2 > self.dir_start {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated inline value length",
                     ));
@@ -762,7 +790,7 @@ impl<'a> IdxBlockReader<'a> {
                 let vstart = kend + 2;
                 let vend = vstart + vlen;
                 if vend > self.dir_start {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated inline value payload",
                     ));
@@ -772,7 +800,7 @@ impl<'a> IdxBlockReader<'a> {
             2 => {
                 let vend = kend + BLOB_PTR_ENCODED_LEN;
                 if vend > self.dir_start {
-                    return Err(io::Error::new(
+                    return Err(io_err(
                         io::ErrorKind::InvalidData,
                         "truncated BlobPtr in 4 KB index block",
                     ));
@@ -782,9 +810,10 @@ impl<'a> IdxBlockReader<'a> {
             }
             3 => kend..kend,
             other => {
-                return Err(io::Error::new(
+                return Err(io_err_with_tag(
                     io::ErrorKind::InvalidData,
-                    format!("unknown IndexValue type_tag: {other}"),
+                    "unknown IndexValue type_tag",
+                    other,
                 ));
             }
         };
@@ -3399,5 +3428,249 @@ mod tests {
         let multi = sb2.finish().unwrap();
         assert_eq!(multi.record_count(), 200);
         assert!(multi.num_blocks() > 1);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn unwrap_io<T>(res: io::Result<T>) -> T {
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                std::mem::forget(e);
+                panic!("unexpected io::Error in Kani proof");
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn target_eq_2(target: &[u8], expected: &[u8; 2]) -> bool {
+        target.len() == 2 && target[0] == expected[0] && target[1] == expected[1]
+    }
+
+    #[inline(always)]
+    fn assert_bytes_eq_2(actual: &[u8], expected: &[u8; 2]) {
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0], expected[0]);
+        assert_eq!(actual[1], expected[1]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn verify_idx_block_open_preverified_header_bounds() {
+        let mut buf = [0u8; IDX_BLOCK_SIZE];
+        let num_entries: u16 = kani::any();
+        buf[4088..4090].copy_from_slice(&num_entries.to_le_bytes());
+
+        let res = IdxBlockReader::open_preverified(&buf);
+        if (num_entries as usize) > MAX_IDX_BLOCK_ENTRIES {
+            assert!(res.is_err());
+        } else {
+            let reader = res.unwrap();
+            assert_eq!(reader.num_entries(), num_entries as usize);
+            assert_eq!(
+                reader.dir_start,
+                IDX_BLOCK_USABLE_SIZE - (num_entries as usize) * 2
+            );
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_idx_block_accessors_arbitrary_bytes_no_panic() {
+        let buf: [u8; 40] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+        let dir_start = buf.len() - n * 2;
+        let reader = IdxBlockReader::from_slice_for_kani(&buf, n, dir_start);
+
+        let idx: usize = kani::any();
+        kani::assume(idx < 4);
+        let _ = reader.entry_offset(idx);
+        let _ = reader.key_at(idx);
+        let _ = reader.parse_entry_span_at(idx);
+        if let Ok(raw) = reader.raw_entry_at(idx) {
+            if raw.val_type == 2 {
+                let _ = RawIdxEntry::decode_blob_ptr(raw.val_bytes);
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_idx_block_layout_validator_arbitrary_bytes_no_panic() {
+        let buf: [u8; 40] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= 2);
+        let dir_start = buf.len() - n * 2;
+        let mut i = 0usize;
+        while i < n {
+            let off =
+                u16::from_le_bytes([buf[dir_start + i * 2], buf[dir_start + i * 2 + 1]]) as usize;
+            if off + 2 <= buf.len() {
+                let klen = u16::from_le_bytes([buf[off], buf[off + 1]]) as usize;
+                kani::assume(klen <= 4 || off + MIN_IDX_ENTRY_BYTES + klen > dir_start);
+            }
+            i += 1;
+        }
+        let _ = validate_block_entry_layout(&buf, n, dir_start);
+    }
+
+    fn write_inline_entry(buf: &mut [u8], off: usize, key: &[u8; 2], lsn: u64, val: &[u8; 2]) {
+        buf[off..off + 2].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 2] = 1;
+        buf[off + 3..off + 11].copy_from_slice(&lsn.to_le_bytes());
+        buf[off + 11..off + 13].copy_from_slice(key);
+        buf[off + 13..off + 15].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 15..off + 17].copy_from_slice(val);
+    }
+
+    fn write_tombstone_entry(buf: &mut [u8], off: usize, key: &[u8; 2], lsn: u64) {
+        buf[off..off + 2].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 2] = 3;
+        buf[off + 3..off + 11].copy_from_slice(&lsn.to_le_bytes());
+        buf[off + 11..off + 13].copy_from_slice(key);
+    }
+
+    fn write_blob_ptr_entry(buf: &mut [u8], off: usize, key: &[u8; 2], lsn: u64, ptr: BlobPtr) {
+        buf[off..off + 2].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 2] = 2;
+        buf[off + 3..off + 11].copy_from_slice(&lsn.to_le_bytes());
+        buf[off + 11..off + 13].copy_from_slice(key);
+        buf[off + 13] = ptr.kind as u8;
+        buf[off + 14..off + 16].copy_from_slice(&ptr.table_id.to_le_bytes());
+        buf[off + 16..off + 24].copy_from_slice(&ptr.seg_id.to_le_bytes());
+        buf[off + 24..off + 28].copy_from_slice(&ptr.offset.to_le_bytes());
+        buf[off + 28..off + 32].copy_from_slice(&ptr.len.to_le_bytes());
+        buf[off + 32..off + 36].copy_from_slice(&ptr.crc32c.to_le_bytes());
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_idx_block_binary_search_inline_and_tombstone() {
+        let target_buf: [u8; 3] = kani::any();
+        let target_len: usize = kani::any();
+        kani::assume(target_len <= 3);
+        let target = &target_buf[..target_len];
+
+        let empty = IdxBlockReader::from_slice_for_kani(&[], 0, 0);
+        assert!(unwrap_io(empty.find_raw(target)).is_none());
+
+        let mut buf = [0u8; 64];
+        let k0: [u8; 2] = kani::any();
+        let k1: [u8; 2] = kani::any();
+        let k2: [u8; 2] = kani::any();
+        kani::assume(u16::from_be_bytes(k0) < u16::from_be_bytes(k1));
+        kani::assume(u16::from_be_bytes(k1) < u16::from_be_bytes(k2));
+
+        let lsn0: u64 = kani::any();
+        let lsn1: u64 = kani::any();
+        let lsn2: u64 = kani::any();
+        let v0: [u8; 2] = kani::any();
+        let v2: [u8; 2] = kani::any();
+
+        write_inline_entry(&mut buf, 0, &k0, lsn0, &v0);
+        write_tombstone_entry(&mut buf, 17, &k1, lsn1);
+        write_inline_entry(&mut buf, 30, &k2, lsn2, &v2);
+        buf[58..60].copy_from_slice(&0u16.to_le_bytes());
+        buf[60..62].copy_from_slice(&17u16.to_le_bytes());
+        buf[62..64].copy_from_slice(&30u16.to_le_bytes());
+
+        let reader = IdxBlockReader::from_slice_for_kani(&buf, 3, 58);
+        let res = unwrap_io(reader.find_raw(target));
+
+        if target_eq_2(target, &k0) {
+            let Some(raw) = res else {
+                panic!("k0 must be found");
+            };
+            assert_eq!(raw.lsn, lsn0);
+            assert_eq!(raw.val_type, 1);
+            assert_bytes_eq_2(raw.key, &k0);
+            assert_bytes_eq_2(raw.val_bytes, &v0);
+        } else if target_eq_2(target, &k1) {
+            let Some(raw) = res else {
+                panic!("k1 must be found");
+            };
+            assert_eq!(raw.lsn, lsn1);
+            assert_eq!(raw.val_type, 3);
+            assert_bytes_eq_2(raw.key, &k1);
+            assert!(raw.val_bytes.is_empty());
+        } else if target_eq_2(target, &k2) {
+            let Some(raw) = res else {
+                panic!("k2 must be found");
+            };
+            assert_eq!(raw.lsn, lsn2);
+            assert_eq!(raw.val_type, 1);
+            assert_bytes_eq_2(raw.key, &k2);
+            assert_bytes_eq_2(raw.val_bytes, &v2);
+        } else {
+            assert!(res.is_none());
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_idx_block_binary_search_with_blob_ptr() {
+        let mut buf = [0u8; 60];
+        let k0: [u8; 2] = kani::any();
+        let k1: [u8; 2] = kani::any();
+        kani::assume(u16::from_be_bytes(k0) < u16::from_be_bytes(k1));
+
+        let lsn0: u64 = kani::any();
+        let lsn1: u64 = kani::any();
+        let expected_ptr = BlobPtr {
+            kind: if kani::any() {
+                BlobKind::Standard
+            } else {
+                BlobKind::Lru
+            },
+            table_id: kani::any(),
+            seg_id: kani::any(),
+            offset: kani::any(),
+            len: kani::any(),
+            crc32c: kani::any(),
+        };
+        let v1: [u8; 2] = kani::any();
+
+        write_blob_ptr_entry(&mut buf, 0, &k0, lsn0, expected_ptr);
+        write_inline_entry(&mut buf, 36, &k1, lsn1, &v1);
+        buf[56..58].copy_from_slice(&0u16.to_le_bytes());
+        buf[58..60].copy_from_slice(&36u16.to_le_bytes());
+
+        let target_buf: [u8; 3] = kani::any();
+        let target_len: usize = kani::any();
+        kani::assume(target_len <= 3);
+        let target = &target_buf[..target_len];
+
+        let reader = IdxBlockReader::from_slice_for_kani(&buf, 2, 56);
+        let res = unwrap_io(reader.find_raw(target));
+
+        if target_eq_2(target, &k0) {
+            let Some(raw) = res else {
+                panic!("k0 must be found");
+            };
+            assert_eq!(raw.lsn, lsn0);
+            assert_eq!(raw.val_type, 2);
+            assert_bytes_eq_2(raw.key, &k0);
+            let dp = unwrap_io(RawIdxEntry::decode_blob_ptr(raw.val_bytes));
+            assert_eq!(dp.kind, expected_ptr.kind);
+            assert_eq!(dp.table_id, expected_ptr.table_id);
+            assert_eq!(dp.seg_id, expected_ptr.seg_id);
+            assert_eq!(dp.offset, expected_ptr.offset);
+            assert_eq!(dp.len, expected_ptr.len);
+            assert_eq!(dp.crc32c, expected_ptr.crc32c);
+        } else if target_eq_2(target, &k1) {
+            let Some(raw) = res else {
+                panic!("k1 must be found");
+            };
+            assert_eq!(raw.lsn, lsn1);
+            assert_eq!(raw.val_type, 1);
+            assert_bytes_eq_2(raw.key, &k1);
+            assert_bytes_eq_2(raw.val_bytes, &v1);
+        } else {
+            assert!(res.is_none());
+        }
     }
 }

@@ -153,21 +153,67 @@ pub fn crc32c(data: &[u8]) -> u32 {
 /// Updates an existing CRC32C checksum `crc` with additional `data`.
 #[inline]
 pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(kani)))]
     {
         if std::arch::is_x86_feature_detected!("sse4.2") {
             // Safety: SSE4.2 support has been verified at runtime.
             return unsafe { crc32c_sse42(crc, data) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(kani)))]
     {
         if std::arch::is_aarch64_feature_detected!("crc") {
             // Safety: ARMv8 CRC32 extension support has been verified at runtime.
             return unsafe { crc32c_aarch64(crc, data) };
         }
     }
-    crc32c_software(crc, data)
+    #[cfg(kani)]
+    {
+        crc32c_bitwise(crc, data)
+    }
+    #[cfg(not(kani))]
+    {
+        crc32c_software(crc, data)
+    }
+}
+
+#[cfg(any(kani, test))]
+#[inline(always)]
+const fn crc32c_step_bit(c: u32) -> u32 {
+    (c >> 1) ^ (POLY & 0u32.wrapping_sub(c & 1))
+}
+
+#[cfg(any(kani, test))]
+#[inline(always)]
+const fn crc32c_step_byte(c: u32, b: u8) -> u32 {
+    let c = c ^ (b as u32);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    let c = crc32c_step_bit(c);
+    crc32c_step_bit(c)
+}
+
+/// Branchless bitwise pure-Rust CRC32C used under Kani to avoid `8 x 256` lookup-table muxes.
+#[cfg(any(kani, test))]
+fn crc32c_bitwise(crc: u32, data: &[u8]) -> u32 {
+    let mut c = !crc;
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        c = crc32c_step_byte(c, data[i]);
+        c = crc32c_step_byte(c, data[i + 1]);
+        c = crc32c_step_byte(c, data[i + 2]);
+        c = crc32c_step_byte(c, data[i + 3]);
+        i += 4;
+    }
+    while i < data.len() {
+        c = crc32c_step_byte(c, data[i]);
+        i += 1;
+    }
+    !c
 }
 
 /// Pure safe Rust Slice-by-8 implementation of CRC32C.
@@ -666,6 +712,24 @@ mod tests {
                 crc32c_software(0, slice),
                 "CRC32C mismatch at len={len}"
             );
+        }
+    }
+
+    #[test]
+    fn crc32c_bitwise_matches_software() {
+        let mut buf = vec![0u8; 4096];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(173).wrapping_add(19) & 0xFF) as u8;
+        }
+        for &seed in &[0u32, 0x1234_5678, u32::MAX] {
+            for &len in &[0usize, 1, 7, 8, 9, 15, 16, 31, 32, 64, 4096] {
+                let slice = &buf[..len];
+                assert_eq!(
+                    crc32c_bitwise(seed, slice),
+                    crc32c_software(seed, slice),
+                    "bitwise CRC32C mismatch at len={len}, seed={seed:#x}"
+                );
+            }
         }
     }
 }

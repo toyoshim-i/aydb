@@ -2,6 +2,8 @@
 
 use std::io;
 
+use crate::util::io_err;
+
 /// Sequential bounds-checked binary reader over a byte slice.
 #[derive(Debug, Clone, Copy)]
 pub struct ByteReader<'a> {
@@ -52,10 +54,10 @@ impl<'a> ByteReader<'a> {
     #[inline]
     pub fn read_bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
         let Some(end) = self.pos.checked_add(len) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, self.eof_msg));
+            return Err(io_err(io::ErrorKind::InvalidData, self.eof_msg));
         };
         if end > self.buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, self.eof_msg));
+            return Err(io_err(io::ErrorKind::InvalidData, self.eof_msg));
         }
         let slice = &self.buf[self.pos..end];
         self.pos = end;

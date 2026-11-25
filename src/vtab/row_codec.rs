@@ -4,6 +4,7 @@
 use std::io::{self, ErrorKind};
 
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
+use crate::util::io_err;
 use crate::vtab::ffi::{
     SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
     sqlite_value_blob_bytes, sqlite_value_text_bytes, sqlite3_context, sqlite3_result_blob,
@@ -540,7 +541,7 @@ pub fn encode_row(cols: &[SqlValue]) -> Vec<u8> {
 }
 
 fn row_too_large() -> io::Error {
-    io::Error::new(
+    io_err(
         ErrorKind::FileTooLarge,
         "row exceeds the binary row format limits",
     )
@@ -559,11 +560,18 @@ fn add_cell_size(total: u32, prefix: u32, payload: usize) -> io::Result<u32> {
 }
 
 fn allocate_row(size: u32) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(size as usize)
-        .map_err(|_| io::Error::from(ErrorKind::OutOfMemory))?;
-    buf.resize(size as usize, 0);
-    Ok(buf)
+    #[cfg(kani)]
+    {
+        Ok(vec![0u8; size as usize])
+    }
+    #[cfg(not(kani))]
+    {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size as usize)
+            .map_err(|_| io::Error::from(ErrorKind::OutOfMemory))?;
+        buf.resize(size as usize, 0);
+        Ok(buf)
+    }
 }
 
 /// Encodes a row, returning `FileTooLarge` when the column count or total length exceeds
@@ -1109,17 +1117,11 @@ enum StoredColumn<'a> {
 
 fn stored_column_count(row: &[u8]) -> io::Result<usize> {
     if row.len() < 4 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated row header",
-        ));
+        return Err(io_err(ErrorKind::InvalidData, "truncated row header"));
     }
     let count = usize::from(u16::from_le_bytes([row[0], row[1]]));
     if row.len() < 4 + count * 5 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated column directory",
-        ));
+        return Err(io_err(ErrorKind::InvalidData, "truncated column directory"));
     }
     Ok(count)
 }
@@ -1139,7 +1141,7 @@ fn stored_column(row: &[u8], index: usize) -> io::Result<StoredColumn<'_>> {
         offset_at(pos + 5)
     };
     let invalid = || {
-        io::Error::new(
+        io_err(
             ErrorKind::InvalidData,
             "invalid stored column extent or type",
         )
@@ -1762,5 +1764,208 @@ mod tests {
             ErrorKind::InvalidData
         );
         assert_eq!(read_stored_i64_column(&valid_row, 0).unwrap(), None);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn assert_bytes_eq(a: &[u8], b: &[u8]) {
+        assert_eq!(a.len(), b.len());
+        let mut i = 0;
+        while i < a.len() {
+            assert_eq!(a[i], b[i]);
+            i += 1;
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_row_codec_decode_arbitrary_bytes_no_panic() {
+        let buf: [u8; 32] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let row = &buf[..len];
+        let col_idx: usize = kani::any();
+        kani::assume(col_idx <= 6);
+
+        let _ = stored_column_count(row);
+        let _ = stored_column(row, col_idx);
+        let _ = read_stored_i64_column(row, col_idx);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_row_codec_extract_key_binary_no_panic() {
+        let buf: [u8; 20] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let row = &buf[..len];
+        let col_idx: usize = kani::any();
+        kani::assume(col_idx <= 3);
+
+        if row.len() >= 4 + (col_idx + 1) * 5 && row[4 + col_idx * 5] == 2 {
+            return;
+        }
+        let _ = extract_column_key_bytes_with_collation(row, col_idx, ColCollation::Binary);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_row_codec_collation_nocase_props() {
+        let buf: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let s = &buf[..len];
+
+        let mut nocase = Vec::with_capacity(6);
+        ColCollation::NoCase.push_normalized_text(s, &mut nocase);
+        assert_eq!(nocase.len(), s.len());
+        let mut saw_nul = false;
+        let mut i = 0;
+        while i < s.len() {
+            if s[i] == 0 {
+                saw_nul = true;
+            }
+            if saw_nul {
+                assert_eq!(nocase[i], 0);
+            } else {
+                assert!(!(b'A'..=b'Z').contains(&nocase[i]));
+            }
+            i += 1;
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn verify_row_codec_collation_rtrim_props() {
+        let buf: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let s = &buf[..len];
+
+        let mut rtrim = Vec::with_capacity(6);
+        ColCollation::RTrim.push_normalized_text(s, &mut rtrim);
+        assert!(rtrim.len() <= s.len());
+        if !rtrim.is_empty() {
+            assert_ne!(rtrim[rtrim.len() - 1], b' ');
+        }
+        assert_bytes_eq(&rtrim, &s[..rtrim.len()]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_row_codec_try_encode_one_col_roundtrip() {
+        let tag: u8 = kani::any();
+        kani::assume(tag < 5);
+        match tag {
+            0 => {
+                let encoded = try_encode_row(&[SqlValue::Null]).unwrap();
+                assert_eq!(stored_column_count(&encoded).unwrap(), 1);
+                assert!(matches!(
+                    stored_column(&encoded, 0).unwrap(),
+                    StoredColumn::Null
+                ));
+            }
+            1 => {
+                let v: i64 = kani::any();
+                let encoded = try_encode_row(&[SqlValue::Integer(v)]).unwrap();
+                assert_eq!(stored_column_count(&encoded).unwrap(), 1);
+                assert!(matches!(
+                    stored_column(&encoded, 0).unwrap(),
+                    StoredColumn::Integer(dv) if dv == v
+                ));
+            }
+            2 => {
+                let bits: u64 = kani::any();
+                let encoded = try_encode_row(&[SqlValue::Float(f64::from_bits(bits))]).unwrap();
+                assert_eq!(stored_column_count(&encoded).unwrap(), 1);
+                match stored_column(&encoded, 0).unwrap() {
+                    StoredColumn::Float(dv) => assert_eq!(dv.to_bits(), bits),
+                    _ => panic!("decoded column variant mismatch"),
+                }
+            }
+            3 => {
+                let encoded = try_encode_row(&[SqlValue::Text(String::from("ab"))]).unwrap();
+                assert_eq!(stored_column_count(&encoded).unwrap(), 1);
+                match stored_column(&encoded, 0).unwrap() {
+                    StoredColumn::Text(db) => assert_bytes_eq(db, b"ab"),
+                    _ => panic!("decoded column variant mismatch"),
+                }
+            }
+            _ => {
+                let b0: u8 = kani::any();
+                let b1: u8 = kani::any();
+                let expected = [b0, b1];
+                let encoded = try_encode_row(&[SqlValue::Blob(vec![b0, b1])]).unwrap();
+                assert_eq!(stored_column_count(&encoded).unwrap(), 1);
+                match stored_column(&encoded, 0).unwrap() {
+                    StoredColumn::Blob(db) => assert_bytes_eq(db, &expected),
+                    _ => panic!("decoded column variant mismatch"),
+                }
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_row_codec_try_encode_two_col_roundtrip() {
+        let a: i64 = kani::any();
+        let b0: u8 = kani::any();
+        let b1: u8 = kani::any();
+        let expected = [b0, b1];
+        let enc2 = try_encode_row(&[SqlValue::Integer(a), SqlValue::Blob(vec![b0, b1])]).unwrap();
+        assert_eq!(stored_column_count(&enc2).unwrap(), 2);
+        assert!(matches!(
+            stored_column(&enc2, 0).unwrap(),
+            StoredColumn::Integer(v) if v == a
+        ));
+        match stored_column(&enc2, 1).unwrap() {
+            StoredColumn::Blob(db) => assert_bytes_eq(db, &expected),
+            _ => panic!("expected second column to be Blob"),
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn verify_row_codec_i64_and_f64_memcomparable_roundtrip_and_order() {
+        let a: i64 = kani::any();
+        let b: i64 = kani::any();
+        let ka = u64::from_be_bytes(encode_i64_memcomparable(a));
+        let kb = u64::from_be_bytes(encode_i64_memcomparable(b));
+        assert_eq!(decode_i64_memcomparable(ka.to_be_bytes()), a);
+        assert_eq!(a < b, ka < kb);
+        let ta = encode_i64_tagged_key(a);
+        assert_eq!(ta[0], KEY_TAG_INTEGER);
+        assert_eq!(decode_i64_tagged_key(&ta), Some(a));
+
+        assert_eq!(
+            u64::from_be_bytes(encode_f64_memcomparable(-0.0)),
+            u64::from_be_bytes(encode_f64_memcomparable(0.0))
+        );
+        assert_eq!(
+            u64::from_be_bytes(encode_f64_memcomparable(-f64::NAN)),
+            u64::from_be_bytes(encode_f64_memcomparable(f64::NAN))
+        );
+
+        let bits: u64 = kani::any();
+        let is_zero = (bits & 0x7FFF_FFFF_FFFF_FFFF) == 0;
+        let is_nan = (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000
+            && (bits & 0x000F_FFFF_FFFF_FFFF) != 0;
+        if !is_zero && !is_nan {
+            let decoded = decode_f64_memcomparable(encode_f64_memcomparable(f64::from_bits(bits)));
+            assert_eq!(decoded.to_bits(), bits);
+        }
+
+        let fx: f64 = kani::any();
+        let fy: f64 = kani::any();
+        kani::assume(fx.is_finite() && fy.is_finite());
+        if fx < fy {
+            assert!(
+                u64::from_be_bytes(encode_f64_memcomparable(fx))
+                    < u64::from_be_bytes(encode_f64_memcomparable(fy))
+            );
+        }
     }
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::pal::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 use crate::util::byte_reader::ByteReader;
 use crate::util::crc32c::crc32c;
+use crate::util::{io_err, io_err_with_tag};
 
 mod recovery;
 pub use self::recovery::{
@@ -105,9 +106,10 @@ impl BlobKind {
         match v {
             0 => Ok(Self::Standard),
             1 => Ok(Self::Lru),
-            other => Err(io::Error::new(
+            other => Err(io_err_with_tag(
                 io::ErrorKind::InvalidData,
-                format!("invalid BlobKind discriminant: {other}"),
+                "invalid BlobKind discriminant",
+                other,
             )),
         }
     }
@@ -148,6 +150,99 @@ pub enum WalRecord {
     TxContinue,
 }
 
+/// Zero-allocation byte-span view of one [`WalRecord`] decoded from a [`ByteReader`].
+enum BorrowedWalRecord {
+    PutInline {
+        key: std::ops::Range<usize>,
+        value: std::ops::Range<usize>,
+    },
+    PutBlobPtr {
+        key: std::ops::Range<usize>,
+        blob_ptr: BlobPtr,
+    },
+    Delete {
+        key: std::ops::Range<usize>,
+    },
+    TxBegin,
+    TxCommit,
+    TxContinue,
+}
+
+impl BorrowedWalRecord {
+    #[inline]
+    fn read_range(r: &mut ByteReader<'_>, len: usize) -> io::Result<std::ops::Range<usize>> {
+        let start = r.position();
+        let _ = r.read_bytes(len)?;
+        Ok(start..r.position())
+    }
+
+    fn decode_from(r: &mut ByteReader<'_>) -> io::Result<Self> {
+        let op = r.read_u8()?;
+        match op {
+            1 => {
+                let klen = r.read_u32_le()? as usize;
+                let key = Self::read_range(r, klen)?;
+                let vlen = r.read_u32_le()? as usize;
+                let value = Self::read_range(r, vlen)?;
+                Ok(Self::PutInline { key, value })
+            }
+            2 => {
+                let klen = r.read_u32_le()? as usize;
+                let key = Self::read_range(r, klen)?;
+                let kind = BlobKind::from_u8(r.read_u8()?)?;
+                let table_id = r.read_u16_le()?;
+                let seg_id = r.read_u64_le()?;
+                let offset = r.read_u32_le()?;
+                let len = r.read_u32_le()?;
+                let crc = r.read_u32_le()?;
+                Ok(Self::PutBlobPtr {
+                    key,
+                    blob_ptr: BlobPtr {
+                        kind,
+                        table_id,
+                        seg_id,
+                        offset,
+                        len,
+                        crc32c: crc,
+                    },
+                })
+            }
+            3 => {
+                let klen = r.read_u32_le()? as usize;
+                let key = Self::read_range(r, klen)?;
+                Ok(Self::Delete { key })
+            }
+            4 => Ok(Self::TxBegin),
+            5 => Ok(Self::TxCommit),
+            6 => Ok(Self::TxContinue),
+            other => Err(io_err_with_tag(
+                io::ErrorKind::InvalidData,
+                "unknown WalRecord op_type",
+                other,
+            )),
+        }
+    }
+
+    fn into_owned(self, data: &[u8]) -> WalRecord {
+        match self {
+            Self::PutInline { key, value } => WalRecord::PutInline {
+                key: data[key].to_vec(),
+                value: data[value].to_vec(),
+            },
+            Self::PutBlobPtr { key, blob_ptr } => WalRecord::PutBlobPtr {
+                key: data[key].to_vec(),
+                blob_ptr,
+            },
+            Self::Delete { key } => WalRecord::Delete {
+                key: data[key].to_vec(),
+            },
+            Self::TxBegin => WalRecord::TxBegin,
+            Self::TxCommit => WalRecord::TxCommit,
+            Self::TxContinue => WalRecord::TxContinue,
+        }
+    }
+}
+
 /// An atomic group of [`WalRecord`] mutations assigned a single monotonically increasing `lsn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalBatch {
@@ -169,6 +264,43 @@ impl WalBatch {
         }
     }
 
+    fn encode_single_record_into(rec: &WalRecord, buf: &mut Vec<u8>) {
+        match rec {
+            WalRecord::PutInline { key, value } => {
+                buf.push(1u8);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buf.extend_from_slice(value);
+            }
+            WalRecord::PutBlobPtr { key, blob_ptr } => {
+                buf.push(2u8);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.push(blob_ptr.kind as u8);
+                buf.extend_from_slice(&blob_ptr.table_id.to_le_bytes());
+                buf.extend_from_slice(&blob_ptr.seg_id.to_le_bytes());
+                buf.extend_from_slice(&blob_ptr.offset.to_le_bytes());
+                buf.extend_from_slice(&blob_ptr.len.to_le_bytes());
+                buf.extend_from_slice(&blob_ptr.crc32c.to_le_bytes());
+            }
+            WalRecord::Delete { key } => {
+                buf.push(3u8);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+            }
+            WalRecord::TxBegin => {
+                buf.push(4u8);
+            }
+            WalRecord::TxCommit => {
+                buf.push(5u8);
+            }
+            WalRecord::TxContinue => {
+                buf.push(6u8);
+            }
+        }
+    }
+
     /// Appends serialized record bytes for `records` into `buf`, validating 32-bit length bounds.
     pub fn try_append_records_to_buf(records: &[WalRecord], buf: &mut Vec<u8>) -> io::Result<()> {
         let mut extra = 0usize;
@@ -176,7 +308,7 @@ impl WalBatch {
             let rec_bytes = match rec {
                 WalRecord::PutInline { key, value } => {
                     if u32::try_from(key.len()).is_err() || u32::try_from(value.len()).is_err() {
-                        return Err(io::Error::new(
+                        return Err(io_err(
                             io::ErrorKind::InvalidInput,
                             "WAL PutInline key or value exceeds u32::MAX bytes",
                         ));
@@ -187,7 +319,7 @@ impl WalBatch {
                 }
                 WalRecord::PutBlobPtr { key, .. } => {
                     if u32::try_from(key.len()).is_err() {
-                        return Err(io::Error::new(
+                        return Err(io_err(
                             io::ErrorKind::InvalidInput,
                             "WAL PutBlobPtr key exceeds u32::MAX bytes",
                         ));
@@ -196,7 +328,7 @@ impl WalBatch {
                 }
                 WalRecord::Delete { key } => {
                     if u32::try_from(key.len()).is_err() {
-                        return Err(io::Error::new(
+                        return Err(io_err(
                             io::ErrorKind::InvalidInput,
                             "WAL Delete key exceeds u32::MAX bytes",
                         ));
@@ -205,54 +337,19 @@ impl WalBatch {
                 }
                 WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => Some(1),
             }
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "WAL record size overflow")
-            })?;
+            .ok_or_else(|| io_err(io::ErrorKind::InvalidInput, "WAL record size overflow"))?;
             extra = extra.checked_add(rec_bytes).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "WAL batch byte size overflow")
+                io_err(io::ErrorKind::InvalidInput, "WAL batch byte size overflow")
             })?;
         }
         buf.try_reserve(extra).map_err(|_| {
-            io::Error::new(
+            io_err(
                 io::ErrorKind::OutOfMemory,
                 "failed to reserve buffer for WAL records",
             )
         })?;
         for rec in records {
-            match rec {
-                WalRecord::PutInline { key, value } => {
-                    buf.push(1u8);
-                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(key);
-                    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(value);
-                }
-                WalRecord::PutBlobPtr { key, blob_ptr } => {
-                    buf.push(2u8);
-                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(key);
-                    buf.push(blob_ptr.kind as u8);
-                    buf.extend_from_slice(&blob_ptr.table_id.to_le_bytes());
-                    buf.extend_from_slice(&blob_ptr.seg_id.to_le_bytes());
-                    buf.extend_from_slice(&blob_ptr.offset.to_le_bytes());
-                    buf.extend_from_slice(&blob_ptr.len.to_le_bytes());
-                    buf.extend_from_slice(&blob_ptr.crc32c.to_le_bytes());
-                }
-                WalRecord::Delete { key } => {
-                    buf.push(3u8);
-                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(key);
-                }
-                WalRecord::TxBegin => {
-                    buf.push(4u8);
-                }
-                WalRecord::TxCommit => {
-                    buf.push(5u8);
-                }
-                WalRecord::TxContinue => {
-                    buf.push(6u8);
-                }
-            }
+            Self::encode_single_record_into(rec, buf);
         }
         Ok(())
     }
@@ -284,14 +381,14 @@ impl WalBatch {
     /// if counts or lengths exceed 32-bit wire limits or buffer allocation fails.
     pub fn try_encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
         let record_count = u32::try_from(self.records.len()).map_err(|_| {
-            io::Error::new(
+            io_err(
                 io::ErrorKind::InvalidInput,
                 "WAL batch record count exceeds u32::MAX",
             )
         })?;
         out.clear();
         out.try_reserve(WAL_BATCH_HEADER_SIZE).map_err(|_| {
-            io::Error::new(
+            io_err(
                 io::ErrorKind::OutOfMemory,
                 "failed to reserve buffer for WAL batch header",
             )
@@ -317,15 +414,16 @@ impl WalBatch {
         out
     }
 
-    /// Decodes a serialized [`WalBatch`] and verifies its `batch_crc32c`.
-    pub fn decode(data: &[u8]) -> io::Result<Self> {
+    fn parse_header_and_verify_crc(
+        data: &[u8],
+    ) -> io::Result<(u64, usize, u64, u64, ByteReader<'_>)> {
         let mut r = ByteReader::with_eof_msg(data, "truncated WalBatch payload");
 
         let lsn = r.read_u64_le()?;
         let expected_crc = r.read_u32_le()?;
         // The CRC range starts at `record_count`, so verify it before trusting any later field.
         if crc32c(r.remaining_slice()) != expected_crc {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "WalBatch CRC32C mismatch",
             ));
@@ -336,74 +434,32 @@ impl WalBatch {
 
         // Minimum serialized WalRecord is 1 byte (1B op for a marker).
         if record_count > r.remaining() {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "WalBatch record_count exceeds remaining payload bytes",
             ));
         }
+        Ok((lsn, record_count, prev_lsn, durable_lsn, r))
+    }
+
+    /// Decodes a serialized [`WalBatch`] and verifies its `batch_crc32c`.
+    pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let (lsn, record_count, prev_lsn, durable_lsn, mut r) =
+            Self::parse_header_and_verify_crc(data)?;
+
         let mut records = Vec::new();
         records.try_reserve_exact(record_count).map_err(|_| {
-            io::Error::new(
+            io_err(
                 io::ErrorKind::InvalidData,
                 "WalBatch records allocation overflow",
             )
         })?;
         for _ in 0..record_count {
-            let op = r.read_u8()?;
-            match op {
-                1 => {
-                    let klen = r.read_u32_le()? as usize;
-                    let key = r.read_bytes(klen)?.to_vec();
-                    let vlen = r.read_u32_le()? as usize;
-                    let value = r.read_bytes(vlen)?.to_vec();
-                    records.push(WalRecord::PutInline { key, value });
-                }
-                2 => {
-                    let klen = r.read_u32_le()? as usize;
-                    let key = r.read_bytes(klen)?.to_vec();
-                    let kind = BlobKind::from_u8(r.read_u8()?)?;
-                    let table_id = r.read_u16_le()?;
-                    let seg_id = r.read_u64_le()?;
-                    let offset = r.read_u32_le()?;
-                    let len = r.read_u32_le()?;
-                    let crc = r.read_u32_le()?;
-                    records.push(WalRecord::PutBlobPtr {
-                        key,
-                        blob_ptr: BlobPtr {
-                            kind,
-                            table_id,
-                            seg_id,
-                            offset,
-                            len,
-                            crc32c: crc,
-                        },
-                    });
-                }
-                3 => {
-                    let klen = r.read_u32_le()? as usize;
-                    let key = r.read_bytes(klen)?.to_vec();
-                    records.push(WalRecord::Delete { key });
-                }
-                4 => {
-                    records.push(WalRecord::TxBegin);
-                }
-                5 => {
-                    records.push(WalRecord::TxCommit);
-                }
-                6 => {
-                    records.push(WalRecord::TxContinue);
-                }
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown WalRecord op_type: {other}"),
-                    ));
-                }
-            }
+            records.push(BorrowedWalRecord::decode_from(&mut r)?.into_owned(data));
         }
 
         if !r.is_empty() {
-            return Err(io::Error::new(
+            return Err(io_err(
                 io::ErrorKind::InvalidData,
                 "unexpected trailing bytes in WalBatch",
             ));
@@ -2641,5 +2697,173 @@ mod tests {
         let mut checked = Vec::new();
         batch.try_encode_into(&mut checked).unwrap();
         assert_eq!(checked, batch.encode());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn assert_bytes_eq(a: &[u8], b: &[u8]) {
+        assert_eq!(a.len(), b.len());
+        let mut i = 0;
+        while i < a.len() {
+            assert_eq!(a[i], b[i]);
+            i += 1;
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_wal_record_decode_arbitrary_bytes_no_panic() {
+        let buf: [u8; 40] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let mut r = ByteReader::with_eof_msg(&buf[..len], "truncated WalBatch payload");
+        let _ = BorrowedWalRecord::decode_from(&mut r);
+    }
+
+    fn unwrap_io<T>(res: io::Result<T>) -> T {
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                std::mem::forget(e);
+                panic!("unexpected io::Error in Kani proof");
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn check_wal_roundtrip(
+        record: &WalRecord,
+        cap: usize,
+        verify: impl FnOnce(BorrowedWalRecord, &[u8]),
+    ) {
+        let mut buf = Vec::with_capacity(cap);
+        WalBatch::encode_single_record_into(record, &mut buf);
+        let mut r = ByteReader::with_eof_msg(&buf, "truncated WalBatch payload");
+        let decoded = unwrap_io(BorrowedWalRecord::decode_from(&mut r));
+        assert!(r.is_empty());
+        verify(decoded, &buf);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_wal_record_roundtrip_inline_delete_and_markers() {
+        let kbytes: [u8; 2] = kani::any();
+        let vbytes: [u8; 2] = kani::any();
+        let kind_tag: u8 = kani::any();
+        kani::assume(kind_tag < 5);
+
+        match kind_tag {
+            0 => {
+                let record = WalRecord::PutInline {
+                    key: kbytes.to_vec(),
+                    value: vbytes.to_vec(),
+                };
+                check_wal_roundtrip(&record, 24, |decoded, buf| match decoded {
+                    BorrowedWalRecord::PutInline { key: dk, value: dv } => {
+                        assert_bytes_eq(&buf[dk], &kbytes);
+                        assert_bytes_eq(&buf[dv], &vbytes);
+                    }
+                    _ => panic!("decoded variant mismatch"),
+                });
+            }
+            1 => {
+                let record = WalRecord::Delete {
+                    key: kbytes.to_vec(),
+                };
+                check_wal_roundtrip(&record, 16, |decoded, buf| match decoded {
+                    BorrowedWalRecord::Delete { key: dk } => {
+                        assert_bytes_eq(&buf[dk], &kbytes);
+                    }
+                    _ => panic!("decoded variant mismatch"),
+                });
+            }
+            2 => {
+                check_wal_roundtrip(&WalRecord::TxBegin, 8, |decoded, _| {
+                    assert!(matches!(decoded, BorrowedWalRecord::TxBegin));
+                });
+            }
+            3 => {
+                check_wal_roundtrip(&WalRecord::TxCommit, 8, |decoded, _| {
+                    assert!(matches!(decoded, BorrowedWalRecord::TxCommit));
+                });
+            }
+            _ => {
+                check_wal_roundtrip(&WalRecord::TxContinue, 8, |decoded, _| {
+                    assert!(matches!(decoded, BorrowedWalRecord::TxContinue));
+                });
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn verify_wal_record_roundtrip_blob_ptr() {
+        let kbytes: [u8; 2] = kani::any();
+        let blob_ptr = BlobPtr {
+            kind: if kani::any() {
+                BlobKind::Standard
+            } else {
+                BlobKind::Lru
+            },
+            table_id: kani::any(),
+            seg_id: kani::any(),
+            offset: kani::any(),
+            len: kani::any(),
+            crc32c: kani::any(),
+        };
+        let record = WalRecord::PutBlobPtr {
+            key: kbytes.to_vec(),
+            blob_ptr,
+        };
+
+        check_wal_roundtrip(&record, 48, |decoded, buf| match decoded {
+            BorrowedWalRecord::PutBlobPtr {
+                key: dk,
+                blob_ptr: dp,
+            } => {
+                assert_bytes_eq(&buf[dk], &kbytes);
+                assert_eq!(dp.kind, blob_ptr.kind);
+                assert_eq!(dp.table_id, blob_ptr.table_id);
+                assert_eq!(dp.seg_id, blob_ptr.seg_id);
+                assert_eq!(dp.offset, blob_ptr.offset);
+                assert_eq!(dp.len, blob_ptr.len);
+                assert_eq!(dp.crc32c, blob_ptr.crc32c);
+            }
+            _ => panic!("decoded variant mismatch"),
+        });
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_wal_batch_header_and_crc_validation() {
+        let buf: [u8; 36] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= 20);
+        let _ = WalBatch::parse_header_and_verify_crc(&buf[..len]);
+
+        let lsn: u64 = kani::any();
+        let prev_lsn: u64 = kani::any();
+        let durable_lsn: u64 = kani::any();
+        let op: u8 = kani::any();
+
+        let mut batch_buf = [0u8; WAL_BATCH_HEADER_SIZE + 1];
+        batch_buf[32] = op;
+        WalBatch::finalize_encoded_buf(lsn, prev_lsn, durable_lsn, 1, &mut batch_buf);
+
+        let (d_lsn, rc, d_prev, d_dur, r) =
+            WalBatch::parse_header_and_verify_crc(&batch_buf).unwrap();
+        assert_eq!(d_lsn, lsn);
+        assert_eq!(rc, 1);
+        assert_eq!(d_prev, prev_lsn);
+        assert_eq!(d_dur, durable_lsn);
+        let rem = r.remaining_slice();
+        assert_eq!(rem.len(), 1);
+        assert_eq!(rem[0], op);
+
+        batch_buf[32] ^= 0x01;
+        assert!(WalBatch::parse_header_and_verify_crc(&batch_buf).is_err());
     }
 }
