@@ -1,7 +1,9 @@
 name: Trybot
-run-name: Trybot · ${{ github.ref_name }} · seed ${{ inputs.seed_start }} (+${{ inputs.seed_count }})
+run-name: Trybot · ${{ github.ref_name }} · seed ${{ inputs.seed_start || '4000' }} (+${{ inputs.seed_count || '100' }})
 
 on:
+  schedule:
+    - cron: '0 4 * * 0'
   workflow_dispatch:
     inputs:
       seed_start:
@@ -32,8 +34,8 @@ jobs:
       run:
         shell: bash
     env:
-      SEED_START: ${{ inputs.seed_start }}
-      SEED_COUNT: ${{ inputs.seed_count }}
+      SEED_START: ${{ inputs.seed_start || '4000' }}
+      SEED_COUNT: ${{ inputs.seed_count || '100' }}
     steps:
       - name: Validate seed range
         run: |
@@ -78,13 +80,20 @@ jobs:
 
       - name: Additional crash tests
         env:
-          AYDB_CRASH_SEED_START: ${{ inputs.seed_start }}
-          AYDB_CRASH_SEEDS: ${{ inputs.seed_count }}
+          AYDB_CRASH_SEED_START: ${{ inputs.seed_start || '4000' }}
+          AYDB_CRASH_SEEDS: ${{ inputs.seed_count || '100' }}
         run: |
           if [[ "$AYDB_CRASH_SEEDS" == 1 ]]; then
             export AYDB_CRASH_SEED="$AYDB_CRASH_SEED_START"
           fi
           cargo test --lib engine::crash_tests::crash_ -- --nocapture 2>&1 | tee crash.log
+
+      - name: Multi-connection differential stress
+        env:
+          AYDB_MULTI_CONN_SEEDS: '100'
+        run: |
+          set -o pipefail
+          cargo test --lib multi_conn_mixed_native_ddl_compaction_matches_oracle -- --nocapture 2>&1 | tee multi_conn.log
 
       - name: Save test logs
         if: always()
@@ -94,4 +103,41 @@ jobs:
           path: |
             regression.log
             crash.log
+            multi_conn.log
+          if-no-files-found: ignore
+
+  kani:
+    name: Kani bounded verification on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Kani toolchain and binaries
+        id: kani-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+          key: kani-${{ runner.os }}-0.68.0
+      - name: Install Kani 0.68.0
+        if: steps.kani-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --version 0.68.0 kani-verifier
+          cargo kani setup
+      - name: Run Kani verification
+        run: |
+          set -o pipefail
+          cargo kani --lib 2>&1 | tee kani.log
+      - name: Save Kani log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trybot-kani
+          path: kani.log
           if-no-files-found: ignore

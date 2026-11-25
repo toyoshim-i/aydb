@@ -317,6 +317,7 @@ jobs:
             tx_fsm_engine_2pc_poison.ndjson \
             tx_fsm_engine_group_and_errors.ndjson \
             tx_fsm_vtab_sqlite.ndjson \
+            tx_fsm_multi_conn_diff.ndjson \
             wal_links_scenarios.ndjson \
             wal_judge_scenarios.ndjson; do
             test -s "$trace_dir/$f"
