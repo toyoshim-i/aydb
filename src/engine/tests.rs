@@ -8294,9 +8294,9 @@ fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without
     engine.statement_savepoint_for_conn(1, 7).unwrap();
     {
         let tx = engine.tx_state.active_tx().unwrap();
-        assert!(tx.statement_savepoint_active);
+        assert!(engine.tx_state.statement_savepoint_active());
         assert!(matches!(
-            tx.savepoints.last().unwrap().meta,
+            tx.savepoint_payloads.last().unwrap().meta,
             tx::SavepointMeta::Statement(_)
         ));
     }
@@ -8353,7 +8353,7 @@ fn statement_savepoint_rollback_restores_blobs_capped_bytes_and_row_meta_without
     assert_eq!(engine.get_row(7, b"k2").unwrap(), None);
     {
         let tx = engine.tx_state.active_tx().unwrap();
-        assert!(!tx.statement_savepoint_active);
+        assert!(!engine.tx_state.statement_savepoint_active());
         assert!(tx.statement_blob_undo.is_empty());
     }
 
@@ -10171,9 +10171,9 @@ fn write_scope_internal_bypass_preserves_prepare_while_normal_invalidates() {
     // Simulate table 1001 (SyncTransactional) reaching `xSync` before table 1002.
     assert!(!engine.mark_vtab_synced_ready_to_commit(1001, WriteDurability::SyncTransactional));
     {
-        let tx = engine.tx_state.active_tx().unwrap();
-        assert!(tx.sync_durability_upgrade);
-        assert_eq!(tx.synced_vtabs, vec![1001]);
+        let core = engine.tx_state.core().unwrap();
+        assert!(core.sync_durability_upgrade());
+        assert_eq!(core.synced_vtabs(), &[1001]);
     }
 
     // InternalBypass succeeds past the 256-byte limit and leaves preparation/durability intact.
@@ -10191,9 +10191,9 @@ fn write_scope_internal_bypass_preserves_prepare_while_normal_invalidates() {
         .unwrap();
     assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Prepared));
     {
-        let tx = engine.tx_state.active_tx().unwrap();
-        assert!(tx.sync_durability_upgrade);
-        assert_eq!(tx.synced_vtabs, vec![1001]);
+        let core = engine.tx_state.core().unwrap();
+        assert!(core.sync_durability_upgrade());
+        assert_eq!(core.synced_vtabs(), &[1001]);
     }
 
     // Normal scope rejects writes exceeding `max_transaction_bytes` while leaving `Prepared` intact.
@@ -10220,9 +10220,9 @@ fn write_scope_internal_bypass_preserves_prepare_while_normal_invalidates() {
         .unwrap();
     assert_eq!(engine.tx_state.phase(), Some(tx::TxPhase::Active));
     {
-        let tx = engine.tx_state.active_tx().unwrap();
-        assert!(!tx.sync_durability_upgrade);
-        assert!(tx.synced_vtabs.is_empty());
+        let core = engine.tx_state.core().unwrap();
+        assert!(!core.sync_durability_upgrade());
+        assert!(core.synced_vtabs().is_empty());
     }
     engine.rollback_transaction_for_conn(1).unwrap();
 }

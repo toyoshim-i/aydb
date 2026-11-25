@@ -12,6 +12,13 @@ use crate::pal::{PlatformFile, PlatformFs};
 use crate::wal::{WalBatch, WalRecord};
 
 use super::reader::CxRef;
+#[cfg(test)]
+pub(super) use super::tx_fsm::TxPhase;
+pub(super) use super::tx_fsm::WriteScope;
+use super::tx_fsm::{
+    self, FlushCompleteMode, HealthState, TxCore, TxCoreState, TxEffect, TxEffects, TxError,
+    TxEvent, TxMachine,
+};
 use super::{EngineReader, StorageEngine, WriteDurability};
 
 /// Savepoint id of the engine savepoint that makes one `xUpdate` call atomic. SQLite numbers its
@@ -221,26 +228,6 @@ pub(crate) enum CommitStep<F: PlatformFile> {
     },
 }
 
-/// Explicit write scope for `StorageEngine::commit_wal_and_memtable_core` and internal helpers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteScope {
-    /// Normal user writes obeying `max_transaction_bytes` and invalidating prior commit preparation.
-    Normal,
-    /// Internal recovery/reconcile/drop/eviction writes bypassing `max_transaction_bytes`
-    /// without resetting outer commit preparation or durability upgrade state.
-    InternalBypass,
-}
-
-/// Phase of an active explicit or savepoint-backed transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TxPhase {
-    Active,
-    Preparing,
-    Prepared,
-    FlushingWal,
-    SyncInFlight,
-}
-
 #[derive(Clone)]
 pub(crate) struct TxMetaSnapshot {
     pub(super) next_lsn: u64,
@@ -259,23 +246,21 @@ pub(crate) struct TxMetaSnapshot {
     pub(super) quotas_modified_in_tx: bool,
 }
 
-/// Per-transaction state owned by [`TxState::InTx`] and dropped atomically on return to [`TxState::Idle`].
-pub(super) struct ActiveTx {
-    pub(super) depth: core::num::NonZeroUsize,
-    /// Optional connection identifier (`*mut sqlite3 as usize`) owning the active transaction.
-    pub(super) owner_conn: Option<usize>,
-    /// True after a participating sync vtab reached `xSync`, so a later buffered vtab preparing
-    /// the commit upgrades `pending_sync` inside `prepare_commit_transaction()`.
-    pub(super) sync_durability_upgrade: bool,
+#[derive(Clone)]
+pub(crate) struct SavepointPayload {
+    pub(super) buf_offset: usize,
+    pub(super) undo_len: usize,
+    pub(super) meta: SavepointMeta,
+}
+
+/// Per-transaction data payload owned alongside [`TxCore`] by [`TxState::InTx`] and dropped
+/// or moved out atomically on return to [`TxState::Idle`].
+pub(super) struct ActiveTxData {
     pub(super) pending_buf: Vec<u8>,
-    pub(super) pending_record_count: u32,
-    pub(super) pending_bytes: usize,
-    pub(super) pending_sync: bool,
     /// Uncommitted writes of the active explicit transaction (see [`TxOverlay`]).
     pub(super) overlay: TxOverlay,
     pub(super) start_meta: TxMetaSnapshot,
-    pub(super) savepoints: Vec<SavepointMarker>,
-    pub(super) statement_savepoint_active: bool,
+    pub(super) savepoint_payloads: Vec<SavepointPayload>,
     pub(super) statement_blob_undo: Vec<BlobUndo>,
     /// Deferred `(table_id, pk, max_tick)` access-tracker clears recorded by in-transaction
     /// writes/evictions and applied only once the transaction commits.
@@ -285,13 +270,6 @@ pub(super) struct ActiveTx {
     /// Virtual tables created (`xCreate`) inside the currently active transaction, as
     /// `(table_id, normalised name, normalised sqlite schema name)`.
     pub(super) vtabs_created: Vec<(u16, String, String)>,
-    /// Virtual-table pointers (`p_vtab as usize`) participating in the active SQLite transaction
-    /// (`xBegin` or `xCreate`). Kept for the duration of the transaction so a `SQLITE_BUSY` retry
-    /// on `COMMIT` waits for all participating tables to reach `xSync` again.
-    pub(super) vtabs: Vec<usize>,
-    /// Subset of [`Self::vtabs`] that have already reached `xSync` during the current commit
-    /// attempt; cleared when all participating tables have synced or on new in-tx writes.
-    pub(super) synced_vtabs: Vec<usize>,
     /// True if any capped-table quota was registered or modified inside the active transaction.
     pub(super) quotas_modified: bool,
     /// True if the active transaction modified any UNIQUE completion marker (`0xFFFF`).
@@ -302,65 +280,35 @@ pub(super) struct ActiveTx {
     pub(super) deferred_compact: bool,
 }
 
-impl ActiveTx {
-    pub(super) fn new(
-        owner_conn: Option<usize>,
-        start_meta: TxMetaSnapshot,
-        mut pending_buf: Vec<u8>,
-    ) -> Self {
+impl ActiveTxData {
+    fn new(start_meta: TxMetaSnapshot, mut pending_buf: Vec<u8>) -> Self {
         pending_buf.clear();
         Self {
-            depth: core::num::NonZeroUsize::MIN,
-            owner_conn,
-            sync_durability_upgrade: false,
             pending_buf,
-            pending_record_count: 0,
-            pending_bytes: 0,
-            pending_sync: false,
             overlay: TxOverlay::default(),
             start_meta,
-            savepoints: Vec::new(),
-            statement_savepoint_active: false,
+            savepoint_payloads: Vec::new(),
             statement_blob_undo: Vec::new(),
             pending_lru_clears: Vec::new(),
             dropped_tables: Vec::new(),
             vtabs_created: Vec::new(),
-            vtabs: Vec::new(),
-            synced_vtabs: Vec::new(),
             quotas_modified: false,
             unique_marker_modified: false,
             deferred_flush: false,
             deferred_compact: false,
         }
     }
-
-    #[inline]
-    pub(super) fn invalidate_prepare(&mut self, phase: &mut TxPhase) {
-        *phase = TxPhase::Active;
-        self.synced_vtabs.clear();
-        self.sync_durability_upgrade = false;
-    }
-
-    pub(super) fn refresh_statement_savepoint_active(&mut self) {
-        let active = self
-            .savepoints
-            .iter()
-            .any(|s| matches!(s.meta, SavepointMeta::Statement(_)));
-        self.statement_savepoint_active = active;
-        if !active {
-            self.statement_blob_undo.clear();
-        }
-    }
 }
 
-/// Top-level transaction state machine on [`StorageEngine`].
+/// Top-level transaction state machine wrapper on [`StorageEngine`], pairing pure [`TxCore`]
+/// with its shell-managed [`ActiveTxData`] payload.
 #[derive(Default)]
 pub(super) enum TxState {
     #[default]
     Idle,
     InTx {
-        phase: TxPhase,
-        tx: Box<ActiveTx>,
+        core: TxCore,
+        data: Box<ActiveTxData>,
     },
 }
 
@@ -370,76 +318,60 @@ impl TxState {
     /// observing [`Self::start_meta`].
     #[inline]
     pub(super) fn is_active(&self) -> bool {
-        matches!(
-            self,
-            TxState::InTx {
-                phase: TxPhase::Active
-                    | TxPhase::Preparing
-                    | TxPhase::Prepared
-                    | TxPhase::SyncInFlight,
-                ..
-            }
-        )
+        matches!(self, Self::InTx { core, .. } if core.is_active())
     }
 
     /// True whenever a transaction is present, including [`TxPhase::FlushingWal`].
     #[inline]
     pub(super) fn is_in_tx(&self) -> bool {
-        !matches!(self, TxState::Idle)
+        !matches!(self, Self::Idle)
     }
 
     #[inline]
-    pub(super) fn active_tx(&self) -> Option<&ActiveTx> {
+    pub(super) fn core(&self) -> Option<&TxCore> {
         match self {
-            TxState::InTx {
-                phase:
-                    TxPhase::Active | TxPhase::Preparing | TxPhase::Prepared | TxPhase::SyncInFlight,
-                tx,
-            } => Some(tx),
-            TxState::Idle | TxState::InTx { .. } => None,
+            Self::InTx { core, .. } => Some(core),
+            Self::Idle => None,
         }
     }
 
     #[inline]
-    pub(super) fn active_tx_mut(&mut self) -> Option<&mut ActiveTx> {
+    pub(super) fn active_core(&self) -> Option<&TxCore> {
         match self {
-            TxState::InTx {
-                phase:
-                    TxPhase::Active | TxPhase::Preparing | TxPhase::Prepared | TxPhase::SyncInFlight,
-                tx,
-            } => Some(tx),
-            TxState::Idle | TxState::InTx { .. } => None,
+            Self::InTx { core, .. } if core.is_active() => Some(core),
+            Self::Idle | Self::InTx { .. } => None,
         }
     }
 
     #[inline]
-    pub(super) fn any_tx(&self) -> Option<&ActiveTx> {
+    pub(super) fn active_tx(&self) -> Option<&ActiveTxData> {
         match self {
-            TxState::InTx { tx, .. } => Some(tx),
-            TxState::Idle => None,
+            Self::InTx { core, data } if core.is_active() => Some(data),
+            Self::Idle | Self::InTx { .. } => None,
         }
     }
 
     #[inline]
-    pub(super) fn any_tx_mut(&mut self) -> Option<&mut ActiveTx> {
+    pub(super) fn active_tx_mut(&mut self) -> Option<&mut ActiveTxData> {
         match self {
-            TxState::InTx { tx, .. } => Some(tx),
-            TxState::Idle => None,
+            Self::InTx { core, data } if core.is_active() => Some(data),
+            Self::Idle | Self::InTx { .. } => None,
         }
     }
 
     #[inline]
-    pub(super) fn active_phase_and_tx_mut(&mut self) -> Option<(&mut TxPhase, &mut ActiveTx)> {
+    pub(super) fn any_tx(&self) -> Option<&ActiveTxData> {
         match self {
-            TxState::InTx {
-                phase:
-                    phase @ (TxPhase::Active
-                    | TxPhase::Preparing
-                    | TxPhase::Prepared
-                    | TxPhase::SyncInFlight),
-                tx,
-            } => Some((phase, tx)),
-            TxState::Idle | TxState::InTx { .. } => None,
+            Self::InTx { data, .. } => Some(data),
+            Self::Idle => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn any_tx_mut(&mut self) -> Option<&mut ActiveTxData> {
+        match self {
+            Self::InTx { data, .. } => Some(data),
+            Self::Idle => None,
         }
     }
 
@@ -451,69 +383,76 @@ impl TxState {
     #[cfg(test)]
     #[inline]
     pub(super) fn phase(&self) -> Option<TxPhase> {
-        match self {
-            TxState::InTx { phase, .. } => Some(*phase),
-            TxState::Idle => None,
-        }
+        self.core().map(TxCore::phase)
     }
 
+    #[cfg(test)]
     #[inline]
-    pub(super) fn set_phase(&mut self, next: TxPhase) {
-        if let TxState::InTx { phase, .. } = self {
-            *phase = next;
-        }
+    pub(super) fn is_prepared(&self) -> bool {
+        self.phase() == Some(TxPhase::Prepared)
     }
 
     #[inline]
     pub(super) fn is_preparing(&self) -> bool {
-        matches!(
-            self,
-            TxState::InTx {
-                phase: TxPhase::Preparing,
-                ..
-            }
-        )
-    }
-
-    #[inline]
-    pub(super) fn is_prepared(&self) -> bool {
-        matches!(
-            self,
-            TxState::InTx {
-                phase: TxPhase::Prepared,
-                ..
-            }
-        )
-    }
-
-    #[inline]
-    pub(super) fn is_sync_in_flight(&self) -> bool {
-        matches!(
-            self,
-            TxState::InTx {
-                phase: TxPhase::SyncInFlight,
-                ..
-            }
-        )
+        self.core().is_some_and(TxCore::is_preparing)
     }
 
     #[inline]
     pub(super) fn pending_record_count(&self) -> u32 {
-        self.any_tx().map_or(0, |tx| tx.pending_record_count)
+        self.core().map_or(0, TxCore::pending_record_count)
+    }
+
+    #[inline]
+    pub(super) fn pending_bytes(&self) -> usize {
+        self.core().map_or(0, TxCore::pending_bytes)
+    }
+
+    #[inline]
+    pub(super) fn statement_savepoint_active(&self) -> bool {
+        self.core().is_some_and(TxCore::statement_savepoint_active)
     }
 
     #[cfg(test)]
     #[inline]
     pub(super) fn pending_sync(&self) -> bool {
-        self.any_tx().is_some_and(|tx| tx.pending_sync)
+        self.core().is_some_and(TxCore::pending_sync)
     }
 
     #[inline]
-    pub(super) fn take_to_idle(&mut self) -> Option<(TxPhase, Box<ActiveTx>)> {
+    pub(super) fn can_record_write(
+        &self,
+        poisoned: bool,
+        scope: WriteScope,
+        record_count: usize,
+        batch_bytes: usize,
+        max_transaction_bytes: usize,
+    ) -> Result<bool, TxError> {
+        let health = if poisoned {
+            HealthState::Poisoned
+        } else {
+            HealthState::Healthy
+        };
+        tx_fsm::can_record_write(
+            health,
+            self.core(),
+            scope,
+            record_count,
+            batch_bytes,
+            max_transaction_bytes,
+        )
+    }
+
+    #[inline]
+    fn take_parts(&mut self) -> (TxCoreState, Option<Box<ActiveTxData>>) {
         match core::mem::take(self) {
-            TxState::Idle => None,
-            TxState::InTx { phase, tx } => Some((phase, tx)),
+            Self::Idle => (TxCoreState::Idle, None),
+            Self::InTx { core, data } => (TxCoreState::InTx(core), Some(data)),
         }
+    }
+
+    #[inline]
+    fn install_in_tx(&mut self, core: TxCore, data: Box<ActiveTxData>) {
+        *self = Self::InTx { core, data };
     }
 }
 
@@ -704,19 +643,68 @@ impl TxOverlay {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct SavepointMarker {
-    pub(super) sp_id: i32,
-    pub(super) buf_offset: usize,
-    pub(super) record_count: u32,
-    pub(super) pending_tx_bytes: usize,
-    pub(super) pending_tx_sync: bool,
-    pub(super) implicit_tx: bool,
-    pub(super) undo_len: usize,
-    pub(super) meta: SavepointMeta,
-}
-
 impl<FS: PlatformFs> StorageEngine<FS> {
+    pub(super) fn tx_error_to_io(&self, err: TxError) -> io::Error {
+        match err {
+            TxError::Poisoned => self
+                .check_not_poisoned()
+                .err()
+                .unwrap_or_else(|| io::Error::other("engine is poisoned and must be reopened")),
+            TxError::Busy => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "database is locked by another connection's active transaction",
+            ),
+            TxError::TxBudgetExceeded => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction exceeds max_transaction_bytes budget",
+            ),
+            TxError::TooManyRecords => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many records in transaction",
+            ),
+            TxError::UnknownSavepoint(sp_id) => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot roll back to unknown savepoint {sp_id}"),
+            ),
+            TxError::InvalidPhase => io::Error::other("invalid transaction state transition"),
+        }
+    }
+
+    pub(super) fn apply_tx_event(
+        &mut self,
+        event: TxEvent,
+    ) -> Result<(TxEffects, Option<Box<ActiveTxData>>), TxError> {
+        let health = if self.is_poisoned() {
+            HealthState::Poisoned
+        } else {
+            HealthState::Healthy
+        };
+        let (prev_core, data_opt) = self.tx_state.take_parts();
+        let machine = TxMachine::from_parts(health, prev_core);
+        let (next_machine, outcome) = tx_fsm::step(machine, event);
+        let taken = match (next_machine.state, data_opt) {
+            (TxCoreState::InTx(core), Some(data)) => {
+                self.tx_state.install_in_tx(core, data);
+                None
+            }
+            (TxCoreState::InTx(core), None) => {
+                debug_assert!(
+                    outcome
+                        .as_ref()
+                        .is_ok_and(|eff| eff.iter().any(|e| matches!(e, TxEffect::InitTxData)))
+                );
+                self.in_flight_autocommit_blob_starts.clear();
+                let start_meta = self.capture_initial_tx_meta_snapshot();
+                let buf = self.take_scratch_tx_buf();
+                let data = Box::new(ActiveTxData::new(start_meta, buf));
+                self.tx_state.install_in_tx(core, data);
+                None
+            }
+            (TxCoreState::Idle, data) => data,
+        };
+        outcome.map(|effects| (effects, taken))
+    }
+
     /// Returns `true` if an explicit or savepoint-backed transaction is currently active.
     #[inline]
     pub fn in_active_transaction(&self) -> bool {
@@ -728,17 +716,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// [`crate::wal::WalRecord`] entries into a single atomic [`WalBatch`] flushed on [`Self::commit_transaction`].
     pub fn begin_transaction(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        if let Some(tx) = self.tx_state.any_tx_mut() {
-            tx.depth = tx.depth.checked_add(1).expect("transaction depth overflow");
-        } else {
-            self.in_flight_autocommit_blob_starts.clear();
-            let start_meta = self.capture_initial_tx_meta_snapshot();
-            let buf = self.take_scratch_tx_buf();
-            self.tx_state = TxState::InTx {
-                phase: TxPhase::Active,
-                tx: Box::new(ActiveTx::new(None, start_meta, buf)),
-            };
-        }
+        let _ = self.apply_tx_event(TxEvent::Begin);
     }
 
     /// Begins an explicit transaction owned by SQLite connection `conn_id`.
@@ -746,25 +724,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// an active transaction on this `StorageEngine`.
     pub fn begin_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.check_not_poisoned()?;
-        if let Some(tx) = self.tx_state.any_tx_mut() {
-            if tx.owner_conn != Some(conn_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "database is locked by another connection's active transaction",
-                ));
-            }
-            tx.depth = tx.depth.checked_add(1).expect("transaction depth overflow");
-        } else {
-            self.in_flight_autocommit_blob_starts.clear();
-            let start_meta = self.capture_initial_tx_meta_snapshot();
-            let buf = self.take_scratch_tx_buf();
-            self.tx_state = TxState::InTx {
-                phase: TxPhase::Active,
-                tx: Box::new(ActiveTx::new(Some(conn_id), start_meta, buf)),
-            };
-        }
-        Ok(())
+        self.apply_tx_event(TxEvent::BeginForConn { conn_id })
+            .map(|_| ())
+            .map_err(|e| self.tx_error_to_io(e))
     }
 
     /// Begins (or joins) the engine transaction for SQLite connection `conn_id` on behalf of
@@ -775,63 +737,29 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         conn_id: usize,
         vtab_id: usize,
     ) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        self.check_write_allowed_for_conn(conn_id)?;
-        if !self.tx_state.is_active() {
-            self.begin_transaction_for_conn(conn_id)?;
-        } else {
-            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        }
-        if let Some(tx) = self.tx_state.active_tx_mut() {
-            if !tx.vtabs.contains(&vtab_id) {
-                tx.vtabs.push(vtab_id);
-                tx.synced_vtabs.clear();
-                tx.sync_durability_upgrade = false;
-            }
-        }
-        Ok(())
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.apply_tx_event(TxEvent::BeginVtab { conn_id, vtab_id })
+            .map(|_| ())
+            .map_err(|e| self.tx_error_to_io(e))
     }
 
     /// Registers an already-created `vtab_id` (`p_vtab as usize`) with the active transaction
     /// owned by `conn_id` (used when `xCreate` adds a table without SQLite invoking `xBegin`).
     pub(crate) fn attach_vtab_to_tx(&mut self, conn_id: usize, vtab_id: usize) {
-        if let Some(tx) = self
-            .tx_state
-            .active_tx_mut()
-            .filter(|tx| tx.owner_conn == Some(conn_id))
-        {
-            if !tx.vtabs.contains(&vtab_id) {
-                tx.vtabs.push(vtab_id);
-                tx.synced_vtabs.clear();
-                tx.sync_durability_upgrade = false;
-            }
-        }
+        let _ = self.apply_tx_event(TxEvent::AttachVtab { conn_id, vtab_id });
     }
 
     /// Removes `vtab_id` from the active transaction's participating tables on disconnect.
     pub(crate) fn detach_vtab_from_tx(&mut self, conn_id: usize, vtab_id: usize) {
-        if let Some(tx) = self
-            .tx_state
-            .active_tx_mut()
-            .filter(|tx| tx.owner_conn == Some(conn_id))
-        {
-            tx.vtabs.retain(|&id| id != vtab_id);
-            tx.synced_vtabs.retain(|&id| id != vtab_id);
-        }
+        let _ = self.apply_tx_event(TxEvent::DetachVtab { conn_id, vtab_id });
     }
 
     /// Returns the effective durability of the active transaction, upgrading `fallback` if any
     /// participating table requested synchronous durability.
     pub(crate) fn effective_tx_durability(&self, fallback: WriteDurability) -> WriteDurability {
-        if self
-            .tx_state
-            .any_tx()
-            .is_some_and(|tx| tx.pending_sync || tx.sync_durability_upgrade)
-        {
-            WriteDurability::SyncTransactional
-        } else {
-            fallback
-        }
+        self.tx_state
+            .core()
+            .map_or(fallback, |core| core.effective_durability(fallback))
     }
 
     /// Records that `vtab_id` has reached `xSync` with `durability` and returns `true` when all
@@ -842,35 +770,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         vtab_id: usize,
         durability: WriteDurability,
     ) -> bool {
-        let Some(tx) = self.tx_state.active_tx_mut() else {
+        let Ok((effects, _)) = self.apply_tx_event(TxEvent::VtabSync {
+            vtab_id,
+            durability,
+        }) else {
             return true;
         };
-        if durability == WriteDurability::SyncTransactional {
-            tx.sync_durability_upgrade = true;
+        for eff in effects.iter() {
+            if let TxEffect::VtabSyncOutcome { all_synced } = eff {
+                return all_synced;
+            }
         }
-        if !tx.synced_vtabs.contains(&vtab_id) {
-            tx.synced_vtabs.push(vtab_id);
-        }
-        let all_synced = tx.vtabs.iter().all(|id| tx.synced_vtabs.contains(id));
-        if all_synced {
-            tx.synced_vtabs.clear();
-        }
-        all_synced
+        true
     }
 
     /// Whether `conn_id` has a transaction open in the engine (it has written since `BEGIN`).
     pub(crate) fn conn_has_open_transaction(&self, conn_id: usize) -> bool {
         self.tx_state
-            .active_tx()
-            .is_some_and(|tx| tx.owner_conn == Some(conn_id))
+            .active_core()
+            .is_some_and(|core| core.owner_conn() == Some(conn_id))
     }
 
     /// Checks whether `conn_id` is permitted to mutate this `StorageEngine`.
     /// Returns `io::ErrorKind::WouldBlock` (`SQLITE_BUSY`) if another connection holds an active transaction.
     #[inline]
     pub fn check_write_allowed_for_conn(&self, conn_id: usize) -> io::Result<()> {
-        if let Some(tx) = self.tx_state.active_tx() {
-            if tx.owner_conn != Some(conn_id) {
+        if let Some(core) = self.tx_state.active_core() {
+            if core.owner_conn() != Some(conn_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "database is locked by another connection's active transaction",
@@ -929,30 +855,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// flushes/syncs out-of-line blob segments, and pre-checks WAL capacity so any fallible I/O
     /// or space errors surface during `xSync` while `xRollback` can still cleanly undo all state.
     pub fn prepare_commit_transaction(&mut self, durability: WriteDurability) -> io::Result<()> {
-        if !self.tx_state.is_active() {
+        let (effects, _) = self
+            .apply_tx_event(TxEvent::BeginPrepare { durability })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        let Some(effective_durability) = effects.iter().find_map(|eff| match eff {
+            TxEffect::RunPrepare {
+                effective_durability,
+            } => Some(effective_durability),
+            _ => None,
+        }) else {
             return Ok(());
-        }
-        self.check_not_poisoned()?;
-        let effective_durability = {
-            let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() else {
-                return Ok(());
-            };
-            let requested_sync =
-                durability == WriteDurability::SyncTransactional || tx.sync_durability_upgrade;
-            let need_sync_upgrade = requested_sync && !tx.pending_sync;
-            if *phase == TxPhase::Prepared && !need_sync_upgrade {
-                return Ok(());
-            }
-            if requested_sync {
-                tx.pending_sync = true;
-            }
-            let effective = if tx.pending_sync {
-                WriteDurability::SyncTransactional
-            } else {
-                WriteDurability::BufferedFast
-            };
-            *phase = TxPhase::Preparing;
-            effective
         };
 
         let res: io::Result<()> = (|| {
@@ -1008,16 +920,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             Ok(())
         })();
 
-        match res {
-            Ok(()) => {
-                self.tx_state.set_phase(TxPhase::Prepared);
-                Ok(())
-            }
-            Err(e) => {
-                self.tx_state.set_phase(TxPhase::Active);
-                Err(e)
-            }
-        }
+        let _ = self.apply_tx_event(TxEvent::FinishPrepare { ok: res.is_ok() });
+        res
+    }
+
+    #[inline]
+    fn tx_has_metadata_changes(&self) -> bool {
+        let mem_should_flush = self.memtable.should_flush();
+        self.tx_state.active_tx().is_some_and(|tx| {
+            tx.quotas_modified
+                || !tx.dropped_tables.is_empty()
+                || tx.deferred_flush
+                || tx.deferred_compact
+                || mem_should_flush
+        })
     }
 
     /// Commits an explicit batch transaction (`COMMIT`), writing all coalesced [`crate::wal::WalRecord`]
@@ -1029,53 +945,117 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// persistence, compaction, flush) fails; such failures are counted in
     /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
-        let Some(tx) = self.tx_state.active_tx_mut() else {
-            return Ok(());
-        };
-        if tx.depth.get() > 1 {
-            tx.depth = core::num::NonZeroUsize::new(tx.depth.get() - 1).unwrap();
-            return Ok(());
-        }
-        if let Err(e) = self.check_not_poisoned() {
-            let _ = self.rollback_transaction();
-            return Err(e);
-        }
-        if !self.tx_state.is_prepared() {
-            let durability = self.effective_tx_durability(WriteDurability::BufferedFast);
-            if let Err(e) = self.prepare_commit_transaction(durability) {
+        let has_metadata_changes = self.tx_has_metadata_changes();
+        let (effects, _) = match self.apply_tx_event(TxEvent::PlanCommit {
+            conn_id: None,
+            defer_sync_allowed: false,
+            can_group: false,
+            has_metadata_changes,
+            buf_len_exceeds_chunk: false,
+        }) {
+            Ok(res) => res,
+            Err(err) => {
+                let io_err = self.tx_error_to_io(err);
                 let _ = self.rollback_transaction();
-                return Err(e);
+                return Err(io_err);
+            }
+        };
+        let mut need_prepare = false;
+        let mut clear_empty_overlay = false;
+        let mut need_drain = false;
+        let mut early_done = false;
+        let mut had_effect = false;
+        for eff in effects.iter() {
+            had_effect = true;
+            match eff {
+                TxEffect::DecDepthDone => early_done = true,
+                TxEffect::EnsurePreparedBeforeCommit {
+                    effective_durability,
+                } => {
+                    need_prepare = true;
+                    if let Err(e) = self.prepare_commit_transaction(effective_durability) {
+                        let _ = self.rollback_transaction();
+                        return Err(e);
+                    }
+                }
+                TxEffect::ClearEmptyOverlay => clear_empty_overlay = true,
+                TxEffect::DrainPendingGroup => need_drain = true,
+                _ => unreachable!("unexpected effect from commit PlanCommit"),
             }
         }
-        let mem_should_flush = self.memtable.should_flush();
-        let need_drain = if let Some(tx) = self.tx_state.active_tx_mut() {
-            let has_metadata_changes = tx.quotas_modified
-                || !tx.dropped_tables.is_empty()
-                || tx.deferred_flush
-                || tx.deferred_compact
-                || mem_should_flush;
-            if tx.pending_record_count == 0 && !has_metadata_changes {
-                // Nothing of its own to publish: drop what it saw from earlier, undurable commits.
-                tx.overlay.clear();
-                false
-            } else {
-                true
+        if !had_effect || early_done {
+            return Ok(());
+        }
+        if need_prepare {
+            let has_metadata_changes = self.tx_has_metadata_changes();
+            let (effects, _) = match self.apply_tx_event(TxEvent::PlanCommit {
+                conn_id: None,
+                defer_sync_allowed: false,
+                can_group: false,
+                has_metadata_changes,
+                buf_len_exceeds_chunk: false,
+            }) {
+                Ok(res) => res,
+                Err(err) => {
+                    let io_err = self.tx_error_to_io(err);
+                    let _ = self.rollback_transaction();
+                    return Err(io_err);
+                }
+            };
+            for eff in effects.iter() {
+                match eff {
+                    TxEffect::ClearEmptyOverlay => clear_empty_overlay = true,
+                    TxEffect::DrainPendingGroup => need_drain = true,
+                    _ => unreachable!("unexpected post-prepare effect from PlanCommit"),
+                }
             }
-        } else {
-            false
-        };
+        }
+        if clear_empty_overlay {
+            if let Some(tx) = self.tx_state.active_tx_mut() {
+                tx.overlay.clear();
+            }
+        }
         if need_drain {
             if let Err(e) = self.drain_pending_durable() {
                 let _ = self.rollback_transaction();
                 return Err(e);
             }
         }
-        self.tx_state.set_phase(TxPhase::FlushingWal);
-        if let Err(e) = self.flush_pending_tx_records() {
+        let (effects, _) = match self.apply_tx_event(TxEvent::EnterWalFlush {
+            defer_sync_barrier: false,
+        }) {
+            Ok(res) => res,
+            Err(err) => {
+                let io_err = self.tx_error_to_io(err);
+                let _ = self.rollback_transaction();
+                return Err(io_err);
+            }
+        };
+        let (durability, record_count) = match effects.iter().next() {
+            Some(TxEffect::FlushWal {
+                durability,
+                record_count,
+                ..
+            }) => (durability, record_count),
+            _ => unreachable!("EnterWalFlush must emit FlushWal"),
+        };
+        if let Err(e) = self.flush_pending_tx_records(durability, record_count) {
             let _ = self.rollback_transaction();
             return Err(e);
         }
-        self.publish_committed_transaction();
+        let (effects, taken) = self
+            .apply_tx_event(TxEvent::CompleteWalFlush {
+                mode: FlushCompleteMode::PublishImmediate,
+            })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        debug_assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, TxEffect::PublishCommittedTx))
+        );
+        if let Some(data) = taken {
+            self.publish_committed_transaction_data(data);
+        }
         Ok(())
     }
 
@@ -1090,22 +1070,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         &mut self,
         conn_id: usize,
     ) -> io::Result<CommitStep<FS::File>> {
-        self.check_write_allowed_for_conn(conn_id)?;
-        let deferrable = matches!(
-            &self.tx_state,
-            TxState::InTx {
-                phase: TxPhase::Prepared,
-                tx,
-            } if tx.depth.get() == 1
-                && tx.pending_sync
-                && tx.pending_record_count > 0
-                && tx.pending_buf.len() <= MAX_WAL_CHUNK_BYTES
-        );
-        if !deferrable {
-            self.commit_transaction()?;
-            return Ok(CommitStep::Done);
-        }
-        let groupable = self.capped_tables.is_empty()
+        let can_group = self.capped_tables.is_empty()
             && !self.memtable.should_flush()
             && !self.has_pending_corrupt_evictions()
             && self.tx_state.active_tx().is_some_and(|tx| {
@@ -1114,46 +1079,99 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     && !tx.deferred_flush
                     && !tx.deferred_compact
             });
-        if !groupable {
-            if let Err(e) = self.drain_pending_durable() {
+        let buf_len_exceeds_chunk = self
+            .tx_state
+            .active_tx()
+            .is_some_and(|tx| tx.pending_buf.len() > MAX_WAL_CHUNK_BYTES);
+        let (effects, _) = match self.apply_tx_event(TxEvent::PlanCommit {
+            conn_id: Some(conn_id),
+            defer_sync_allowed: true,
+            can_group,
+            has_metadata_changes: false,
+            buf_len_exceeds_chunk,
+        }) {
+            Ok(res) => res,
+            Err(TxError::Busy) => return Err(self.tx_error_to_io(TxError::Busy)),
+            Err(err) => {
+                let io_err = self.tx_error_to_io(err);
                 let _ = self.rollback_transaction();
-                return Err(e);
+                return Err(io_err);
+            }
+        };
+        for eff in effects.iter() {
+            match eff {
+                TxEffect::FallbackFullCommit => {
+                    self.commit_transaction()?;
+                    return Ok(CommitStep::Done);
+                }
+                TxEffect::DrainPendingGroup => {
+                    if let Err(e) = self.drain_pending_durable() {
+                        let _ = self.rollback_transaction();
+                        return Err(e);
+                    }
+                }
+                _ => unreachable!("unexpected effect in begin_commit_for_conn PlanCommit"),
             }
         }
 
-        // Move to `FlushingWal` during the append so a full WAL can rotate without deferring
-        // while still retaining the pre-transaction `start_meta` snapshot.
-        self.tx_state.set_phase(TxPhase::FlushingWal);
-        self.storage.set_sync_defer_barrier(true);
-        let appended = self.flush_pending_tx_records();
+        let (effects, _) = match self.apply_tx_event(TxEvent::EnterWalFlush {
+            defer_sync_barrier: true,
+        }) {
+            Ok(res) => res,
+            Err(err) => {
+                let io_err = self.tx_error_to_io(err);
+                let _ = self.rollback_transaction();
+                return Err(io_err);
+            }
+        };
+        let (durability, record_count, defer_sync_barrier) = match effects.iter().next() {
+            Some(TxEffect::FlushWal {
+                durability,
+                record_count,
+                defer_sync_barrier,
+            }) => (durability, record_count, defer_sync_barrier),
+            _ => unreachable!("EnterWalFlush must emit FlushWal"),
+        };
+        self.storage.set_sync_defer_barrier(defer_sync_barrier);
+        let appended = self.flush_pending_tx_records(durability, record_count);
         self.storage.set_sync_defer_barrier(false);
         if let Err(e) = appended {
             let _ = self.rollback_transaction();
             return Err(e);
         }
-        if !groupable {
-            self.tx_state.set_phase(TxPhase::SyncInFlight);
-            return Ok(CommitStep::AwaitingSync(self.sync_wal().file_handle()));
-        }
 
-        let lsn = self.next_lsn - 1;
-        let Some((_, mut tx)) = self.tx_state.take_to_idle() else {
-            unreachable!("FlushingWal tx disappeared before group handoff");
+        let mode = if can_group {
+            FlushCompleteMode::HandOffGroup
+        } else {
+            FlushCompleteMode::AwaitSync
         };
-        let own_entries = core::mem::take(&mut tx.overlay.map);
-        debug_assert!(
-            own_entries
-                .values()
-                .all(|entry| entry.lsn >= tx.start_meta.next_lsn)
-        );
-        self.pending_group.push_back((lsn, own_entries));
-        self.commit_gate.note_appended(lsn);
-        self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
-        Ok(CommitStep::AwaitingGroup {
-            lsn,
-            file: self.sync_wal().file_handle(),
-            gate: Arc::clone(&self.commit_gate),
-        })
+        let (effects, taken) = self
+            .apply_tx_event(TxEvent::CompleteWalFlush { mode })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        match effects.iter().next() {
+            Some(TxEffect::ReturnAwaitingSync) => {
+                Ok(CommitStep::AwaitingSync(self.sync_wal().file_handle()))
+            }
+            Some(TxEffect::HandOffPendingGroup) => {
+                let mut data = taken.expect("HandOffPendingGroup must take ActiveTxData");
+                let lsn = self.next_lsn - 1;
+                let own_entries = core::mem::take(&mut data.overlay.map);
+                debug_assert!(
+                    own_entries
+                        .values()
+                        .all(|entry| entry.lsn >= data.start_meta.next_lsn)
+                );
+                self.pending_group.push_back((lsn, own_entries));
+                self.commit_gate.note_appended(lsn);
+                self.release_tx_slot(data.pending_buf, data.unique_marker_modified);
+                Ok(CommitStep::AwaitingGroup {
+                    lsn,
+                    file: self.sync_wal().file_handle(),
+                    gate: Arc::clone(&self.commit_gate),
+                })
+            }
+            _ => unreachable!("unexpected effect in CompleteWalFlush"),
+        }
     }
 
     /// Completes a commit started by [`Self::begin_commit_for_conn`] with the flush result.
@@ -1161,29 +1179,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A failed flush leaves the durability of the batch unknown, so the engine is poisoned and
     /// the transaction is discarded from memory.
     pub(crate) fn finish_commit_for_conn(&mut self, flushed: io::Result<()>) -> io::Result<()> {
-        if self.tx_state.is_sync_in_flight() {
-            self.tx_state.set_phase(TxPhase::FlushingWal);
-        }
-        if let Err(e) = self.check_not_poisoned() {
-            if self.tx_state.is_in_tx() {
-                let _ = self.rollback_transaction();
+        let ok = flushed.is_ok();
+        let (effects, taken) = match self.apply_tx_event(TxEvent::FinishSyncCommit { ok }) {
+            Ok(res) => res,
+            Err(TxError::Poisoned) => {
+                let poison_err = self.tx_error_to_io(TxError::Poisoned);
+                if self.tx_state.is_in_tx() {
+                    let _ = self.rollback_transaction();
+                }
+                return Err(poison_err);
             }
-            return Err(e);
-        }
-        match flushed {
-            Ok(()) => {
-                // The flush ran after the batch was written and no other append can have
-                // followed it, because the transaction held the writer slot.
-                self.wal_links.sync_flushed_all();
-                self.publish_committed_transaction();
-                Ok(())
+            Err(err) => return Err(self.tx_error_to_io(err)),
+        };
+        if effects
+            .iter()
+            .any(|e| matches!(e, TxEffect::PublishCommittedTx))
+        {
+            self.wal_links.sync_flushed_all();
+            if let Some(data) = taken {
+                self.publish_committed_transaction_data(data);
             }
-            Err(e) => {
-                let e = self.poison(e);
-                let _ = self.rollback_transaction();
-                Err(e)
-            }
+            return Ok(());
         }
+        let err = flushed.expect_err("non-publish FinishSyncCommit must carry flush error");
+        let poisoned_err = self.storage.poison(err);
+        if let Some(data) = taken {
+            self.restore_aborted_tx_data(data);
+        }
+        Err(poisoned_err)
     }
 
     /// Publishes every group-committed batch up to `target` after the leader's device flush.
@@ -1268,10 +1291,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    fn bump_table_epochs_from_overlay_map(
-        &mut self,
+    fn bump_table_epochs_for_ids(&mut self, tids: &[u16]) {
+        for &tid in tids {
+            self.bump_table_mutation_epoch(tid);
+        }
+    }
+
+    fn collect_table_ids_from_overlay_map(
         map: &BTreeMap<Vec<u8>, crate::memtable::MemEntry>,
-    ) {
+    ) -> Vec<u16> {
         let mut tids: Vec<u16> = Vec::new();
         let mut last_tid: Option<u16> = None;
         for key in map.keys() {
@@ -1292,16 +1320,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 tids.push(tid);
             }
         }
-        for tid in tids {
-            self.bump_table_mutation_epoch(tid);
-        }
+        tids
     }
 
-    fn bump_table_epochs_from_undo_suffix(
-        &mut self,
+    fn collect_table_ids_from_undo_suffix(
         undo: &[(Vec<u8>, Option<MemEntry>)],
         undo_target_len: usize,
-    ) {
+    ) -> Vec<u16> {
         let mut tids: Vec<u16> = Vec::new();
         let mut last_tid: Option<u16> = None;
         for (key, _) in &undo[undo_target_len..] {
@@ -1324,9 +1349,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
         }
-        for tid in tids {
-            self.bump_table_mutation_epoch(tid);
-        }
+        tids
     }
 
     fn absorb_durable_through(&mut self, target: u64) {
@@ -1382,11 +1405,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Makes a durably logged transaction visible and runs the post-commit maintenance.
-    fn publish_committed_transaction(&mut self) {
+    fn publish_committed_transaction_data(&mut self, mut tx: Box<ActiveTxData>) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        let Some((_, mut tx)) = self.tx_state.take_to_idle() else {
-            return;
-        };
         // The WAL batch(es) are durably appended: publish the overlay into the MemTable by
         // moving its entries (no clones). On the failure path above the overlay is discarded
         // and the MemTable never saw any of the transaction's data.
@@ -1511,24 +1531,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.commit_transaction()
     }
 
-    /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_buf`
-    /// mutations and restoring `MemTable`, `capped_tables`, and blob `dead_bytes` in
-    /// $O(\text{tx mutations})$ time via the in-memory undo log.
-    ///
-    /// SQLite invokes `xRollback` once per virtual table that took part in the transaction, so a
-    /// rollback with no active transaction is a no-op: there is no start snapshot to restore.
-    pub fn rollback_transaction(&mut self) -> io::Result<()> {
-        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        let Some((phase, tx)) = self.tx_state.take_to_idle() else {
-            return Ok(());
-        };
-        self.bump_table_epochs_from_overlay_map(&tx.overlay.map);
-        if phase == TxPhase::SyncInFlight {
-            let _ = self.poison(io::Error::other("WAL sync interrupted before completion"));
-        }
-        self.restore_engine_meta_from_snapshot(&tx.start_meta);
-        let had_deferred = tx.deferred_flush || tx.deferred_compact;
-        self.release_tx_slot(tx.pending_buf, tx.unique_marker_modified);
+    fn restore_aborted_tx_data(&mut self, data: Box<ActiveTxData>) {
+        let tids = Self::collect_table_ids_from_overlay_map(&data.overlay.map);
+        self.bump_table_epochs_for_ids(&tids);
+        self.restore_engine_meta_from_snapshot(&data.start_meta);
+        let had_deferred = data.deferred_flush || data.deferred_compact;
+        self.release_tx_slot(data.pending_buf, data.unique_marker_modified);
         if had_deferred
             && !self.is_poisoned()
             && (self.compaction_pending()
@@ -1539,13 +1547,110 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 hook();
             }
         }
+    }
+
+    fn rollback_inner(&mut self, conn_id: Option<usize>) -> io::Result<()> {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let (effects, taken) = self
+            .apply_tx_event(TxEvent::Rollback { conn_id })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        if effects
+            .iter()
+            .any(|e| matches!(e, TxEffect::PoisonEngineInterruptedSync))
+        {
+            let _ = self
+                .storage
+                .poison(io::Error::other("WAL sync interrupted before completion"));
+        }
+        if let Some(data) = taken {
+            self.restore_aborted_tx_data(data);
+        }
         Ok(())
+    }
+
+    /// Aborts an explicit batch transaction (`ROLLBACK`), discarding all buffered `pending_buf`
+    /// mutations and restoring `MemTable`, `capped_tables`, and blob `dead_bytes` in
+    /// $O(\text{tx mutations})$ time via the in-memory undo log.
+    ///
+    /// SQLite invokes `xRollback` once per virtual table that took part in the transaction, so a
+    /// rollback with no active transaction is a no-op: there is no start snapshot to restore.
+    pub fn rollback_transaction(&mut self) -> io::Result<()> {
+        self.rollback_inner(None)
     }
 
     /// Aborts an explicit transaction for SQLite connection `conn_id`.
     pub fn rollback_transaction_for_conn(&mut self, conn_id: usize) -> io::Result<()> {
-        self.check_write_allowed_for_conn(conn_id)?;
-        self.rollback_transaction()
+        self.rollback_inner(Some(conn_id))
+    }
+
+    fn savepoint_inner(
+        &mut self,
+        owner_conn: Option<usize>,
+        sp_id: i32,
+        is_statement: bool,
+        table_id: u16,
+        check_poison: bool,
+    ) -> io::Result<()> {
+        let (effects, _) = self
+            .apply_tx_event(TxEvent::Savepoint {
+                owner_conn,
+                sp_id,
+                is_statement,
+                check_poison,
+            })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        for eff in effects.iter() {
+            if let TxEffect::CaptureSavepointPayload {
+                is_statement,
+                zero_buf_offset,
+                ..
+            } = eff
+            {
+                let (buf_offset, undo_len, meta) = {
+                    let tx = self
+                        .tx_state
+                        .active_tx()
+                        .expect("savepoint must have an active transaction");
+                    let buf_offset = if zero_buf_offset {
+                        0
+                    } else {
+                        tx.pending_buf.len()
+                    };
+                    let undo_len = tx.overlay.undo.len();
+                    let meta = if is_statement {
+                        SavepointMeta::Statement(StatementMetaSnapshot {
+                            next_lsn: self.next_lsn,
+                            table_id,
+                            capped_table: self.capped_tables.get(&table_id).cloned(),
+                            table_has_synthetic_rowids: self
+                                .table_has_synthetic_rowids
+                                .get(&table_id)
+                                .copied(),
+                            table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
+                            blob_undo_len: tx.statement_blob_undo.len(),
+                            lru_clears_len: tx.pending_lru_clears.len(),
+                        })
+                    } else {
+                        SavepointMeta::Full(Box::new(self.capture_savepoint_tx_meta_snapshot(tx)))
+                    };
+                    (buf_offset, undo_len, meta)
+                };
+                if let Some(tx) = self.tx_state.active_tx_mut() {
+                    tx.savepoint_payloads.push(SavepointPayload {
+                        buf_offset,
+                        undo_len,
+                        meta,
+                    });
+                }
+                debug_assert_eq!(
+                    self.tx_state.core().map_or(0, |c| c.savepoints().len()),
+                    self.tx_state
+                        .any_tx()
+                        .map_or(0, |d| d.savepoint_payloads.len())
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Opens a transaction savepoint (`xSavepoint`).
@@ -1556,44 +1661,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// before the table had any state in the transaction, so each of them stands for the
     /// transaction's start (see [`Self::rollback_to_savepoint`]).
     pub fn savepoint(&mut self, sp_id: i32) {
-        let mut implicit_tx = false;
-        if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
-            tx.invalidate_prepare(phase);
-        } else {
-            self.begin_transaction();
-            implicit_tx = true;
-        }
-        let marker = {
-            let tx = self
-                .tx_state
-                .active_tx()
-                .expect("savepoint must have an active transaction");
-            // Every table of the engine that joins the transaction is announced the innermost open
-            // savepoint, so a savepoint can arrive again, now with the changes other tables made
-            // since it was opened. The marker taken when it first arrived is the right one.
-            if tx.savepoints.iter().any(|s| s.sp_id == sp_id) {
-                return;
-            }
-            let buf_offset = if tx.pending_record_count == 0 {
-                0
-            } else {
-                tx.pending_buf.len()
-            };
-            let meta_snapshot = self.capture_savepoint_tx_meta_snapshot(tx);
-            SavepointMarker {
-                sp_id,
-                buf_offset,
-                record_count: tx.pending_record_count,
-                pending_tx_bytes: tx.pending_bytes,
-                pending_tx_sync: tx.pending_sync,
-                implicit_tx,
-                undo_len: tx.overlay.undo.len(),
-                meta: SavepointMeta::Full(Box::new(meta_snapshot)),
-            }
-        };
-        if let Some(tx) = self.tx_state.active_tx_mut() {
-            tx.savepoints.push(marker);
-        }
+        let _ = self.savepoint_inner(None, sp_id, false, 0, false);
     }
 
     /// Opens a lightweight statement-scoped savepoint for a single `vtab_update` call on
@@ -1603,68 +1671,48 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         conn_id: usize,
         table_id: u16,
     ) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        self.check_write_allowed_for_conn(conn_id)?;
-        let mut implicit_tx = false;
-        if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
-            tx.invalidate_prepare(phase);
-        } else {
-            self.begin_transaction();
-            if let Some(tx) = self.tx_state.active_tx_mut() {
-                tx.owner_conn = Some(conn_id);
-            }
-            implicit_tx = true;
-        }
-        let marker = {
-            let tx = self
-                .tx_state
-                .active_tx()
-                .expect("statement savepoint must have an active transaction");
-            if tx.savepoints.iter().any(|s| s.sp_id == STATEMENT_SAVEPOINT) {
-                return Ok(());
-            }
-            let buf_offset = if tx.pending_record_count == 0 {
-                0
-            } else {
-                tx.pending_buf.len()
-            };
-            let stmt_meta = StatementMetaSnapshot {
-                next_lsn: self.next_lsn,
-                table_id,
-                capped_table: self.capped_tables.get(&table_id).cloned(),
-                table_has_synthetic_rowids: self.table_has_synthetic_rowids.get(&table_id).copied(),
-                table_has_row_meta: self.table_has_row_meta.get(&table_id).copied(),
-                blob_undo_len: tx.statement_blob_undo.len(),
-                lru_clears_len: tx.pending_lru_clears.len(),
-            };
-            SavepointMarker {
-                sp_id: STATEMENT_SAVEPOINT,
-                buf_offset,
-                record_count: tx.pending_record_count,
-                pending_tx_bytes: tx.pending_bytes,
-                pending_tx_sync: tx.pending_sync,
-                implicit_tx,
-                undo_len: tx.overlay.undo.len(),
-                meta: SavepointMeta::Statement(stmt_meta),
-            }
-        };
-        if let Some(tx) = self.tx_state.active_tx_mut() {
-            tx.savepoints.push(marker);
-            tx.statement_savepoint_active = true;
-        }
-        Ok(())
+        self.savepoint_inner(Some(conn_id), STATEMENT_SAVEPOINT, true, table_id, true)
     }
 
     /// Opens a transaction savepoint for SQLite connection `conn_id`.
     pub fn savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        self.check_write_allowed_for_conn(conn_id)?;
-        let was_idle = !self.tx_state.is_active();
-        self.savepoint(sp_id);
-        if was_idle {
-            if let Some(tx) = self.tx_state.active_tx_mut() {
-                tx.owner_conn = Some(conn_id);
+        self.savepoint_inner(Some(conn_id), sp_id, false, 0, true)
+    }
+
+    fn release_savepoint_inner(&mut self, conn_id: Option<usize>, sp_id: i32) -> io::Result<()> {
+        let (effects, _) = self
+            .apply_tx_event(TxEvent::ReleaseSavepoint { conn_id, sp_id })
+            .map_err(|e| self.tx_error_to_io(e))?;
+        let mut commit_implicit = false;
+        for eff in effects.iter() {
+            match eff {
+                TxEffect::TruncateSavepointPayloads {
+                    new_len,
+                    clear_overlay_undo,
+                    clear_stmt_blob_undo,
+                } => {
+                    if let Some(tx) = self.tx_state.active_tx_mut() {
+                        tx.savepoint_payloads.truncate(new_len);
+                        if clear_overlay_undo {
+                            tx.overlay.undo.clear();
+                        }
+                        if clear_stmt_blob_undo {
+                            tx.statement_blob_undo.clear();
+                        }
+                    }
+                    debug_assert_eq!(
+                        self.tx_state.core().map_or(0, |c| c.savepoints().len()),
+                        self.tx_state
+                            .any_tx()
+                            .map_or(0, |d| d.savepoint_payloads.len())
+                    );
+                }
+                TxEffect::CommitImplicitTx => commit_implicit = true,
+                _ => unreachable!("unexpected effect in ReleaseSavepoint"),
             }
+        }
+        if commit_implicit {
+            self.commit_transaction()?;
         }
         Ok(())
     }
@@ -1674,37 +1722,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// A release of an id the engine never saw (a savepoint opened before the table joined the
     /// transaction) removes every savepoint it knows with a higher id.
     pub fn release_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
-        let should_commit_implicit = {
-            let Some(tx) = self.tx_state.active_tx_mut() else {
-                return Ok(());
-            };
-            let pos = tx
-                .savepoints
-                .iter()
-                .position(|s| s.sp_id == sp_id)
-                .or_else(|| tx.savepoints.iter().position(|s| s.sp_id > sp_id));
-            if let Some(pos) = pos {
-                let implicit_tx = tx.savepoints[pos].implicit_tx;
-                tx.savepoints.truncate(pos);
-                tx.refresh_statement_savepoint_active();
-                if tx.savepoints.is_empty() {
-                    tx.overlay.undo.clear();
-                }
-                implicit_tx && tx.depth.get() == 1
-            } else {
-                false
-            }
-        };
-        if should_commit_implicit {
-            self.commit_transaction()?;
-        }
-        Ok(())
+        self.release_savepoint_inner(None, sp_id)
     }
 
     /// Releases savepoints `>= sp_id` for SQLite connection `conn_id`.
     pub fn release_savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
-        self.check_write_allowed_for_conn(conn_id)?;
-        self.release_savepoint(sp_id)
+        self.release_savepoint_inner(Some(conn_id), sp_id)
     }
 
     /// Rolls back all mutations since savepoint `sp_id` (`xRollbackTo`) in
@@ -1718,99 +1741,152 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// savepoint opened after the table joined; it is an error, so that a rollback is never
     /// silently skipped.
     pub fn rollback_to_savepoint(&mut self, sp_id: i32) -> io::Result<()> {
+        self.rollback_to_savepoint_inner(None, sp_id)
+    }
+
+    fn rollback_to_savepoint_inner(
+        &mut self,
+        conn_id: Option<usize>,
+        sp_id: i32,
+    ) -> io::Result<()> {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        let Some((_phase, mut tx)) = self.tx_state.take_to_idle() else {
-            return Ok(());
-        };
-        if tx.unique_marker_modified {
-            self.bump_unique_marker_gen();
-        }
-        tx.synced_vtabs.clear();
-        tx.sync_durability_upgrade = false;
-        let Some(pos) = tx.savepoints.iter().position(|s| s.sp_id == sp_id) else {
-            if tx.savepoints.iter().any(|s| s.sp_id < sp_id) {
-                self.tx_state = TxState::InTx {
-                    phase: TxPhase::Active,
-                    tx,
-                };
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cannot roll back to unknown savepoint {sp_id}"),
-                ));
-            }
-            self.rollback_taken_tx_to_start(&mut tx);
-            self.tx_state = TxState::InTx {
-                phase: TxPhase::Active,
-                tx,
+        let (effects, _) =
+            match self.apply_tx_event(TxEvent::RollbackToSavepoint { conn_id, sp_id }) {
+                Ok(res) => res,
+                Err(err @ TxError::UnknownSavepoint(_)) => {
+                    if self
+                        .tx_state
+                        .any_tx()
+                        .is_some_and(|tx| tx.unique_marker_modified)
+                    {
+                        self.bump_unique_marker_gen();
+                    }
+                    return Err(self.tx_error_to_io(err));
+                }
+                Err(err) => return Err(self.tx_error_to_io(err)),
             };
-            return Ok(());
-        };
-        tx.savepoints.truncate(pos + 1);
-        let marker = tx.savepoints.pop().unwrap();
-        if marker.record_count == 0 {
-            tx.pending_buf.clear();
-        } else {
-            tx.pending_buf.truncate(marker.buf_offset);
-        }
-        tx.pending_record_count = marker.record_count;
-        tx.pending_bytes = marker.pending_tx_bytes;
-        tx.pending_sync = marker.pending_tx_sync;
-        match &marker.meta {
-            SavepointMeta::Statement(st) => {
-                self.restore_statement_on_tx(&mut tx, marker.undo_len, st);
-            }
-            SavepointMeta::Full(snap) => {
-                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-                self.bump_table_epochs_from_undo_suffix(&tx.overlay.undo, marker.undo_len);
-                tx.overlay.rollback_to(marker.undo_len);
-                self.restore_engine_meta_from_snapshot(snap);
-                tx.dropped_tables.truncate(snap.dropped_tables_len);
-                tx.pending_lru_clears.truncate(snap.lru_clears_len);
-                tx.vtabs_created = snap.vtabs_created_in_tx.clone();
-                tx.quotas_modified = snap.quotas_modified_in_tx;
+        for eff in effects.iter() {
+            match eff {
+                TxEffect::BumpUniqueGenIfModified => {
+                    if self
+                        .tx_state
+                        .any_tx()
+                        .is_some_and(|tx| tx.unique_marker_modified)
+                    {
+                        self.bump_unique_marker_gen();
+                    }
+                }
+                TxEffect::RestoreTxToStart => {
+                    self.restore_tx_payload_to_start();
+                }
+                TxEffect::RestoreSavepointPayload {
+                    index,
+                    clear_pending_buf,
+                } => {
+                    self.restore_savepoint_payload(index, clear_pending_buf);
+                }
+                _ => unreachable!("unexpected effect in RollbackToSavepoint"),
             }
         }
-        tx.savepoints.push(marker);
-        tx.refresh_statement_savepoint_active();
-        self.tx_state = TxState::InTx {
-            phase: TxPhase::Active,
-            tx,
-        };
+        debug_assert_eq!(
+            self.tx_state.core().map_or(0, |c| c.savepoints().len()),
+            self.tx_state
+                .any_tx()
+                .map_or(0, |d| d.savepoint_payloads.len())
+        );
         Ok(())
     }
 
-    /// Undoes everything a taken transaction did while keeping it open.
-    fn rollback_taken_tx_to_start(&mut self, tx: &mut ActiveTx) {
+    /// Undoes everything in `ActiveTxData` back to transaction start while keeping it open.
+    fn restore_tx_payload_to_start(&mut self) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.bump_table_epochs_from_overlay_map(&tx.overlay.map);
-        tx.savepoints.clear();
-        tx.statement_savepoint_active = false;
-        tx.statement_blob_undo.clear();
-        tx.pending_lru_clears.clear();
-        tx.pending_record_count = 0;
-        tx.pending_bytes = 0;
-        tx.pending_buf.clear();
-        tx.pending_sync = false;
-        tx.overlay.clear();
-        tx.dropped_tables.truncate(tx.start_meta.dropped_tables_len);
-        tx.vtabs_created = tx.start_meta.vtabs_created_in_tx.clone();
-        tx.quotas_modified = tx.start_meta.quotas_modified_in_tx;
-        self.restore_engine_meta_from_snapshot(&tx.start_meta);
+        let (tids, start_meta) = {
+            let Some(tx) = self.tx_state.any_tx() else {
+                return;
+            };
+            (
+                Self::collect_table_ids_from_overlay_map(&tx.overlay.map),
+                tx.start_meta.clone(),
+            )
+        };
+        self.bump_table_epochs_for_ids(&tids);
+        self.restore_engine_meta_from_snapshot(&start_meta);
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            tx.savepoint_payloads.clear();
+            tx.statement_blob_undo.clear();
+            tx.pending_lru_clears.clear();
+            tx.pending_buf.clear();
+            tx.overlay.clear();
+            tx.dropped_tables.truncate(start_meta.dropped_tables_len);
+            tx.vtabs_created = start_meta.vtabs_created_in_tx;
+            tx.quotas_modified = start_meta.quotas_modified_in_tx;
+        }
     }
 
-    fn restore_statement_on_tx(
-        &mut self,
-        tx: &mut ActiveTx,
-        undo_target_len: usize,
-        st: &StatementMetaSnapshot,
-    ) {
+    fn restore_savepoint_payload(&mut self, index: usize, clear_pending_buf: bool) {
+        let Some(payload) = self.tx_state.any_tx_mut().and_then(|tx| {
+            tx.savepoint_payloads.truncate(index + 1);
+            let p = tx.savepoint_payloads.pop()?;
+            if clear_pending_buf {
+                tx.pending_buf.clear();
+            } else {
+                tx.pending_buf.truncate(p.buf_offset);
+            }
+            Some(p)
+        }) else {
+            return;
+        };
+        match &payload.meta {
+            SavepointMeta::Statement(st) => {
+                self.restore_statement_payload(payload.undo_len, st);
+            }
+            SavepointMeta::Full(snap) => {
+                self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+                let tids = self.tx_state.any_tx().map_or_else(Vec::new, |tx| {
+                    Self::collect_table_ids_from_undo_suffix(&tx.overlay.undo, payload.undo_len)
+                });
+                self.bump_table_epochs_for_ids(&tids);
+                if let Some(tx) = self.tx_state.any_tx_mut() {
+                    tx.overlay.rollback_to(payload.undo_len);
+                }
+                self.restore_engine_meta_from_snapshot(snap);
+                if let Some(tx) = self.tx_state.any_tx_mut() {
+                    tx.dropped_tables.truncate(snap.dropped_tables_len);
+                    tx.pending_lru_clears.truncate(snap.lru_clears_len);
+                    tx.vtabs_created = snap.vtabs_created_in_tx.clone();
+                    tx.quotas_modified = snap.quotas_modified_in_tx;
+                }
+            }
+        }
+        let stmt_active = self.tx_state.statement_savepoint_active();
+        if let Some(tx) = self.tx_state.any_tx_mut() {
+            if !stmt_active {
+                tx.statement_blob_undo.clear();
+            }
+            tx.savepoint_payloads.push(payload);
+        }
+    }
+
+    fn restore_statement_payload(&mut self, undo_target_len: usize, st: &StatementMetaSnapshot) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        self.bump_table_epochs_from_undo_suffix(&tx.overlay.undo, undo_target_len);
-        tx.overlay.rollback_to(undo_target_len);
+        let tids = self.tx_state.any_tx().map_or_else(Vec::new, |tx| {
+            Self::collect_table_ids_from_undo_suffix(&tx.overlay.undo, undo_target_len)
+        });
+        self.bump_table_epochs_for_ids(&tids);
         self.next_lsn = st.next_lsn;
-        tx.pending_lru_clears.truncate(st.lru_clears_len);
-        while tx.statement_blob_undo.len() > st.blob_undo_len {
-            let entry = tx.statement_blob_undo.pop().unwrap();
+        let blob_entries = {
+            let Some(tx) = self.tx_state.any_tx_mut() else {
+                return;
+            };
+            tx.overlay.rollback_to(undo_target_len);
+            tx.pending_lru_clears.truncate(st.lru_clears_len);
+            let mut entries = Vec::new();
+            while tx.statement_blob_undo.len() > st.blob_undo_len {
+                entries.push(tx.statement_blob_undo.pop().unwrap());
+            }
+            entries
+        };
+        for entry in blob_entries {
             match entry {
                 BlobUndo::Appended {
                     kind: crate::wal::BlobKind::Standard,
@@ -1877,15 +1953,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Rolls back to savepoint `sp_id` for SQLite connection `conn_id`.
     pub fn rollback_to_savepoint_for_conn(&mut self, conn_id: usize, sp_id: i32) -> io::Result<()> {
-        self.check_write_allowed_for_conn(conn_id)?;
-        self.rollback_to_savepoint(sp_id)
+        self.rollback_to_savepoint_inner(Some(conn_id), sp_id)
     }
 
     fn capture_initial_tx_meta_snapshot(&self) -> TxMetaSnapshot {
         self.capture_tx_meta_snapshot_fields(0, 0, Vec::new(), false)
     }
 
-    fn capture_savepoint_tx_meta_snapshot(&self, tx: &ActiveTx) -> TxMetaSnapshot {
+    fn capture_savepoint_tx_meta_snapshot(&self, tx: &ActiveTxData) -> TxMetaSnapshot {
         self.capture_tx_meta_snapshot_fields(
             tx.dropped_tables.len(),
             tx.pending_lru_clears.len(),
@@ -1949,29 +2024,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_has_row_meta = snap.table_has_row_meta.clone();
     }
 
-    pub(super) fn flush_pending_tx_records(&mut self) -> io::Result<()> {
+    pub(super) fn flush_pending_tx_records(
+        &mut self,
+        durability: WriteDurability,
+        record_count: u32,
+    ) -> io::Result<()> {
         self.check_not_poisoned()?;
-        match self.tx_state.any_tx_mut() {
-            None => return Ok(()),
-            Some(tx) if tx.pending_record_count == 0 => {
-                tx.pending_sync = false;
-                return Ok(());
-            }
-            Some(_) => {}
+        if record_count == 0 {
+            return Ok(());
         }
         self.lsn_after_batches(1)?;
-        let (record_count, durability, mut raw_buf) = {
-            let tx = self.tx_state.any_tx_mut().unwrap();
-            let count = tx.pending_record_count;
-            let dur = if tx.pending_sync {
-                WriteDurability::SyncTransactional
-            } else {
-                WriteDurability::BufferedFast
-            };
-            tx.pending_record_count = 0;
-            tx.pending_sync = false;
-            (count, dur, core::mem::take(&mut tx.pending_buf))
+        let Some(tx) = self.tx_state.any_tx_mut() else {
+            return Ok(());
         };
+        let mut raw_buf = core::mem::take(&mut tx.pending_buf);
 
         let res = (|| -> io::Result<()> {
             if durability == WriteDurability::SyncTransactional {

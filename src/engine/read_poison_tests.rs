@@ -260,8 +260,8 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
     let (rec_count, tx_bytes, overlay_len, undo_len) = {
         let tx = engine.tx_state.active_tx().expect("active tx");
         (
-            tx.pending_record_count,
-            tx.pending_bytes,
+            engine.tx_state.pending_record_count(),
+            engine.tx_state.pending_bytes(),
             tx.overlay.map.len(),
             tx.overlay.undo.len(),
         )
@@ -277,8 +277,8 @@ fn eager_promotion_does_not_mutate_active_transaction_or_budget() {
         }
     }
     let tx = engine.tx_state.active_tx().expect("active tx");
-    assert_eq!(tx.pending_record_count, rec_count);
-    assert_eq!(tx.pending_bytes, tx_bytes);
+    assert_eq!(engine.tx_state.pending_record_count(), rec_count);
+    assert_eq!(engine.tx_state.pending_bytes(), tx_bytes);
     assert_eq!(engine.mutation_epoch, epoch);
     assert_eq!(tx.overlay.map.len(), overlay_len);
     assert_eq!(tx.overlay.undo.len(), undo_len);

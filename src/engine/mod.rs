@@ -15,6 +15,7 @@ mod salvage;
 mod scan;
 mod snapshot;
 mod tx;
+mod tx_fsm;
 mod unique_index;
 mod wal_links;
 #[cfg(test)]
@@ -77,6 +78,7 @@ use self::scoped_guards::{
     ReconcilingCappedGuard, RelocatingBlobsGuard, ScopedReconcilingTable, ScopedRelocatingFlag,
 };
 use self::tx::WriteScope;
+use self::tx_fsm::TxEvent;
 use self::wal_links::LogStream;
 
 /// Type-enforced RAII guards for engine-scoped re-entrancy/phase latches.
@@ -1974,7 +1976,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Records a WAL I/O failure (first one wins) and returns the original error.
     pub(super) fn poison(&mut self, e: io::Error) -> io::Error {
-        self.storage.poison(e)
+        let e = self.storage.poison(e);
+        let _ = self.apply_tx_event(TxEvent::MarkPoisoned);
+        e
     }
 
     /// How long a SQL writer waits for its turn before failing with `SQLITE_BUSY`.
@@ -2316,7 +2320,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     .or_default()
                     .push(tok);
             }
-            for marker in &mut tx.savepoints {
+            for marker in &mut tx.savepoint_payloads {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
                     let prefix_len = snap.dropped_tables_len.min(tx.dropped_tables.len());
                     let dropped_before_sp = tx.dropped_tables[..prefix_len]
@@ -2388,7 +2392,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     &mut self.table_inline_thresholds,
                 );
             }
-            for marker in &mut tx.savepoints {
+            for marker in &mut tx.savepoint_payloads {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
                     let prefix_len = snap.dropped_tables_len.min(tx.dropped_tables.len());
                     let dropped_before_sp = tx.dropped_tables[..prefix_len]
@@ -2607,7 +2611,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 &mut tx.start_meta.active_vtab_holders,
                 &mut tx.start_meta.active_vtab_ids,
             );
-            for marker in &mut tx.savepoints {
+            for marker in &mut tx.savepoint_payloads {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
                     remove_from(&mut snap.active_vtab_holders, &mut snap.active_vtab_ids);
                 }
@@ -3044,19 +3048,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
             })
             .sum();
-        if self.config.max_transaction_bytes > 0 && !self.tx_state.is_preparing() {
-            if let Some(tx) = self.tx_state.active_tx() {
-                let est_row_bytes =
-                    ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
-                        .saturating_add(extra_bytes);
-                if tx.pending_bytes.saturating_add(est_row_bytes)
-                    > self.config.max_transaction_bytes
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "transaction exceeds max_transaction_bytes budget",
-                    ));
-                }
+        if self.config.max_transaction_bytes > 0
+            && self.tx_state.is_active()
+            && !self.tx_state.is_preparing()
+        {
+            let est_row_bytes =
+                ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
+                    .saturating_add(extra_bytes);
+            if self.tx_state.pending_bytes().saturating_add(est_row_bytes)
+                > self.config.max_transaction_bytes
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transaction exceeds max_transaction_bytes budget",
+                ));
             }
         }
         let mut new_row_blob_ptr = None;
@@ -3473,10 +3478,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// connection sees committed data only.
     #[inline]
     pub fn read_view_for_conn(&self, conn_id: usize) -> ReadView {
-        if let Some(tx) = self.tx_state.active_tx() {
-            if tx.owner_conn != Some(conn_id) {
-                return ReadView::Committed;
-            }
+        if self
+            .tx_state
+            .active_core()
+            .is_some_and(|core| core.owner_conn() != Some(conn_id))
+        {
+            return ReadView::Committed;
         }
         ReadView::Owner
     }
@@ -4457,19 +4464,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             prev_len,
                         );
                     }
-                    if let Some(tx) = self
-                        .tx_state
-                        .active_tx_mut()
-                        .filter(|t| t.statement_savepoint_active)
-                    {
-                        let delta = new_len.saturating_sub(prev_len);
-                        if delta > 0 {
-                            tx.statement_blob_undo.push(tx::BlobUndo::Appended {
-                                kind: BlobKind::Standard,
-                                table_id: 0,
-                                seg_id,
-                                len: delta,
-                            });
+                    if self.tx_state.statement_savepoint_active() {
+                        if let Some(tx) = self.tx_state.active_tx_mut() {
+                            let delta = new_len.saturating_sub(prev_len);
+                            if delta > 0 {
+                                tx.statement_blob_undo.push(tx::BlobUndo::Appended {
+                                    kind: BlobKind::Standard,
+                                    table_id: 0,
+                                    seg_id,
+                                    len: delta,
+                                });
+                            }
                         }
                     }
                 }
@@ -4538,19 +4543,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             prev_len,
                         );
                     }
-                    if let Some(tx) = self
-                        .tx_state
-                        .active_tx_mut()
-                        .filter(|t| t.statement_savepoint_active)
-                    {
-                        let delta = new_len.saturating_sub(prev_len);
-                        if delta > 0 {
-                            tx.statement_blob_undo.push(tx::BlobUndo::Appended {
-                                kind: BlobKind::Lru,
-                                table_id,
-                                seg_id,
-                                len: delta,
-                            });
+                    if self.tx_state.statement_savepoint_active() {
+                        if let Some(tx) = self.tx_state.active_tx_mut() {
+                            let delta = new_len.saturating_sub(prev_len);
+                            if delta > 0 {
+                                tx.statement_blob_undo.push(tx::BlobUndo::Appended {
+                                    kind: BlobKind::Lru,
+                                    table_id,
+                                    seg_id,
+                                    len: delta,
+                                });
+                            }
                         }
                     }
                 }
@@ -4568,19 +4571,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     if b.dead_bytes > prev_dead {
                         self.unrelocatable_std_blobs.remove(&ptr.seg_id);
                     }
-                    if let Some(tx) = self
-                        .tx_state
-                        .active_tx_mut()
-                        .filter(|t| t.statement_savepoint_active)
-                    {
-                        let delta = b.dead_bytes.saturating_sub(prev_dead);
-                        if delta > 0 {
-                            tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
-                                kind: BlobKind::Standard,
-                                table_id: 0,
-                                seg_id: ptr.seg_id,
-                                len: delta,
-                            });
+                    if self.tx_state.statement_savepoint_active() {
+                        if let Some(tx) = self.tx_state.active_tx_mut() {
+                            let delta = b.dead_bytes.saturating_sub(prev_dead);
+                            if delta > 0 {
+                                tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                                    kind: BlobKind::Standard,
+                                    table_id: 0,
+                                    seg_id: ptr.seg_id,
+                                    len: delta,
+                                });
+                            }
                         }
                     }
                 }
@@ -4589,19 +4590,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 if let Some(b) = self.lru_blobs.get_mut(&(ptr.table_id, ptr.seg_id)) {
                     let prev_dead = b.dead_bytes;
                     b.dead_bytes = b.dead_bytes.saturating_add(ptr.len as u64);
-                    if let Some(tx) = self
-                        .tx_state
-                        .active_tx_mut()
-                        .filter(|t| t.statement_savepoint_active)
-                    {
-                        let delta = b.dead_bytes.saturating_sub(prev_dead);
-                        if delta > 0 {
-                            tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
-                                kind: BlobKind::Lru,
-                                table_id: ptr.table_id,
-                                seg_id: ptr.seg_id,
-                                len: delta,
-                            });
+                    if self.tx_state.statement_savepoint_active() {
+                        if let Some(tx) = self.tx_state.active_tx_mut() {
+                            let delta = b.dead_bytes.saturating_sub(prev_dead);
+                            if delta > 0 {
+                                tx.statement_blob_undo.push(tx::BlobUndo::MarkedDead {
+                                    kind: BlobKind::Lru,
+                                    table_id: ptr.table_id,
+                                    seg_id: ptr.seg_id,
+                                    len: delta,
+                                });
+                            }
                         }
                     }
                 }
@@ -4793,29 +4792,33 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
                 })
                 .sum();
-            let bypass = scope == WriteScope::InternalBypass || self.tx_state.is_preparing();
             let max_transaction_bytes = self.config.max_transaction_bytes;
+            let poisoned = self.is_poisoned();
+            let reset_buf = match self.tx_state.can_record_write(
+                poisoned,
+                scope,
+                records.len(),
+                batch_bytes,
+                max_transaction_bytes,
+            ) {
+                Ok(reset) => reset,
+                Err(err) => {
+                    let io_err = self.tx_error_to_io(err);
+                    let _ = self.apply_tx_event(TxEvent::RecordWrite {
+                        scope,
+                        durability,
+                        record_count: records.len(),
+                        batch_bytes,
+                        max_transaction_bytes,
+                    });
+                    return Err(io_err);
+                }
+            };
             {
-                let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() else {
+                let Some(tx) = self.tx_state.active_tx_mut() else {
                     unreachable!("checked self.tx_state.is_active()");
                 };
-                let next_tx_bytes = tx.pending_bytes.saturating_add(batch_bytes);
-                if !bypass && max_transaction_bytes > 0 && next_tx_bytes > max_transaction_bytes {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "transaction exceeds max_transaction_bytes budget",
-                    ));
-                }
-                let record_count = u32::try_from(records.len())
-                    .ok()
-                    .and_then(|n| tx.pending_record_count.checked_add(n))
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "too many records in transaction",
-                        )
-                    })?;
-                if tx.pending_record_count == 0 {
+                if reset_buf {
                     tx.pending_buf.clear();
                     tx.pending_buf
                         .extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
@@ -4825,19 +4828,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     tx.pending_buf.truncate(prev_buf_len);
                     return Err(e);
                 }
-                if !bypass {
-                    tx.invalidate_prepare(phase);
-                }
-                tx.pending_bytes = next_tx_bytes;
-                if durability == WriteDurability::SyncTransactional {
-                    tx.pending_sync = true;
-                }
-                tx.pending_record_count = record_count;
             }
+            let (effects, _) = self
+                .apply_tx_event(TxEvent::RecordWrite {
+                    scope,
+                    durability,
+                    record_count: records.len(),
+                    batch_bytes,
+                    max_transaction_bytes,
+                })
+                .map_err(|e| self.tx_error_to_io(e))?;
+            let record_undo = effects.iter().any(|e| match e {
+                tx_fsm::TxEffect::AppendTxBatch { record_undo, .. } => record_undo,
+                _ => false,
+            });
             self.next_lsn = successor;
             self.note_records_table_mutations(&records);
             if let Some(tx) = self.tx_state.active_tx_mut() {
-                let record_undo = !tx.savepoints.is_empty();
                 for rec in records {
                     tx.overlay.apply(lsn, rec, record_undo);
                 }

@@ -144,9 +144,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
         } else if prev_max != Some(max_bytes) {
-            if let Some((phase, tx)) = self.tx_state.active_phase_and_tx_mut() {
+            if let Some(tx) = self.tx_state.active_tx_mut() {
                 tx.quotas_modified = true;
-                tx.invalidate_prepare(phase);
+                let _ = self.apply_tx_event(super::tx_fsm::TxEvent::InvalidatePrepare);
             }
         }
         Ok(())
