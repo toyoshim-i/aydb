@@ -5431,3 +5431,73 @@ fn unique_ready_latch_rejects_zero_and_uncommitted_latches() {
     assert_eq!(latch.raw_gen(), 0);
     assert!(!latch.is_ready_for(5));
 }
+
+#[test]
+fn vtab_sqlite_2pc_and_savepoint_trace_replays_cleanly_in_tx_fsm() {
+    let tmp = TempTestDir::new("m3_vtab_tx_fsm_trace");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let engine = Arc::new(RwLock::new(
+        StorageEngine::open(fs, EngineConfig::default()).unwrap(),
+    ));
+    let conn = SqliteConnection::open_in_memory().unwrap();
+    conn.register_aydb_module(Arc::clone(&engine)).unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t_buf USING aydb(table_id=1, durability='buffered', columns='id INTEGER PRIMARY KEY, v TEXT');
+         CREATE VIRTUAL TABLE t_sync USING aydb(table_id=2, durability='sync', columns='id INTEGER PRIMARY KEY, v TEXT');",
+    )
+    .unwrap();
+
+    engine.write().unwrap().enable_tx_trace();
+
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t_buf VALUES (1, 'a');
+         SAVEPOINT sp1;
+         INSERT INTO t_sync VALUES (1, 'b');
+         ROLLBACK TO sp1;
+         INSERT INTO t_sync VALUES (2, 'c');
+         RELEASE sp1;
+         COMMIT;
+         BEGIN;
+         INSERT INTO t_buf VALUES (2, 'rolled_back');
+         ROLLBACK;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM t_buf ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(1), SqlValue::Text("a".into())]]
+    );
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM t_sync ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(2), SqlValue::Text("c".into())]]
+    );
+
+    let trace = engine.write().unwrap().take_tx_trace().unwrap();
+    assert!(!trace.is_empty());
+    trace
+        .replay_verify()
+        .expect("SQLite vtab trace must replay identically");
+
+    let normalized = trace.normalize_ids();
+    normalized
+        .replay_verify()
+        .expect("normalized SQLite vtab trace must replay cleanly");
+
+    let ndjson = normalized.to_ndjson();
+    let first_line = ndjson.lines().next().unwrap();
+    assert_eq!(
+        first_line,
+        "{\"kind\":\"header\",\"schema\":1,\"fsm\":\"tx_fsm\"}"
+    );
+    assert!(ndjson.contains("\"tag\":\"BeginVtab\",\"conn_id\":1,\"vtab_id\":1"));
+    assert!(ndjson.contains("\"tag\":\"BeginVtab\",\"conn_id\":1,\"vtab_id\":2"));
+    assert!(ndjson.contains("\"tag\":\"Savepoint\",\"owner_conn\":1"));
+    assert!(ndjson.contains("\"tag\":\"RollbackToSavepoint\",\"conn_id\":1"));
+    assert!(ndjson.contains("\"tag\":\"ReleaseSavepoint\",\"conn_id\":1"));
+    assert!(ndjson.contains("\"tag\":\"VtabSync\""));
+    assert!(ndjson.contains("\"tag\":\"FinishPrepare\",\"ok\":true"));
+    assert!(ndjson.contains("\"tag\":\"Rollback\",\"conn_id\":1"));
+}

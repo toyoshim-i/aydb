@@ -10694,3 +10694,126 @@ fn healthy_capability_allows_retryable_buf_flush_without_poisoning() {
     engine.sync_active_std_writer().unwrap();
     engine.commit_transaction().unwrap();
 }
+
+#[test]
+fn tx_fsm_trace_replay_matches_live_engine_2pc_savepoints_and_poison() {
+    let tmp = TempTestDir::new("m3_tx_fsm_live_trace");
+    let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
+    let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
+    // Register a capped table before tracing so `begin_commit_for_conn` takes the non-groupable
+    // `AwaitingSync` -> `finish_commit_for_conn` two-phase commit path.
+    engine.register_capped_table(99, 65_536).unwrap();
+
+    engine.enable_tx_trace();
+
+    // 1. Multi-vtab 2PC transaction with savepoint, rollback-to, release, InternalBypass write,
+    //    SyncTransactional upgrade, and clean `AwaitingSync` completion.
+    let conn1 = 0x7000_0001_usize;
+    let vtab1 = 0x8000_0001_usize;
+    let vtab2 = 0x8000_0002_usize;
+    engine.begin_vtab_transaction(conn1, vtab1).unwrap();
+    engine.begin_vtab_transaction(conn1, vtab2).unwrap();
+    engine.savepoint_for_conn(conn1, 0).unwrap();
+    engine
+        .put_row(1, b"rolled", b"v_drop", &[], WriteDurability::BufferedFast)
+        .unwrap();
+    engine.rollback_to_savepoint_for_conn(conn1, 0).unwrap();
+    engine
+        .put_row(1, b"kept", b"v_ok", &[], WriteDurability::SyncTransactional)
+        .unwrap();
+    engine.release_savepoint_for_conn(conn1, 0).unwrap();
+
+    assert!(!engine.mark_vtab_synced_ready_to_commit(vtab1, WriteDurability::SyncTransactional));
+    assert!(engine.mark_vtab_synced_ready_to_commit(vtab2, WriteDurability::BufferedFast));
+    engine
+        .prepare_commit_transaction(WriteDurability::BufferedFast)
+        .unwrap();
+    engine
+        .commit_wal_and_memtable_core(
+            vec![crate::wal::WalRecord::PutInline {
+                key: crate::lru::encode_primary_row_key(1, b"bypass"),
+                value: b"internal".to_vec(),
+            }],
+            WriteDurability::BufferedFast,
+            true,
+            false,
+            tx::WriteScope::InternalBypass,
+        )
+        .unwrap();
+    let tx::CommitStep::AwaitingSync(file) = engine.begin_commit_for_conn(conn1).unwrap() else {
+        panic!("expected non-groupable AwaitingSync commit step");
+    };
+    engine.finish_commit_for_conn(file.sync_barrier()).unwrap();
+    assert_eq!(engine.get_row(1, b"rolled").unwrap(), None);
+    assert_eq!(engine.get_row(1, b"kept").unwrap(), Some(b"v_ok".to_vec()));
+    assert_eq!(
+        engine.get_row(1, b"bypass").unwrap(),
+        Some(b"internal".to_vec())
+    );
+
+    // 2. Second transaction failing `finish_commit_for_conn` poisons the engine, then a foreign
+    //    connection attempt is rejected with Poisoned.
+    let conn2 = 0x7000_0002_usize;
+    engine.begin_transaction_for_conn(conn2).unwrap();
+    engine
+        .put_row(
+            1,
+            b"doomed",
+            b"v_fail",
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+    let tx::CommitStep::AwaitingSync(_) = engine.begin_commit_for_conn(conn2).unwrap() else {
+        panic!("expected non-groupable AwaitingSync commit step");
+    };
+    assert!(
+        engine
+            .finish_commit_for_conn(Err(io::Error::other("simulated barrier failure")))
+            .is_err()
+    );
+    assert!(engine.is_poisoned());
+    assert!(engine.begin_transaction_for_conn(0x7000_0003).is_err());
+
+    assert!(!engine.tx_trace().unwrap().is_empty());
+    assert!(engine.tx_trace().unwrap().len() >= 18);
+    let trace = engine.take_tx_trace().unwrap();
+    assert!(engine.tx_trace().is_none());
+    trace
+        .replay_verify()
+        .expect("live engine trace must replay");
+
+    let normalized = trace.normalize_ids();
+    normalized
+        .replay_verify()
+        .expect("normalized trace must replay");
+    let ndjson = normalized.to_ndjson();
+    let lines: Vec<&str> = ndjson.lines().collect();
+    assert_eq!(
+        lines[0],
+        "{\"kind\":\"header\",\"schema\":1,\"fsm\":\"tx_fsm\"}"
+    );
+    assert!(ndjson.contains("\"tag\":\"BeginVtab\",\"conn_id\":1,\"vtab_id\":1"));
+    assert!(ndjson.contains("\"tag\":\"BeginVtab\",\"conn_id\":1,\"vtab_id\":2"));
+    assert!(ndjson.contains(
+        "\"tag\":\"Savepoint\",\"owner_conn\":1,\"sp_id\":0,\"is_statement\":false,\"check_poison\":true"
+    ));
+    assert!(ndjson.contains("\"tag\":\"RollbackToSavepoint\",\"conn_id\":1,\"sp_id\":0"));
+    assert!(ndjson.contains("\"tag\":\"ReleaseSavepoint\",\"conn_id\":1,\"sp_id\":0"));
+    assert!(
+        ndjson.contains("\"tag\":\"VtabSync\",\"vtab_id\":1,\"durability\":\"SyncTransactional\"")
+    );
+    assert!(ndjson.contains("\"tag\":\"BeginPrepare\",\"durability\":\"BufferedFast\""));
+    assert!(ndjson.contains("\"tag\":\"FinishPrepare\",\"ok\":true"));
+    assert!(ndjson.contains("\"scope\":\"InternalBypass\""));
+    assert!(ndjson.contains("\"tag\":\"EnterWalFlush\",\"defer_sync_barrier\":true"));
+    assert!(ndjson.contains("\"tag\":\"CompleteWalFlush\",\"mode\":\"AwaitSync\""));
+    assert!(ndjson.contains("\"tag\":\"FinishSyncCommit\",\"ok\":true"));
+    assert!(ndjson.contains("\"tag\":\"FinishSyncCommit\",\"ok\":false"));
+    assert!(ndjson.contains(
+        "\"event\":{\"tag\":\"BeginForConn\",\"conn_id\":3},\"post\":{\"health\":\"Poisoned\",\"state\":{\"tag\":\"Idle\"}},\"outcome\":{\"status\":\"Err\",\"error\":{\"tag\":\"Poisoned\"}}"
+    ));
+}

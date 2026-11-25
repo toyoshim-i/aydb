@@ -1009,6 +1009,9 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Test seam: makes the next vtab commit `sync_barrier` fail as a device flush failure would.
     #[cfg(test)]
     pub(super) debug_fail_next_wal_sync: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only Sans-I/O `tx_fsm` trace recorder attached to [`StorageEngine::apply_tx_event`].
+    #[cfg(test)]
+    pub(super) tx_trace: Option<tx_fsm::TxTraceRecorder>,
 }
 
 /// Opens a blob segment found by directory listing but absent from the catalog. A file that
@@ -1815,6 +1818,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             debug_fail_next_wal_append: false,
             #[cfg(test)]
             debug_fail_next_wal_sync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            tx_trace: None,
         };
         engine.access_tracker = AccessTracker::new(1, engine.config.max_in_memory_access_ticks);
 

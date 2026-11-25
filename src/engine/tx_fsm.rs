@@ -942,6 +942,672 @@ impl TxMachine {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TxTraceOutcome {
+    Ok(TxEffects),
+    Err(TxError),
+}
+
+#[cfg(test)]
+impl TxTraceOutcome {
+    pub(super) fn from_result(res: &Result<TxEffects, TxError>) -> Self {
+        match res {
+            Ok(eff) => Self::Ok(*eff),
+            Err(err) => Self::Err(*err),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TxTraceStep {
+    pub(super) seq: u64,
+    pub(super) pre: TxMachine,
+    pub(super) event: TxEvent,
+    pub(super) post: TxMachine,
+    pub(super) outcome: TxTraceOutcome,
+}
+
+/// Deterministic `#[cfg(test)]` trace recorder for [`TxMachine`] transitions, supporting
+/// pointer-ID normalization, self-contained FSM replay verification, and zero-dependency
+/// Schema v1 NDJSON serialization.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TxTraceRecorder {
+    steps: Vec<TxTraceStep>,
+}
+
+#[cfg(test)]
+impl TxTraceRecorder {
+    pub(super) fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    #[inline]
+    pub(super) fn last_health(&self) -> Option<HealthState> {
+        self.steps.last().map(|s| s.post.health)
+    }
+
+    pub(super) fn record(
+        &mut self,
+        pre: TxMachine,
+        event: TxEvent,
+        post: TxMachine,
+        outcome: TxTraceOutcome,
+    ) {
+        let seq = self.steps.len() as u64;
+        self.steps.push(TxTraceStep {
+            seq,
+            pre,
+            event,
+            post,
+            outcome,
+        });
+    }
+
+    pub(super) fn record_external_poison(&mut self, core: &TxCoreState) {
+        let pre = TxMachine::from_parts(HealthState::Healthy, core.clone());
+        let (post, res) = step(pre.clone(), TxEvent::MarkPoisoned);
+        self.record(
+            pre,
+            TxEvent::MarkPoisoned,
+            post,
+            TxTraceOutcome::from_result(&res),
+        );
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Renumbers `conn_id` and `vtab_id` values to `1, 2, ...` in first-appearance order across
+    /// `pre -> event -> post` for deterministic ASLR-free comparison.
+    pub(crate) fn normalize_ids(&self) -> Self {
+        let mut conns: Vec<usize> = Vec::new();
+        let mut vtabs: Vec<usize> = Vec::new();
+        let steps = self
+            .steps
+            .iter()
+            .map(|s| {
+                let pre = normalize_machine(&s.pre, &mut conns, &mut vtabs);
+                let event = normalize_event(s.event, &mut conns, &mut vtabs);
+                let post = normalize_machine(&s.post, &mut conns, &mut vtabs);
+                TxTraceStep {
+                    seq: s.seq,
+                    pre,
+                    event,
+                    post,
+                    outcome: s.outcome,
+                }
+            })
+            .collect();
+        Self { steps }
+    }
+
+    /// Replays every recorded transition from `steps[0].pre` through [`step`] and checks exact
+    /// sequence continuity, post-state equality, and emitted effect/error equivalence.
+    pub(crate) fn replay_verify(&self) -> Result<(), String> {
+        let Some(first) = self.steps.first() else {
+            return Ok(());
+        };
+        let mut cur = first.pre.clone();
+        for (idx, s) in self.steps.iter().enumerate() {
+            if s.seq != idx as u64 {
+                return Err(format!("trace step {idx} has non-sequential seq {}", s.seq));
+            }
+            if cur != s.pre {
+                return Err(format!(
+                    "trace continuity mismatch at seq {idx}: expected pre {:?}, got {:?}",
+                    s.pre, cur
+                ));
+            }
+            let (next, res) = step(cur, s.event);
+            if next != s.post {
+                return Err(format!(
+                    "post-state mismatch at seq {idx} ({:?}): expected {:?}, got {:?}",
+                    s.event, s.post, next
+                ));
+            }
+            let actual_outcome = TxTraceOutcome::from_result(&res);
+            if actual_outcome != s.outcome {
+                return Err(format!(
+                    "outcome mismatch at seq {idx} ({:?}): expected {:?}, got {:?}",
+                    s.event, s.outcome, actual_outcome
+                ));
+            }
+            cur = next;
+        }
+        Ok(())
+    }
+
+    /// Serializes the recorded trace into deterministic Schema v1 NDJSON without external crates.
+    pub(crate) fn to_ndjson(&self) -> String {
+        let mut out = String::with_capacity(64 + self.steps.len() * 384);
+        write_ndjson_trace(&mut out, &self.steps).expect("fmt::Write to String cannot fail");
+        out
+    }
+}
+
+#[cfg(test)]
+fn intern_id(table: &mut Vec<usize>, raw: usize) -> usize {
+    if let Some(pos) = table.iter().position(|&id| id == raw) {
+        pos + 1
+    } else {
+        table.push(raw);
+        table.len()
+    }
+}
+
+#[cfg(test)]
+fn normalize_machine(
+    machine: &TxMachine,
+    conns: &mut Vec<usize>,
+    vtabs: &mut Vec<usize>,
+) -> TxMachine {
+    let state = match &machine.state {
+        TxCoreState::Idle => TxCoreState::Idle,
+        TxCoreState::InTx(core) => TxCoreState::InTx(TxCore {
+            phase: core.phase,
+            depth: core.depth,
+            owner_conn: core.owner_conn.map(|cid| intern_id(conns, cid)),
+            pending_record_count: core.pending_record_count,
+            pending_bytes: core.pending_bytes,
+            pending_sync: core.pending_sync,
+            sync_durability_upgrade: core.sync_durability_upgrade,
+            vtabs: core
+                .vtabs
+                .iter()
+                .map(|&vid| intern_id(vtabs, vid))
+                .collect(),
+            synced_vtabs: core
+                .synced_vtabs
+                .iter()
+                .map(|&vid| intern_id(vtabs, vid))
+                .collect(),
+            savepoints: core.savepoints.clone(),
+            statement_savepoint_active: core.statement_savepoint_active,
+        }),
+    };
+    TxMachine {
+        health: machine.health,
+        state,
+    }
+}
+
+#[cfg(test)]
+fn normalize_event(event: TxEvent, conns: &mut Vec<usize>, vtabs: &mut Vec<usize>) -> TxEvent {
+    match event {
+        TxEvent::BeginForConn { conn_id } => TxEvent::BeginForConn {
+            conn_id: intern_id(conns, conn_id),
+        },
+        TxEvent::BeginVtab { conn_id, vtab_id } => TxEvent::BeginVtab {
+            conn_id: intern_id(conns, conn_id),
+            vtab_id: intern_id(vtabs, vtab_id),
+        },
+        TxEvent::AttachVtab { conn_id, vtab_id } => TxEvent::AttachVtab {
+            conn_id: intern_id(conns, conn_id),
+            vtab_id: intern_id(vtabs, vtab_id),
+        },
+        TxEvent::DetachVtab { conn_id, vtab_id } => TxEvent::DetachVtab {
+            conn_id: intern_id(conns, conn_id),
+            vtab_id: intern_id(vtabs, vtab_id),
+        },
+        TxEvent::VtabSync {
+            vtab_id,
+            durability,
+        } => TxEvent::VtabSync {
+            vtab_id: intern_id(vtabs, vtab_id),
+            durability,
+        },
+        TxEvent::Savepoint {
+            owner_conn,
+            sp_id,
+            is_statement,
+            check_poison,
+        } => TxEvent::Savepoint {
+            owner_conn: owner_conn.map(|cid| intern_id(conns, cid)),
+            sp_id,
+            is_statement,
+            check_poison,
+        },
+        TxEvent::ReleaseSavepoint { conn_id, sp_id } => TxEvent::ReleaseSavepoint {
+            conn_id: conn_id.map(|cid| intern_id(conns, cid)),
+            sp_id,
+        },
+        TxEvent::RollbackToSavepoint { conn_id, sp_id } => TxEvent::RollbackToSavepoint {
+            conn_id: conn_id.map(|cid| intern_id(conns, cid)),
+            sp_id,
+        },
+        TxEvent::PlanCommit {
+            conn_id,
+            defer_sync_allowed,
+            can_group,
+            has_metadata_changes,
+            buf_len_exceeds_chunk,
+        } => TxEvent::PlanCommit {
+            conn_id: conn_id.map(|cid| intern_id(conns, cid)),
+            defer_sync_allowed,
+            can_group,
+            has_metadata_changes,
+            buf_len_exceeds_chunk,
+        },
+        TxEvent::Rollback { conn_id } => TxEvent::Rollback {
+            conn_id: conn_id.map(|cid| intern_id(conns, cid)),
+        },
+        other @ (TxEvent::Begin
+        | TxEvent::RecordWrite { .. }
+        | TxEvent::InvalidatePrepare
+        | TxEvent::BeginPrepare { .. }
+        | TxEvent::FinishPrepare { .. }
+        | TxEvent::EnterWalFlush { .. }
+        | TxEvent::CompleteWalFlush { .. }
+        | TxEvent::FinishSyncCommit { .. }
+        | TxEvent::MarkPoisoned) => other,
+    }
+}
+
+#[cfg(test)]
+fn write_ndjson_trace(out: &mut String, steps: &[TxTraceStep]) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    out.push_str("{\"kind\":\"header\",\"schema\":1,\"fsm\":\"tx_fsm\"}\n");
+    for s in steps {
+        write!(out, "{{\"kind\":\"step\",\"seq\":{},\"pre\":", s.seq)?;
+        write_tx_machine(out, &s.pre)?;
+        out.push_str(",\"event\":");
+        write_tx_event(out, &s.event)?;
+        out.push_str(",\"post\":");
+        write_tx_machine(out, &s.post)?;
+        out.push_str(",\"outcome\":");
+        write_tx_outcome(out, &s.outcome)?;
+        out.push_str("}\n");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn health_str(h: HealthState) -> &'static str {
+    match h {
+        HealthState::Healthy => "Healthy",
+        HealthState::Poisoned => "Poisoned",
+    }
+}
+
+#[cfg(test)]
+fn phase_str(p: TxPhase) -> &'static str {
+    match p {
+        TxPhase::Active => "Active",
+        TxPhase::Preparing => "Preparing",
+        TxPhase::Prepared => "Prepared",
+        TxPhase::FlushingWal => "FlushingWal",
+        TxPhase::SyncInFlight => "SyncInFlight",
+    }
+}
+
+#[cfg(test)]
+fn scope_str(s: WriteScope) -> &'static str {
+    match s {
+        WriteScope::Normal => "Normal",
+        WriteScope::InternalBypass => "InternalBypass",
+    }
+}
+
+#[cfg(test)]
+fn durability_str(d: WriteDurability) -> &'static str {
+    match d {
+        WriteDurability::BufferedFast => "BufferedFast",
+        WriteDurability::SyncTransactional => "SyncTransactional",
+    }
+}
+
+#[cfg(test)]
+fn flush_mode_str(m: FlushCompleteMode) -> &'static str {
+    match m {
+        FlushCompleteMode::PublishImmediate => "PublishImmediate",
+        FlushCompleteMode::AwaitSync => "AwaitSync",
+        FlushCompleteMode::HandOffGroup => "HandOffGroup",
+    }
+}
+
+#[cfg(test)]
+fn write_opt_usize(out: &mut String, val: Option<usize>) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    match val {
+        Some(v) => write!(out, "{v}"),
+        None => {
+            out.push_str("null");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_usize_array(out: &mut String, items: &[usize]) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    out.push('[');
+    for (idx, item) in items.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        write!(out, "{item}")?;
+    }
+    out.push(']');
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_savepoint_frame(out: &mut String, f: &SavepointFrame) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    write!(
+        out,
+        "{{\"sp_id\":{},\"is_statement\":{},\"record_count\":{},\"pending_bytes\":{},\"pending_sync\":{},\"implicit_tx\":{}}}",
+        f.sp_id, f.is_statement, f.record_count, f.pending_bytes, f.pending_sync, f.implicit_tx
+    )
+}
+
+#[cfg(test)]
+fn write_tx_machine(out: &mut String, m: &TxMachine) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    write!(out, "{{\"health\":\"{}\",\"state\":", health_str(m.health))?;
+    match &m.state {
+        TxCoreState::Idle => out.push_str("{\"tag\":\"Idle\"}"),
+        TxCoreState::InTx(c) => {
+            write!(
+                out,
+                "{{\"tag\":\"InTx\",\"phase\":\"{}\",\"depth\":{},\"owner_conn\":",
+                phase_str(c.phase),
+                c.depth.get()
+            )?;
+            write_opt_usize(out, c.owner_conn)?;
+            write!(
+                out,
+                ",\"pending_record_count\":{},\"pending_bytes\":{},\"pending_sync\":{},\"sync_durability_upgrade\":{},\"vtabs\":",
+                c.pending_record_count, c.pending_bytes, c.pending_sync, c.sync_durability_upgrade
+            )?;
+            write_usize_array(out, &c.vtabs)?;
+            out.push_str(",\"synced_vtabs\":");
+            write_usize_array(out, &c.synced_vtabs)?;
+            out.push_str(",\"savepoints\":[");
+            for (idx, sp) in c.savepoints.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_savepoint_frame(out, sp)?;
+            }
+            write!(
+                out,
+                "],\"statement_savepoint_active\":{}}}",
+                c.statement_savepoint_active
+            )?;
+        }
+    }
+    out.push('}');
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tx_event(out: &mut String, ev: &TxEvent) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    match ev {
+        TxEvent::Begin => out.push_str("{\"tag\":\"Begin\"}"),
+        TxEvent::BeginForConn { conn_id } => {
+            write!(out, "{{\"tag\":\"BeginForConn\",\"conn_id\":{conn_id}}}")?;
+        }
+        TxEvent::BeginVtab { conn_id, vtab_id } => {
+            write!(
+                out,
+                "{{\"tag\":\"BeginVtab\",\"conn_id\":{conn_id},\"vtab_id\":{vtab_id}}}"
+            )?;
+        }
+        TxEvent::AttachVtab { conn_id, vtab_id } => {
+            write!(
+                out,
+                "{{\"tag\":\"AttachVtab\",\"conn_id\":{conn_id},\"vtab_id\":{vtab_id}}}"
+            )?;
+        }
+        TxEvent::DetachVtab { conn_id, vtab_id } => {
+            write!(
+                out,
+                "{{\"tag\":\"DetachVtab\",\"conn_id\":{conn_id},\"vtab_id\":{vtab_id}}}"
+            )?;
+        }
+        TxEvent::VtabSync {
+            vtab_id,
+            durability,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"VtabSync\",\"vtab_id\":{vtab_id},\"durability\":\"{}\"}}",
+                durability_str(*durability)
+            )?;
+        }
+        TxEvent::RecordWrite {
+            scope,
+            durability,
+            record_count,
+            batch_bytes,
+            max_transaction_bytes,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"RecordWrite\",\"scope\":\"{}\",\"durability\":\"{}\",\"record_count\":{record_count},\"batch_bytes\":{batch_bytes},\"max_transaction_bytes\":{max_transaction_bytes}}}",
+                scope_str(*scope),
+                durability_str(*durability)
+            )?;
+        }
+        TxEvent::InvalidatePrepare => out.push_str("{\"tag\":\"InvalidatePrepare\"}"),
+        TxEvent::BeginPrepare { durability } => {
+            write!(
+                out,
+                "{{\"tag\":\"BeginPrepare\",\"durability\":\"{}\"}}",
+                durability_str(*durability)
+            )?;
+        }
+        TxEvent::FinishPrepare { ok } => {
+            write!(out, "{{\"tag\":\"FinishPrepare\",\"ok\":{ok}}}")?;
+        }
+        TxEvent::Savepoint {
+            owner_conn,
+            sp_id,
+            is_statement,
+            check_poison,
+        } => {
+            out.push_str("{\"tag\":\"Savepoint\",\"owner_conn\":");
+            write_opt_usize(out, *owner_conn)?;
+            write!(
+                out,
+                ",\"sp_id\":{sp_id},\"is_statement\":{is_statement},\"check_poison\":{check_poison}}}"
+            )?;
+        }
+        TxEvent::ReleaseSavepoint { conn_id, sp_id } => {
+            out.push_str("{\"tag\":\"ReleaseSavepoint\",\"conn_id\":");
+            write_opt_usize(out, *conn_id)?;
+            write!(out, ",\"sp_id\":{sp_id}}}")?;
+        }
+        TxEvent::RollbackToSavepoint { conn_id, sp_id } => {
+            out.push_str("{\"tag\":\"RollbackToSavepoint\",\"conn_id\":");
+            write_opt_usize(out, *conn_id)?;
+            write!(out, ",\"sp_id\":{sp_id}}}")?;
+        }
+        TxEvent::PlanCommit {
+            conn_id,
+            defer_sync_allowed,
+            can_group,
+            has_metadata_changes,
+            buf_len_exceeds_chunk,
+        } => {
+            out.push_str("{\"tag\":\"PlanCommit\",\"conn_id\":");
+            write_opt_usize(out, *conn_id)?;
+            write!(
+                out,
+                ",\"defer_sync_allowed\":{defer_sync_allowed},\"can_group\":{can_group},\"has_metadata_changes\":{has_metadata_changes},\"buf_len_exceeds_chunk\":{buf_len_exceeds_chunk}}}"
+            )?;
+        }
+        TxEvent::EnterWalFlush { defer_sync_barrier } => {
+            write!(
+                out,
+                "{{\"tag\":\"EnterWalFlush\",\"defer_sync_barrier\":{defer_sync_barrier}}}"
+            )?;
+        }
+        TxEvent::CompleteWalFlush { mode } => {
+            write!(
+                out,
+                "{{\"tag\":\"CompleteWalFlush\",\"mode\":\"{}\"}}",
+                flush_mode_str(*mode)
+            )?;
+        }
+        TxEvent::FinishSyncCommit { ok } => {
+            write!(out, "{{\"tag\":\"FinishSyncCommit\",\"ok\":{ok}}}")?;
+        }
+        TxEvent::Rollback { conn_id } => {
+            out.push_str("{\"tag\":\"Rollback\",\"conn_id\":");
+            write_opt_usize(out, *conn_id)?;
+            out.push('}');
+        }
+        TxEvent::MarkPoisoned => out.push_str("{\"tag\":\"MarkPoisoned\"}"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tx_effect(out: &mut String, eff: &TxEffect) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    match eff {
+        TxEffect::InitTxData => out.push_str("{\"tag\":\"InitTxData\"}"),
+        TxEffect::AppendTxBatch {
+            reset_buf,
+            record_undo,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"AppendTxBatch\",\"reset_buf\":{reset_buf},\"record_undo\":{record_undo}}}"
+            )?;
+        }
+        TxEffect::VtabSyncOutcome { all_synced } => {
+            write!(
+                out,
+                "{{\"tag\":\"VtabSyncOutcome\",\"all_synced\":{all_synced}}}"
+            )?;
+        }
+        TxEffect::RunPrepare {
+            effective_durability,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"RunPrepare\",\"effective_durability\":\"{}\"}}",
+                durability_str(*effective_durability)
+            )?;
+        }
+        TxEffect::CaptureSavepointPayload {
+            sp_id,
+            is_statement,
+            zero_buf_offset,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"CaptureSavepointPayload\",\"sp_id\":{sp_id},\"is_statement\":{is_statement},\"zero_buf_offset\":{zero_buf_offset}}}"
+            )?;
+        }
+        TxEffect::TruncateSavepointPayloads {
+            new_len,
+            clear_overlay_undo,
+            clear_stmt_blob_undo,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"TruncateSavepointPayloads\",\"new_len\":{new_len},\"clear_overlay_undo\":{clear_overlay_undo},\"clear_stmt_blob_undo\":{clear_stmt_blob_undo}}}"
+            )?;
+        }
+        TxEffect::CommitImplicitTx => out.push_str("{\"tag\":\"CommitImplicitTx\"}"),
+        TxEffect::BumpUniqueGenIfModified => {
+            out.push_str("{\"tag\":\"BumpUniqueGenIfModified\"}");
+        }
+        TxEffect::RestoreTxToStart => out.push_str("{\"tag\":\"RestoreTxToStart\"}"),
+        TxEffect::RestoreSavepointPayload {
+            index,
+            clear_pending_buf,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"RestoreSavepointPayload\",\"index\":{index},\"clear_pending_buf\":{clear_pending_buf}}}"
+            )?;
+        }
+        TxEffect::DecDepthDone => out.push_str("{\"tag\":\"DecDepthDone\"}"),
+        TxEffect::EnsurePreparedBeforeCommit {
+            effective_durability,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"EnsurePreparedBeforeCommit\",\"effective_durability\":\"{}\"}}",
+                durability_str(*effective_durability)
+            )?;
+        }
+        TxEffect::FallbackFullCommit => out.push_str("{\"tag\":\"FallbackFullCommit\"}"),
+        TxEffect::DrainPendingGroup => out.push_str("{\"tag\":\"DrainPendingGroup\"}"),
+        TxEffect::ClearEmptyOverlay => out.push_str("{\"tag\":\"ClearEmptyOverlay\"}"),
+        TxEffect::FlushWal {
+            durability,
+            record_count,
+            defer_sync_barrier,
+        } => {
+            write!(
+                out,
+                "{{\"tag\":\"FlushWal\",\"durability\":\"{}\",\"record_count\":{record_count},\"defer_sync_barrier\":{defer_sync_barrier}}}",
+                durability_str(*durability)
+            )?;
+        }
+        TxEffect::PublishCommittedTx => out.push_str("{\"tag\":\"PublishCommittedTx\"}"),
+        TxEffect::ReturnAwaitingSync => out.push_str("{\"tag\":\"ReturnAwaitingSync\"}"),
+        TxEffect::HandOffPendingGroup => out.push_str("{\"tag\":\"HandOffPendingGroup\"}"),
+        TxEffect::PoisonEngineInterruptedSync => {
+            out.push_str("{\"tag\":\"PoisonEngineInterruptedSync\"}");
+        }
+        TxEffect::PoisonEngineSyncFailed => out.push_str("{\"tag\":\"PoisonEngineSyncFailed\"}"),
+        TxEffect::RestoreStartMetaAndRelease => {
+            out.push_str("{\"tag\":\"RestoreStartMetaAndRelease\"}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tx_outcome(out: &mut String, outcome: &TxTraceOutcome) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    match outcome {
+        TxTraceOutcome::Ok(effects) => {
+            out.push_str("{\"status\":\"Ok\",\"effects\":[");
+            for (idx, eff) in effects.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_tx_effect(out, &eff)?;
+            }
+            out.push_str("]}");
+        }
+        TxTraceOutcome::Err(err) => {
+            out.push_str("{\"status\":\"Err\",\"error\":");
+            match err {
+                TxError::Poisoned => out.push_str("{\"tag\":\"Poisoned\"}"),
+                TxError::Busy => out.push_str("{\"tag\":\"Busy\"}"),
+                TxError::TxBudgetExceeded => out.push_str("{\"tag\":\"TxBudgetExceeded\"}"),
+                TxError::TooManyRecords => out.push_str("{\"tag\":\"TooManyRecords\"}"),
+                TxError::UnknownSavepoint(sp_id) => {
+                    write!(out, "{{\"tag\":\"UnknownSavepoint\",\"sp_id\":{sp_id}}}")?;
+                }
+                TxError::InvalidPhase => out.push_str("{\"tag\":\"InvalidPhase\"}"),
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1230,5 +1896,126 @@ mod tests {
             ),
             TxError::Poisoned
         );
+    }
+
+    fn record_trace_sequence(
+        conn1: usize,
+        conn2: usize,
+        vtab1: usize,
+        vtab2: usize,
+    ) -> TxTraceRecorder {
+        let mut rec = TxTraceRecorder::new();
+        let mut machine = TxMachine::new();
+        let events = [
+            TxEvent::BeginVtab {
+                conn_id: conn1,
+                vtab_id: vtab1,
+            },
+            TxEvent::BeginVtab {
+                conn_id: conn1,
+                vtab_id: vtab2,
+            },
+            TxEvent::Savepoint {
+                owner_conn: Some(conn1),
+                sp_id: 0,
+                is_statement: false,
+                check_poison: true,
+            },
+            TxEvent::RecordWrite {
+                scope: WriteScope::Normal,
+                durability: WriteDurability::BufferedFast,
+                record_count: 1,
+                batch_bytes: 64,
+                max_transaction_bytes: 4096,
+            },
+            TxEvent::RollbackToSavepoint {
+                conn_id: Some(conn1),
+                sp_id: 0,
+            },
+            TxEvent::RecordWrite {
+                scope: WriteScope::Normal,
+                durability: WriteDurability::SyncTransactional,
+                record_count: 1,
+                batch_bytes: 128,
+                max_transaction_bytes: 4096,
+            },
+            TxEvent::ReleaseSavepoint {
+                conn_id: Some(conn1),
+                sp_id: 0,
+            },
+            TxEvent::VtabSync {
+                vtab_id: vtab1,
+                durability: WriteDurability::SyncTransactional,
+            },
+            TxEvent::VtabSync {
+                vtab_id: vtab2,
+                durability: WriteDurability::BufferedFast,
+            },
+            TxEvent::BeginPrepare {
+                durability: WriteDurability::BufferedFast,
+            },
+            TxEvent::FinishPrepare { ok: true },
+            TxEvent::PlanCommit {
+                conn_id: Some(conn1),
+                defer_sync_allowed: true,
+                can_group: false,
+                has_metadata_changes: false,
+                buf_len_exceeds_chunk: false,
+            },
+            TxEvent::EnterWalFlush {
+                defer_sync_barrier: true,
+            },
+            TxEvent::CompleteWalFlush {
+                mode: FlushCompleteMode::AwaitSync,
+            },
+            TxEvent::FinishSyncCommit { ok: false },
+            TxEvent::BeginForConn { conn_id: conn2 },
+        ];
+        for ev in events {
+            let pre = machine.clone();
+            let (post, res) = step(machine, ev);
+            rec.record(pre, ev, post.clone(), TxTraceOutcome::from_result(&res));
+            machine = post;
+        }
+        rec
+    }
+
+    #[test]
+    fn tx_fsm_trace_normalize_ids_and_ndjson_v1_replay_are_deterministic() {
+        let t1 = record_trace_sequence(0x7F11_0000, 0x7F11_0008, 0x7F11_1100, 0x7F11_2200);
+        let t2 = record_trace_sequence(0x55AA_0010, 0x55AA_0020, 0x55AA_0030, 0x55AA_0040);
+
+        assert!(!t1.is_empty());
+        assert_eq!(t1.len(), 16);
+        assert!(t1.replay_verify().is_ok());
+        assert!(t2.replay_verify().is_ok());
+
+        let n1 = t1.normalize_ids();
+        let n2 = t2.normalize_ids();
+        assert_eq!(n1, n2);
+        assert!(n1.replay_verify().is_ok());
+
+        let nd1 = n1.to_ndjson();
+        let nd2 = n2.to_ndjson();
+        assert_eq!(nd1, nd2);
+
+        let lines: Vec<&str> = nd1.lines().collect();
+        assert_eq!(lines.len(), 17);
+        assert_eq!(
+            lines[0],
+            "{\"kind\":\"header\",\"schema\":1,\"fsm\":\"tx_fsm\"}"
+        );
+        assert!(lines[1].contains("\"conn_id\":1,\"vtab_id\":1"));
+        assert!(lines[2].contains("\"conn_id\":1,\"vtab_id\":2"));
+        assert!(lines[16].contains("\"conn_id\":2"));
+        assert!(lines[16].contains("\"status\":\"Err\",\"error\":{\"tag\":\"Poisoned\"}"));
+
+        let mut tampered_post = n1.clone();
+        tampered_post.steps[3].post.health = HealthState::Poisoned;
+        assert!(tampered_post.replay_verify().is_err());
+
+        let mut tampered_chain = n1;
+        tampered_chain.steps[4].pre.state = TxCoreState::Idle;
+        assert!(tampered_chain.replay_verify().is_err());
     }
 }

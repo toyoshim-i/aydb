@@ -670,6 +670,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn enable_tx_trace(&mut self) {
+        self.tx_trace = Some(tx_fsm::TxTraceRecorder::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tx_trace(&self) -> Option<&tx_fsm::TxTraceRecorder> {
+        self.tx_trace.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_tx_trace(&mut self) -> Option<tx_fsm::TxTraceRecorder> {
+        self.tx_trace.take()
+    }
+
     pub(super) fn apply_tx_event(
         &mut self,
         event: TxEvent,
@@ -680,8 +695,40 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             HealthState::Healthy
         };
         let (prev_core, data_opt) = self.tx_state.take_parts();
+        #[cfg(test)]
+        let machine = {
+            let pre_health = if let Some(recorder) = self.tx_trace.as_mut() {
+                if recorder.last_health() == Some(HealthState::Healthy)
+                    && health == HealthState::Poisoned
+                {
+                    if event == TxEvent::MarkPoisoned {
+                        HealthState::Healthy
+                    } else {
+                        recorder.record_external_poison(&prev_core);
+                        HealthState::Poisoned
+                    }
+                } else {
+                    health
+                }
+            } else {
+                health
+            };
+            TxMachine::from_parts(pre_health, prev_core)
+        };
+        #[cfg(not(test))]
         let machine = TxMachine::from_parts(health, prev_core);
+        #[cfg(test)]
+        let pre = self.tx_trace.is_some().then(|| machine.clone());
         let (next_machine, outcome) = tx_fsm::step(machine, event);
+        #[cfg(test)]
+        if let (Some(recorder), Some(pre)) = (self.tx_trace.as_mut(), pre) {
+            recorder.record(
+                pre,
+                event,
+                next_machine.clone(),
+                tx_fsm::TxTraceOutcome::from_result(&outcome),
+            );
+        }
         let taken = match (next_machine.state, data_opt) {
             (TxCoreState::InTx(core), Some(data)) => {
                 self.tx_state.install_in_tx(core, data);
