@@ -32,6 +32,8 @@ mod integrity_tests;
 #[cfg(test)]
 mod key_null_tests;
 #[cfg(test)]
+mod multi_conn_diff_tests;
+#[cfg(test)]
 mod pk_update_tests;
 #[cfg(test)]
 mod read_poison_tests;
