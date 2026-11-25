@@ -1,6 +1,10 @@
 name = "aydb_formal"
 version = "0.1.0"
-defaultTargets = ["AydbFormal"]
+defaultTargets = ["AydbFormal", "aydb-trace-check"]
 
 [[lean_lib]]
 name = "AydbFormal"
+
+[[lean_exe]]
+name = "aydb-trace-check"
+root = "TraceCheck"

@@ -5432,9 +5432,14 @@ fn unique_ready_latch_rejects_zero_and_uncommitted_latches() {
     assert!(!latch.is_ready_for(5));
 }
 
-#[test]
-fn vtab_sqlite_2pc_and_savepoint_trace_replays_cleanly_in_tx_fsm() {
-    let tmp = TempTestDir::new("m3_vtab_tx_fsm_trace");
+fn setup_vtab_trace_fixture(
+    prefix: &str,
+) -> (
+    TempTestDir,
+    Arc<RwLock<StorageEngine<OsFs>>>,
+    SqliteConnection,
+) {
+    let tmp = TempTestDir::new(prefix);
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let engine = Arc::new(RwLock::new(
         StorageEngine::open(fs, EngineConfig::default()).unwrap(),
@@ -5446,6 +5451,12 @@ fn vtab_sqlite_2pc_and_savepoint_trace_replays_cleanly_in_tx_fsm() {
          CREATE VIRTUAL TABLE t_sync USING aydb(table_id=2, durability='sync', columns='id INTEGER PRIMARY KEY, v TEXT');",
     )
     .unwrap();
+    (tmp, engine, conn)
+}
+
+#[test]
+fn vtab_sqlite_2pc_and_savepoint_trace_replays_cleanly_in_tx_fsm() {
+    let (_tmp, engine, conn) = setup_vtab_trace_fixture("m3_vtab_tx_fsm_trace");
 
     engine.write().unwrap().enable_tx_trace();
 
@@ -5500,4 +5511,58 @@ fn vtab_sqlite_2pc_and_savepoint_trace_replays_cleanly_in_tx_fsm() {
     assert!(ndjson.contains("\"tag\":\"VtabSync\""));
     assert!(ndjson.contains("\"tag\":\"FinishPrepare\",\"ok\":true"));
     assert!(ndjson.contains("\"tag\":\"Rollback\",\"conn_id\":1"));
+}
+
+#[test]
+fn export_formal_traces_vtab_sqlite() {
+    let (_tmp, engine, conn) = setup_vtab_trace_fixture("m4_vtab_tx_fsm_trace");
+
+    engine.write().unwrap().enable_tx_trace();
+
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t_buf VALUES (1, 'a');
+         SAVEPOINT sp1;
+         INSERT INTO t_sync VALUES (1, 'b');
+         ROLLBACK TO sp1;
+         INSERT INTO t_sync VALUES (2, 'c');
+         RELEASE sp1;",
+    )
+    .unwrap();
+
+    // Duplicate PK inside an active explicit transaction exercises statement-savepoint rollback.
+    assert!(
+        conn.execute_batch("INSERT INTO t_buf VALUES (1, 'dup');")
+            .is_err()
+    );
+
+    conn.execute_batch(
+        "COMMIT;
+         BEGIN;
+         INSERT INTO t_buf VALUES (2, 'rolled_back');
+         ROLLBACK;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        conn.query_all("SELECT id, v FROM t_buf ORDER BY id", &[])
+            .unwrap(),
+        vec![vec![SqlValue::Integer(1), SqlValue::Text("a".into())]]
+    );
+
+    let trace = engine.write().unwrap().take_tx_trace().unwrap();
+    assert!(!trace.is_empty());
+    trace.replay_verify().unwrap();
+    let normalized = trace.normalize_ids();
+    normalized.replay_verify().unwrap();
+    let ndjson = normalized.to_ndjson();
+
+    if let Some(dir) = std::env::var_os("AYDB_EXPORT_TRACES_DIR") {
+        if !dir.is_empty() {
+            let dir_path = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir_path).expect("create AYDB_EXPORT_TRACES_DIR");
+            std::fs::write(dir_path.join("tx_fsm_vtab_sqlite.ndjson"), &ndjson)
+                .expect("write tx_fsm_vtab_sqlite.ndjson");
+        }
+    }
 }

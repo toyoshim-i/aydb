@@ -193,4 +193,169 @@ mod tests {
         l.rotated();
         assert_eq!(l.stamp(), (2, 2));
     }
+
+    #[test]
+    fn export_formal_traces_wal_links() {
+        use core::fmt::Write as _;
+
+        fn emit_step(
+            out: &mut String,
+            seq: &mut u64,
+            links: &mut WalLinks,
+            event_json: &str,
+            apply: impl FnOnce(&mut WalLinks),
+        ) {
+            let prev_durable = links.stamp().1;
+            apply(links);
+            let stamp = links.stamp();
+            assert!(stamp.1 >= prev_durable);
+            writeln!(
+                out,
+                "{{\"kind\":\"step\",\"seq\":{},\"event\":{event_json},\"stamp\":[{},{}]}}",
+                *seq, stamp.0, stamp.1
+            )
+            .unwrap();
+            *seq += 1;
+        }
+
+        let mut out = String::from("{\"kind\":\"header\",\"schema\":1,\"fsm\":\"wal_links\"}\n");
+        let mut seq = 0u64;
+
+        // Scenario 1: Base 0, synchronous & buffered interleaving, cross-stream gap, partial & full flush.
+        writeln!(out, "{{\"kind\":\"init\",\"base\":0}}").unwrap();
+        let mut links = WalLinks::new(0);
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":1,\"prev\":0,\"synced\":true}",
+            |l| l.appended(LogStream::Sync, 1, 0, true),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Buffered\",\"lsn\":2,\"prev\":1,\"synced\":false}",
+            |l| l.appended(LogStream::Buffered, 2, 1, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Buffered\",\"lsn\":3,\"prev\":2,\"synced\":false}",
+            |l| l.appended(LogStream::Buffered, 3, 2, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"BufSynced\"}",
+            |l| l.buf_synced(),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Buffered\",\"lsn\":4,\"prev\":3,\"synced\":false}",
+            |l| l.appended(LogStream::Buffered, 4, 3, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":5,\"prev\":4,\"synced\":true}",
+            |l| l.appended(LogStream::Sync, 5, 4, true),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"BufSynced\"}",
+            |l| l.buf_synced(),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":6,\"prev\":5,\"synced\":false}",
+            |l| l.appended(LogStream::Sync, 6, 5, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":7,\"prev\":6,\"synced\":false}",
+            |l| l.appended(LogStream::Sync, 7, 6, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":8,\"prev\":7,\"synced\":false}",
+            |l| l.appended(LogStream::Sync, 8, 7, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"SyncFlushed\",\"through\":7}",
+            |l| l.sync_flushed(7),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links,
+            "{\"tag\":\"SyncFlushedAll\"}",
+            |l| l.sync_flushed_all(),
+        );
+
+        // Scenario 2: Non-zero base after checkpoint, mixed gap held back across sync flush, then rotated.
+        writeln!(out, "{{\"kind\":\"init\",\"base\":7}}").unwrap();
+        let mut links2 = WalLinks::new(7);
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links2,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":8,\"prev\":7,\"synced\":false}",
+            |l| l.appended(LogStream::Sync, 8, 7, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links2,
+            "{\"tag\":\"Appended\",\"stream\":\"Buffered\",\"lsn\":9,\"prev\":8,\"synced\":false}",
+            |l| l.appended(LogStream::Buffered, 9, 8, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links2,
+            "{\"tag\":\"Appended\",\"stream\":\"Sync\",\"lsn\":10,\"prev\":9,\"synced\":false}",
+            |l| l.appended(LogStream::Sync, 10, 9, false),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links2,
+            "{\"tag\":\"SyncFlushed\",\"through\":10}",
+            |l| l.sync_flushed(10),
+        );
+        emit_step(
+            &mut out,
+            &mut seq,
+            &mut links2,
+            "{\"tag\":\"Rotated\"}",
+            |l| l.rotated(),
+        );
+
+        assert!(seq >= 17);
+        if let Some(dir) = std::env::var_os("AYDB_EXPORT_TRACES_DIR") {
+            if !dir.is_empty() {
+                let dir_path = std::path::Path::new(&dir);
+                std::fs::create_dir_all(dir_path).expect("create AYDB_EXPORT_TRACES_DIR");
+                std::fs::write(dir_path.join("wal_links_scenarios.ndjson"), &out)
+                    .expect("write wal_links_scenarios.ndjson");
+            }
+        }
+    }
 }

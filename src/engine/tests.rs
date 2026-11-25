@@ -10695,9 +10695,8 @@ fn healthy_capability_allows_retryable_buf_flush_without_poisoning() {
     engine.commit_transaction().unwrap();
 }
 
-#[test]
-fn tx_fsm_trace_replay_matches_live_engine_2pc_savepoints_and_poison() {
-    let tmp = TempTestDir::new("m3_tx_fsm_live_trace");
+fn run_live_2pc_poison_trace(prefix: &str) -> tx_fsm::TxTraceRecorder {
+    let tmp = TempTestDir::new(prefix);
     let fs = Arc::new(OsFs::open(&tmp.path, true).unwrap());
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     // Register a capped table before tracing so `begin_commit_for_conn` takes the non-groupable
@@ -10783,6 +10782,12 @@ fn tx_fsm_trace_replay_matches_live_engine_2pc_savepoints_and_poison() {
     let trace = engine.take_tx_trace().unwrap();
     assert!(engine.tx_trace().is_none());
     trace
+}
+
+#[test]
+fn tx_fsm_trace_replay_matches_live_engine_2pc_savepoints_and_poison() {
+    let trace = run_live_2pc_poison_trace("m3_tx_fsm_live_trace");
+    trace
         .replay_verify()
         .expect("live engine trace must replay");
 
@@ -10816,4 +10821,103 @@ fn tx_fsm_trace_replay_matches_live_engine_2pc_savepoints_and_poison() {
     assert!(ndjson.contains(
         "\"event\":{\"tag\":\"BeginForConn\",\"conn_id\":3},\"post\":{\"health\":\"Poisoned\",\"state\":{\"tag\":\"Idle\"}},\"outcome\":{\"status\":\"Err\",\"error\":{\"tag\":\"Poisoned\"}}"
     ));
+}
+
+fn maybe_write_formal_trace(filename: &str, ndjson: &str) {
+    let Some(dir) = std::env::var_os("AYDB_EXPORT_TRACES_DIR") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let dir_path = std::path::Path::new(&dir);
+    std::fs::create_dir_all(dir_path).expect("create AYDB_EXPORT_TRACES_DIR");
+    std::fs::write(dir_path.join(filename), ndjson).expect("write formal trace fixture");
+}
+
+#[test]
+fn export_formal_traces_tx_fsm_scenarios() {
+    let trace1 = run_live_2pc_poison_trace("m4_trace_2pc_poison");
+    trace1.replay_verify().unwrap();
+    let norm1 = trace1.normalize_ids();
+    norm1.replay_verify().unwrap();
+    let ndjson1 = norm1.to_ndjson();
+    maybe_write_formal_trace("tx_fsm_engine_2pc_poison.ndjson", &ndjson1);
+
+    // Scenario 2: Group commit handoff, TxBudgetExceeded, Busy foreign conn, UnknownSavepoint,
+    // interrupted SyncInFlight rollback poisoning, and post-poison absorption.
+    let tmp = TempTestDir::new("m4_trace_group_errors");
+    let mut engine = open_group_engine(&tmp);
+    engine.config.max_transaction_bytes = 512;
+    engine.enable_tx_trace();
+
+    let conn1 = 0x7100_0001_usize;
+    let conn2 = 0x7100_0002_usize;
+
+    // 2a. Clean group commit handoff (`HandOffGroup`).
+    let ticket = commit_into_group(&mut engine, conn1, b"g1", b"val1");
+    let _target = flush_group(&mut engine, &ticket);
+
+    // 2b. Budget reject (`TxBudgetExceeded`), foreign `Busy`, `UnknownSavepoint(99)`.
+    engine.begin_transaction_for_conn(conn1).unwrap();
+    engine.savepoint_for_conn(conn1, 0).unwrap();
+    engine
+        .put_row(1, b"ok1", b"small", &[], GROUP_SYNC)
+        .unwrap();
+    let budget_err = engine
+        .commit_wal_and_memtable_core(
+            vec![crate::wal::WalRecord::PutInline {
+                key: crate::lru::encode_primary_row_key(1, b"too_big"),
+                value: vec![0x41u8; 600],
+            }],
+            GROUP_SYNC,
+            true,
+            false,
+            tx::WriteScope::Normal,
+        )
+        .unwrap_err();
+    assert_eq!(budget_err.kind(), io::ErrorKind::InvalidInput);
+    let busy_err = engine.begin_transaction_for_conn(conn2).unwrap_err();
+    assert_eq!(busy_err.kind(), io::ErrorKind::WouldBlock);
+    let unknown_sp_err = engine
+        .rollback_to_savepoint_for_conn(conn1, 99)
+        .unwrap_err();
+    assert_eq!(unknown_sp_err.kind(), io::ErrorKind::InvalidInput);
+    engine.release_savepoint_for_conn(conn1, 0).unwrap();
+    engine.rollback_transaction_for_conn(conn1).unwrap();
+
+    // 2c. Interrupted `SyncInFlight` rollback triggers `PoisonEngineInterruptedSync`, followed by
+    //     post-poison rejection.
+    engine.register_capped_table(99, 65_536).unwrap();
+    engine.begin_transaction_for_conn(conn1).unwrap();
+    engine
+        .put_row(
+            1,
+            b"sync_k",
+            &[0x22u8; 64],
+            &[],
+            WriteDurability::SyncTransactional,
+        )
+        .unwrap();
+    engine
+        .prepare_commit_transaction(WriteDurability::SyncTransactional)
+        .unwrap();
+    let step = engine.begin_commit_for_conn(conn1).unwrap();
+    assert!(matches!(step, CommitStep::AwaitingSync(_)));
+    engine.rollback_transaction().unwrap();
+    assert!(engine.is_poisoned());
+    assert!(engine.begin_transaction_for_conn(conn2).is_err());
+
+    let trace2 = engine.take_tx_trace().unwrap();
+    trace2.replay_verify().unwrap();
+    let norm2 = trace2.normalize_ids();
+    norm2.replay_verify().unwrap();
+    let ndjson2 = norm2.to_ndjson();
+    assert!(ndjson2.contains("\"mode\":\"HandOffGroup\""));
+    assert!(ndjson2.contains("\"error\":{\"tag\":\"TxBudgetExceeded\"}"));
+    assert!(ndjson2.contains("\"error\":{\"tag\":\"Busy\"}"));
+    assert!(ndjson2.contains("\"error\":{\"tag\":\"UnknownSavepoint\",\"sp_id\":99}"));
+    assert!(ndjson2.contains("\"tag\":\"PoisonEngineInterruptedSync\""));
+    assert!(ndjson2.contains("\"error\":{\"tag\":\"Poisoned\"}"));
+    maybe_write_formal_trace("tx_fsm_engine_group_and_errors.ndjson", &ndjson2);
 }

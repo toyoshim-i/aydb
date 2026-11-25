@@ -1008,3 +1008,109 @@ fn full_scan_reads_past_zeroed_and_older_epoch_sectors() {
         );
     }
 }
+
+#[test]
+fn export_formal_traces_wal_judge() {
+    use super::recovery::{Cut, WalDamageReason};
+    use core::fmt::Write as _;
+
+    fn cut_kind_str(k: CutKind) -> &'static str {
+        match k {
+            CutKind::Link => "Link",
+            CutKind::Blob => "Blob",
+            CutKind::PastStop => "PastStop",
+        }
+    }
+
+    fn reason_str(r: WalDamageReason) -> &'static str {
+        match r {
+            WalDamageReason::MissingPredecessor => "MissingPredecessor",
+            WalDamageReason::UnverifiableBlob => "UnverifiableBlob",
+            WalDamageReason::CorruptSector => "CorruptSector",
+            WalDamageReason::AcknowledgedTailLost => "AcknowledgedTailLost",
+            WalDamageReason::UnsupportedFormat => "UnsupportedFormat",
+        }
+    }
+
+    let flags_none = StopFlags::default();
+    let flags_corrupt = StopFlags {
+        unsupported_format: false,
+        corrupt_sector: true,
+    };
+    let flags_unsup = StopFlags {
+        unsupported_format: true,
+        corrupt_sector: false,
+    };
+    let flags_both = StopFlags {
+        unsupported_format: true,
+        corrupt_sector: true,
+    };
+
+    let cut = |lsn: u64, kind: CutKind| Some(Cut { lsn, kind });
+
+    let cases: Vec<(Option<Cut>, u64, u64, StopFlags)> = vec![
+        // floor <= last_good => no damage regardless of cut or flags
+        (None, 0, 0, flags_none),
+        (None, 5, 5, flags_none),
+        (cut(6, CutKind::Link), 5, 6, flags_both),
+        (cut(8, CutKind::Blob), 7, 7, flags_unsup),
+        // floor > last_good, no cut => AcknowledgedTailLost overridden by format/corrupt flags
+        (None, 4, 2, flags_none),
+        (None, 4, 2, flags_corrupt),
+        (None, 4, 2, flags_unsup),
+        (None, 4, 2, flags_both),
+        // cut.lsn <= floor (Link, Blob, PastStop)
+        (cut(3, CutKind::Link), 5, 1, flags_none),
+        (cut(5, CutKind::Link), 5, 1, flags_none),
+        (cut(3, CutKind::Link), 5, 1, flags_corrupt),
+        (cut(3, CutKind::Link), 5, 1, flags_unsup),
+        (cut(3, CutKind::Blob), 5, 1, flags_none),
+        (cut(5, CutKind::Blob), 5, 1, flags_corrupt),
+        (cut(3, CutKind::Blob), 5, 1, flags_unsup),
+        (cut(3, CutKind::Blob), 5, 1, flags_both),
+        (cut(4, CutKind::PastStop), 5, 1, flags_none),
+        (cut(4, CutKind::PastStop), 5, 1, flags_unsup),
+        // cut.lsn > floor (floor batch gone, cut lies above floor)
+        (cut(8, CutKind::Link), 5, 2, flags_none),
+        (cut(8, CutKind::Link), 5, 2, flags_unsup),
+        (cut(8, CutKind::Blob), 5, 2, flags_none),
+        (cut(8, CutKind::Blob), 5, 2, flags_corrupt),
+        (cut(8, CutKind::PastStop), 5, 2, flags_none),
+        (cut(8, CutKind::PastStop), 5, 2, flags_both),
+    ];
+
+    let mut out = String::from("{\"kind\":\"header\",\"schema\":1,\"fsm\":\"wal_judge\"}\n");
+    for (seq, (c, floor, last_good, flags)) in cases.iter().enumerate() {
+        let actual = judge(*c, *floor, *last_good, *flags);
+        assert_eq!(actual.is_some(), *floor > *last_good);
+        let cut_json = match c {
+            None => String::from("null"),
+            Some(c) => format!(
+                "{{\"lsn\":{},\"kind\":\"{}\"}}",
+                c.lsn,
+                cut_kind_str(c.kind)
+            ),
+        };
+        let res_json = match actual {
+            None => String::from("null"),
+            Some((reason, lost)) => {
+                format!("{{\"reason\":\"{}\",\"lost\":{lost}}}", reason_str(reason))
+            }
+        };
+        writeln!(
+            out,
+            "{{\"kind\":\"case\",\"seq\":{seq},\"cut\":{cut_json},\"floor\":{floor},\"last_good\":{last_good},\"flags\":{{\"unsupported_format\":{},\"corrupt_sector\":{}}},\"result\":{res_json}}}",
+            flags.unsupported_format, flags.corrupt_sector
+        )
+        .unwrap();
+    }
+
+    if let Some(dir) = std::env::var_os("AYDB_EXPORT_TRACES_DIR") {
+        if !dir.is_empty() {
+            let dir_path = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir_path).expect("create AYDB_EXPORT_TRACES_DIR");
+            std::fs::write(dir_path.join("wal_judge_scenarios.ndjson"), &out)
+                .expect("write wal_judge_scenarios.ndjson");
+        }
+    }
+}
