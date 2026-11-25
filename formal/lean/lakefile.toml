@@ -1,0 +1,6 @@
+name = "aydb_formal"
+version = "0.1.0"
+defaultTargets = ["AydbFormal"]
+
+[[lean_lib]]
+name = "AydbFormal"
