@@ -13,6 +13,7 @@ mod reader;
 mod rowid;
 mod salvage;
 mod scan;
+pub use scan::{RangeScanOptions, SecondaryScanOptions, SlabScanOutput};
 mod snapshot;
 mod tx;
 mod tx_fsm;

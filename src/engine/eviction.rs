@@ -920,14 +920,18 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     fn observe_lru_queue_ticks(&mut self, table_id: u16) -> io::Result<()> {
         let lru_prefix = encode_namespace_prefix(table_id, NS_LRU_QUEUE);
         let mut newest_tick = None;
-        self.visit_merged_prefix_range_reverse_view(
+        self.visit_merged_prefix_range_view(
             ReadView::Owner,
-            &lru_prefix,
-            &lru_prefix,
-            true,
-            None,
-            1,
-            false,
+            super::scan::MergeScanSpec {
+                prefix: &lru_prefix,
+                seek_key: &lru_prefix,
+                lower_inclusive: true,
+                upper_key_bound: None,
+                reverse: true,
+                limit: 1,
+                populate_cache: false,
+                need_values: false,
+            },
             |key, _lsn, _value| {
                 let (tick, _) = decode_lru_queue_key(table_id, key).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid LRU queue key")

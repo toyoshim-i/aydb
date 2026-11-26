@@ -338,15 +338,19 @@ fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
         eng.reader_for_conn(1)
             .scan_range_into_slab(
                 UNCAPPED,
-                None,
-                None,
-                false,
-                100,
-                false,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                Some(&mut lazy),
+                super::RangeScanOptions {
+                    lower: None,
+                    upper: None,
+                    reverse: false,
+                    limit: 100,
+                    keys_only: false,
+                },
+                super::SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: Some(&mut lazy),
+                },
             )
             .expect("shared &self owner-view scan must not fail with NEED_FLUSH after rollback");
         assert!(pks.iter().any(|k| k.as_slice() == b"committed_blob"));
@@ -362,15 +366,19 @@ fn shared_reader_scan_and_poisoned_scan_succeed_after_rolled_back_blob_write() {
         eng.reader_for_conn(1)
             .scan_range_into_slab(
                 UNCAPPED,
-                None,
-                None,
-                false,
-                100,
-                false,
-                &mut eager_pks,
-                &mut eager_slab,
-                &mut eager_spans,
-                None,
+                super::RangeScanOptions {
+                    lower: None,
+                    upper: None,
+                    reverse: false,
+                    limit: 100,
+                    keys_only: false,
+                },
+                super::SlabScanOutput {
+                    pks: &mut eager_pks,
+                    slab: &mut eager_slab,
+                    spans: &mut eager_spans,
+                    lazy_blobs: None,
+                },
             )
             .expect("shared &self eager-value scan must not fail with NEED_FLUSH after rollback");
         assert_eq!(eager_spans.len(), 6);

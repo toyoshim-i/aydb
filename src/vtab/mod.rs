@@ -69,9 +69,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use crate::engine::LazyBlob;
 use crate::engine::{
-    CommitStep, EngineReader, GroupRole, STATEMENT_SAVEPOINT, StorageEngine, WriteDurability,
+    CommitStep, EngineReader, GroupRole, LazyBlob, RangeScanOptions, STATEMENT_SAVEPOINT,
+    SecondaryScanOptions, SlabScanOutput, StorageEngine, WriteDurability,
 };
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
@@ -1066,16 +1066,20 @@ fn start_pk_full_scan(
     cursor.keys_only = keys_only;
     eng.scan_range_into_slab_with_cache(
         table_id,
-        None,
-        None,
-        reverse,
-        CURSOR_STREAM_CHUNK_ROWS,
-        keys_only,
+        RangeScanOptions {
+            lower: None,
+            upper: None,
+            reverse,
+            limit: CURSOR_STREAM_CHUNK_ROWS,
+            keys_only,
+        },
         false,
-        &mut cursor.pks,
-        &mut cursor.slab,
-        &mut cursor.spans,
-        Some(&mut cursor.lazy_blobs),
+        SlabScanOutput {
+            pks: &mut cursor.pks,
+            slab: &mut cursor.slab,
+            spans: &mut cursor.spans,
+            lazy_blobs: Some(&mut cursor.lazy_blobs),
+        },
     )?;
     let fetched_rows = if keys_only {
         cursor.pks.len()
@@ -1218,16 +1222,20 @@ fn max_integer_rowid(
             spans.clear();
             reader.scan_range_into_slab_with_cache(
                 table_id,
-                Some((&lower, true)),
-                Some((&upper, upper_inclusive)),
+                RangeScanOptions {
+                    lower: Some((&lower, true)),
+                    upper: Some((&upper, upper_inclusive)),
+                    reverse: true,
+                    limit,
+                    keys_only: true,
+                },
                 true,
-                limit,
-                true,
-                true,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )?;
             for k in &pks {
                 if let Some(id) = decode_i64_tagged_key(k) {
@@ -2641,16 +2649,20 @@ unsafe fn execute_exact_index_lookup(
         let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
             vtab.table_id,
             index_id,
-            &prefix,
-            (&prefix, true),
-            None,
-            CURSOR_STREAM_CHUNK_ROWS,
-            keys_only,
+            SecondaryScanOptions {
+                prefix: &prefix,
+                lower_sec_key: (&prefix, true),
+                upper_sec_key: None,
+                limit: CURSOR_STREAM_CHUNK_ROWS,
+                keys_only,
+            },
             true,
-            &mut cursor.pks,
-            &mut cursor.slab,
-            &mut cursor.spans,
-            Some(&mut cursor.lazy_blobs),
+            SlabScanOutput {
+                pks: &mut cursor.pks,
+                slab: &mut cursor.slab,
+                spans: &mut cursor.spans,
+                lazy_blobs: Some(&mut cursor.lazy_blobs),
+            },
         ) {
             Ok(last_opt) => last_opt,
             Err(e) => return io_err_to_sqlite_rc(&e),
@@ -2926,16 +2938,20 @@ unsafe fn execute_vtab_filter(
                 let next_last_sec = match eng.scan_secondary_index_into_slab_with_cache(
                     vtab.table_id,
                     index_id,
-                    &idx_prefix,
-                    (lo_slice, lo_inc),
-                    upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    CURSOR_STREAM_CHUNK_ROWS,
-                    keys_only,
+                    SecondaryScanOptions {
+                        prefix: &idx_prefix,
+                        lower_sec_key: (lo_slice, lo_inc),
+                        upper_sec_key: upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        limit: CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                    },
                     has_user_lower && upper_bound.is_some(),
-                    &mut cursor.pks,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                    Some(&mut cursor.lazy_blobs),
+                    SlabScanOutput {
+                        pks: &mut cursor.pks,
+                        slab: &mut cursor.slab,
+                        spans: &mut cursor.spans,
+                        lazy_blobs: Some(&mut cursor.lazy_blobs),
+                    },
                 ) {
                     Ok(last_opt) => last_opt,
                     Err(e) => return io_err_to_sqlite_rc(&e),
@@ -2995,16 +3011,20 @@ unsafe fn execute_vtab_filter(
                 cursor.keys_only = keys_only;
                 if let Err(e) = eng.scan_range_into_slab_with_cache(
                     vtab.table_id,
-                    lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    reverse,
-                    CURSOR_STREAM_CHUNK_ROWS,
-                    keys_only,
+                    RangeScanOptions {
+                        lower: lower_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        upper: upper_bound.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        reverse,
+                        limit: CURSOR_STREAM_CHUNK_ROWS,
+                        keys_only,
+                    },
                     lower_bound.is_some() && upper_bound.is_some(),
-                    &mut cursor.pks,
-                    &mut cursor.slab,
-                    &mut cursor.spans,
-                    Some(&mut cursor.lazy_blobs),
+                    SlabScanOutput {
+                        pks: &mut cursor.pks,
+                        slab: &mut cursor.slab,
+                        spans: &mut cursor.spans,
+                        lazy_blobs: Some(&mut cursor.lazy_blobs),
+                    },
                 ) {
                     return io_err_to_sqlite_rc(&e);
                 }
@@ -3157,16 +3177,20 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                         match eng.scan_secondary_index_into_slab_with_cache(
                             vtab.table_id,
                             sec_index_id,
-                            &cursor.stream_sec_prefix,
-                            (last_pk.as_slice(), false),
-                            upper_ref,
-                            CURSOR_STREAM_CHUNK_ROWS,
-                            keys_only,
+                            SecondaryScanOptions {
+                                prefix: &cursor.stream_sec_prefix,
+                                lower_sec_key: (last_pk.as_slice(), false),
+                                upper_sec_key: upper_ref,
+                                limit: CURSOR_STREAM_CHUNK_ROWS,
+                                keys_only,
+                            },
                             false,
-                            &mut cursor.pks,
-                            &mut cursor.slab,
-                            &mut cursor.spans,
-                            Some(&mut cursor.lazy_blobs),
+                            SlabScanOutput {
+                                pks: &mut cursor.pks,
+                                slab: &mut cursor.slab,
+                                spans: &mut cursor.spans,
+                                lazy_blobs: Some(&mut cursor.lazy_blobs),
+                            },
                         ) {
                             Ok(last_opt) => {
                                 next_last_sec = last_opt;
@@ -3225,16 +3249,20 @@ unsafe extern "system" fn vtab_next(p_cursor: *mut sqlite3_vtab_cursor) -> c_int
                     cursor.lazy_blobs.clear();
                     if let Err(e) = eng.scan_range_into_slab_with_cache(
                         vtab.table_id,
-                        lower_ref,
-                        upper_ref,
-                        reverse,
-                        CURSOR_STREAM_CHUNK_ROWS,
-                        keys_only,
+                        RangeScanOptions {
+                            lower: lower_ref,
+                            upper: upper_ref,
+                            reverse,
+                            limit: CURSOR_STREAM_CHUNK_ROWS,
+                            keys_only,
+                        },
                         false,
-                        &mut cursor.pks,
-                        &mut cursor.slab,
-                        &mut cursor.spans,
-                        Some(&mut cursor.lazy_blobs),
+                        SlabScanOutput {
+                            pks: &mut cursor.pks,
+                            slab: &mut cursor.slab,
+                            spans: &mut cursor.spans,
+                            lazy_blobs: Some(&mut cursor.lazy_blobs),
+                        },
                     ) {
                         return io_err_to_sqlite_rc(&e);
                     }

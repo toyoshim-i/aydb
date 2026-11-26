@@ -1565,15 +1565,19 @@ fn size_tiered_auto_compaction_scan_keys_and_tx_budget() {
     engine
         .scan_range_into_slab(
             1,
-            Some((b"base_key_0008", true)),
-            Some((b"base_key_0012", true)),
-            true,
-            2,
-            false,
-            &mut rev_pks,
-            &mut rev_slab,
-            &mut rev_spans,
-            None,
+            RangeScanOptions {
+                lower: Some((b"base_key_0008", true)),
+                upper: Some((b"base_key_0012", true)),
+                reverse: true,
+                limit: 2,
+                keys_only: false,
+            },
+            SlabScanOutput {
+                pks: &mut rev_pks,
+                slab: &mut rev_slab,
+                spans: &mut rev_spans,
+                lazy_blobs: None,
+            },
         )
         .unwrap();
     assert_eq!(rev_spans.len(), 2);
@@ -2019,15 +2023,19 @@ fn reverse_streaming_scan_row_meta_skip_and_tx_blob_read() {
         engine
             .scan_range_into_slab(
                 12,
-                Some((&10u32.to_be_bytes(), true)),
-                Some((&44u32.to_be_bytes(), true)),
-                true,
-                5,
-                false,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                RangeScanOptions {
+                    lower: Some((&10u32.to_be_bytes(), true)),
+                    upper: Some((&44u32.to_be_bytes(), true)),
+                    reverse: true,
+                    limit: 5,
+                    keys_only: false,
+                },
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         assert_eq!(spans.len(), 5);
@@ -2208,15 +2216,19 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
             .scan_secondary_index_into_slab(
                 1,
                 1,
-                &prefix,
-                (&cur_lo, cur_inc),
-                None,
-                7,
-                true,
-                &mut chunk_pks,
-                &mut slab,
-                &mut spans,
-                None,
+                SecondaryScanOptions {
+                    prefix: &prefix,
+                    lower_sec_key: (&cur_lo, cur_inc),
+                    upper_sec_key: None,
+                    limit: 7,
+                    keys_only: true,
+                },
+                SlabScanOutput {
+                    pks: &mut chunk_pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         assert!(slab.is_empty() && spans.is_empty());
@@ -2242,15 +2254,19 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
             .scan_secondary_index_into_slab(
                 1,
                 1,
-                &prefix,
-                (&cur_lo2, cur_inc2),
-                None,
-                6,
-                false,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                SecondaryScanOptions {
+                    prefix: &prefix,
+                    lower_sec_key: (&cur_lo2, cur_inc2),
+                    upper_sec_key: None,
+                    limit: 6,
+                    keys_only: false,
+                },
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         for (s, e) in spans {
@@ -3341,15 +3357,19 @@ fn keys_of_r(r: &crate::engine::EngineReader<'_, OsFs>, reverse: bool) -> Vec<St
     let mut spans = Vec::new();
     r.scan_range_into_slab(
         1,
-        None,
-        None,
-        reverse,
-        usize::MAX,
-        true,
-        &mut pks,
-        &mut slab,
-        &mut spans,
-        None,
+        RangeScanOptions {
+            lower: None,
+            upper: None,
+            reverse,
+            limit: usize::MAX,
+            keys_only: true,
+        },
+        SlabScanOutput {
+            pks: &mut pks,
+            slab: &mut slab,
+            spans: &mut spans,
+            lazy_blobs: None,
+        },
     )
     .unwrap();
     pks.into_iter()
@@ -3364,15 +3384,19 @@ fn keys_of(engine: &mut StorageEngine<OsFs>, reverse: bool) -> Vec<String> {
     engine
         .scan_range_into_slab(
             1,
-            None,
-            None,
-            reverse,
-            usize::MAX,
-            true,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            None,
+            RangeScanOptions {
+                lower: None,
+                upper: None,
+                reverse,
+                limit: usize::MAX,
+                keys_only: true,
+            },
+            SlabScanOutput {
+                pks: &mut pks,
+                slab: &mut slab,
+                spans: &mut spans,
+                lazy_blobs: None,
+            },
         )
         .unwrap();
     pks.into_iter()
@@ -3994,15 +4018,19 @@ fn full_scan_bypasses_block_cache_insertion() {
     engine
         .scan_range_into_slab(
             1,
-            None,
-            None,
-            false,
-            usize::MAX,
-            true,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            None,
+            RangeScanOptions {
+                lower: None,
+                upper: None,
+                reverse: false,
+                limit: usize::MAX,
+                keys_only: true,
+            },
+            SlabScanOutput {
+                pks: &mut pks,
+                slab: &mut slab,
+                spans: &mut spans,
+                lazy_blobs: None,
+            },
         )
         .unwrap();
     assert_eq!(pks.len(), 50);
@@ -4052,15 +4080,19 @@ fn chunked_full_scan_bypasses_block_cache_while_secondary_lookup_populates_it() 
         engine
             .scan_range_into_slab(
                 1,
-                lower_pk.as_deref().map(|pk| (pk, false)),
-                None,
-                false,
-                256,
-                true,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                RangeScanOptions {
+                    lower: lower_pk.as_deref().map(|pk| (pk, false)),
+                    upper: None,
+                    reverse: false,
+                    limit: 256,
+                    keys_only: true,
+                },
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         total_pks += pks.len();
@@ -8182,15 +8214,19 @@ fn pending_group_visible_to_next_writer_without_cloning_into_overlay() {
     engine
         .scan_range_into_slab(
             1,
-            None,
-            None,
-            true,
-            100,
-            false,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            Some(&mut lazy),
+            RangeScanOptions {
+                lower: None,
+                upper: None,
+                reverse: true,
+                limit: 100,
+                keys_only: false,
+            },
+            SlabScanOutput {
+                pks: &mut pks,
+                slab: &mut slab,
+                spans: &mut spans,
+                lazy_blobs: Some(&mut lazy),
+            },
         )
         .unwrap();
     assert_eq!(pks, vec![b"k3".to_vec(), b"k2".to_vec()]);
@@ -8629,15 +8665,19 @@ fn prefetch_lazy_blobs_coalesces_reads_and_isolates_bad_pointer() {
     engine
         .scan_range_into_slab(
             1,
-            None,
-            None,
-            false,
-            16,
-            false,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            Some(&mut lazy),
+            RangeScanOptions {
+                lower: None,
+                upper: None,
+                reverse: false,
+                limit: 16,
+                keys_only: false,
+            },
+            SlabScanOutput {
+                pks: &mut pks,
+                slab: &mut slab,
+                spans: &mut spans,
+                lazy_blobs: Some(&mut lazy),
+            },
         )
         .unwrap();
     assert_eq!(pks.len(), 6);
@@ -8781,15 +8821,19 @@ fn mem_only_secondary_scan_clamps_seek_below_prefix_like_merged_scan() {
             .scan_secondary_index_into_slab(
                 2,
                 1,
-                &prefix,
-                (&below_prefix_seek, true),
-                None,
-                16,
-                true,
-                &mut pks_only,
-                &mut slab_only,
-                &mut spans_only,
-                None,
+                SecondaryScanOptions {
+                    prefix: &prefix,
+                    lower_sec_key: (&below_prefix_seek, true),
+                    upper_sec_key: None,
+                    limit: 16,
+                    keys_only: true,
+                },
+                SlabScanOutput {
+                    pks: &mut pks_only,
+                    slab: &mut slab_only,
+                    spans: &mut spans_only,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
 
@@ -8800,15 +8844,19 @@ fn mem_only_secondary_scan_clamps_seek_below_prefix_like_merged_scan() {
             .scan_secondary_index_into_slab(
                 2,
                 1,
-                &prefix,
-                (&below_prefix_seek, false),
-                None,
-                16,
-                false,
-                &mut pks_rows,
-                &mut slab_rows,
-                &mut spans_rows,
-                None,
+                SecondaryScanOptions {
+                    prefix: &prefix,
+                    lower_sec_key: (&below_prefix_seek, false),
+                    upper_sec_key: None,
+                    limit: 16,
+                    keys_only: false,
+                },
+                SlabScanOutput {
+                    pks: &mut pks_rows,
+                    slab: &mut slab_rows,
+                    spans: &mut spans_rows,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         let rows: Vec<Vec<u8>> = spans_rows
@@ -9326,7 +9374,20 @@ fn empty_pk_resume_key_and_mem_only_prepopulated_limit_behave_consistently() {
         let mut spans = Vec::new();
         engine
             .scan_range_into_slab(
-                1, None, None, false, 1, false, &mut pks, &mut slab, &mut spans, None,
+                1,
+                RangeScanOptions {
+                    lower: None,
+                    upper: None,
+                    reverse: false,
+                    limit: 1,
+                    keys_only: false,
+                },
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         assert_eq!(spans.len(), 1, "flushed={flushed}");
@@ -9342,15 +9403,19 @@ fn empty_pk_resume_key_and_mem_only_prepopulated_limit_behave_consistently() {
         engine
             .scan_range_into_slab(
                 1,
-                Some((&last_pk, false)),
-                None,
-                false,
-                1,
-                false,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                RangeScanOptions {
+                    lower: Some((&last_pk, false)),
+                    upper: None,
+                    reverse: false,
+                    limit: 1,
+                    keys_only: false,
+                },
+                SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         assert_eq!(

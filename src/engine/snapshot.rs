@@ -372,7 +372,20 @@ mod tests {
             let mut spans = Vec::new();
             reader
                 .scan_range_into_slab(
-                    1, None, None, reverse, 100, false, &mut pks, &mut slab, &mut spans, None,
+                    1,
+                    crate::engine::RangeScanOptions {
+                        lower: None,
+                        upper: None,
+                        reverse,
+                        limit: 100,
+                        keys_only: false,
+                    },
+                    crate::engine::SlabScanOutput {
+                        pks: &mut pks,
+                        slab: &mut slab,
+                        spans: &mut spans,
+                        lazy_blobs: None,
+                    },
                 )
                 .unwrap();
             // Eager payload scans return only the resume key alongside all row spans.
@@ -389,15 +402,19 @@ mod tests {
             .scan_secondary_index_into_slab(
                 1,
                 1,
-                &prefix,
-                (&prefix, true),
-                None,
-                100,
-                true,
-                &mut pks,
-                &mut slab,
-                &mut spans,
-                None,
+                crate::engine::SecondaryScanOptions {
+                    prefix: &prefix,
+                    lower_sec_key: (&prefix, true),
+                    upper_sec_key: None,
+                    limit: 100,
+                    keys_only: true,
+                },
+                crate::engine::SlabScanOutput {
+                    pks: &mut pks,
+                    slab: &mut slab,
+                    spans: &mut spans,
+                    lazy_blobs: None,
+                },
             )
             .unwrap();
         assert_eq!(pks, [b"a", b"b", b"c"]);

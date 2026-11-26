@@ -3,13 +3,13 @@
 use std::io;
 use std::ops::Bound;
 
-use crate::index::{IndexEntry, IndexValue};
+use crate::index::{IdxSegmentCursor, IdxSegmentRevCursor, IndexEntry, IndexValue, RawIdxEntry};
 use crate::lru::{
     NS_PRIMARY_ROW, decode_primary_row_key, decode_secondary_index_pk_slice,
     encode_namespace_prefix, encode_primary_row_key, encode_secondary_index_exact_prefix,
 };
 use crate::memtable::MemEntry;
-use crate::pal::PlatformFs;
+use crate::pal::{PlatformFile, PlatformFs};
 use crate::wal::BlobPtr;
 
 use super::reader::ReadSource;
@@ -17,6 +17,237 @@ use super::{CorruptPolicy, LazyBlob, ReadCtx, ReadView, StorageEngine};
 
 /// Result of [`StorageEngine::scan_table_batch`]: the readable rows and the resume cursor.
 pub type TableBatch = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
+
+/// Caller-owned reusable buffers populated by streaming slab range scans.
+pub struct SlabScanOutput<'a, F: PlatformFile> {
+    pub pks: &'a mut Vec<Vec<u8>>,
+    pub slab: &'a mut Vec<u8>,
+    pub spans: &'a mut Vec<(usize, usize)>,
+    pub lazy_blobs: Option<&'a mut Vec<Option<LazyBlob<F>>>>,
+}
+
+impl<F: PlatformFile> SlabScanOutput<'_, F> {
+    #[inline]
+    pub(crate) fn reborrow(&mut self) -> SlabScanOutput<'_, F> {
+        SlabScanOutput {
+            pks: self.pks,
+            slab: self.slab,
+            spans: self.spans,
+            lazy_blobs: self.lazy_blobs.as_deref_mut(),
+        }
+    }
+}
+
+/// Bounds and projection options for [`StorageEngine::scan_range_into_slab`].
+#[derive(Debug, Clone, Copy)]
+pub struct RangeScanOptions<'a> {
+    pub lower: Option<(&'a [u8], bool)>,
+    pub upper: Option<(&'a [u8], bool)>,
+    pub reverse: bool,
+    pub limit: usize,
+    pub keys_only: bool,
+}
+
+/// Bounds and projection options for [`StorageEngine::scan_secondary_index_into_slab`].
+#[derive(Debug, Clone, Copy)]
+pub struct SecondaryScanOptions<'a> {
+    pub prefix: &'a [u8],
+    pub lower_sec_key: (&'a [u8], bool),
+    pub upper_sec_key: Option<(&'a [u8], bool)>,
+    pub limit: usize,
+    pub keys_only: bool,
+}
+
+/// Internal bounds and options for [`StorageEngine::visit_merged_prefix_range`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MergeScanSpec<'a> {
+    pub prefix: &'a [u8],
+    pub seek_key: &'a [u8],
+    pub lower_inclusive: bool,
+    pub upper_key_bound: Option<(&'a [u8], bool)>,
+    pub reverse: bool,
+    pub limit: usize,
+    pub populate_cache: bool,
+    pub need_values: bool,
+}
+
+/// Stack-allocated primary-row key encoder avoiding heap allocation for `pk.len() <= 61`.
+pub(super) enum SmallPrimaryKey {
+    Stack([u8; 64], usize),
+    Heap(Vec<u8>),
+}
+
+impl SmallPrimaryKey {
+    #[inline]
+    pub(super) fn encode(table_id: u16, pk: &[u8]) -> Self {
+        let total = 3usize.saturating_add(pk.len());
+        if total <= 64 {
+            let mut buf = [0u8; 64];
+            let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
+            buf[0..3].copy_from_slice(&prefix);
+            buf[3..total].copy_from_slice(pk);
+            Self::Stack(buf, total)
+        } else {
+            Self::Heap(encode_primary_row_key(table_id, pk))
+        }
+    }
+
+    #[inline]
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Stack(buf, len) => &buf[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+}
+
+trait SegCursor {
+    fn current_key(&self) -> Option<&[u8]>;
+    fn peek_raw(&self) -> Option<RawIdxEntry<'_>>;
+    fn advance(&mut self) -> io::Result<()>;
+}
+
+impl<F: PlatformFile> SegCursor for IdxSegmentCursor<'_, F> {
+    #[inline]
+    fn current_key(&self) -> Option<&[u8]> {
+        Self::current_key(self)
+    }
+
+    #[inline]
+    fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        Self::peek_raw(self)
+    }
+
+    #[inline]
+    fn advance(&mut self) -> io::Result<()> {
+        Self::advance(self)
+    }
+}
+
+impl<F: PlatformFile> SegCursor for IdxSegmentRevCursor<'_, F> {
+    #[inline]
+    fn current_key(&self) -> Option<&[u8]> {
+        Self::current_key(self)
+    }
+
+    #[inline]
+    fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
+        Self::peek_raw(self)
+    }
+
+    #[inline]
+    fn advance(&mut self) -> io::Result<()> {
+        Self::advance(self)
+    }
+}
+
+struct SlabRowEmitter<'a, FS: PlatformFs> {
+    eng: &'a StorageEngine<FS>,
+    cx: &'a ReadCtx<'a, FS::File>,
+    out: SlabScanOutput<'a, FS::File>,
+    keys_only: bool,
+    lazy_ok: bool,
+    start_pks: usize,
+    start_spans: usize,
+    limit: usize,
+    last_pk_buf: Vec<u8>,
+    have_last_pk: bool,
+}
+
+impl<'a, FS: PlatformFs> SlabRowEmitter<'a, FS> {
+    fn new(
+        eng: &'a StorageEngine<FS>,
+        cx: &'a ReadCtx<'a, FS::File>,
+        out: SlabScanOutput<'a, FS::File>,
+        lazy_ok: bool,
+        opts: RangeScanOptions<'_>,
+    ) -> Self {
+        let start_pks = out.pks.len();
+        let start_spans = out.spans.len();
+        Self {
+            eng,
+            cx,
+            out,
+            keys_only: opts.keys_only,
+            lazy_ok,
+            start_pks,
+            start_spans,
+            limit: opts.limit,
+            last_pk_buf: Vec::new(),
+            have_last_pk: false,
+        }
+    }
+
+    #[inline]
+    fn reached_limit(&self) -> bool {
+        if self.keys_only {
+            self.out.pks.len() - self.start_pks >= self.limit
+        } else {
+            self.out.spans.len() - self.start_spans >= self.limit
+        }
+    }
+
+    fn emit_pk_or_resume(&mut self, pk: &[u8]) {
+        if self.out.lazy_blobs.is_some() {
+            self.out.pks.push(pk.to_vec());
+        } else {
+            self.last_pk_buf.clear();
+            self.last_pk_buf.extend_from_slice(pk);
+            self.have_last_pk = true;
+        }
+    }
+
+    fn emit(&mut self, pk: &[u8], full_key: &[u8], val: MergedValueRef<'_>) -> io::Result<bool> {
+        if self.keys_only {
+            self.out.pks.push(pk.to_vec());
+            return Ok(true);
+        }
+        match val {
+            MergedValueRef::Inline(v) => {
+                let start = self.out.slab.len();
+                self.out.slab.extend_from_slice(v);
+                self.out.spans.push((start, self.out.slab.len()));
+                if let Some(lazy_blobs) = &mut self.out.lazy_blobs {
+                    lazy_blobs.push(None);
+                }
+                self.emit_pk_or_resume(pk);
+                Ok(true)
+            }
+            MergedValueRef::Blob(ptr) => {
+                if self.lazy_ok {
+                    if let Some(lazy_blobs) = &mut self.out.lazy_blobs {
+                        self.out.spans.push((0, 0));
+                        lazy_blobs.push(Some(self.eng.pin_lazy_blob_src(self.cx.src, &ptr)));
+                        self.out.pks.push(pk.to_vec());
+                        return Ok(true);
+                    }
+                }
+                let start = self.out.slab.len();
+                if self.eng.read_flushed_blob_append_into_src(
+                    self.cx.src,
+                    &ptr,
+                    full_key,
+                    self.out.slab,
+                )? {
+                    self.out.spans.push((start, self.out.slab.len()));
+                    if let Some(lazy_blobs) = &mut self.out.lazy_blobs {
+                        lazy_blobs.push(None);
+                    }
+                    self.emit_pk_or_resume(pk);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    fn finish(self) {
+        if !self.keys_only && self.out.lazy_blobs.is_none() && self.have_last_pk {
+            self.out.pks.push(self.last_pk_buf);
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -203,278 +434,128 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.scan_range_into_slab_cx(
             cx,
             table_id,
-            lower_b,
-            upper_b,
-            false,
-            limit,
-            true,
+            RangeScanOptions {
+                lower: lower_b,
+                upper: upper_b,
+                reverse: false,
+                limit,
+                keys_only: true,
+            },
             populate_cache,
-            &mut pks,
-            &mut slab,
-            &mut spans,
-            None,
+            SlabScanOutput {
+                pks: &mut pks,
+                slab: &mut slab,
+                spans: &mut spans,
+                lazy_blobs: None,
+            },
         )?;
         Ok(pks)
     }
 
-    /// Streams live rows in `table_id` within `lower` and `upper` directly into `slab_out` and
-    /// `spans_out` (or into `pks_out` when `keys_only` is `true` without dereferencing blobs)
-    /// without intermediate per-row `Vec<u8>` allocations.
+    /// Streams live rows in `table_id` according to `opts` directly into `out` (`out.slab` and
+    /// `out.spans`, or `out.pks` when `opts.keys_only` is `true` without dereferencing blobs),
+    /// avoiding intermediate per-row `Vec<u8>` allocations.
     ///
-    /// When `lazy_blobs_out` is `Some`, out-of-line blobs are NOT read from disk during the scan;
-    /// instead, a placeholder span `(0, 0)` is recorded in `spans_out` and `Some(blob_ptr)` is pushed
-    /// to `lazy_blobs_out`, deferring disk I/O and CRC32C checks until `vtab_column` actually visits the row.
-    #[allow(clippy::too_many_arguments)]
+    /// When `out.lazy_blobs` is `Some`, out-of-line blobs are NOT read from disk during the scan;
+    /// instead, a placeholder span `(0, 0)` is recorded in `out.spans` and `Some(blob_ptr)` is
+    /// pushed to `out.lazy_blobs`, deferring disk I/O and CRC32C checks until visited.
     pub fn scan_range_into_slab(
         &mut self,
         table_id: u16,
-        lower: Option<(&[u8], bool)>,
-        upper: Option<(&[u8], bool)>,
-        reverse: bool,
-        limit: usize,
-        keys_only: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        opts: RangeScanOptions<'_>,
+        mut out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<()> {
-        let populate_cache = should_populate_range_cache(lower, upper, limit);
+        let populate_cache = should_populate_range_cache(opts.lower, opts.upper, opts.limit);
         self.owner_read(|eng, cx| {
-            eng.scan_range_into_slab_cx(
-                cx,
-                table_id,
-                lower,
-                upper,
-                reverse,
-                limit,
-                keys_only,
-                populate_cache,
-                pks_out,
-                slab_out,
-                spans_out,
-                lazy_blobs_out.as_deref_mut(),
-            )
+            eng.scan_range_into_slab_cx(cx, table_id, opts, populate_cache, out.reborrow())
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_range_into_slab_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
-        lower: Option<(&[u8], bool)>,
-        upper: Option<(&[u8], bool)>,
-        reverse: bool,
-        limit: usize,
-        keys_only: bool,
+        opts: RangeScanOptions<'_>,
         populate_cache: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<()> {
-        if limit == 0 {
+        if opts.limit == 0 {
             return Ok(());
         }
         let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
-        let mut lb_stack = [0u8; 64];
-        let lb_heap;
-        let seek_key: &[u8] = match lower {
-            Some((lb_pk, _)) if 3 + lb_pk.len() <= lb_stack.len() => {
-                lb_stack[0..3].copy_from_slice(&prefix);
-                lb_stack[3..3 + lb_pk.len()].copy_from_slice(lb_pk);
-                &lb_stack[..3 + lb_pk.len()]
-            }
-            Some((lb_pk, _)) => {
-                lb_heap = encode_primary_row_key(table_id, lb_pk);
-                &lb_heap
-            }
-            None => &prefix,
-        };
+        let seek_buf = opts
+            .lower
+            .map(|(pk, _)| SmallPrimaryKey::encode(table_id, pk));
+        let seek_key: &[u8] = seek_buf
+            .as_ref()
+            .map(SmallPrimaryKey::as_slice)
+            .unwrap_or(&prefix);
 
-        let mut ub_stack = [0u8; 64];
-        let ub_heap;
-        let upper_key_slice: Option<(&[u8], bool)> = match upper {
-            Some((ub_pk, inc)) if 3 + ub_pk.len() <= ub_stack.len() => {
-                ub_stack[0..3].copy_from_slice(&prefix);
-                ub_stack[3..3 + ub_pk.len()].copy_from_slice(ub_pk);
-                Some((&ub_stack[..3 + ub_pk.len()], inc))
-            }
-            Some((ub_pk, inc)) => {
-                ub_heap = encode_primary_row_key(table_id, ub_pk);
-                Some((&ub_heap, inc))
-            }
-            None => None,
-        };
+        let upper_buf = opts
+            .upper
+            .map(|(pk, inc)| (SmallPrimaryKey::encode(table_id, pk), inc));
+        let upper_key_slice: Option<(&[u8], bool)> =
+            upper_buf.as_ref().map(|(k, inc)| (k.as_slice(), *inc));
 
-        let lo_inc = lower.map(|(_, inc)| inc).unwrap_or(true);
+        let lo_inc = opts.lower.map(|(_, inc)| inc).unwrap_or(true);
         if let Some((ub, ub_inc)) = upper_key_slice {
             if seek_key > ub || (seek_key == ub && (!lo_inc || !ub_inc)) {
                 return Ok(());
             }
         }
 
-        if !keys_only {
+        if !opts.keys_only {
             self.ensure_all_flushed_cx(cx)?;
         }
         // Lazy dereference cannot skip a row once the cursor has emitted it, so tables whose
         // corrupt rows must vanish (`CorruptPolicy::Evict`) verify blobs eagerly during the scan.
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
-        let start_pks = pks_out.len();
-        let start_spans = spans_out.len();
+        let mut emitter = SlabRowEmitter::new(self, cx, out, lazy_ok, opts);
 
-        if self.idx_segments_for(cx.src).is_empty() && !reverse {
+        if self.idx_segments_for(cx.src).is_empty() && !opts.reverse {
             let Some(range) =
                 PreparedPrefixRange::prepare(&prefix, seek_key, lo_inc, upper_key_slice)
             else {
                 return Ok(());
             };
-            let mut last_pk_buf: Vec<u8> = Vec::new();
-            let mut have_last_pk = false;
             for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
                 if !range.in_upper_and_prefix(k) {
                     break;
                 }
-                if keys_only {
-                    if !matches!(entry.value, IndexValue::Tombstone) {
-                        pks_out.push(k[3..].to_vec());
-                        if pks_out.len() - start_pks >= limit {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                match &entry.value {
-                    IndexValue::Inline(v) => {
-                        let start = slab_out.len();
-                        slab_out.extend_from_slice(v);
-                        spans_out.push((start, slab_out.len()));
-                        if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                            lazy_blobs.push(None);
-                            pks_out.push(k[3..].to_vec());
-                        } else {
-                            last_pk_buf.clear();
-                            last_pk_buf.extend_from_slice(&k[3..]);
-                            have_last_pk = true;
-                        }
-                        if spans_out.len() - start_spans >= limit {
-                            break;
-                        }
-                    }
-                    IndexValue::Blob(ptr) => {
-                        if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
-                            spans_out.push((0, 0));
-                            lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, ptr)));
-                            pks_out.push(k[3..].to_vec());
-                            if spans_out.len() - start_spans >= limit {
-                                break;
-                            }
-                        } else {
-                            let start = slab_out.len();
-                            if self.read_flushed_blob_append_into_src(cx.src, ptr, k, slab_out)? {
-                                spans_out.push((start, slab_out.len()));
-                                if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                                    lazy_blobs.push(None);
-                                    pks_out.push(k[3..].to_vec());
-                                } else {
-                                    last_pk_buf.clear();
-                                    last_pk_buf.extend_from_slice(&k[3..]);
-                                    have_last_pk = true;
-                                }
-                                if spans_out.len() - start_spans >= limit {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    IndexValue::Tombstone => {}
+                let val_ref = match &entry.value {
+                    IndexValue::Inline(v) => MergedValueRef::Inline(v.as_slice()),
+                    IndexValue::Blob(ptr) => MergedValueRef::Blob(*ptr),
+                    IndexValue::Tombstone => continue,
+                };
+                if emitter.emit(&k[3..], k, val_ref)? && emitter.reached_limit() {
+                    break;
                 }
             }
-            if !keys_only && lazy_blobs_out.is_none() && have_last_pk {
-                pks_out.push(last_pk_buf);
-            }
+            emitter.finish();
             return Ok(());
         }
 
-        let mut last_pk_buf: Vec<u8> = Vec::new();
-        let mut have_last_pk = false;
-        let mut emit_entry = |key: &[u8], _lsn: u64, val: MergedValueRef<'_>| -> io::Result<bool> {
-            if key.len() < 3 || !key.starts_with(&prefix) {
-                return Ok(false);
-            }
-            if keys_only {
-                pks_out.push(key[3..].to_vec());
-                return Ok(true);
-            }
-            match val {
-                MergedValueRef::Inline(v) => {
-                    let start = slab_out.len();
-                    slab_out.extend_from_slice(v);
-                    spans_out.push((start, slab_out.len()));
-                    if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                        lazy_blobs.push(None);
-                        pks_out.push(key[3..].to_vec());
-                    } else {
-                        last_pk_buf.clear();
-                        last_pk_buf.extend_from_slice(&key[3..]);
-                        have_last_pk = true;
-                    }
-                    Ok(true)
-                }
-                MergedValueRef::Blob(ptr) => {
-                    if let (true, Some(lazy_blobs)) = (lazy_ok, &mut lazy_blobs_out) {
-                        spans_out.push((0, 0));
-                        lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, &ptr)));
-                        pks_out.push(key[3..].to_vec());
-                        Ok(true)
-                    } else {
-                        let start = slab_out.len();
-                        if self.read_flushed_blob_append_into_src(cx.src, &ptr, key, slab_out)? {
-                            spans_out.push((start, slab_out.len()));
-                            if let Some(lazy_blobs) = &mut lazy_blobs_out {
-                                lazy_blobs.push(None);
-                                pks_out.push(key[3..].to_vec());
-                            } else {
-                                last_pk_buf.clear();
-                                last_pk_buf.extend_from_slice(&key[3..]);
-                                have_last_pk = true;
-                            }
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    }
-                }
-            }
-        };
-
-        if reverse {
-            self.visit_merged_prefix_range_reverse_src(
-                cx.src,
-                &prefix,
+        self.visit_merged_prefix_range_src(
+            cx.src,
+            MergeScanSpec {
+                prefix: &prefix,
                 seek_key,
-                lo_inc,
-                upper_key_slice,
-                limit,
+                lower_inclusive: lo_inc,
+                upper_key_bound: upper_key_slice,
+                reverse: opts.reverse,
+                limit: opts.limit,
                 populate_cache,
-                &mut emit_entry,
-            )?;
-        } else {
-            self.visit_merged_prefix_range_src(
-                cx.src,
-                &prefix,
-                seek_key,
-                lo_inc,
-                upper_key_slice,
-                limit,
-                populate_cache,
-                &mut emit_entry,
-            )?;
-        }
+                need_values: !opts.keys_only,
+            },
+            |key, _lsn, val| {
+                if key.len() < 3 || !key.starts_with(&prefix) {
+                    return Ok(false);
+                }
+                emitter.emit(&key[3..], key, val)
+            },
+        )?;
 
-        if !keys_only && lazy_blobs_out.is_none() && have_last_pk {
-            pks_out.push(last_pk_buf);
-        }
+        emitter.finish();
         Ok(())
     }
 
@@ -492,15 +573,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut unused_pks = Vec::new();
         self.scan_range_into_slab(
             table_id,
-            lower_bound,
-            upper_bound,
-            false,
-            limit,
-            false,
-            &mut unused_pks,
-            slab,
-            spans,
-            None,
+            RangeScanOptions {
+                lower: lower_bound,
+                upper: upper_bound,
+                reverse: false,
+                limit,
+                keys_only: false,
+            },
+            SlabScanOutput {
+                pks: &mut unused_pks,
+                slab,
+                spans,
+                lazy_blobs: None,
+            },
         )
     }
 
@@ -555,29 +640,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok((Vec::new(), None));
         }
         let prefix = encode_namespace_prefix(table_id, NS_PRIMARY_ROW);
-        let seek_key = match lower_bound {
-            Some((lb_pk, _)) => encode_primary_row_key(table_id, lb_pk),
-            None => prefix.to_vec(),
-        };
+        let seek_buf = lower_bound.map(|(pk, _)| SmallPrimaryKey::encode(table_id, pk));
+        let seek_key: &[u8] = seek_buf
+            .as_ref()
+            .map(SmallPrimaryKey::as_slice)
+            .unwrap_or(&prefix);
         let lo_inc = lower_bound.map(|(_, inc)| inc).unwrap_or(true);
-        let upper_full =
-            upper_bound.map(|(ub_pk, inc)| (encode_primary_row_key(table_id, ub_pk), inc));
+        let upper_buf = upper_bound.map(|(pk, inc)| (SmallPrimaryKey::encode(table_id, pk), inc));
+        let upper_slice = upper_buf.as_ref().map(|(k, inc)| (k.as_slice(), *inc));
 
-        if let Some((ref ub, ub_inc)) = upper_full {
-            if seek_key.as_slice() > ub.as_slice()
-                || (seek_key.as_slice() == ub.as_slice() && (!lo_inc || !ub_inc))
-            {
+        if let Some((ub, ub_inc)) = upper_slice {
+            if seek_key > ub || (seek_key == ub && (!lo_inc || !ub_inc)) {
                 return Ok((Vec::new(), None));
             }
         }
 
         if self.idx_segments.is_empty() {
-            let Some(range) = PreparedPrefixRange::prepare(
-                &prefix,
-                &seek_key,
-                lo_inc,
-                upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
-            ) else {
+            let Some(range) = PreparedPrefixRange::prepare(&prefix, seek_key, lo_inc, upper_slice)
+            else {
                 return Ok((Vec::new(), None));
             };
             let entries: Vec<(Vec<u8>, IndexValue)> = self
@@ -608,12 +688,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok((rows, next));
         }
 
-        let populate_cache = lower_bound.is_some() && upper_bound.is_some() && limit <= 256;
+        let populate_cache = should_populate_range_cache(lower_bound, upper_bound, limit);
         let merged = self.scan_merged_prefix_range(
             &prefix,
-            &seek_key,
+            seek_key,
             lo_inc,
-            upper_full.as_ref().map(|(v, inc)| (v.as_slice(), *inc)),
+            upper_slice,
             limit,
             populate_cache,
         )?;
@@ -665,12 +745,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let mut pks = Vec::new();
         self.visit_merged_prefix_range(
-            &prefix,
-            &prefix,
-            true,
-            None,
-            usize::MAX,
-            true,
+            MergeScanSpec {
+                prefix: &prefix,
+                seek_key: &prefix,
+                lower_inclusive: true,
+                upper_key_bound: None,
+                reverse: false,
+                limit: usize::MAX,
+                populate_cache: true,
+                need_values: false,
+            },
             |key, _lsn, _val| {
                 if key.starts_with(&prefix) {
                     pks.push(key[prefix.len()..].to_vec());
@@ -683,222 +767,178 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(pks)
     }
 
-    /// Streams up to `limit` live rows matching a secondary index range `[lower_sec_key, upper_sec_key]`
-    /// under `prefix` into `slab_out` and `spans_out` (or into `pks_out` when `keys_only` is `true`),
-    /// returning `Ok(Some(last_sec_key))` when `limit` rows were emitted so the caller can resume
-    /// the next chunk in `vtab_next`.
-    #[allow(clippy::too_many_arguments)]
+    /// Streams up to `opts.limit` live rows matching a secondary index range under `opts.prefix`
+    /// into `out` (`out.slab` and `out.spans`, or `out.pks` when `opts.keys_only` is `true`),
+    /// returning `Ok(Some(last_sec_key))` when `opts.limit` rows were emitted so the caller can
+    /// resume the next chunk in `vtab_next`.
     pub fn scan_secondary_index_into_slab(
         &mut self,
         table_id: u16,
         index_id: u16,
-        prefix: &[u8],
-        lower_sec_key: (&[u8], bool),
-        upper_sec_key: Option<(&[u8], bool)>,
-        limit: usize,
-        keys_only: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        opts: SecondaryScanOptions<'_>,
+        mut out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let populate_cache = should_populate_secondary_cache(prefix, upper_sec_key, limit);
+        let populate_cache =
+            should_populate_secondary_cache(opts.prefix, opts.upper_sec_key, opts.limit);
         self.owner_read(|eng, cx| {
             eng.scan_secondary_index_into_slab_cx(
                 cx,
                 table_id,
                 index_id,
-                prefix,
-                lower_sec_key,
-                upper_sec_key,
-                limit,
-                keys_only,
+                opts,
                 populate_cache,
-                pks_out,
-                slab_out,
-                spans_out,
-                lazy_blobs_out.as_deref_mut(),
+                out.reborrow(),
             )
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn collect_mem_secondary_pks_cx(
+    fn collect_secondary_pks_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         index_id: u16,
-        prefix: &[u8],
-        seek_slice: &[u8],
-        lower_inclusive: bool,
-        upper_sec_key: Option<(&[u8], bool)>,
-        limit: usize,
+        spec: MergeScanSpec<'_>,
         pks_out: &mut Vec<Vec<u8>>,
         last_sec_key_buf: &mut Vec<u8>,
-    ) {
-        let Some(range) =
-            PreparedPrefixRange::prepare(prefix, seek_slice, lower_inclusive, upper_sec_key)
-        else {
-            return;
-        };
-        let mut emitted = 0usize;
-        for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
-            if !range.in_upper_and_prefix(k) {
-                break;
+    ) -> io::Result<()> {
+        if self.idx_segments_for(cx.src).is_empty() {
+            let Some(range) = PreparedPrefixRange::prepare(
+                spec.prefix,
+                spec.seek_key,
+                spec.lower_inclusive,
+                spec.upper_key_bound,
+            ) else {
+                return Ok(());
+            };
+            let mut emitted = 0usize;
+            for (k, entry, _) in self.mem_view_for(cx.src, range.lo_bound(), range.hi_bound()) {
+                if !range.in_upper_and_prefix(k) {
+                    break;
+                }
+                if matches!(entry.value, IndexValue::Tombstone) {
+                    continue;
+                }
+                if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
+                    pks_out.push(pk.to_vec());
+                    last_sec_key_buf.clear();
+                    last_sec_key_buf.extend_from_slice(k);
+                    emitted += 1;
+                    if emitted >= spec.limit {
+                        break;
+                    }
+                }
             }
-            if matches!(entry.value, IndexValue::Tombstone) {
-                continue;
-            }
+            return Ok(());
+        }
+
+        self.visit_merged_prefix_range_src(cx.src, spec, |k, _lsn, _val| {
             if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
                 pks_out.push(pk.to_vec());
                 last_sec_key_buf.clear();
                 last_sec_key_buf.extend_from_slice(k);
-                emitted += 1;
-                if emitted >= limit {
-                    break;
-                }
+                Ok(true)
+            } else {
+                Ok(false)
             }
-        }
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_secondary_index_into_slab_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
         index_id: u16,
-        prefix: &[u8],
-        lower_sec_key: (&[u8], bool),
-        upper_sec_key: Option<(&[u8], bool)>,
-        limit: usize,
-        keys_only: bool,
+        opts: SecondaryScanOptions<'_>,
         populate_cache: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        mut lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        mut out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<Option<Vec<u8>>> {
-        if limit == 0 {
+        if opts.limit == 0 {
             return Ok(None);
         }
-        let (seek_slice, mut cur_inc) = lower_sec_key;
-        if let Some((ub, ub_inc)) = upper_sec_key {
+        let (seek_slice, mut cur_inc) = opts.lower_sec_key;
+        if let Some((ub, ub_inc)) = opts.upper_sec_key {
             if seek_slice > ub || (seek_slice == ub && (!cur_inc || !ub_inc)) {
                 return Ok(None);
             }
         }
 
-        if !keys_only {
+        if !opts.keys_only {
             self.ensure_all_flushed_cx(cx)?;
         }
 
-        let start_pks = pks_out.len();
-        let start_spans = spans_out.len();
+        let start_pks = out.pks.len();
+        let start_spans = out.spans.len();
         let mut last_sec_key_buf: Vec<u8> = Vec::new();
 
-        if keys_only {
-            if self.idx_segments_for(cx.src).is_empty() {
-                self.collect_mem_secondary_pks_cx(
-                    cx,
-                    table_id,
-                    index_id,
-                    prefix,
-                    seek_slice,
-                    cur_inc,
-                    upper_sec_key,
-                    limit,
-                    pks_out,
-                    &mut last_sec_key_buf,
-                );
-            } else {
-                self.visit_merged_prefix_range_src(
-                    cx.src,
-                    prefix,
-                    seek_slice,
-                    cur_inc,
-                    upper_sec_key,
-                    limit,
+        if opts.keys_only {
+            self.collect_secondary_pks_cx(
+                cx,
+                table_id,
+                index_id,
+                MergeScanSpec {
+                    prefix: opts.prefix,
+                    seek_key: seek_slice,
+                    lower_inclusive: cur_inc,
+                    upper_key_bound: opts.upper_sec_key,
+                    reverse: false,
+                    limit: opts.limit,
                     populate_cache,
-                    |k, _lsn, _val| {
-                        if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
-                            pks_out.push(pk.to_vec());
-                            last_sec_key_buf.clear();
-                            last_sec_key_buf.extend_from_slice(k);
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    },
-                )?;
-            }
-            if pks_out.len() - start_pks >= limit && !last_sec_key_buf.is_empty() {
+                    need_values: false,
+                },
+                out.pks,
+                &mut last_sec_key_buf,
+            )?;
+            if out.pks.len() - start_pks >= opts.limit && !last_sec_key_buf.is_empty() {
                 return Ok(Some(last_sec_key_buf));
             }
             return Ok(None);
         }
 
         let mut cur_seek_owned: Option<Vec<u8>> = None;
-        let mut batch_pks: Vec<Vec<u8>> = Vec::with_capacity(limit.min(256));
+        let mut batch_pks: Vec<Vec<u8>> = Vec::with_capacity(opts.limit.min(256));
 
-        while spans_out.len() - start_spans < limit {
-            let batch_need = limit - (spans_out.len() - start_spans);
+        while out.spans.len() - start_spans < opts.limit {
+            let batch_need = opts.limit - (out.spans.len() - start_spans);
             batch_pks.clear();
             let active_seek: &[u8] = cur_seek_owned.as_deref().unwrap_or(seek_slice);
 
-            if self.idx_segments_for(cx.src).is_empty() {
-                self.collect_mem_secondary_pks_cx(
-                    cx,
-                    table_id,
-                    index_id,
-                    prefix,
-                    active_seek,
-                    cur_inc,
-                    upper_sec_key,
-                    batch_need,
-                    &mut batch_pks,
-                    &mut last_sec_key_buf,
-                );
-            } else {
-                self.visit_merged_prefix_range_src(
-                    cx.src,
-                    prefix,
-                    active_seek,
-                    cur_inc,
-                    upper_sec_key,
-                    batch_need,
+            self.collect_secondary_pks_cx(
+                cx,
+                table_id,
+                index_id,
+                MergeScanSpec {
+                    prefix: opts.prefix,
+                    seek_key: active_seek,
+                    lower_inclusive: cur_inc,
+                    upper_key_bound: opts.upper_sec_key,
+                    reverse: false,
+                    limit: batch_need,
                     populate_cache,
-                    |k, _lsn, _val| {
-                        if let Some(pk) = decode_secondary_index_pk_slice(table_id, index_id, k) {
-                            batch_pks.push(pk.to_vec());
-                            last_sec_key_buf.clear();
-                            last_sec_key_buf.extend_from_slice(k);
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    },
-                )?;
-            }
+                    need_values: false,
+                },
+                &mut batch_pks,
+                &mut last_sec_key_buf,
+            )?;
 
             if batch_pks.is_empty() {
                 return Ok(None);
             }
             let scanned_count = batch_pks.len();
-            for pk in &batch_pks {
-                if let Some(lazy_blobs) = &mut lazy_blobs_out {
+            for pk in batch_pks.drain(..) {
+                if let Some(lazy_blobs) = &mut out.lazy_blobs {
                     if self
-                        .get_row_into_lazy_cx(cx, table_id, pk, slab_out, spans_out, lazy_blobs)?
+                        .get_row_into_lazy_cx(cx, table_id, &pk, out.slab, out.spans, lazy_blobs)?
                     {
-                        pks_out.push(pk.clone());
+                        out.pks.push(pk);
                     }
                 } else {
-                    self.get_row_into_cx(cx, table_id, pk, slab_out, spans_out)?;
+                    self.get_row_into_cx(cx, table_id, &pk, out.slab, out.spans)?;
                 }
             }
             if scanned_count < batch_need {
                 return Ok(None);
             }
-            if spans_out.len() - start_spans >= limit {
+            if out.spans.len() - start_spans >= opts.limit {
                 return Ok(Some(last_sec_key_buf));
             }
             cur_seek_owned = Some(last_sec_key_buf.clone());
@@ -916,34 +956,45 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.scan_merged_prefix_from(prefix, prefix, usize::MAX)
     }
 
+    fn collect_merged_prefix_range_src(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        spec: MergeScanSpec<'_>,
+    ) -> io::Result<Vec<IndexEntry>> {
+        let mut out = Vec::new();
+        self.visit_merged_prefix_range_src(src, spec, |key, lsn, val| {
+            let value = match val {
+                MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
+                MergedValueRef::Blob(ptr) => IndexValue::Blob(ptr),
+            };
+            out.push(IndexEntry {
+                key: key.to_vec(),
+                lsn,
+                value,
+            });
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
     pub(super) fn scan_merged_prefix_view(
         &self,
         view: ReadView,
         prefix: &[u8],
     ) -> io::Result<Vec<IndexEntry>> {
-        let mut out = Vec::new();
-        self.visit_merged_prefix_range_view(
-            view,
-            prefix,
-            prefix,
-            true,
-            None,
-            usize::MAX,
-            false,
-            |key, lsn, val| {
-                let value = match val {
-                    MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
-                    MergedValueRef::Blob(ptr) => IndexValue::Blob(ptr),
-                };
-                out.push(IndexEntry {
-                    key: key.to_vec(),
-                    lsn,
-                    value,
-                });
-                Ok(true)
+        self.collect_merged_prefix_range_src(
+            ReadSource::from_view(view),
+            MergeScanSpec {
+                prefix,
+                seek_key: prefix,
+                lower_inclusive: true,
+                upper_key_bound: None,
+                reverse: false,
+                limit: usize::MAX,
+                populate_cache: false,
+                need_values: true,
             },
-        )?;
-        Ok(out)
+        )
     }
 
     pub(super) fn scan_merged_prefix_from(
@@ -970,321 +1021,154 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         limit: usize,
         populate_cache: bool,
     ) -> io::Result<Vec<IndexEntry>> {
-        let mut out = Vec::new();
-        self.visit_merged_prefix_range(
-            prefix,
-            seek_key,
-            lower_inclusive,
-            upper_key_bound,
-            limit,
-            populate_cache,
-            |key, lsn, val| {
-                let value = match val {
-                    MergedValueRef::Inline(v) => IndexValue::Inline(v.to_vec()),
-                    MergedValueRef::Blob(ptr) => IndexValue::Blob(ptr),
-                };
-                out.push(IndexEntry {
-                    key: key.to_vec(),
-                    lsn,
-                    value,
-                });
-                Ok(true)
+        self.collect_merged_prefix_range_src(
+            ReadSource::Owner,
+            MergeScanSpec {
+                prefix,
+                seek_key,
+                lower_inclusive,
+                upper_key_bound,
+                reverse: false,
+                limit,
+                populate_cache,
+                need_values: true,
             },
-        )?;
-        Ok(out)
+        )
     }
 
-    /// Streams up to `limit` live entries from the ascending K-way merge across `self.memtable`
-    /// and `self.idx_segments` into `on_live` without allocating intermediate `IndexEntry`
-    /// structs or per-entry `Vec<u8>` buffers.
-    #[allow(clippy::too_many_arguments)]
+    /// Streams up to `spec.limit` live entries from the ascending or descending K-way merge across
+    /// `self.memtable` and `self.idx_segments` into `on_live` without allocating intermediate
+    /// `IndexEntry` structs or per-entry `Vec<u8>` buffers.
     pub(super) fn visit_merged_prefix_range<F>(
         &self,
-        prefix: &[u8],
-        seek_key: &[u8],
-        lower_inclusive: bool,
-        upper_key_bound: Option<(&[u8], bool)>,
-        limit: usize,
-        populate_cache: bool,
+        spec: MergeScanSpec<'_>,
         on_live: F,
     ) -> io::Result<()>
     where
         F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
     {
-        self.visit_merged_prefix_range_view(
-            ReadView::Owner,
-            prefix,
-            seek_key,
-            lower_inclusive,
-            upper_key_bound,
-            limit,
-            populate_cache,
-            on_live,
-        )
+        self.visit_merged_prefix_range_view(ReadView::Owner, spec, on_live)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_merged_prefix_range_view<F>(
         &self,
         view: ReadView,
-        prefix: &[u8],
-        seek_key: &[u8],
-        lower_inclusive: bool,
-        upper_key_bound: Option<(&[u8], bool)>,
-        limit: usize,
-        populate_cache: bool,
+        spec: MergeScanSpec<'_>,
         on_live: F,
     ) -> io::Result<()>
     where
         F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
     {
-        self.visit_merged_prefix_range_src(
-            ReadSource::from_view(view),
-            prefix,
-            seek_key,
-            lower_inclusive,
-            upper_key_bound,
-            limit,
-            populate_cache,
-            on_live,
-        )
+        self.visit_merged_prefix_range_src(ReadSource::from_view(view), spec, on_live)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_merged_prefix_range_src<F>(
         &self,
         src: ReadSource<'_, FS::File>,
-        prefix: &[u8],
-        seek_key: &[u8],
-        lower_inclusive: bool,
-        upper_key_bound: Option<(&[u8], bool)>,
-        limit: usize,
-        populate_cache: bool,
-        mut on_live: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
-    {
-        if limit == 0 {
-            return Ok(());
-        }
-        let Some(range) =
-            PreparedPrefixRange::prepare(prefix, seek_key, lower_inclusive, upper_key_bound)
-        else {
-            return Ok(());
-        };
-
-        let mut mem_iter = self.mem_view_for_dir(src, range.lo_bound(), range.hi_bound(), false);
-        let mut mem_exhausted = false;
-
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
-        let upper_for_overlap = range.upper_for_overlap();
-        for seg in self.idx_segments_for(src) {
-            if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
-                continue;
-            }
-            if !prefix.is_empty() && seg.min_key() > prefix && !seg.min_key().starts_with(prefix) {
-                continue;
-            }
-            seg_cursors.push(seg.cursor_from_with_cache(
-                range.eff_lo_key,
-                range.eff_lo_inc,
-                populate_cache,
-            )?);
-        }
-
-        let mut emitted = 0usize;
-        let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
-        let mut best_val_buf: Vec<u8> = Vec::with_capacity(256);
-
-        while emitted < limit {
-            let mut min_key: Option<&[u8]> = None;
-
-            if !mem_exhausted {
-                if let Some(k) = mem_iter.peek_key() {
-                    if range.in_upper_and_prefix(k) {
-                        min_key = Some(k);
-                    } else {
-                        mem_exhausted = true;
-                    }
-                } else {
-                    mem_exhausted = true;
-                }
-            }
-
-            for cur in &seg_cursors {
-                if let Some(k) = cur.current_key() {
-                    if range.in_upper_and_prefix(k) {
-                        match min_key {
-                            None => min_key = Some(k),
-                            Some(mk) if k < mk => {
-                                min_key = Some(k);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            let Some(target_key_slice) = min_key else {
-                break;
-            };
-            target_key_buf.clear();
-            target_key_buf.extend_from_slice(target_key_slice);
-
-            // `(lsn, value, from_overlay)`: overlay entries always win over segments by source
-            // precedence; memtable entries are compared against segments by LSN.
-            let mut best_mem_entry: Option<(u64, &IndexValue, bool)> = None;
-            if !mem_exhausted && mem_iter.peek_key() == Some(target_key_buf.as_slice()) {
-                let (_, mem_entry, from_overlay) = mem_iter.advance().unwrap();
-                best_mem_entry = Some((mem_entry.lsn, &mem_entry.value, from_overlay));
-            }
-
-            let mut best_seg_meta: Option<(u64, u8)> = None;
-            for cur in &mut seg_cursors {
-                while cur.current_key() == Some(target_key_buf.as_slice()) {
-                    let raw = cur.peek_raw().unwrap();
-                    let beats_mem = best_mem_entry
-                        .is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
-                    if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
-                        best_seg_meta = Some((raw.lsn, raw.val_type));
-                        best_val_buf.clear();
-                        best_val_buf.extend_from_slice(raw.val_bytes);
-                    }
-                    cur.advance()?;
-                }
-            }
-
-            if let Some((seg_lsn, val_type)) = best_seg_meta {
-                match val_type {
-                    1 => {
-                        if on_live(
-                            &target_key_buf,
-                            seg_lsn,
-                            MergedValueRef::Inline(&best_val_buf),
-                        )? {
-                            emitted += 1;
-                        }
-                    }
-                    2 => {
-                        let ptr = crate::index::RawIdxEntry::decode_blob_ptr(&best_val_buf)?;
-                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Blob(ptr))? {
-                            emitted += 1;
-                        }
-                    }
-                    3 => {}
-                    other => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unknown idx entry val_type {other}"),
-                        ));
-                    }
-                }
-            } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
-                match mem_val {
-                    IndexValue::Inline(v) => {
-                        if on_live(
-                            &target_key_buf,
-                            mem_lsn,
-                            MergedValueRef::Inline(v.as_slice()),
-                        )? {
-                            emitted += 1;
-                        }
-                    }
-                    IndexValue::Blob(ptr) => {
-                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Blob(*ptr))? {
-                            emitted += 1;
-                        }
-                    }
-                    IndexValue::Tombstone => {}
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Streams up to `limit` live entries from the descending K-way merge across `self.memtable`
-    /// and `self.idx_segments` into `on_live` without allocating intermediate `IndexEntry`
-    /// structs or per-entry `Vec<u8>` buffers.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn visit_merged_prefix_range_reverse_view<F>(
-        &self,
-        view: ReadView,
-        prefix: &[u8],
-        seek_key: &[u8],
-        lower_inclusive: bool,
-        upper_key_bound: Option<(&[u8], bool)>,
-        limit: usize,
-        populate_cache: bool,
+        spec: MergeScanSpec<'_>,
         on_live: F,
     ) -> io::Result<()>
     where
         F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
     {
-        self.visit_merged_prefix_range_reverse_src(
-            ReadSource::from_view(view),
-            prefix,
-            seek_key,
-            lower_inclusive,
-            upper_key_bound,
-            limit,
-            populate_cache,
-            on_live,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn visit_merged_prefix_range_reverse_src<F>(
-        &self,
-        src: ReadSource<'_, FS::File>,
-        prefix: &[u8],
-        seek_key: &[u8],
-        lower_inclusive: bool,
-        upper_key_bound: Option<(&[u8], bool)>,
-        limit: usize,
-        populate_cache: bool,
-        mut on_live: F,
-    ) -> io::Result<()>
-    where
-        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
-    {
-        if limit == 0 {
+        if spec.limit == 0 {
             return Ok(());
         }
-        let Some(range) =
-            PreparedPrefixRange::prepare(prefix, seek_key, lower_inclusive, upper_key_bound)
-        else {
+        let Some(range) = PreparedPrefixRange::prepare(
+            spec.prefix,
+            spec.seek_key,
+            spec.lower_inclusive,
+            spec.upper_key_bound,
+        ) else {
             return Ok(());
         };
 
-        let mut mem_iter = self.mem_view_for_dir(src, range.lo_bound(), range.hi_bound(), true);
-        let mut mem_exhausted = false;
-
-        let seg_upper_arg = range.seg_upper_arg();
         let upper_for_overlap = range.upper_for_overlap();
-        let mut seg_cursors = Vec::with_capacity(self.idx_segments_for(src).len());
-        for seg in self.idx_segments_for(src) {
-            if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
-                continue;
+        let prefix = spec.prefix;
+        let segments = self.idx_segments_for(src);
+
+        if spec.reverse {
+            let seg_upper_arg = range.seg_upper_arg();
+            let mut seg_cursors = Vec::with_capacity(segments.len());
+            for seg in segments {
+                if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
+                    continue;
+                }
+                if !prefix.is_empty()
+                    && seg.min_key() > prefix
+                    && !seg.min_key().starts_with(prefix)
+                {
+                    continue;
+                }
+                seg_cursors
+                    .push(seg.cursor_reverse_from_with_cache(seg_upper_arg, spec.populate_cache)?);
             }
-            if !prefix.is_empty() && seg.min_key() > prefix && !seg.min_key().starts_with(prefix) {
-                continue;
+            self.visit_merged_prefix_range_impl::<true, _, _>(
+                src,
+                &range,
+                spec,
+                seg_cursors,
+                on_live,
+            )
+        } else {
+            let mut seg_cursors = Vec::with_capacity(segments.len());
+            for seg in segments {
+                if !seg.overlaps_range(range.eff_lo_key, upper_for_overlap) {
+                    continue;
+                }
+                if !prefix.is_empty()
+                    && seg.min_key() > prefix
+                    && !seg.min_key().starts_with(prefix)
+                {
+                    continue;
+                }
+                seg_cursors.push(seg.cursor_from_with_cache(
+                    range.eff_lo_key,
+                    range.eff_lo_inc,
+                    spec.populate_cache,
+                )?);
             }
-            seg_cursors.push(seg.cursor_reverse_from_with_cache(seg_upper_arg, populate_cache)?);
+            self.visit_merged_prefix_range_impl::<false, _, _>(
+                src,
+                &range,
+                spec,
+                seg_cursors,
+                on_live,
+            )
         }
+    }
+
+    fn visit_merged_prefix_range_impl<const REVERSE: bool, C, F>(
+        &self,
+        src: ReadSource<'_, FS::File>,
+        range: &PreparedPrefixRange<'_>,
+        spec: MergeScanSpec<'_>,
+        mut seg_cursors: Vec<C>,
+        mut on_live: F,
+    ) -> io::Result<()>
+    where
+        C: SegCursor,
+        F: FnMut(&[u8], u64, MergedValueRef<'_>) -> io::Result<bool>,
+    {
+        let mut mem_iter = self.mem_view_for_dir(src, range.lo_bound(), range.hi_bound(), REVERSE);
+        let mut mem_exhausted = false;
 
         let mut emitted = 0usize;
         let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
         let mut best_val_buf: Vec<u8> = Vec::with_capacity(256);
 
-        while emitted < limit {
-            let mut max_key: Option<&[u8]> = None;
+        while emitted < spec.limit {
+            let mut chosen_key: Option<&[u8]> = None;
 
             if !mem_exhausted {
                 if let Some(k) = mem_iter.peek_key() {
-                    if range.in_lower_and_prefix(k) {
-                        max_key = Some(k);
+                    let in_range = if REVERSE {
+                        range.in_lower_and_prefix(k)
+                    } else {
+                        range.in_upper_and_prefix(k)
+                    };
+                    if in_range {
+                        chosen_key = Some(k);
                     } else {
                         mem_exhausted = true;
                     }
@@ -1295,11 +1179,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
             for cur in &seg_cursors {
                 if let Some(k) = cur.current_key() {
-                    if range.in_lower_and_prefix(k) {
-                        match max_key {
-                            None => max_key = Some(k),
-                            Some(mk) if k > mk => {
-                                max_key = Some(k);
+                    let in_range = if REVERSE {
+                        range.in_lower_and_prefix(k)
+                    } else {
+                        range.in_upper_and_prefix(k)
+                    };
+                    if in_range {
+                        match chosen_key {
+                            None => chosen_key = Some(k),
+                            Some(ck) if (if REVERSE { k > ck } else { k < ck }) => {
+                                chosen_key = Some(k);
                             }
                             _ => {}
                         }
@@ -1307,7 +1196,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
             }
 
-            let Some(target_key_slice) = max_key else {
+            let Some(target_key_slice) = chosen_key else {
                 break;
             };
             target_key_buf.clear();
@@ -1329,8 +1218,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         .is_none_or(|(m_lsn, _, from_ov)| !from_ov && raw.lsn > m_lsn);
                     if beats_mem && best_seg_meta.is_none_or(|(s_lsn, _)| raw.lsn > s_lsn) {
                         best_seg_meta = Some((raw.lsn, raw.val_type));
-                        best_val_buf.clear();
-                        best_val_buf.extend_from_slice(raw.val_bytes);
+                        if spec.need_values || raw.val_type == 2 {
+                            best_val_buf.clear();
+                            best_val_buf.extend_from_slice(raw.val_bytes);
+                        }
                     }
                     cur.advance()?;
                 }
@@ -1339,16 +1230,17 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Some((seg_lsn, val_type)) = best_seg_meta {
                 match val_type {
                     1 => {
-                        if on_live(
-                            &target_key_buf,
-                            seg_lsn,
-                            MergedValueRef::Inline(&best_val_buf),
-                        )? {
+                        let inline = if spec.need_values {
+                            best_val_buf.as_slice()
+                        } else {
+                            &[]
+                        };
+                        if on_live(&target_key_buf, seg_lsn, MergedValueRef::Inline(inline))? {
                             emitted += 1;
                         }
                     }
                     2 => {
-                        let ptr = crate::index::RawIdxEntry::decode_blob_ptr(&best_val_buf)?;
+                        let ptr = RawIdxEntry::decode_blob_ptr(&best_val_buf)?;
                         if on_live(&target_key_buf, seg_lsn, MergedValueRef::Blob(ptr))? {
                             emitted += 1;
                         }
@@ -1364,11 +1256,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some((mem_lsn, mem_val, _)) = best_mem_entry {
                 match mem_val {
                     IndexValue::Inline(v) => {
-                        if on_live(
-                            &target_key_buf,
-                            mem_lsn,
-                            MergedValueRef::Inline(v.as_slice()),
-                        )? {
+                        let inline = if spec.need_values { v.as_slice() } else { &[] };
+                        if on_live(&target_key_buf, mem_lsn, MergedValueRef::Inline(inline))? {
                             emitted += 1;
                         }
                     }

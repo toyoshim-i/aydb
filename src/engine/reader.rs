@@ -11,6 +11,7 @@ use std::ops::Deref;
 
 use crate::pal::{PlatformFile, PlatformFs};
 
+use super::scan::{RangeScanOptions, SecondaryScanOptions, SlabScanOutput, SmallPrimaryKey};
 use super::snapshot::ReadSnapshot;
 use super::{LazyBlob, StorageEngine};
 
@@ -197,8 +198,10 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
 
     /// Whether a live row with primary key `pk` exists in this view.
     pub fn row_exists(&self, table_id: u16, pk: &[u8]) -> io::Result<bool> {
-        let row_key = crate::lru::encode_primary_row_key(table_id, pk);
-        Ok(self.eng.check_existing_row_src(self.cx.src, &row_key)?
+        let row_key = SmallPrimaryKey::encode(table_id, pk);
+        Ok(self
+            .eng
+            .check_existing_row_src(self.cx.src, row_key.as_slice())?
             != super::ExistingRowStatus::NotFound)
     }
 
@@ -228,131 +231,65 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
     }
 
     /// See [`StorageEngine::scan_range_into_slab`].
-    #[allow(clippy::too_many_arguments)]
     pub fn scan_range_into_slab(
         &self,
         table_id: u16,
-        lower: Option<(&[u8], bool)>,
-        upper: Option<(&[u8], bool)>,
-        reverse: bool,
-        limit: usize,
-        keys_only: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        opts: RangeScanOptions<'_>,
+        out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<()> {
-        let populate_cache = super::scan::should_populate_range_cache(lower, upper, limit);
-        self.scan_range_into_slab_with_cache(
-            table_id,
-            lower,
-            upper,
-            reverse,
-            limit,
-            keys_only,
-            populate_cache,
-            pks_out,
-            slab_out,
-            spans_out,
-            lazy_blobs_out,
-        )
+        let populate_cache =
+            super::scan::should_populate_range_cache(opts.lower, opts.upper, opts.limit);
+        self.scan_range_into_slab_with_cache(table_id, opts, populate_cache, out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_range_into_slab_with_cache(
         &self,
         table_id: u16,
-        lower: Option<(&[u8], bool)>,
-        upper: Option<(&[u8], bool)>,
-        reverse: bool,
-        limit: usize,
-        keys_only: bool,
+        opts: RangeScanOptions<'_>,
         populate_cache: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<()> {
-        self.eng.scan_range_into_slab_cx(
-            &self.cx,
-            table_id,
-            lower,
-            upper,
-            reverse,
-            limit,
-            keys_only,
-            populate_cache,
-            pks_out,
-            slab_out,
-            spans_out,
-            lazy_blobs_out,
-        )
+        self.eng
+            .scan_range_into_slab_cx(&self.cx, table_id, opts, populate_cache, out)
     }
 
     /// See [`StorageEngine::scan_secondary_index_into_slab`].
-    #[allow(clippy::too_many_arguments)]
     pub fn scan_secondary_index_into_slab(
         &self,
         table_id: u16,
         index_id: u16,
-        prefix: &[u8],
-        lower_sec_key: (&[u8], bool),
-        upper_sec_key: Option<(&[u8], bool)>,
-        limit: usize,
-        keys_only: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        opts: SecondaryScanOptions<'_>,
+        out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let populate_cache =
-            super::scan::should_populate_secondary_cache(prefix, upper_sec_key, limit);
+        let populate_cache = super::scan::should_populate_secondary_cache(
+            opts.prefix,
+            opts.upper_sec_key,
+            opts.limit,
+        );
         self.scan_secondary_index_into_slab_with_cache(
             table_id,
             index_id,
-            prefix,
-            lower_sec_key,
-            upper_sec_key,
-            limit,
-            keys_only,
+            opts,
             populate_cache,
-            pks_out,
-            slab_out,
-            spans_out,
-            lazy_blobs_out,
+            out,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_secondary_index_into_slab_with_cache(
         &self,
         table_id: u16,
         index_id: u16,
-        prefix: &[u8],
-        lower_sec_key: (&[u8], bool),
-        upper_sec_key: Option<(&[u8], bool)>,
-        limit: usize,
-        keys_only: bool,
+        opts: SecondaryScanOptions<'_>,
         populate_cache: bool,
-        pks_out: &mut Vec<Vec<u8>>,
-        slab_out: &mut Vec<u8>,
-        spans_out: &mut Vec<(usize, usize)>,
-        lazy_blobs_out: Option<&mut Vec<Option<LazyBlob<FS::File>>>>,
+        out: SlabScanOutput<'_, FS::File>,
     ) -> io::Result<Option<Vec<u8>>> {
         self.eng.scan_secondary_index_into_slab_cx(
             &self.cx,
             table_id,
             index_id,
-            prefix,
-            lower_sec_key,
-            upper_sec_key,
-            limit,
-            keys_only,
+            opts,
             populate_cache,
-            pks_out,
-            slab_out,
-            spans_out,
-            lazy_blobs_out,
+            out,
         )
     }
 }
