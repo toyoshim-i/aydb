@@ -18,7 +18,7 @@ The current interfaces are native Rust storage operations and the SQLite adapter
 
 * [Architecture and roadmap](ARCHITECTURE.md): requirements, durability contracts, subsystem boundaries, and future milestones.
 * [Development guidelines](DEVELOPMENT.md): contribution workflow and verification requirements.
-* [State-machine and formal verification plan](plans/STATE_MACHINE_AND_FORMAL_VERIFICATION.md): planned work to replace loose engine/adapter flags with typed state machines, Sans-I/O transition cores, Lean 4 proofs, and progressive engineering rules.
+* [State-machine and formal verification plan](plans/STATE_MACHINE_AND_FORMAL_VERIFICATION.md): architecture, proof scope, and verification record for typed Sans-I/O state machines (`SM-1`–`SM-3`), zero-dependency Lean 4 specs and trace refinement, Kani bounded model checking (M0–M5 complete), and M6 Aeneas deferral.
 * [Phase 1 overview](phase1/00_OVERVIEW.md): storage engine textbook. Chapters cover [platform I/O](phase1/01_PAL_AND_OS_CACHE.md), [metadata and GC](phase1/02_BOOT_META_AND_GC.md), [WAL and recovery](phase1/03_EPOCH_WAL_AND_RECOVERY.md), [segments and blobs](phase1/04_WISCKEY_AND_SEGMENTS.md), and [LRU and engine coordination](phase1/05_CAPPED_LRU_AND_KV_API.md).
 * [Phase 2 overview](phase2/00_OVERVIEW.md): SQLite integration textbook. Chapters cover [adapter internals](phase2/01_SQLITE_VTAB_ADAPTER.md), [application workload benchmarks](phase2/02_SQLITE_VS_AYDB_BENCHMARKS.md), and [standard SQL workload benchmarks](phase2/03_STANDARD_SQL_BENCHMARKS.md).
 

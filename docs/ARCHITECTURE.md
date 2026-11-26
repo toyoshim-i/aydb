@@ -722,3 +722,8 @@ Only CRC-verified bytes enter the block and blob caches, so a hit skips re-verif
 * Read blobs directly into `Vec` spare capacity with a streaming CRC, avoiding the zeroed 16 KB stack buffer and the extra copy.
 * Combine the overlay and MemTable lookups of owner reads, or skip the overlay probe for untouched key ranges.
 * Use a cheaper coalescing path for buffered commits from several connections, without rewriting a synced sector in place.
+
+### 8.4 State-Machine Safety and Formal Verification
+
+* Core engine transaction, WAL recovery/publish, and virtual-table protocol control paths are factored into pure Sans-I/O state machines (`SM-1` `tx_fsm`, `SM-2` `wal/publish` & `recovery`, `SM-3` `vtab` session/savepoint transitions), backed by 47 zero-dependency Lean 4 theorems and six deterministic NDJSON trace-refinement fixtures verified via `aydb-trace-check`, alongside 26 Kani CBMC bounded model-checking proofs over production Rust (`M0`–`M5`).
+* Direct Rust-to-Lean extraction via Aeneas (`M6` stretch evaluation) was empirically benchmarked and **deferred** due to mandatory `mathlib4` dependencies incompatible with zero-dependency `formal/lean/`, heavy de-idiomatization rewrites (`+166 / -59` lines on `tx_fsm`), and nightly `rustc_driver`/Charon fragility. See [the M6 evaluation outcome](plans/STATE_MACHINE_AND_FORMAL_VERIFICATION.md#8-m6-stretch-evaluation-outcome-aeneas-deferred) for exact spike metrics and revisit criteria.
