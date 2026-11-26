@@ -22,38 +22,35 @@ use std::sync::Arc;
 use super::path::{normalize_db_root_path, validate_flat_file_name};
 use super::{OpenHint, PlatformFile, PlatformFs, PreallocStrategy};
 
-#[allow(clippy::upper_case_acronyms)]
-type HANDLE = *mut core::ffi::c_void;
-#[allow(clippy::upper_case_acronyms)]
-type BOOL = i32;
-#[allow(clippy::upper_case_acronyms)]
-type DWORD = u32;
+type WinHandle = *mut core::ffi::c_void;
+type WinBool = i32;
+type WinDword = u32;
 
-const INVALID_HANDLE_VALUE: HANDLE = (-1isize) as HANDLE;
-const FALSE: BOOL = 0;
+const INVALID_HANDLE_VALUE: WinHandle = (-1isize) as WinHandle;
+const FALSE: WinBool = 0;
 
-const GENERIC_READ: DWORD = 0x8000_0000;
-const GENERIC_WRITE: DWORD = 0x4000_0000;
+const GENERIC_READ: WinDword = 0x8000_0000;
+const GENERIC_WRITE: WinDword = 0x4000_0000;
 
-const FILE_SHARE_NONE: DWORD = 0;
-const FILE_SHARE_READ: DWORD = 1;
-const FILE_SHARE_WRITE: DWORD = 2;
-const FILE_SHARE_DELETE: DWORD = 4;
+const FILE_SHARE_NONE: WinDword = 0;
+const FILE_SHARE_READ: WinDword = 1;
+const FILE_SHARE_WRITE: WinDword = 2;
+const FILE_SHARE_DELETE: WinDword = 4;
 
-const CREATE_ALWAYS: DWORD = 2;
-const OPEN_EXISTING: DWORD = 3;
-const OPEN_ALWAYS: DWORD = 4;
+const CREATE_ALWAYS: WinDword = 2;
+const OPEN_EXISTING: WinDword = 3;
+const OPEN_ALWAYS: WinDword = 4;
 
-const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
-const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
-const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
-const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x0800_0000;
-const FILE_FLAG_RANDOM_ACCESS: DWORD = 0x1000_0000;
+const FILE_ATTRIBUTE_NORMAL: WinDword = 0x0000_0080;
+const FILE_FLAG_BACKUP_SEMANTICS: WinDword = 0x0200_0000;
+const FILE_FLAG_OVERLAPPED: WinDword = 0x4000_0000;
+const FILE_FLAG_SEQUENTIAL_SCAN: WinDword = 0x0800_0000;
+const FILE_FLAG_RANDOM_ACCESS: WinDword = 0x1000_0000;
 
-const ERROR_INVALID_FUNCTION: DWORD = 1;
-const ERROR_ACCESS_DENIED: DWORD = 5;
-const ERROR_SHARING_VIOLATION: DWORD = 32;
-const ERROR_NOT_SUPPORTED: DWORD = 50;
+const ERROR_INVALID_FUNCTION: WinDword = 1;
+const ERROR_ACCESS_DENIED: WinDword = 5;
+const ERROR_SHARING_VIOLATION: WinDword = 32;
+const ERROR_NOT_SUPPORTED: WinDword = 50;
 
 /// Number of retries after a first `ERROR_SHARING_VIOLATION` on open.
 const SHARING_VIOLATION_RETRIES: u32 = 10;
@@ -64,9 +61,9 @@ const SHARING_VIOLATION_RETRIES: u32 = 10;
 fn sharing_violation_backoff(retry: u32) -> Option<std::time::Duration> {
     (retry < SHARING_VIOLATION_RETRIES).then(|| std::time::Duration::from_millis(1u64 << retry))
 }
-const ERROR_HANDLE_EOF: DWORD = 38;
-const ERROR_ALREADY_EXISTS: DWORD = 183;
-const ERROR_IO_PENDING: DWORD = 997;
+const ERROR_HANDLE_EOF: WinDword = 38;
+const ERROR_ALREADY_EXISTS: WinDword = 183;
+const ERROR_IO_PENDING: WinDword = 997;
 
 /// Instructs the Windows I/O Manager not to signal the file handle object on synchronous
 /// or queued completion, avoiding extra kernel dispatcher work on every cached read/write.
@@ -86,7 +83,7 @@ struct Overlapped {
     internal_high: usize,
     offset: u32,
     offset_high: u32,
-    h_event: HANDLE,
+    h_event: WinHandle,
 }
 
 #[repr(C)]
@@ -108,68 +105,96 @@ struct FileIoPriorityHintInfo {
 unsafe extern "system" {
     fn CreateFileW(
         lp_file_name: *const u16,
-        dw_desired_access: DWORD,
-        dw_share_mode: DWORD,
+        dw_desired_access: WinDword,
+        dw_share_mode: WinDword,
         lp_security_attributes: *const core::ffi::c_void,
-        dw_creation_disposition: DWORD,
-        dw_flags_and_attributes: DWORD,
-        h_template_file: HANDLE,
-    ) -> HANDLE;
+        dw_creation_disposition: WinDword,
+        dw_flags_and_attributes: WinDword,
+        h_template_file: WinHandle,
+    ) -> WinHandle;
 
     fn ReadFile(
-        h_file: HANDLE,
+        h_file: WinHandle,
         lp_buffer: *mut u8,
-        n_number_of_bytes_to_read: DWORD,
-        lp_number_of_bytes_read: *mut DWORD,
+        n_number_of_bytes_to_read: WinDword,
+        lp_number_of_bytes_read: *mut WinDword,
         lp_overlapped: *mut Overlapped,
-    ) -> BOOL;
+    ) -> WinBool;
 
     fn WriteFile(
-        h_file: HANDLE,
+        h_file: WinHandle,
         lp_buffer: *const u8,
-        n_number_of_bytes_to_write: DWORD,
-        lp_number_of_bytes_written: *mut DWORD,
+        n_number_of_bytes_to_write: WinDword,
+        lp_number_of_bytes_written: *mut WinDword,
         lp_overlapped: *mut Overlapped,
-    ) -> BOOL;
+    ) -> WinBool;
 
     fn GetOverlappedResult(
-        h_file: HANDLE,
+        h_file: WinHandle,
         lp_overlapped: *mut Overlapped,
-        lp_number_of_bytes_transferred: *mut DWORD,
-        b_wait: BOOL,
-    ) -> BOOL;
+        lp_number_of_bytes_transferred: *mut WinDword,
+        b_wait: WinBool,
+    ) -> WinBool;
 
-    fn FlushFileBuffers(h_file: HANDLE) -> BOOL;
+    fn FlushFileBuffers(h_file: WinHandle) -> WinBool;
 
-    fn GetFileSizeEx(h_file: HANDLE, lp_file_size: *mut i64) -> BOOL;
+    fn GetFileSizeEx(h_file: WinHandle, lp_file_size: *mut i64) -> WinBool;
 
     fn SetFileInformationByHandle(
-        h_file: HANDLE,
+        h_file: WinHandle,
         file_information_class: i32,
         lp_file_information: *const core::ffi::c_void,
-        dw_buffer_size: DWORD,
-    ) -> BOOL;
+        dw_buffer_size: WinDword,
+    ) -> WinBool;
 
     fn CreateEventW(
         lp_event_attributes: *const core::ffi::c_void,
-        b_manual_reset: BOOL,
-        b_initial_state: BOOL,
+        b_manual_reset: WinBool,
+        b_initial_state: WinBool,
         lp_name: *const u16,
-    ) -> HANDLE;
+    ) -> WinHandle;
 
-    fn SetFileCompletionNotificationModes(file_handle: HANDLE, flags: u8) -> BOOL;
+    fn SetFileCompletionNotificationModes(file_handle: WinHandle, flags: u8) -> WinBool;
 
-    fn CloseHandle(h_object: HANDLE) -> BOOL;
+    fn CloseHandle(h_object: WinHandle) -> WinBool;
 
-    fn GetLastError() -> DWORD;
+    fn GetLastError() -> WinDword;
+}
+
+/// RAII wrapper for a valid Win32 file/directory `WinHandle` that closes on drop.
+#[derive(Debug)]
+struct OwnedHandle(WinHandle);
+
+impl OwnedHandle {
+    #[inline]
+    fn from_raw(raw: WinHandle) -> Option<Self> {
+        if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    #[inline]
+    fn raw(&self) -> WinHandle {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// Per-thread manual-reset Win32 Event used when an overlapped I/O returns `ERROR_IO_PENDING`.
-struct ThreadLocalEvent(HANDLE);
+struct ThreadLocalEvent(WinHandle);
 
 impl ThreadLocalEvent {
     #[inline]
-    fn get_or_create(&mut self) -> io::Result<HANDLE> {
+    fn get_or_create(&mut self) -> io::Result<WinHandle> {
         if self.0.is_null() {
             // Create an unnamed, manual-reset event initialized to non-signaled.
             let h = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
@@ -210,7 +235,7 @@ fn validate_io_offset(offset: u64) -> io::Result<()> {
 #[inline]
 fn with_tls_event<F, R>(f: F) -> io::Result<R>
 where
-    F: FnOnce(HANDLE) -> io::Result<R>,
+    F: FnOnce(WinHandle) -> io::Result<R>,
 {
     let mut f = Some(f);
     match TLS_EVENT.try_with(|cell| {
@@ -218,7 +243,7 @@ where
         let h_event = guard.get_or_create()?;
         // Setting the low bit (`| 1`) instructs the Windows kernel not to queue an IOCP
         // packet if the handle is ever associated with an I/O Completion Port.
-        let tagged_event = ((h_event as usize) | 1) as HANDLE;
+        let tagged_event = ((h_event as usize) | 1) as WinHandle;
         (f.take().unwrap())(tagged_event)
     }) {
         Ok(res) => res,
@@ -227,16 +252,32 @@ where
             // one-shot manual-reset event so destructor flushes never panic.
             let mut one_shot = ThreadLocalEvent(ptr::null_mut());
             let h_event = one_shot.get_or_create()?;
-            let tagged_event = ((h_event as usize) | 1) as HANDLE;
+            let tagged_event = ((h_event as usize) | 1) as WinHandle;
             (f.take().unwrap())(tagged_event)
         }
     }
 }
 
+/// Calls `SetFileInformationByHandle` for `handle` with typed payload `info`.
+fn set_file_info<T>(handle: WinHandle, class: i32, info: &T) -> io::Result<()> {
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            class,
+            (info as *const T).cast(),
+            core::mem::size_of::<T>() as WinDword,
+        )
+    };
+    if ok == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Windows implementation of [`PlatformFile`].
 #[derive(Debug)]
 pub struct WinPlatformFile {
-    handle: HANDLE,
+    handle: OwnedHandle,
 }
 
 // Safety: `WinPlatformFile` performs exclusively positional overlapped I/O with per-thread
@@ -295,7 +336,7 @@ impl WinPlatformFile {
 
         let mut retry = 0u32;
         let handle = loop {
-            let handle = unsafe {
+            let raw = unsafe {
                 CreateFileW(
                     wide_path.as_ptr(),
                     access,
@@ -306,7 +347,7 @@ impl WinPlatformFile {
                     ptr::null_mut(),
                 )
             };
-            if handle != INVALID_HANDLE_VALUE {
+            if let Some(handle) = OwnedHandle::from_raw(raw) {
                 break handle;
             }
             let err = unsafe { GetLastError() };
@@ -328,7 +369,7 @@ impl WinPlatformFile {
         // Best-effort: skip signaling the file handle dispatcher object since overlapped I/O
         // always uses a dedicated `OVERLAPPED::hEvent`.
         unsafe {
-            let _ = SetFileCompletionNotificationModes(handle, FILE_SKIP_SET_EVENT_ON_HANDLE);
+            let _ = SetFileCompletionNotificationModes(handle.raw(), FILE_SKIP_SET_EVENT_ON_HANDLE);
         }
 
         if hint == OpenHint::BackgroundBulk {
@@ -336,14 +377,7 @@ impl WinPlatformFile {
             let prio = FileIoPriorityHintInfo {
                 priority_hint: IO_PRIORITY_HINT_LOW,
             };
-            unsafe {
-                let _ = SetFileInformationByHandle(
-                    handle,
-                    FILE_IO_PRIORITY_HINT_INFO_CLASS,
-                    (&prio as *const FileIoPriorityHintInfo).cast(),
-                    core::mem::size_of::<FileIoPriorityHintInfo>() as DWORD,
-                );
-            }
+            let _ = set_file_info(handle.raw(), FILE_IO_PRIORITY_HINT_INFO_CLASS, &prio);
         }
 
         Ok((Self { handle }, already_existed))
@@ -353,52 +387,85 @@ impl WinPlatformFile {
         let len_i64 = i64::try_from(target_len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "file size exceeds i64::MAX")
         })?;
-        let info = FileAllocationInfo {
-            allocation_size: len_i64,
-        };
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                self.handle,
-                FILE_ALLOCATION_INFO_CLASS,
-                (&info as *const FileAllocationInfo).cast(),
-                core::mem::size_of::<FileAllocationInfo>() as DWORD,
-            )
-        };
-        if ok == FALSE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        set_file_info(
+            self.handle.raw(),
+            FILE_ALLOCATION_INFO_CLASS,
+            &FileAllocationInfo {
+                allocation_size: len_i64,
+            },
+        )
     }
 
     fn set_eof(&self, target_len: u64) -> io::Result<()> {
         let len_i64 = i64::try_from(target_len).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "file size exceeds i64::MAX")
         })?;
-        let info = FileEndOfFileInfo {
-            end_of_file: len_i64,
-        };
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                self.handle,
-                FILE_END_OF_FILE_INFO_CLASS,
-                (&info as *const FileEndOfFileInfo).cast(),
-                core::mem::size_of::<FileEndOfFileInfo>() as DWORD,
-            )
-        };
-        if ok == FALSE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        set_file_info(
+            self.handle.raw(),
+            FILE_END_OF_FILE_INFO_CLASS,
+            &FileEndOfFileInfo {
+                end_of_file: len_i64,
+            },
+        )
     }
-}
 
-impl Drop for WinPlatformFile {
-    fn drop(&mut self) {
-        if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
-            unsafe {
-                CloseHandle(self.handle);
+    fn run_overlapped_io(
+        &self,
+        offset: u64,
+        eof_as_zero: bool,
+        start: impl FnOnce(*mut Overlapped) -> WinBool,
+    ) -> io::Result<usize> {
+        let raw_handle = self.handle.raw();
+        with_tls_event(|h_event| {
+            let mut overlapped = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: offset as u32,
+                offset_high: (offset >> 32) as u32,
+                h_event,
+            };
+            let mut bytes_transferred: WinDword = 0;
+
+            let res = start(&mut overlapped);
+            if res != FALSE {
+                // Fast path: completed synchronously in the Windows Cache Manager. Use
+                // `GetOverlappedResult(..., 0)` so an overlapped call never relies on
+                // `lpNumberOfBytesRead`/`lpNumberOfBytesWritten`.
+                let sync_ok = unsafe {
+                    GetOverlappedResult(raw_handle, &mut overlapped, &mut bytes_transferred, 0)
+                };
+                if sync_ok != FALSE {
+                    return Ok(bytes_transferred as usize);
+                }
+                let sync_err = unsafe { GetLastError() };
+                if eof_as_zero && sync_err == ERROR_HANDLE_EOF {
+                    return Ok(0);
+                }
+                return Err(io::Error::from_raw_os_error(sync_err as i32));
             }
-        }
+
+            let err = unsafe { GetLastError() };
+            if eof_as_zero && err == ERROR_HANDLE_EOF {
+                return Ok(0);
+            }
+            if err != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+
+            // Slow path: wait on the thread-local manual-reset event (`ReadFile`/`WriteFile`
+            // reset `OVERLAPPED::hEvent` automatically before starting the next I/O).
+            let wait_res = unsafe {
+                GetOverlappedResult(raw_handle, &mut overlapped, &mut bytes_transferred, 1)
+            };
+            if wait_res != FALSE {
+                return Ok(bytes_transferred as usize);
+            }
+            let wait_err = unsafe { GetLastError() };
+            if eof_as_zero && wait_err == ERROR_HANDLE_EOF {
+                return Ok(0);
+            }
+            Err(io::Error::from_raw_os_error(wait_err as i32))
+        })
     }
 }
 
@@ -408,65 +475,16 @@ impl PlatformFile for WinPlatformFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;
-
-        with_tls_event(|h_event| {
-            let mut overlapped = Overlapped {
-                internal: 0,
-                internal_high: 0,
-                offset: offset as u32,
-                offset_high: (offset >> 32) as u32,
-                h_event,
-            };
-            let mut bytes_read: DWORD = 0;
-
-            let res = unsafe {
-                ReadFile(
-                    self.handle,
-                    buf.as_mut_ptr(),
-                    chunk_len,
-                    ptr::null_mut(),
-                    &mut overlapped,
-                )
-            };
-
-            if res != FALSE {
-                // Fast path: completed synchronously in the Windows Cache Manager. Use
-                // `GetOverlappedResult(..., 0)` so an overlapped call never relies on
-                // `lpNumberOfBytesRead`.
-                let sync_ok = unsafe {
-                    GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 0)
-                };
-                if sync_ok != FALSE {
-                    return Ok(bytes_read as usize);
-                }
-                let sync_err = unsafe { GetLastError() };
-                if sync_err == ERROR_HANDLE_EOF {
-                    return Ok(0);
-                }
-                return Err(io::Error::from_raw_os_error(sync_err as i32));
-            }
-
-            let err = unsafe { GetLastError() };
-            if err == ERROR_HANDLE_EOF {
-                return Ok(0);
-            }
-            if err != ERROR_IO_PENDING {
-                return Err(io::Error::from_raw_os_error(err as i32));
-            }
-
-            // Slow path: wait on the thread-local manual-reset event (`ReadFile`/`WriteFile`
-            // reset `OVERLAPPED::hEvent` automatically before starting the next I/O).
-            let wait_res =
-                unsafe { GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 1) };
-            if wait_res != FALSE {
-                return Ok(bytes_read as usize);
-            }
-            let wait_err = unsafe { GetLastError() };
-            if wait_err == ERROR_HANDLE_EOF {
-                return Ok(0);
-            }
-            Err(io::Error::from_raw_os_error(wait_err as i32))
+        let chunk_len = buf.len().min(u32::MAX as usize) as WinDword;
+        let raw_handle = self.handle.raw();
+        self.run_overlapped_io(offset, true, |overlapped| unsafe {
+            ReadFile(
+                raw_handle,
+                buf.as_mut_ptr(),
+                chunk_len,
+                ptr::null_mut(),
+                overlapped,
+            )
         })
     }
 
@@ -497,52 +515,18 @@ impl PlatformFile for WinPlatformFile {
 
     fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         validate_io_offset(offset)?;
+        let raw_handle = self.handle.raw();
         while !buf.is_empty() {
             validate_io_offset(offset)?;
-            let chunk_len = buf.len().min(u32::MAX as usize) as DWORD;
-            let written = with_tls_event(|h_event| {
-                let mut overlapped = Overlapped {
-                    internal: 0,
-                    internal_high: 0,
-                    offset: offset as u32,
-                    offset_high: (offset >> 32) as u32,
-                    h_event,
-                };
-                let mut bytes_written: DWORD = 0;
-
-                let res = unsafe {
-                    WriteFile(
-                        self.handle,
-                        buf.as_ptr(),
-                        chunk_len,
-                        ptr::null_mut(),
-                        &mut overlapped,
-                    )
-                };
-
-                if res != FALSE {
-                    let sync_ok = unsafe {
-                        GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_written, 0)
-                    };
-                    if sync_ok != FALSE {
-                        return Ok(bytes_written as usize);
-                    }
-                    return Err(io::Error::last_os_error());
-                }
-
-                let err = unsafe { GetLastError() };
-                if err != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(err as i32));
-                }
-
-                let wait_res = unsafe {
-                    GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_written, 1)
-                };
-                if wait_res != FALSE {
-                    return Ok(bytes_written as usize);
-                }
-
-                Err(io::Error::last_os_error())
+            let chunk_len = buf.len().min(u32::MAX as usize) as WinDword;
+            let written = self.run_overlapped_io(offset, false, |overlapped| unsafe {
+                WriteFile(
+                    raw_handle,
+                    buf.as_ptr(),
+                    chunk_len,
+                    ptr::null_mut(),
+                    overlapped,
+                )
             })?;
 
             if written == 0 {
@@ -561,7 +545,7 @@ impl PlatformFile for WinPlatformFile {
 
     fn file_len(&self) -> io::Result<u64> {
         let mut size: i64 = 0;
-        let ok = unsafe { GetFileSizeEx(self.handle, &mut size) };
+        let ok = unsafe { GetFileSizeEx(self.handle.raw(), &mut size) };
         if ok == FALSE {
             return Err(io::Error::last_os_error());
         }
@@ -607,7 +591,7 @@ impl PlatformFile for WinPlatformFile {
     }
 
     fn sync_durable(&self) -> io::Result<()> {
-        let ok = unsafe { FlushFileBuffers(self.handle) };
+        let ok = unsafe { FlushFileBuffers(self.handle.raw()) };
         if ok == FALSE {
             return Err(io::Error::last_os_error());
         }
@@ -662,7 +646,7 @@ impl WinPlatformFs {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let handle = unsafe {
+        let raw = unsafe {
             CreateFileW(
                 wide_dir.as_ptr(),
                 GENERIC_WRITE,
@@ -673,7 +657,7 @@ impl WinPlatformFs {
                 ptr::null_mut(),
             )
         };
-        if handle == INVALID_HANDLE_VALUE {
+        let Some(handle) = OwnedHandle::from_raw(raw) else {
             let err = unsafe { GetLastError() };
             if matches!(
                 err,
@@ -682,22 +666,16 @@ impl WinPlatformFs {
                 return Ok(());
             }
             return Err(io::Error::from_raw_os_error(err as i32));
-        }
-        let ok = unsafe { FlushFileBuffers(handle) };
-        let err = if ok == FALSE {
-            unsafe { GetLastError() }
-        } else {
-            0
         };
-        unsafe {
-            CloseHandle(handle);
+        let ok = unsafe { FlushFileBuffers(handle.raw()) };
+        if ok != FALSE {
+            return Ok(());
         }
-        if ok != FALSE
-            || matches!(
-                err,
-                ERROR_ACCESS_DENIED | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
-            )
-        {
+        let err = unsafe { GetLastError() };
+        if matches!(
+            err,
+            ERROR_ACCESS_DENIED | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
+        ) {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(err as i32))
@@ -877,10 +855,10 @@ mod tests {
         };
         let ok = unsafe {
             SetFileInformationByHandle(
-                file.handle,
+                file.handle.raw(),
                 FILE_IO_PRIORITY_HINT_INFO_CLASS,
                 (&prio as *const FileIoPriorityHintInfo).cast(),
-                core::mem::size_of::<FileIoPriorityHintInfo>() as DWORD,
+                core::mem::size_of::<FileIoPriorityHintInfo>() as WinDword,
             )
         };
         assert_ne!(

@@ -38,3 +38,20 @@ pub(crate) fn io_err_with_tag(
         std::io::Error::new(kind, format!("{prefix}: {tag}"))
     }
 }
+
+/// 128-byte cache-line-aligned mutex wrapper for sharded concurrent tables,
+/// poisoning-tolerant on lock acquisition.
+#[repr(align(128))]
+pub(crate) struct CachePaddedMutex<T>(std::sync::Mutex<T>);
+
+impl<T> CachePaddedMutex<T> {
+    #[inline]
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    #[inline]
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

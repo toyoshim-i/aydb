@@ -272,6 +272,26 @@ fn parse_and_check_blob_header(
     Some((key_len, val_len))
 }
 
+fn verify_blob_body(
+    buf: &[u8],
+    expected_crc: u32,
+    expected_key: Option<&[u8]>,
+    key_len: usize,
+) -> Option<usize> {
+    if crc32c(&buf[8..]) != expected_crc {
+        return None;
+    }
+
+    let val_start = BLOB_RECORD_HEADER_LEN + key_len;
+    if let Some(exp_k) = expected_key {
+        if &buf[BLOB_RECORD_HEADER_LEN..val_start] != exp_k {
+            return None;
+        }
+    }
+
+    Some(val_start)
+}
+
 impl<F: PlatformFile> BlobSegmentReader<F> {
     pub fn new(file: Arc<F>, seq_id: u64) -> Self {
         Self::new_with_len(file, seq_id, 0)
@@ -317,20 +337,7 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
     ) -> Option<&'a [u8]> {
         let (key_len, val_len) =
             parse_and_check_blob_header(buf, buf.len(), expected_crc, expected_key)?;
-
-        let actual_crc = crc32c(&buf[8..]);
-        if actual_crc != expected_crc {
-            return None;
-        }
-
-        let key_slice = &buf[BLOB_RECORD_HEADER_LEN..BLOB_RECORD_HEADER_LEN + key_len];
-        if let Some(exp_k) = expected_key {
-            if key_slice != exp_k {
-                return None;
-            }
-        }
-
-        let val_start = BLOB_RECORD_HEADER_LEN + key_len;
+        let val_start = verify_blob_body(buf, expected_crc, expected_key, key_len)?;
         Some(&buf[val_start..val_start + val_len])
     }
 
@@ -408,9 +415,11 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
             Err(e) => return Err(e),
         }
-        if parse_and_check_blob_header(&hdr, len, ptr.crc32c, expected_key).is_none() {
+        let Some((key_len, val_len)) =
+            parse_and_check_blob_header(&hdr, len, ptr.crc32c, expected_key)
+        else {
             return Ok(false);
-        }
+        };
 
         let orig_len = out.len();
         let new_len = orig_len.checked_add(len).ok_or_else(|| {
@@ -450,13 +459,13 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
             }
         }
 
-        let buf = &out[orig_len..new_len];
-        let Some(val_slice) = Self::verify_blob_record(buf, ptr.crc32c, expected_key) else {
+        let Some(val_offset) =
+            verify_blob_body(&out[orig_len..new_len], ptr.crc32c, expected_key, key_len)
+        else {
             out.truncate(orig_len);
             return Ok(false);
         };
-        let val_len = val_slice.len();
-        let val_start = (val_slice.as_ptr() as usize) - (out.as_ptr() as usize);
+        let val_start = orig_len + val_offset;
         out.copy_within(val_start..val_start + val_len, orig_len);
         out.truncate(orig_len + val_len);
         Ok(true)

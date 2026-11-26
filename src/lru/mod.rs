@@ -4,8 +4,10 @@
 pub use crate::index::key_codec;
 
 use std::collections::HashMap;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+
+use crate::util::CachePaddedMutex;
 
 const TRACKER_SHARDS: usize = 16;
 
@@ -61,17 +63,7 @@ pub struct AccessTracker {
     max_entries_per_shard: usize,
     /// Interior mutability so committed-view reads (`&self`) can record hits. Shard locks are
     /// held only for in-memory map updates and never across I/O.
-    shards: Vec<TrackerShard>,
-}
-
-#[repr(align(128))]
-struct TrackerShard(Mutex<TrackerShardInner>);
-
-impl TrackerShard {
-    #[inline]
-    fn lock(&self) -> MutexGuard<'_, TrackerShardInner> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    shards: Vec<CachePaddedMutex<TrackerShardInner>>,
 }
 
 #[derive(Default)]
@@ -95,7 +87,7 @@ impl AccessTracker {
         let max_entries_per_shard = (max_entries.max(64) / TRACKER_SHARDS).max(1);
         let mut shards = Vec::with_capacity(TRACKER_SHARDS);
         for _ in 0..TRACKER_SHARDS {
-            shards.push(TrackerShard(Mutex::new(TrackerShardInner::default())));
+            shards.push(CachePaddedMutex::new(TrackerShardInner::default()));
         }
         Self {
             next_tick: AtomicU64::new(initial_tick.max(1)),
@@ -430,7 +422,7 @@ mod tests {
 
     #[test]
     fn access_tracker_shards_are_cache_line_aligned() {
-        assert!(std::mem::align_of::<TrackerShard>() >= 128);
+        assert!(std::mem::align_of::<CachePaddedMutex<TrackerShardInner>>() >= 128);
     }
 
     #[test]

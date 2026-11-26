@@ -70,29 +70,34 @@ fn full_fsync_unsupported(errno: i32) -> bool {
     matches!(errno, MACOS_ENOTSUP | MACOS_EOPNOTSUPP | MACOS_ENOTTY)
 }
 
+/// Retries an operation whenever it fails with `ErrorKind::Interrupted` (`EINTR`).
+#[inline]
+fn retry_eintr<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Runs a full-sync primitive (`fcntl(F_FULLFSYNC)`) with `EINTR` retries, falling back to a
 /// plain `fsync` (also retrying `EINTR`) only when the error code indicates the filesystem
 /// does not support `F_FULLFSYNC` (`ENOTSUP`, `EOPNOTSUPP`, `ENOTTY`).
 #[cfg(any(target_os = "macos", test))]
 fn sync_full_or_fallback(
     mut full: impl FnMut() -> io::Result<()>,
-    mut fallback: impl FnMut() -> io::Result<()>,
+    fallback: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
-        match full() {
+        match retry_eintr(&mut full) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if full_fsync_unsupported(e.raw_os_error().unwrap_or(0)) => break,
             Err(e) => return Err(e),
         }
     }
-    loop {
-        match fallback() {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
+    retry_eintr(fallback)
 }
 
 #[cfg(target_os = "macos")]
@@ -613,17 +618,14 @@ impl UnixPlatformFs {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        loop {
+        retry_eintr(|| {
             let rc = unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) };
             if rc == 0 {
-                break;
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
             }
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
+        })?;
         Ok(Self {
             root: normalized,
             dir_file: Arc::new(dir_file),

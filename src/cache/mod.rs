@@ -14,9 +14,10 @@
 //! insertion on full-table scans and background compaction cursors.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use crate::index::IDX_BLOCK_SIZE;
+use crate::util::CachePaddedMutex;
 
 /// Default number of shards for cache concurrency.
 const NUM_SHARDS: usize = 16;
@@ -69,19 +70,9 @@ impl BlockClockShard {
     }
 }
 
-#[repr(align(128))]
-struct PaddedBlockShard(Mutex<BlockClockShard>);
-
-impl PaddedBlockShard {
-    #[inline]
-    fn lock(&self) -> MutexGuard<'_, BlockClockShard> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 /// Strictly-bounded in-process cache for verified 4 KB `idx_*.db` data blocks.
 pub struct VerifiedBlockCache {
-    shards: Vec<PaddedBlockShard>,
+    shards: Vec<CachePaddedMutex<BlockClockShard>>,
     total_slots: usize,
 }
 
@@ -104,9 +95,7 @@ impl VerifiedBlockCache {
         let mut shards = Vec::with_capacity(num_shards);
         for i in 0..num_shards {
             let shard_slots = base + usize::from(i < rem);
-            shards.push(PaddedBlockShard(Mutex::new(BlockClockShard::new(
-                shard_slots,
-            ))));
+            shards.push(CachePaddedMutex::new(BlockClockShard::new(shard_slots)));
         }
 
         Self {
@@ -386,21 +375,11 @@ impl BlobClockShard {
     }
 }
 
-#[repr(align(128))]
-struct PaddedBlobShard(Mutex<BlobClockShard>);
-
-impl PaddedBlobShard {
-    #[inline]
-    fn lock(&self) -> MutexGuard<'_, BlobClockShard> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 const BLOB_CACHE_ENTRY_OVERHEAD: usize = 64;
 
 /// Strictly-bounded in-process cache for small verified out-of-line blob payloads.
 pub struct VerifiedBlobCache {
-    shards: Vec<PaddedBlobShard>,
+    shards: Vec<CachePaddedMutex<BlobClockShard>>,
     shard_caps: Vec<usize>,
     max_shard_capacity: usize,
 }
@@ -427,7 +406,7 @@ impl VerifiedBlobCache {
         for i in 0..num_shards {
             let cap = base + usize::from(i < rem);
             shard_caps.push(cap);
-            shards.push(PaddedBlobShard(Mutex::new(BlobClockShard::new(cap))));
+            shards.push(CachePaddedMutex::new(BlobClockShard::new(cap)));
         }
         let max_shard_capacity = shard_caps.iter().copied().max().unwrap_or(0);
 
@@ -820,8 +799,8 @@ mod tests {
 
     #[test]
     fn cache_shards_are_cache_line_aligned() {
-        assert!(std::mem::align_of::<PaddedBlockShard>() >= 128);
-        assert!(std::mem::align_of::<PaddedBlobShard>() >= 128);
+        assert!(std::mem::align_of::<CachePaddedMutex<BlockClockShard>>() >= 128);
+        assert!(std::mem::align_of::<CachePaddedMutex<BlobClockShard>>() >= 128);
     }
 
     #[test]
