@@ -10,16 +10,6 @@
 //! 4. Post-Crash Blob GC Accounting (`dead_bytes` preservation across WAL recovery).
 //! 5. Deterministic I/O Fault Injection (`ENOSPC` / `EIO` during `flush_memtable`).
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -204,6 +194,12 @@ pub struct FaultInjectingFs {
     ctrl: Arc<SimFsControl>,
 }
 
+impl Default for FaultInjectingFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FaultInjectingFs {
     pub fn new() -> Self {
         Self {
@@ -239,21 +235,22 @@ impl FaultInjectingFs {
         for (name, file_arc) in files.iter() {
             let mut st = file_arc.lock().unwrap();
             if honor_write_through_hint && st.hint == OpenHint::MutableSyncLog {
-                if inject_torn_tail && name == "wal_sync.db" {
-                    if let Some(last) = st.last_write.clone() {
-                        // Roll back the last 4 KB write to only its first 512 bytes (torn sector)
-                        let mut base = st.pre_last_write_bytes.clone();
-                        let torn_len = last.data.len().min(512);
-                        let end = (last.offset as usize) + torn_len;
-                        if end > base.len() {
-                            base.resize(end, 0);
-                        }
-                        base[last.offset as usize..end].copy_from_slice(&last.data[..torn_len]);
-                        st.page_cache_bytes = base.clone();
-                        st.durable_bytes = base;
-                        st.unsynced_writes.clear();
-                        continue;
+                if inject_torn_tail
+                    && name == "wal_sync.db"
+                    && let Some(last) = st.last_write.clone()
+                {
+                    // Roll back the last 4 KB write to only its first 512 bytes (torn sector)
+                    let mut base = st.pre_last_write_bytes.clone();
+                    let torn_len = last.data.len().min(512);
+                    let end = (last.offset as usize) + torn_len;
+                    if end > base.len() {
+                        base.resize(end, 0);
                     }
+                    base[last.offset as usize..end].copy_from_slice(&last.data[..torn_len]);
+                    st.page_cache_bytes = base.clone();
+                    st.durable_bytes = base;
+                    st.unsynced_writes.clear();
+                    continue;
                 }
                 st.durable_bytes = st.page_cache_bytes.clone();
                 st.unsynced_writes.clear();
@@ -457,8 +454,10 @@ fn bench_suite_2_process_crash_wal_modes(failures: &mut Vec<String>) {
         ),
     ] {
         let fs = Arc::new(FaultInjectingFs::new());
-        let mut cfg = EngineConfig::default();
-        cfg.buf_wal_mode = mode;
+        let cfg = EngineConfig {
+            buf_wal_mode: mode,
+            ..Default::default()
+        };
 
         let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
         for i in 0..N_COMMITS {
@@ -548,9 +547,11 @@ fn bench_suite_3_transaction_rollback_invariants(failures: &mut Vec<String>) {
     // Scenario 3B: Sealed Blob Segment Overwrite + Rollback
     {
         let fs = Arc::new(FaultInjectingFs::new());
-        let mut cfg = EngineConfig::default();
-        cfg.inline_threshold_bytes = 128;
-        cfg.max_blob_segment_bytes = 4096; // Seal segment after 1 x 4 KB blob
+        let cfg = EngineConfig {
+            inline_threshold_bytes: 128,
+            max_blob_segment_bytes: 4096,
+            ..Default::default()
+        }; // Seal segment after 1 x 4 KB blob
         let mut engine = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
 
         let orig_blob = vec![0x11u8; 4096];
@@ -699,9 +700,11 @@ fn bench_suite_4_post_crash_blob_leak(failures: &mut Vec<String>) {
     // Scenario 4A: 100% of a sealed blob segment is deleted in RAM/WAL, then crash BEFORE flush_memtable()
     {
         let fs = Arc::new(FaultInjectingFs::new());
-        let mut cfg = EngineConfig::default();
-        cfg.inline_threshold_bytes = 128;
-        cfg.max_blob_segment_bytes = 16 * 1024; // 16 KB per blob segment (4 blobs of 4 KB)
+        let cfg = EngineConfig {
+            inline_threshold_bytes: 128,
+            max_blob_segment_bytes: 16 * 1024,
+            ..Default::default()
+        }; // 16 KB per blob segment (4 blobs of 4 KB)
 
         {
             let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
@@ -745,9 +748,11 @@ fn bench_suite_4_post_crash_blob_leak(failures: &mut Vec<String>) {
     // Scenario 4B: Delete 3/4 of each sealed blob segment -> Crash -> Recover -> Delete last 1/4 -> Flush & Compact
     {
         let fs = Arc::new(FaultInjectingFs::new());
-        let mut cfg = EngineConfig::default();
-        cfg.inline_threshold_bytes = 128;
-        cfg.max_blob_segment_bytes = 16 * 1024; // 4 blobs of ~4 KB per segment
+        let cfg = EngineConfig {
+            inline_threshold_bytes: 128,
+            max_blob_segment_bytes: 16 * 1024,
+            ..Default::default()
+        }; // 4 blobs of ~4 KB per segment
 
         {
             let mut engine = StorageEngine::open(Arc::clone(&fs), cfg.clone()).unwrap();
@@ -859,10 +864,10 @@ fn bench_suite_5_io_fault_countdown(failures: &mut Vec<String>) {
         let mut reopened = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
         let mut surviving = 0usize;
         for (k, expected_v) in &oracle {
-            if let Ok(Some(actual_v)) = reopened.get_row(1, k) {
-                if &actual_v == expected_v {
-                    surviving += 1;
-                }
+            if let Ok(Some(actual_v)) = reopened.get_row(1, k)
+                && &actual_v == expected_v
+            {
+                surviving += 1;
             }
         }
 
@@ -960,11 +965,11 @@ fn bench_suite_6_vtab_key_and_rowid_integrity(failures: &mut Vec<String>) {
         let val = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         let candidate = format!("user_{val:016x}");
         let h = aydb::util::crc32c::crc32c(candidate.as_bytes());
-        if let Some(prev) = seen_crc.insert(h, candidate.clone()) {
-            if prev != candidate {
-                pair = Some((prev, candidate));
-                break;
-            }
+        if let Some(prev) = seen_crc.insert(h, candidate.clone())
+            && prev != candidate
+        {
+            pair = Some((prev, candidate));
+            break;
         }
     }
     let (k1, k2) = pair.expect("birthday collision within 500k keys");
@@ -1078,8 +1083,10 @@ pub fn suite_7_audit_regressions(base_dir: &Path, failures: &mut Vec<String>) {
     {
         // Part 1: BufferedUserSpaceCoalesced dangling `First` fragment + restart + subsequent writes
         let fs1 = Arc::new(FaultInjectingFs::new());
-        let mut cfg1 = EngineConfig::default();
-        cfg1.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;
+        let cfg1 = EngineConfig {
+            buf_wal_mode: WalStreamMode::BufferedUserSpaceCoalesced,
+            ..Default::default()
+        };
         {
             let mut eng = StorageEngine::open(Arc::clone(&fs1), cfg1.clone()).unwrap();
             let val = vec![0x41u8; 900];
@@ -1158,8 +1165,10 @@ pub fn suite_7_audit_regressions(base_dir: &Path, failures: &mut Vec<String>) {
     // 7B: Oversized PK rejection & near-4KB row/meta auto-spill without wedging flush_memtable
     {
         let fs = Arc::new(FaultInjectingFs::new());
-        let mut cfg = EngineConfig::default();
-        cfg.inline_threshold_bytes = 4096;
+        let cfg = EngineConfig {
+            inline_threshold_bytes: 4096,
+            ..Default::default()
+        };
         let mut eng = StorageEngine::open(Arc::clone(&fs), cfg).unwrap();
 
         // Oversized PK (> 2048 B) must be rejected with InvalidInput
@@ -1427,23 +1436,11 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let two_phase_ok = {
             let mut eng = shared.write().unwrap();
             eng.register_capped_table(9, 300).unwrap();
-            eng.put_row(
-                9,
-                b"r1",
-                &vec![0x11u8; 150],
-                &[],
-                WriteDurability::BufferedFast,
-            )
-            .unwrap();
+            eng.put_row(9, b"r1", &[0x11u8; 150], &[], WriteDurability::BufferedFast)
+                .unwrap();
             eng.begin_transaction();
-            eng.put_row(
-                9,
-                b"r2",
-                &vec![0x22u8; 200],
-                &[],
-                WriteDurability::BufferedFast,
-            )
-            .unwrap();
+            eng.put_row(9, b"r2", &[0x22u8; 200], &[], WriteDurability::BufferedFast)
+                .unwrap();
             eng.prepare_commit_transaction(WriteDurability::BufferedFast)
                 .unwrap();
             eng.rollback_transaction().unwrap();
@@ -1640,8 +1637,10 @@ pub fn suite_8_followup_audit_regressions(base_dir: &Path) {
         let sub = base_dir.join("suite8_p01_p02_s01");
         let _ = std::fs::remove_dir_all(&sub);
         std::fs::create_dir_all(&sub).unwrap();
-        let mut cfg = EngineConfig::default();
-        cfg.auto_compact_segment_threshold = 4;
+        let cfg = EngineConfig {
+            auto_compact_segment_threshold: 4,
+            ..Default::default()
+        };
 
         // Size-tiered compaction: Build a large base segment (~48 KB), then flush 3 tiny segments; auto-compaction
         // must merge only the 3 tiny suffix segments (`start_idx = 1`, leaving 2 segments total)
@@ -1961,8 +1960,10 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         std::fs::create_dir_all(&sub).unwrap();
 
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.lru_read_tracking = LruReadTrackingMode::EagerWriteOnRead;
+        let cfg = EngineConfig {
+            lru_read_tracking: LruReadTrackingMode::EagerWriteOnRead,
+            ..Default::default()
+        };
 
         let engine = Arc::new(RwLock::new(
             StorageEngine::open(fs.clone(), cfg.clone()).unwrap(),
@@ -1977,8 +1978,10 @@ pub fn suite_9_multi_angle_audit_regressions(base_dir: &Path) {
         let pk_4089 = vec![b'b'; 100];
         let val_3971 = vec![0x44u8; 3971];
         let r03_ok = {
-            let mut r03_cfg = EngineConfig::default();
-            r03_cfg.inline_threshold_bytes = 8192;
+            let r03_cfg = EngineConfig {
+                inline_threshold_bytes: 8192,
+                ..Default::default()
+            };
             let sub_r03 = base_dir.join("s9b_r03_only");
             let _ = std::fs::remove_dir_all(&sub_r03);
             std::fs::create_dir_all(&sub_r03).unwrap();

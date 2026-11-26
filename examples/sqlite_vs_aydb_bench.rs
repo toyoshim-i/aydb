@@ -15,18 +15,8 @@
 //!    Vanilla SQLite (`SELECT` + `UPDATE last_access`) vs. `aydb` Virtual Table (`SELECT` with
 //!    automatic zero-I/O in-memory `AccessTracker` + Lazy Promotion).
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -71,7 +61,7 @@ fn percentile_us(sorted_ns: &[u64], pct: f64) -> f64 {
     (sorted_ns[idx] as f64) / 1000.0
 }
 
-fn bench_small_sync_config_updates(root: &PathBuf) {
+fn bench_small_sync_config_updates(root: &Path) {
     println!(
         "=========================================================================================="
     );
@@ -187,7 +177,7 @@ fn bench_small_sync_config_updates(root: &PathBuf) {
     }
 }
 
-fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
+fn bench_blob_cache_churn_and_eviction(root: &Path) {
     println!(
         "\n=========================================================================================="
     );
@@ -281,8 +271,10 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
         let sub = root.join("aydb_blob_cache");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.max_blob_segment_bytes = 1024 * 1024; // 1.0 MB blob_lru segments
+        let cfg = EngineConfig {
+            max_blob_segment_bytes: 1024 * 1024, // 1.0 MB blob_lru segments
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -332,7 +324,7 @@ fn bench_blob_cache_churn_and_eviction(root: &PathBuf) {
     }
 }
 
-fn bench_read_heavy_cache_lru_tracking(root: &PathBuf) {
+fn bench_read_heavy_cache_lru_tracking(root: &Path) {
     println!(
         "\n=========================================================================================="
     );

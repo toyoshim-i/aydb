@@ -9,25 +9,15 @@
 //!    (`max_blob_segment_bytes = 512 KB`) and measures steady-state write throughput,
 //!    logical bytes vs. physical `blob_lru` files on disk, and $O(1)$ segment unlinking.
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use aydb::engine::{EngineConfig, LruReadTrackingMode, StorageEngine, WriteDurability};
 use aydb::pal::OsFs;
 
-fn bench_lru_read_tracking(root: &PathBuf) {
+fn bench_lru_read_tracking(root: &Path) {
     println!(
         "=========================================================================================="
     );
@@ -58,9 +48,11 @@ fn bench_lru_read_tracking(root: &PathBuf) {
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
 
-        let mut cfg = EngineConfig::default();
-        cfg.lru_read_tracking = mode;
-        cfg.memtable_capacity_bytes = 64 * 1024 * 1024;
+        let cfg = EngineConfig {
+            lru_read_tracking: mode,
+            memtable_capacity_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let mut engine = StorageEngine::open(fs, cfg).unwrap();
         // Quota fits 500 keys of ~264 B each (~132 KB)
@@ -120,7 +112,7 @@ fn bench_lru_read_tracking(root: &PathBuf) {
     }
 }
 
-fn bench_steady_state_capped_eviction(root: &PathBuf) {
+fn bench_steady_state_capped_eviction(root: &Path) {
     println!(
         "\n=========================================================================================="
     );
@@ -145,9 +137,11 @@ fn bench_steady_state_capped_eviction(root: &PathBuf) {
     let _ = std::fs::remove_dir_all(&sub);
     let fs = Arc::new(OsFs::open(&sub, true).unwrap());
 
-    let mut cfg = EngineConfig::default();
-    cfg.inline_threshold_bytes = 512;
-    cfg.max_blob_segment_bytes = 512 * 1024; // 512 KB per blob_lru segment
+    let cfg = EngineConfig {
+        inline_threshold_bytes: 512,
+        max_blob_segment_bytes: 512 * 1024, // 512 KB per blob_lru segment
+        ..Default::default()
+    };
 
     let mut engine = StorageEngine::open(fs, cfg).unwrap();
     const QUOTA_BYTES: u64 = 2 * 1024 * 1024; // 2.0 MB cap

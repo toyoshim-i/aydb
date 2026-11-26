@@ -30,7 +30,7 @@
 //!    - Workload D (Read Latest): 95% Read Latest Inserted / 5% Insert
 //!    - Workload E (Short Ranges): 95% Range Scan (`WHERE k >= ? ORDER BY k ASC LIMIT 10`) / 5% Insert
 //!      — Evaluated at both `256 B` (Inline) and `2048 B` (WiscKey Separated Blob) to expose the
-//!        fundamental B-Tree vs. WiscKey range-scan trade-off!
+//!      fundamental B-Tree vs. WiscKey range-scan trade-off!
 //!    - Workload F (Read-Modify-Write): 50% Point Read / 50% Read-Modify-Write
 //!
 //! 3. **TPC-B-Style (`pgbench`-like) Multi-Table OLTP Workload:**
@@ -39,18 +39,8 @@
 //!      measured under both Buffered (`synchronous = NORMAL` / `wal_buf.db`) and Full Durable Sync
 //!      (`synchronous = FULL` / `wal_sync.db`) modes.
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -116,7 +106,7 @@ impl ZipfRng {
 // SUITE 0: Pre-Benchmark Differential SQL Equivalence Verification
 // =========================================================================
 
-fn verify_differential_sql_equivalence(root: &PathBuf) {
+fn verify_differential_sql_equivalence(root: &Path) {
     println!(
         "=========================================================================================="
     );
@@ -567,7 +557,7 @@ fn run_speedtest1_on_connection(conn: &SqliteConnection) -> SpeedtestTimings {
     }
 }
 
-fn bench_speedtest1_suite(root: &PathBuf) {
+fn bench_speedtest1_suite(root: &Path) {
     println!(
         "=========================================================================================="
     );
@@ -612,8 +602,10 @@ fn bench_speedtest1_suite(root: &PathBuf) {
         let sub = root.join("speedtest_aydb");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
+        let cfg = EngineConfig {
+            buf_wal_mode: WalStreamMode::BufferedImmediateOsCache,
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
 
         let conn = SqliteConnection::open_in_memory().unwrap();
@@ -836,7 +828,7 @@ fn run_ycsb_on_connection(conn: &SqliteConnection, val_size: usize) -> [(String,
     ]
 }
 
-fn bench_ycsb_suite(root: &PathBuf) {
+fn bench_ycsb_suite(root: &Path) {
     for &val_size in &[256usize, 2048] {
         println!(
             "\n=========================================================================================="
@@ -1006,7 +998,7 @@ fn run_tpcb_transactions(conn: &SqliteConnection, n_tx: usize) -> f64 {
     (n_tx as f64) / t0.elapsed().as_secs_f64()
 }
 
-fn bench_tpcb_suite(root: &PathBuf) {
+fn bench_tpcb_suite(root: &Path) {
     println!(
         "\n=========================================================================================="
     );
@@ -1139,7 +1131,7 @@ fn bench_tpcb_suite(root: &PathBuf) {
 // SUITE 4: On-Disk SSTable Evaluation (`memtable_capacity_bytes = 128 KB`)
 // =========================================================================
 
-fn bench_on_disk_sstable_suite(root: &PathBuf) {
+fn bench_on_disk_sstable_suite(root: &Path) {
     println!(
         "\n=========================================================================================="
     );
@@ -1183,9 +1175,11 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let sub = root.join("sstable_st_ay");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.memtable_capacity_bytes = 128 * 1024;
-        cfg.buf_wal_mode = WalStreamMode::BufferedImmediateOsCache;
+        let cfg = EngineConfig {
+            memtable_capacity_bytes: 128 * 1024,
+            buf_wal_mode: WalStreamMode::BufferedImmediateOsCache,
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
@@ -1239,8 +1233,10 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let sub = root.join("sstable_ycsb_ay");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.memtable_capacity_bytes = 128 * 1024;
+        let cfg = EngineConfig {
+            memtable_capacity_bytes: 128 * 1024,
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
@@ -1297,8 +1293,10 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let sub = root.join("sstable_tpcb_ay_buf");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.memtable_capacity_bytes = 128 * 1024;
+        let cfg = EngineConfig {
+            memtable_capacity_bytes: 128 * 1024,
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();
@@ -1347,8 +1345,10 @@ fn bench_on_disk_sstable_suite(root: &PathBuf) {
         let sub = root.join("sstable_tpcb_ay_full");
         let _ = std::fs::remove_dir_all(&sub);
         let fs = Arc::new(OsFs::open(&sub, true).unwrap());
-        let mut cfg = EngineConfig::default();
-        cfg.memtable_capacity_bytes = 128 * 1024;
+        let cfg = EngineConfig {
+            memtable_capacity_bytes: 128 * 1024,
+            ..Default::default()
+        };
         let engine = Arc::new(RwLock::new(StorageEngine::open(fs, cfg).unwrap()));
         let conn = SqliteConnection::open_in_memory().unwrap();
         conn.register_aydb_module(engine.clone()).unwrap();

@@ -10,16 +10,6 @@
 //!    for both `MutableSyncLog` and `MutableBufferedLog`. `MutableSyncLog` latency includes
 //!    `sync_barrier`, as the WAL does.
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

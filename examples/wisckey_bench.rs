@@ -8,18 +8,8 @@
 //! 3. 4 KB Data Block In-Place Lookup: Downward-growing `u16` Offset Directory $O(\log K)$
 //!    Binary Search vs. $O(K)$ Linear Scan.
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::ptr_arg,
-    clippy::useless_vec,
-    clippy::doc_overindented_list_items,
-    clippy::new_without_default
-)]
-
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 use aydb::blob::{BlobSegmentReader, BlobSegmentWriter};
@@ -31,7 +21,7 @@ use aydb::memtable::MemTable;
 use aydb::pal::OsFs;
 use aydb::wal::BlobKind;
 
-fn bench_wisckey_vs_inline(root: &PathBuf) {
+fn bench_wisckey_vs_inline(root: &Path) {
     println!(
         "=========================================================================================="
     );
@@ -178,7 +168,7 @@ fn bench_wisckey_vs_inline(root: &PathBuf) {
     }
 }
 
-fn bench_bloom_filter_scaling(root: &PathBuf) {
+fn bench_bloom_filter_scaling(root: &Path) {
     println!(
         "\n=========================================================================================="
     );
