@@ -344,16 +344,7 @@ mod health {
 
         #[inline]
         pub(super) fn is_blob_flushed_for_cache(&self, ptr: &BlobPtr) -> bool {
-            match ptr.kind {
-                BlobKind::Standard => self.active_std_writer.as_ref().is_none_or(|w| {
-                    w.seq_id() != ptr.seg_id
-                        || (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset()
-                }),
-                BlobKind::Lru => self.active_lru_writers.get(&ptr.table_id).is_none_or(|w| {
-                    w.seq_id() != ptr.seg_id
-                        || (ptr.offset as u64) + (ptr.len as u64) <= w.flushed_offset()
-                }),
-            }
+            !self.blob_unflushed(ptr)
         }
 
         #[inline]

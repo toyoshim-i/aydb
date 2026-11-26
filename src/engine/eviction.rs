@@ -16,6 +16,7 @@ use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
 use super::reader::ReadView;
+use super::scan::{MergeScanSpec, MergedValueRef};
 use super::{ExistingRowStatus, MetaLookup, StorageEngine, WriteDurability};
 
 #[inline]
@@ -656,24 +657,38 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut needs_repair = false;
 
         loop {
-            let row_entries = self.scan_merged_prefix_range(
-                &user_prefix,
-                &r_seek_key,
-                r_lower_inc,
-                None,
-                RECONCILE_BATCH_SIZE,
-                false,
+            let mut row_batch: Vec<(Vec<u8>, usize)> = Vec::new();
+            self.visit_merged_prefix_range(
+                MergeScanSpec {
+                    prefix: &user_prefix,
+                    seek_key: &r_seek_key,
+                    lower_inclusive: r_lower_inc,
+                    upper_key_bound: None,
+                    reverse: false,
+                    limit: RECONCILE_BATCH_SIZE,
+                    populate_cache: false,
+                    need_values: true,
+                },
+                |key, _lsn, val| {
+                    let val_len = match val {
+                        MergedValueRef::Inline(v) => v.len(),
+                        MergedValueRef::Blob(ptr) => {
+                            (ptr.len as usize).saturating_sub(BLOB_RECORD_HEADER_LEN + key.len())
+                        }
+                    };
+                    row_batch.push((key.to_vec(), val_len));
+                    Ok(true)
+                },
             )?;
-            if row_entries.is_empty() {
+            if row_batch.is_empty() {
                 break;
             }
-            r_seek_key = row_entries.last().unwrap().key.clone();
+            r_seek_key = row_batch.last().unwrap().0.clone();
             r_lower_inc = false;
 
             let first_pk =
-                decode_primary_row_key(tid, &row_entries.first().unwrap().key).unwrap_or(&[]);
-            let last_pk =
-                decode_primary_row_key(tid, &row_entries.last().unwrap().key).unwrap_or(&[]);
+                decode_primary_row_key(tid, &row_batch.first().unwrap().0).unwrap_or(&[]);
+            let last_pk = decode_primary_row_key(tid, &row_batch.last().unwrap().0).unwrap_or(&[]);
             let meta_lo = encode_row_meta_key(tid, first_pk);
             let meta_hi = encode_row_meta_key(tid, last_pk);
 
@@ -719,8 +734,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let mut dead_meta_ptrs = Vec::new();
             let mut batch_est_bytes = 0usize;
 
-            for entry in row_entries {
-                let Some(pk) = decode_primary_row_key(tid, &entry.key) else {
+            for (key, val_len) in row_batch {
+                let Some(pk) = decode_primary_row_key(tid, &key) else {
                     continue;
                 };
                 if let Some((meta, old_m_ptr)) = meta_map.get(pk) {
@@ -799,12 +814,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                     }
                 } else {
-                    let val_len = match &entry.value {
-                        IndexValue::Inline(v) => v.len(),
-                        IndexValue::Blob(ptr) => (ptr.len as usize)
-                            .saturating_sub(BLOB_RECORD_HEADER_LEN + entry.key.len()),
-                        IndexValue::Tombstone => continue,
-                    };
                     let logical_size = (pk.len() + val_len) as u32;
                     if let Some((mkey, observed)) = corrupt_meta.remove(pk) {
                         // Count the row at its estimated size; under `Evict` it is queued for

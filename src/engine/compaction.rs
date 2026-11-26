@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
-use crate::index::{IdxSegmentReader, IndexValue, compact_idx_segments};
+use crate::index::{IdxSegmentReader, compact_idx_segments};
 use crate::meta::{
     IdxSegmentMeta, LruBlobSegmentMeta, StdBlobSegmentMeta, format_idx_file_name,
     format_lru_blob_file_name, format_std_blob_file_name,
@@ -13,6 +13,7 @@ use crate::meta::{
 use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
+use super::scan::{MergeScanSpec, MergedValueRef};
 use super::{StorageEngine, WriteDurability};
 
 struct SettledBlobCheckpoint {
@@ -622,15 +623,34 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let scan_limit = max_scan_keys.max(1);
-        let entries = self.scan_merged_prefix_range(
-            &[],
-            &session.seek_key,
-            session.lower_inclusive,
-            None,
-            scan_limit,
-            false,
+        let mut entries_len = 0usize;
+        let mut window_last_key = Vec::new();
+        let mut candidates: Vec<(Vec<u8>, BlobPtr)> = Vec::new();
+        self.visit_merged_prefix_range(
+            MergeScanSpec {
+                prefix: &[],
+                seek_key: &session.seek_key,
+                lower_inclusive: session.lower_inclusive,
+                upper_key_bound: None,
+                reverse: false,
+                limit: scan_limit,
+                populate_cache: false,
+                need_values: false,
+            },
+            |key, _lsn, val| {
+                entries_len += 1;
+                window_last_key.clear();
+                window_last_key.extend_from_slice(key);
+                if let MergedValueRef::Blob(old_ptr) = val {
+                    if old_ptr.kind == BlobKind::Standard
+                        && session.fragmented_seqs.contains(&old_ptr.seg_id)
+                    {
+                        candidates.push((key.to_vec(), old_ptr));
+                    }
+                }
+                Ok(true)
+            },
         )?;
-        let entries_len = entries.len();
         if entries_len == 0 {
             session.done = true;
             return Ok(StdBlobRelocStep::Finished {
@@ -646,79 +666,69 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut batch_est_bytes = 0usize;
         let mut batch_last_key: Option<Vec<u8>> = None;
         let mut batch_relocated = 0usize;
-        for entry in entries {
+        for (key, old_ptr) in candidates {
             if chunk_reloc_bytes > 0 && chunk_reloc_bytes >= max_reloc_bytes {
                 hit_chunk_budget = true;
                 break;
             }
-            if let IndexValue::Blob(old_ptr) = entry.value {
-                if old_ptr.kind == BlobKind::Standard
-                    && session.fragmented_seqs.contains(&old_ptr.seg_id)
-                {
-                    let payload = match self.dereference_blob_lenient(&old_ptr, &entry.key) {
-                        Ok(Some(payload)) => payload,
-                        Ok(None) => {
-                            self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
-                            session.fragmented_seqs.remove(&old_ptr.seg_id);
-                            batch_last_key = Some(entry.key);
-                            continue;
-                        }
-                        Err(e) => {
-                            self.abort_relocation_batch(batch_new_ptrs);
-                            return Err(e);
-                        }
-                    };
-                    let rec_est = 28usize.saturating_add(entry.key.len());
-                    if !batch_wal_records.is_empty()
-                        && batch_est_bytes.saturating_add(rec_est) > session.max_batch_wal_bytes
-                    {
-                        self.flush_relocation_batch(
-                            &mut batch_wal_records,
-                            &mut batch_new_ptrs,
-                            &mut batch_dead_ptrs,
-                        )?;
-                        if let Some(last) = batch_last_key.take() {
-                            session.seek_key = last;
-                            session.lower_inclusive = false;
-                        }
-                        session.relocated += core::mem::take(&mut batch_relocated);
-                        batch_est_bytes = 0;
-                    }
-                    let payload_len = payload.len();
-                    let new_ptr = match self.append_to_blob_segment(
-                        BlobKind::Standard,
-                        0,
-                        &entry.key,
-                        &payload,
-                    ) {
-                        Ok(ptr) => ptr,
-                        Err(e) => {
-                            self.abort_relocation_batch(batch_new_ptrs);
-                            return Err(e);
-                        }
-                    };
-                    let rec = WalRecord::PutBlobPtr {
-                        key: entry.key.clone(),
-                        blob_ptr: new_ptr,
-                    };
-                    batch_last_key = Some(entry.key);
-                    batch_dead_ptrs.push(old_ptr);
-                    batch_new_ptrs.push(new_ptr);
-                    batch_wal_records.push(rec);
-                    batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
-                    chunk_reloc_bytes = chunk_reloc_bytes.saturating_add(payload_len);
-                    batch_relocated += 1;
+            let payload = match self.dereference_blob_lenient(&old_ptr, &key) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => {
+                    self.unrelocatable_std_blobs.insert(old_ptr.seg_id);
+                    session.fragmented_seqs.remove(&old_ptr.seg_id);
+                    batch_last_key = Some(key);
                     continue;
                 }
+                Err(e) => {
+                    self.abort_relocation_batch(batch_new_ptrs);
+                    return Err(e);
+                }
+            };
+            let rec_est = 28usize.saturating_add(key.len());
+            if !batch_wal_records.is_empty()
+                && batch_est_bytes.saturating_add(rec_est) > session.max_batch_wal_bytes
+            {
+                self.flush_relocation_batch(
+                    &mut batch_wal_records,
+                    &mut batch_new_ptrs,
+                    &mut batch_dead_ptrs,
+                )?;
+                if let Some(last) = batch_last_key.take() {
+                    session.seek_key = last;
+                    session.lower_inclusive = false;
+                }
+                session.relocated += core::mem::take(&mut batch_relocated);
+                batch_est_bytes = 0;
             }
-            batch_last_key = Some(entry.key);
+            let payload_len = payload.len();
+            let new_ptr = match self.append_to_blob_segment(BlobKind::Standard, 0, &key, &payload) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    self.abort_relocation_batch(batch_new_ptrs);
+                    return Err(e);
+                }
+            };
+            let rec = WalRecord::PutBlobPtr {
+                key: key.clone(),
+                blob_ptr: new_ptr,
+            };
+            batch_last_key = Some(key);
+            batch_dead_ptrs.push(old_ptr);
+            batch_new_ptrs.push(new_ptr);
+            batch_wal_records.push(rec);
+            batch_est_bytes = batch_est_bytes.saturating_add(rec_est);
+            chunk_reloc_bytes = chunk_reloc_bytes.saturating_add(payload_len);
+            batch_relocated += 1;
         }
         self.flush_relocation_batch(
             &mut batch_wal_records,
             &mut batch_new_ptrs,
             &mut batch_dead_ptrs,
         )?;
-        if let Some(last) = batch_last_key {
+        if !hit_chunk_budget {
+            session.seek_key = window_last_key;
+            session.lower_inclusive = false;
+        } else if let Some(last) = batch_last_key {
             session.seek_key = last;
             session.lower_inclusive = false;
         }
