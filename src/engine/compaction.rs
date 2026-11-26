@@ -16,6 +16,8 @@ use crate::wal::{BlobKind, BlobPtr, WalRecord};
 use super::scan::{MergeScanSpec, MergedValueRef};
 use super::{StorageEngine, WriteDurability};
 
+const STD_BLOB_RELOCATE_THRESHOLD: f64 = 0.5;
+
 struct SettledBlobCheckpoint {
     dead_std_seqs: Vec<u64>,
     dead_lru_keys: Vec<(u16, u64)>,
@@ -150,16 +152,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             } else if let Some(hook) = &self.compaction_hook {
                 hook();
             }
-        } else if !self.tx_state.is_active()
-            && self.config.background_compaction
+        } else if !self.tx_state.is_active() {
+            self.maybe_notify_blob_maintenance_hook();
+        }
+        Ok(())
+    }
+
+    fn maybe_notify_blob_maintenance_hook(&self) {
+        if self.config.background_compaction
             && !self.is_relocating_std_blobs()
-            && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
+            && (self.has_fragmented_std_blobs(STD_BLOB_RELOCATE_THRESHOLD)
+                || self.has_fully_dead_std_blobs())
         {
             if let Some(hook) = &self.compaction_hook {
                 hook();
             }
         }
-        Ok(())
     }
 
     /// Carries out the automatic compaction that a full-WAL rotation had to skip (it flushes with
@@ -209,36 +217,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.sync_active_blob_writers()?;
         self.release_unlinkable_blob_files()?;
 
-        let std_metas: Vec<StdBlobSegmentMeta> = self
-            .std_blobs
-            .iter()
-            .map(|(&seq_id, b)| StdBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-            })
-            .collect();
-        let lru_metas: Vec<LruBlobSegmentMeta> = self
-            .lru_blobs
-            .iter()
-            .map(|(&(_tid, seq_id), b)| LruBlobSegmentMeta {
-                seq_id,
-                file_len: b.file_len,
-                dead_bytes: b.dead_bytes,
-                table_id: b.table_id,
-            })
-            .collect();
+        let std_metas = self.build_std_blob_metas();
+        let lru_metas = self.build_lru_blob_metas();
         let quota_metas = self.build_quota_metas();
         let st = self.meta_mgr().state();
-        // `build_quota_metas` iterates a `HashMap`, so compare the quotas in table order.
-        let sorted_quotas = |v: &[crate::meta::TableQuotaMeta]| {
-            let mut v = v.to_vec();
-            v.sort_by_key(|q| q.table_id);
-            v
-        };
+        let mut stored_quotas = st.table_quotas.clone();
+        stored_quotas.sort_by_key(|q| q.table_id);
         if st.std_blob_segments == std_metas
             && st.lru_blob_segments == lru_metas
-            && sorted_quotas(&st.table_quotas) == sorted_quotas(&quota_metas)
+            && stored_quotas == quota_metas
         {
             return Ok(());
         }
@@ -295,32 +282,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             record_count: new_reader.record_count(),
         };
 
-        let new_sync_epoch = self.sync_wal().active_epoch() + 1;
-        let new_buf_epoch = self.buf_wal().active_epoch() + 1;
-        let new_checkpoint_lsn = self.next_lsn.saturating_sub(1);
-
-        let settled = self.prepare_settled_blob_checkpoint();
-        // During a `RingFull` flush inside an uncommitted transaction, only pre-transaction quotas
-        // reflect the flushed `MemTable`.
-        let quota_metas = self.settled_quota_metas();
-        // The commit rotates the WAL epochs, so no batch can reference these segments any more.
-        let lingering = self.unlink_after_wal_rotation.clone();
-
-        if let Err(e) =
-            self.healthy()?
-                .commit_wal_epoch_rotation(new_sync_epoch, new_buf_epoch, |st| {
-                    st.idx_segments.push(idx_meta);
-                    st.std_blob_segments = settled.std_metas;
-                    st.lru_blob_segments = settled.lru_metas;
-                    st.table_quotas = quota_metas;
-                    st.checkpoint_lsn = new_checkpoint_lsn;
-                    st.sync_wal_epoch = new_sync_epoch;
-                    st.buf_wal_epoch = new_buf_epoch;
-                    for fname in settled.dead_blob_files.iter().chain(&lingering) {
-                        st.queue_pending_delete(fname.clone());
-                    }
-                })
-        {
+        if let Err(e) = self.commit_wal_rotation_checkpoint(Some(idx_meta), true) {
             drop(new_reader);
             if !self.meta_mgr().is_poisoned() {
                 let _ = self.fs.remove_file(&format_idx_file_name(new_seq_id));
@@ -328,17 +290,53 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Err(e);
         }
 
+        self.invalidate_snapshot_idx_segments();
+        self.memtable.clear();
+        self.idx_segments.push(Arc::new(new_reader));
+        Ok(())
+    }
+
+    fn commit_wal_rotation_checkpoint(
+        &mut self,
+        idx_meta: Option<IdxSegmentMeta>,
+        persist_quotas: bool,
+    ) -> io::Result<()> {
+        let new_sync_epoch = self.sync_wal().active_epoch() + 1;
+        let new_buf_epoch = self.buf_wal().active_epoch() + 1;
+        let new_checkpoint_lsn = self.next_lsn.saturating_sub(1);
+
+        let settled = self.prepare_settled_blob_checkpoint();
+        // During a `RingFull` flush inside an uncommitted transaction, only pre-transaction quotas
+        // reflect the flushed `MemTable`.
+        let quota_metas = persist_quotas.then(|| self.settled_quota_metas());
+        // The commit rotates the WAL epochs, so no batch can reference these segments any more.
+        let lingering = self.unlink_after_wal_rotation.clone();
+
+        self.healthy()?
+            .commit_wal_epoch_rotation(new_sync_epoch, new_buf_epoch, |st| {
+                if let Some(meta) = idx_meta {
+                    st.idx_segments.push(meta);
+                }
+                st.std_blob_segments = settled.std_metas;
+                st.lru_blob_segments = settled.lru_metas;
+                if let Some(quotas) = quota_metas {
+                    st.table_quotas = quotas;
+                }
+                st.checkpoint_lsn = new_checkpoint_lsn;
+                st.sync_wal_epoch = new_sync_epoch;
+                st.buf_wal_epoch = new_buf_epoch;
+                for fname in settled.dead_blob_files.iter().chain(&lingering) {
+                    st.queue_pending_delete(fname.clone());
+                }
+            })?;
+
         self.apply_settled_blob_reclaim(
             settled.dead_std_seqs,
             settled.dead_lru_keys,
             !settled.dead_blob_files.is_empty() || !lingering.is_empty(),
         );
-
-        self.invalidate_snapshot_idx_segments();
-        self.memtable.clear();
-        self.idx_segments.push(Arc::new(new_reader));
         self.last_buf_synced_lsn = self.last_buf_append_lsn;
-        // `drain_pending_durable` ran first, so no group-committed batch is lost to the rotation.
+        // Callers drain the group commit first (or have nothing pending, as `open` does).
         self.wal_links.rotated();
         Ok(())
     }
@@ -381,35 +379,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_not_poisoned()?;
         self.healthy()?.flush_buf_wal_to_os()?;
         self.sync_active_blob_writers()?;
-        let new_sync_epoch = self.sync_wal().active_epoch() + 1;
-        let new_buf_epoch = self.buf_wal().active_epoch() + 1;
-        let new_checkpoint_lsn = self.next_lsn.saturating_sub(1);
-        let settled = self.prepare_settled_blob_checkpoint();
-        let quota_metas = persist_quotas.then(|| self.settled_quota_metas());
-        let lingering = self.unlink_after_wal_rotation.clone();
-        self.healthy()?
-            .commit_wal_epoch_rotation(new_sync_epoch, new_buf_epoch, |st| {
-                st.std_blob_segments = settled.std_metas;
-                st.lru_blob_segments = settled.lru_metas;
-                if let Some(quotas) = quota_metas {
-                    st.table_quotas = quotas;
-                }
-                st.checkpoint_lsn = new_checkpoint_lsn;
-                st.sync_wal_epoch = new_sync_epoch;
-                st.buf_wal_epoch = new_buf_epoch;
-                for fname in settled.dead_blob_files.iter().chain(&lingering) {
-                    st.queue_pending_delete(fname.clone());
-                }
-            })?;
-        self.apply_settled_blob_reclaim(
-            settled.dead_std_seqs,
-            settled.dead_lru_keys,
-            !settled.dead_blob_files.is_empty() || !lingering.is_empty(),
-        );
-        self.last_buf_synced_lsn = self.last_buf_append_lsn;
-        // Callers drain the group commit first (or have nothing pending, as `open` does).
-        self.wal_links.rotated();
-        Ok(())
+        self.commit_wal_rotation_checkpoint(None, persist_quotas)
     }
 
     fn fragmented_std_seqs<'a>(
@@ -551,10 +521,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     fn abort_relocation_batch(&mut self, new_ptrs: Vec<BlobPtr>) {
-        self.in_flight_autocommit_blob_starts.clear();
-        for p in new_ptrs {
-            self.record_dead_blob_bytes(&p);
-        }
+        self.abort_uncommitted_blobs(&new_ptrs);
     }
 
     fn flush_relocation_batch(
@@ -759,7 +726,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         }
-        let relocated = self.relocate_fragmented_std_blobs(0.5)?;
+        let relocated = self.relocate_fragmented_std_blobs(STD_BLOB_RELOCATE_THRESHOLD)?;
         if relocated > 0 && !self.memtable.is_empty() {
             self.flush_memtable_no_auto_compact()?;
         }
@@ -912,30 +879,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// dropped here, but a file still held open elsewhere (e.g. by another in-flight job's `Arc`)
     /// cannot be unlinked on Windows (share mode 0); it stays in `pending_delete_files` and is
     /// retried on later commits / at startup.
+    fn validate_compaction_run(&self, out: &CompactionOutput<FS>) -> Option<usize> {
+        let k = out.inputs.len();
+        if k == 0 {
+            return None;
+        }
+        // `inputs` is newest-first; the run's oldest member is the last element.
+        let first_seq = out.inputs[k - 1].seq_id();
+        let st = self
+            .idx_segments
+            .iter()
+            .position(|s| s.seq_id() == first_seq)?;
+        if st + k > self.idx_segments.len() {
+            return None;
+        }
+        let matching =
+            (0..k).all(|i| Arc::ptr_eq(&self.idx_segments[st + i], &out.inputs[k - 1 - i]));
+        (matching && (!out.drop_tombstones || st == 0)).then_some(st)
+    }
+
     pub fn install_compaction(&mut self, out: CompactionOutput<FS>) -> io::Result<bool> {
         if let Err(e) = self.check_not_poisoned() {
             self.discard_compaction_output(out);
             return Err(e);
         }
         let k = out.inputs.len();
-        // `inputs` is newest-first; the run's oldest member is the last element.
-        let first_seq = out.inputs[k - 1].seq_id();
-        let start = self
-            .idx_segments
-            .iter()
-            .position(|s| s.seq_id() == first_seq);
-        let valid = match start {
-            Some(st) if st + k <= self.idx_segments.len() => {
-                (0..k).all(|i| Arc::ptr_eq(&self.idx_segments[st + i], &out.inputs[k - 1 - i]))
-                    && (!out.drop_tombstones || st == 0)
-            }
-            _ => false,
-        };
-        if !valid {
+        let Some(start) = self.validate_compaction_run(&out) else {
             self.discard_compaction_output(out);
             return Ok(false);
-        }
-        let start = start.unwrap();
+        };
 
         let meta_of = |r: &Arc<IdxSegmentReader<FS::File>>| IdxSegmentMeta {
             seq_id: r.seq_id(),
@@ -1022,25 +994,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Err(e);
         }
 
-        if !dead_std_seqs.is_empty() {
-            self.invalidate_snapshot_std_blobs();
-        }
-        if !dead_lru_keys.is_empty() {
-            self.invalidate_snapshot_lru_blobs();
-        }
         self.invalidate_snapshot_idx_segments();
-
-        for seq in dead_std_seqs {
-            self.blob_cache
-                .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
-            self.unrelocatable_std_blobs.remove(&seq);
-            self.std_blobs.remove(&seq);
-        }
-        for key in dead_lru_keys {
-            self.blob_cache
-                .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
-            self.lru_blobs.remove(&key);
-        }
+        self.evict_reclaimed_blob_handles(&dead_std_seqs, &dead_lru_keys);
 
         let CompactionOutput {
             mut new_segment,
@@ -1063,14 +1018,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Ok(h) = self.healthy() {
             h.try_process_pending_deletes();
         }
-        if self.config.background_compaction
-            && !self.is_relocating_std_blobs()
-            && (self.has_fragmented_std_blobs(0.5) || self.has_fully_dead_std_blobs())
-        {
-            if let Some(hook) = &self.compaction_hook {
-                hook();
-            }
-        }
+        self.maybe_notify_blob_maintenance_hook();
         Ok(true)
     }
 
@@ -1174,11 +1122,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    fn apply_settled_blob_reclaim(
+    fn evict_reclaimed_blob_handles(
         &mut self,
-        dead_std_seqs: Vec<u64>,
-        dead_lru_keys: Vec<(u16, u64)>,
-        delete_attempted: bool,
+        dead_std_seqs: &[u64],
+        dead_lru_keys: &[(u16, u64)],
     ) {
         if !dead_std_seqs.is_empty() {
             self.invalidate_snapshot_std_blobs();
@@ -1186,18 +1133,26 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if !dead_lru_keys.is_empty() {
             self.invalidate_snapshot_lru_blobs();
         }
-
-        for seq in dead_std_seqs {
+        for &seq in dead_std_seqs {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
             self.unrelocatable_std_blobs.remove(&seq);
             self.std_blobs.remove(&seq);
         }
-        for key in dead_lru_keys {
+        for &key in dead_lru_keys {
             self.blob_cache
                 .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
             self.lru_blobs.remove(&key);
         }
+    }
+
+    fn apply_settled_blob_reclaim(
+        &mut self,
+        dead_std_seqs: Vec<u64>,
+        dead_lru_keys: Vec<(u16, u64)>,
+        delete_attempted: bool,
+    ) {
+        self.evict_reclaimed_blob_handles(&dead_std_seqs, &dead_lru_keys);
         self.unlink_after_wal_rotation.clear();
         if delete_attempted {
             if let Ok(h) = self.healthy() {
@@ -1283,12 +1238,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             st.lru_blob_segments = lru_metas;
         })?;
 
-        self.invalidate_snapshot_lru_blobs();
-        for &(tid, seq) in &dead_lru {
-            self.blob_cache
-                .invalidate_blob_segment(BlobKind::Lru as u8, tid, seq);
-            self.lru_blobs.remove(&(tid, seq));
-        }
+        self.evict_reclaimed_blob_handles(&[], &dead_lru);
         // The files are not queued for deletion yet: the evicted rows' `Put` batches may still be
         // in the WAL, and recovery must be able to verify their blobs. If the unlink happened
         // here, it would drop each such batch (and in `wal_buf.db` every later one) although a
@@ -1324,23 +1274,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             st.lru_blob_segments = lru_metas;
         })?;
 
-        if !dead_std.is_empty() {
-            self.invalidate_snapshot_std_blobs();
-        }
-        if !dead_lru.is_empty() {
-            self.invalidate_snapshot_lru_blobs();
-        }
-        for seq in dead_std {
-            self.blob_cache
-                .invalidate_blob_segment(BlobKind::Standard as u8, 0, seq);
-            self.unrelocatable_std_blobs.remove(&seq);
-            self.std_blobs.remove(&seq);
-        }
-        for key in dead_lru {
-            self.blob_cache
-                .invalidate_blob_segment(BlobKind::Lru as u8, key.0, key.1);
-            self.lru_blobs.remove(&key);
-        }
+        self.evict_reclaimed_blob_handles(&dead_std, &dead_lru);
         // Defer unlinking whenever uncheckpointed WAL batches may still reference these segments.
         self.unlink_after_wal_rotation.extend(deleted_files);
         self.release_unlinkable_blob_files()?;

@@ -70,8 +70,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::engine::{
-    CommitStep, EngineReader, GroupRole, LazyBlob, RangeScanOptions, STATEMENT_SAVEPOINT,
-    SecondaryScanOptions, SlabScanOutput, StorageEngine, WriteDurability,
+    CommitStep, EngineReader, GroupRole, LazyBlob, PutRowOptions, RangeScanOptions,
+    STATEMENT_SAVEPOINT, SecondaryScanOptions, SlabScanOutput, StorageEngine, WriteDurability,
 };
 use crate::pal::{OsFile, OsFs, PlatformFile};
 pub use crate::vtab::connection::{SqliteConnection, SqliteStatement};
@@ -4152,10 +4152,12 @@ unsafe extern "system" fn vtab_update(
                 vtab.table_id,
                 &new_pk,
                 row_bytes,
-                &sec_keys,
-                extra_records,
-                vtab.durability,
-                known_absent,
+                PutRowOptions {
+                    secondary_keys: &sec_keys,
+                    extra_records,
+                    durability: vtab.durability,
+                    known_absent,
+                },
             )?;
             invalidate_stale_unique_marker_if_needed(&mut eng, vtab)?;
 

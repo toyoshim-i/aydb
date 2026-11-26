@@ -274,9 +274,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && !self.tx_state.is_active()
         {
             if let Err(e) = self.sync_active_std_writer() {
-                for p in state.new_meta_ptrs.drain(..) {
-                    self.record_dead_blob_bytes(&p);
-                }
+                let aborted = std::mem::take(&mut state.new_meta_ptrs);
+                self.abort_uncommitted_blobs(&aborted);
                 return Err(e);
             }
         }
@@ -288,9 +287,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             false,
             super::tx::WriteScope::Normal,
         ) {
-            for p in state.new_meta_ptrs.drain(..) {
-                self.record_dead_blob_bytes(&p);
-            }
+            let aborted = std::mem::take(&mut state.new_meta_ptrs);
+            self.abort_uncommitted_blobs(&aborted);
             return Err(e);
         }
         if state.wrote_any_meta {
@@ -349,9 +347,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             false,
             super::tx::WriteScope::Normal,
         ) {
-            if let Some(ref p) = new_meta_blob_ptr {
-                self.record_dead_blob_bytes(p);
-            }
+            self.abort_uncommitted_blobs(new_meta_blob_ptr.as_slice());
             return Err(e);
         }
         if wrote_meta {
@@ -481,12 +477,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         })();
 
         if let Err(e) = res {
-            if !self.tx_state.is_active() {
-                self.in_flight_autocommit_blob_starts.clear();
-            }
-            for p in state.new_meta_ptrs.drain(..) {
-                self.record_dead_blob_bytes(&p);
-            }
+            let aborted = std::mem::take(&mut state.new_meta_ptrs);
+            self.abort_uncommitted_blobs(&aborted);
             return Err(e);
         }
         Ok(reconciled_rows)

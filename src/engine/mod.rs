@@ -75,6 +75,34 @@ pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport
 
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx, ReadSource};
 pub use self::reader::{EngineReader, ReadView};
+
+/// Optional parameters controlling row insertion in `StorageEngine::put_row_owned_with_hint_and_extra`.
+pub(crate) struct PutRowOptions<'a> {
+    pub(crate) secondary_keys: &'a [(u16, Vec<u8>)],
+    pub(crate) extra_records: Vec<WalRecord>,
+    pub(crate) durability: WriteDurability,
+    pub(crate) known_absent: bool,
+}
+
+struct PreparedRowMutation {
+    row_key: Vec<u8>,
+    new_sec_keys: Vec<Vec<u8>>,
+    is_capped: bool,
+    logical_size: u32,
+}
+
+pub(super) struct OldMetaDeleteOpts<'a> {
+    pub(super) require_capped_for_lru: bool,
+    pub(super) delete_meta_key: bool,
+    pub(super) match_lru_key: Option<&'a [u8]>,
+}
+
+pub(super) struct OldMetaDeleteResult {
+    pub(super) had_old_meta: bool,
+    pub(super) old_meta_blob_ptr: Option<BlobPtr>,
+    pub(super) old_logical_size: u64,
+    pub(super) matched_lru_key: bool,
+}
 use self::scoped_guards::{
     ReconcilingCappedGuard, RelocatingBlobsGuard, ScopedReconcilingTable, ScopedRelocatingFlag,
 };
@@ -2916,29 +2944,22 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             table_id,
             pk,
             value,
-            secondary_keys,
-            Vec::new(),
-            durability,
-            known_absent,
+            PutRowOptions {
+                secondary_keys,
+                extra_records: Vec::new(),
+                durability,
+                known_absent,
+            },
         )
     }
 
-    /// Atomically inserts or overwrites a row (`pk` -> `value`) together with additional derived
-    /// `extra_records` (such as persistent SQLite rowid mappings) in a single WAL/MemTable batch.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn put_row_owned_with_hint_and_extra(
-        &mut self,
+    fn prepare_row_mutation(
+        &self,
         table_id: u16,
         pk: &[u8],
-        value: Vec<u8>,
+        value_len: usize,
         secondary_keys: &[(u16, Vec<u8>)],
-        extra_records: Vec<WalRecord>,
-        durability: WriteDurability,
-        known_absent: bool,
-    ) -> io::Result<()> {
-        self.check_not_poisoned()?;
-        self.drain_group_for_autocommit()?;
-        self.drain_corrupt_evictions()?;
+    ) -> io::Result<PreparedRowMutation> {
         if pk.len() > 2048 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2973,15 +2994,111 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         let is_capped = self.capped_tables.contains_key(&table_id);
-        let logical_size = (pk.len() + value.len()) as u32;
+        let logical_size = (pk.len() + value_len) as u32;
         if let Some(ct) = self.capped_tables.get(&table_id) {
-            if (3 + pk.len() + value.len()) as u64 > ct.max_bytes {
+            if (3 + pk.len() + value_len) as u64 > ct.max_bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "row logical size exceeds capped table max_bytes quota",
                 ));
             }
         }
+
+        Ok(PreparedRowMutation {
+            row_key,
+            new_sec_keys,
+            is_capped,
+            logical_size,
+        })
+    }
+
+    /// Collects cascade `Delete` records and old metadata pointers for an existing row's `'t'`
+    /// metadata (LRU queue entry, secondary index keys, and optional `'t'` key itself), falling
+    /// back to orphan scanning when `'t'` is corrupt.
+    pub(super) fn collect_old_meta_deletes(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        row_key: &[u8],
+        opts: OldMetaDeleteOpts<'_>,
+        records: &mut Vec<WalRecord>,
+    ) -> io::Result<OldMetaDeleteResult> {
+        let mut res = OldMetaDeleteResult {
+            had_old_meta: false,
+            old_meta_blob_ptr: None,
+            old_logical_size: 0,
+            matched_lru_key: false,
+        };
+        let meta_key = encode_row_meta_key(table_id, pk);
+        match self.get_row_meta_lookup(&meta_key)? {
+            MetaLookup::Found(old_meta, m_ptr) => {
+                res.had_old_meta = true;
+                res.old_meta_blob_ptr = m_ptr;
+                res.old_logical_size = old_meta.logical_size as u64;
+                if (!opts.require_capped_for_lru || self.capped_tables.contains_key(&table_id))
+                    && old_meta.recorded_tick > 0
+                {
+                    let lru_k = encode_lru_queue_key(table_id, old_meta.recorded_tick, pk);
+                    if opts.match_lru_key == Some(lru_k.as_slice()) {
+                        res.matched_lru_key = true;
+                    }
+                    records.push(WalRecord::Delete { key: lru_k });
+                }
+                for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
+                    records.push(WalRecord::Delete {
+                        key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
+                    });
+                }
+                if opts.delete_meta_key {
+                    records.push(WalRecord::Delete { key: meta_key });
+                }
+            }
+            MetaLookup::Corrupt(m_ptr) => {
+                // Unreadable metadata: find old 'i'/'l' entries by scanning for `pk` and estimate
+                // `old_logical_size` from the row record.
+                res.had_old_meta = true;
+                res.old_meta_blob_ptr = m_ptr;
+                let (orphans, est) = self.collect_orphans_for_pk(table_id, pk, row_key)?;
+                res.old_logical_size = est;
+                for key in orphans {
+                    if opts.match_lru_key == Some(key.as_slice()) {
+                        res.matched_lru_key = true;
+                    }
+                    records.push(WalRecord::Delete { key });
+                }
+                if opts.delete_meta_key {
+                    records.push(WalRecord::Delete { key: meta_key });
+                }
+            }
+            MetaLookup::Absent => {}
+        }
+        Ok(res)
+    }
+
+    /// Atomically inserts or overwrites a row (`pk` -> `value`) together with additional derived
+    /// `extra_records` (such as persistent SQLite rowid mappings) in a single WAL/MemTable batch.
+    pub(crate) fn put_row_owned_with_hint_and_extra(
+        &mut self,
+        table_id: u16,
+        pk: &[u8],
+        value: Vec<u8>,
+        opts: PutRowOptions<'_>,
+    ) -> io::Result<()> {
+        let PutRowOptions {
+            secondary_keys,
+            extra_records,
+            durability,
+            known_absent,
+        } = opts;
+        self.check_not_poisoned()?;
+        self.drain_group_for_autocommit()?;
+        self.drain_corrupt_evictions()?;
+        let PreparedRowMutation {
+            row_key,
+            new_sec_keys,
+            is_capped,
+            logical_size,
+        } = self.prepare_row_mutation(table_id, pk, value.len(), secondary_keys)?;
 
         // 1. Check if the row already exists so we can clean up old blob bytes, old secondary keys,
         //    and old LRU queue entries (`[TableID | 'l' | old_tick | pk]`).
@@ -2990,7 +3107,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut old_blob_ptr = None;
         let mut old_meta_blob_ptr = None;
         let mut had_old_meta = false;
-        let meta_key = encode_row_meta_key(table_id, pk);
 
         let existing = if known_absent {
             ExistingRowStatus::NotFound
@@ -3002,34 +3118,20 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
 
         if existing != ExistingRowStatus::NotFound && self.may_have_row_meta(table_id)? {
-            match self.get_row_meta_lookup(&meta_key)? {
-                MetaLookup::Found(old_meta, m_ptr) => {
-                    had_old_meta = true;
-                    old_meta_blob_ptr = m_ptr;
-                    old_logical_size = old_meta.logical_size as u64;
-                    if is_capped && old_meta.recorded_tick > 0 {
-                        records.push(WalRecord::Delete {
-                            key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                        });
-                    }
-                    for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                        records.push(WalRecord::Delete {
-                            key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                        });
-                    }
-                }
-                MetaLookup::Corrupt(m_ptr) => {
-                    // Unreadable metadata: find the old 'i'/'l' entries by scanning for `pk`.
-                    had_old_meta = true;
-                    old_meta_blob_ptr = m_ptr;
-                    let (orphans, est) = self.collect_orphans_for_pk(table_id, pk, &row_key)?;
-                    old_logical_size = est;
-                    for key in orphans {
-                        records.push(WalRecord::Delete { key });
-                    }
-                }
-                MetaLookup::Absent => {}
-            }
+            let old_meta = self.collect_old_meta_deletes(
+                table_id,
+                pk,
+                &row_key,
+                OldMetaDeleteOpts {
+                    require_capped_for_lru: is_capped,
+                    delete_meta_key: false,
+                    match_lru_key: None,
+                },
+                &mut records,
+            )?;
+            had_old_meta = old_meta.had_old_meta;
+            old_meta_blob_ptr = old_meta.old_meta_blob_ptr;
+            old_logical_size = old_meta.old_logical_size;
         }
 
         // 2. Write out-of-line blob FIRST if `value.len() >= effective_inline_threshold` or if inline entry exceeds 4 KB block
@@ -3071,10 +3173,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     BlobKind::Lru => self.sync_active_lru_writer(table_id),
                 };
                 if let Err(e) = sync_res {
-                    self.in_flight_autocommit_blob_starts.clear();
-                    if let Some(ref p) = new_row_blob_ptr {
-                        self.record_dead_blob_bytes(p);
-                    }
+                    self.abort_uncommitted_blobs(new_row_blob_ptr.as_slice());
                     return Err(e);
                 }
             }
@@ -3112,16 +3211,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let need_meta = is_capped || !secondary_keys.is_empty();
         let mut new_meta_blob_ptr = None;
         if need_meta {
+            let meta_key = encode_row_meta_key(table_id, pk);
             let meta_bytes =
                 match RowMetaRecord::encode_slice(assigned_tick, logical_size, secondary_keys) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        if !self.tx_state.is_active() {
-                            self.in_flight_autocommit_blob_starts.clear();
-                        }
-                        if let Some(ref p) = new_row_blob_ptr {
-                            self.record_dead_blob_bytes(p);
-                        }
+                        self.abort_uncommitted_blobs(new_row_blob_ptr.as_slice());
                         return Err(e);
                     }
                 };
@@ -3129,17 +3224,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 match self.append_std_meta_record(meta_key, meta_bytes, durability, &mut records) {
                     Ok(ptr_opt) => ptr_opt,
                     Err(e) => {
-                        if !self.tx_state.is_active() {
-                            self.in_flight_autocommit_blob_starts.clear();
-                        }
-                        if let Some(ref p) = new_row_blob_ptr {
-                            self.record_dead_blob_bytes(p);
-                        }
+                        self.abort_uncommitted_blobs(new_row_blob_ptr.as_slice());
                         return Err(e);
                     }
                 };
         } else if had_old_meta {
-            records.push(WalRecord::Delete { key: meta_key });
+            records.push(WalRecord::Delete {
+                key: encode_row_meta_key(table_id, pk),
+            });
         }
 
         records.extend(extra_records);
@@ -3149,12 +3241,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Err(e) =
             self.commit_wal_and_memtable_core(records, durability, true, false, WriteScope::Normal)
         {
-            if let Some(ref p) = new_row_blob_ptr {
-                self.record_dead_blob_bytes(p);
+            let mut aborted = Vec::new();
+            if let Some(p) = new_row_blob_ptr {
+                aborted.push(p);
             }
-            if let Some(ref p) = new_meta_blob_ptr {
-                self.record_dead_blob_bytes(p);
+            if let Some(p) = new_meta_blob_ptr {
+                aborted.push(p);
             }
+            self.abort_uncommitted_blobs(&aborted);
             return Err(e);
         }
         if is_capped {
@@ -3307,9 +3401,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Err(e) =
             self.commit_wal_and_memtable_core(records, durability, true, false, WriteScope::Normal)
         {
-            if let Some(ref p) = new_meta_blob_ptr {
-                self.record_dead_blob_bytes(p);
-            }
+            self.abort_uncommitted_blobs(new_meta_blob_ptr.as_slice());
             return Err(e);
         }
         self.table_has_row_meta.insert(table_id, true);
@@ -3318,6 +3410,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         self.maybe_auto_flush_and_compact();
         Ok(true)
+    }
+
+    /// Cleans up uncommitted blob pointers for a batch whose WAL commit did not happen or failed.
+    ///
+    /// Clears autocommit blob undo tracking when no transaction is active and records every
+    /// pointer in `ptrs` as dead bytes so compaction or eviction can reclaim them later.
+    pub(super) fn abort_uncommitted_blobs(&mut self, ptrs: &[BlobPtr]) {
+        if !self.tx_state.is_active() {
+            self.in_flight_autocommit_blob_starts.clear();
+        }
+        for p in ptrs {
+            self.record_dead_blob_bytes(p);
+        }
     }
 
     /// Encodes `meta_key` -> `meta_bytes` into `records`, spilling oversized metadata to
@@ -3334,8 +3439,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
             if durability == WriteDurability::SyncTransactional && !self.tx_state.is_active() {
                 if let Err(e) = self.sync_active_std_writer() {
-                    self.in_flight_autocommit_blob_starts.clear();
-                    self.record_dead_blob_bytes(&ptr);
+                    self.abort_uncommitted_blobs(std::slice::from_ref(&ptr));
                     return Err(e);
                 }
             }
@@ -3658,37 +3762,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut old_meta_blob_ptr = None;
 
         if self.may_have_row_meta(table_id)? {
-            let meta_key = encode_row_meta_key(table_id, pk);
-            match self.get_row_meta_lookup(&meta_key)? {
-                MetaLookup::Found(old_meta, m_ptr) => {
-                    old_meta_blob_ptr = m_ptr;
-                    old_logical_size = old_meta.logical_size as u64;
-                    if old_meta.recorded_tick > 0 {
-                        records.push(WalRecord::Delete {
-                            key: encode_lru_queue_key(table_id, old_meta.recorded_tick, pk),
-                        });
-                    }
-                    for (old_idx_id, old_col_val) in &old_meta.secondary_keys {
-                        records.push(WalRecord::Delete {
-                            key: encode_secondary_index_key(table_id, *old_idx_id, old_col_val, pk),
-                        });
-                    }
-                    records.push(WalRecord::Delete { key: meta_key });
-                }
-                MetaLookup::Corrupt(m_ptr) => {
-                    // Unreadable metadata: remove the 't' record and every 'i'/'l' entry for
-                    // `pk` found by scanning. The capped-table byte counter is reduced by an
-                    // estimate (pk length + value length taken from the row record).
-                    old_meta_blob_ptr = m_ptr;
-                    let (orphans, est) = self.collect_orphans_for_pk(table_id, pk, &row_key)?;
-                    old_logical_size = est;
-                    for key in orphans {
-                        records.push(WalRecord::Delete { key });
-                    }
-                    records.push(WalRecord::Delete { key: meta_key });
-                }
-                MetaLookup::Absent => {}
-            }
+            let old_meta = self.collect_old_meta_deletes(
+                table_id,
+                pk,
+                &row_key,
+                OldMetaDeleteOpts {
+                    require_capped_for_lru: false,
+                    delete_meta_key: true,
+                    match_lru_key: None,
+                },
+                &mut records,
+            )?;
+            old_meta_blob_ptr = old_meta.old_meta_blob_ptr;
+            old_logical_size = old_meta.old_logical_size;
         }
 
         let is_capped = self.capped_tables.contains_key(&table_id);
