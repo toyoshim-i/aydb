@@ -155,7 +155,7 @@ pub(super) unsafe extern "system" fn trace_reads(
     _detail: *mut c_void,
 ) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-        if IN_INTERNAL_SCHEMA_QUERY.with(Cell::get) {
+        if IN_INTERNAL_SCHEMA_QUERY.with(Cell::get) || context.is_null() {
             return;
         }
         let trace = &*(context as *const ReadTrace);
@@ -186,6 +186,9 @@ pub(super) unsafe extern "system" fn trace_reads(
 
 pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_int {
     catch_unwind(AssertUnwindSafe(|| unsafe {
+        if context.is_null() {
+            return 1;
+        }
         let trace = &*(context as *const ReadTrace);
         trace.pending_ddl.commit_pending()
     }))
@@ -194,6 +197,9 @@ pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_
 
 pub(super) unsafe extern "system" fn ddl_rollback_hook(context: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        if context.is_null() {
+            return;
+        }
         let trace = &*(context as *const ReadTrace);
         trace.pending_ddl.rollback_pending();
     }));

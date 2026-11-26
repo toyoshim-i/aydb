@@ -82,13 +82,13 @@ use crate::vtab::ffi::{
     SQLITE_INDEX_CONSTRAINT_GT, SQLITE_INDEX_CONSTRAINT_LE, SQLITE_INDEX_CONSTRAINT_LT,
     SQLITE_INDEX_SCAN_UNIQUE, SQLITE_INTEGER, SQLITE_IOERR, SQLITE_MISMATCH, SQLITE_NULL,
     SQLITE_OK, SQLITE_REPLACE, SQLITE_ROW, SQLITE_TEXT, SQLITE_TOOBIG, SQLITE_TXN_WRITE,
-    SQLITE_VTAB_CONSTRAINT_SUPPORT, sqlite_column_text_bytes, sqlite_transient,
-    sqlite_value_text_bytes, sqlite3, sqlite3_bind_text, sqlite3_context, sqlite3_declare_vtab,
-    sqlite3_finalize, sqlite3_get_autocommit, sqlite3_index_info, sqlite3_int64, sqlite3_malloc,
-    sqlite3_module, sqlite3_prepare_v2, sqlite3_result_error_code, sqlite3_result_int64,
-    sqlite3_step, sqlite3_stmt, sqlite3_txn_state, sqlite3_value, sqlite3_value_double,
-    sqlite3_value_int64, sqlite3_value_type, sqlite3_vtab, sqlite3_vtab_collation,
-    sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
+    SQLITE_VTAB_CONSTRAINT_SUPPORT, SqliteStmtGuard, set_pz_err, set_vtab_err_msg,
+    sqlite_column_text_bytes, sqlite_transient, sqlite_value_text_bytes, sqlite3,
+    sqlite3_bind_text, sqlite3_context, sqlite3_declare_vtab, sqlite3_get_autocommit,
+    sqlite3_index_info, sqlite3_int64, sqlite3_module, sqlite3_prepare_v2,
+    sqlite3_result_error_code, sqlite3_result_int64, sqlite3_step, sqlite3_stmt, sqlite3_txn_state,
+    sqlite3_value, sqlite3_value_double, sqlite3_value_int64, sqlite3_value_type, sqlite3_vtab,
+    sqlite3_vtab_collation, sqlite3_vtab_config, sqlite3_vtab_cursor, sqlite3_vtab_on_conflict,
 };
 
 const CREATE_SAVEPOINT: i32 = STATEMENT_SAVEPOINT + 1;
@@ -310,16 +310,7 @@ unsafe fn constraint_matches_col_collation(
     let Ok(cstr) = (unsafe { core::ffi::CStr::from_ptr(ptr) }).to_str() else {
         return false;
     };
-    let parsed = if cstr.eq_ignore_ascii_case("BINARY") {
-        Some(ColCollation::Binary)
-    } else if cstr.eq_ignore_ascii_case("NOCASE") {
-        Some(ColCollation::NoCase)
-    } else if cstr.eq_ignore_ascii_case("RTRIM") {
-        Some(ColCollation::RTrim)
-    } else {
-        None
-    };
-    parsed == Some(col_collation)
+    ColCollation::from_name(cstr) == Some(col_collation)
 }
 
 unsafe fn extract_lossless_rowid_arg(val: *mut sqlite3_value) -> Option<i64> {
@@ -1428,41 +1419,6 @@ thread_local! {
 const RENAME_NEEDS_WRITE: &str = "ALTER TABLE RENAME of an aydb table inside a transaction needs an earlier write to an aydb table in that transaction";
 const STALE_VTAB_ERR: &str = "virtual table handle is stale: table was dropped";
 
-/// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
-/// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
-unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
-    let Some(alloc_len) = msg
-        .len()
-        .checked_add(1)
-        .and_then(|n| c_int::try_from(n).ok())
-    else {
-        return core::ptr::null_mut();
-    };
-    unsafe {
-        let buf = sqlite3_malloc(alloc_len) as *mut c_char;
-        if !buf.is_null() {
-            core::ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, buf, msg.len());
-            *buf.add(msg.len()) = 0;
-        }
-        buf
-    }
-}
-
-/// Replaces `(*p_vtab).zErrMsg` with a SQLite-owned copy of `msg`.
-///
-/// # Safety
-/// `p_vtab` must be null or point to a valid `sqlite3_vtab` (such as `vtab.base.get()`).
-unsafe fn set_vtab_err_msg(p_vtab: *mut sqlite3_vtab, msg: &str) {
-    unsafe {
-        if !p_vtab.is_null() {
-            if !(*p_vtab).zErrMsg.is_null() {
-                crate::vtab::ffi::sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
-            }
-            (*p_vtab).zErrMsg = sqlite_error_message(msg);
-        }
-    }
-}
-
 /// Waits, bounded like `xBegin`, for another connection's transaction to end: the same thread
 /// may hold that connection open and could never end it. Returns false once the wait ran out.
 fn wait_for_other_transaction(
@@ -1526,9 +1482,7 @@ unsafe fn vtab_create_or_connect(
         // by an older build) must still connect so that it can be read and dropped; its writes
         // are refused instead.
         if let (true, Some(reason)) = (is_create, ddl.unsupported) {
-            if !pz_err.is_null() {
-                *pz_err = sqlite_error_message(reason);
-            }
+            set_pz_err(pz_err, reason);
             return SQLITE_ERROR;
         }
 
@@ -1558,9 +1512,7 @@ unsafe fn vtab_create_or_connect(
         let autocommit = sqlite3_get_autocommit(db) != 0;
         if is_create && !autocommit {
             if let Err(e) = aux.pending_ddl.reconcile_in_tx_renames(db) {
-                if !pz_err.is_null() {
-                    *pz_err = sqlite_error_message(&e.to_string());
-                }
+                set_pz_err(pz_err, &e.to_string());
                 return io_err_to_sqlite_rc(&e);
             }
         }
@@ -1591,8 +1543,8 @@ unsafe fn vtab_create_or_connect(
                             !(plan.persisted && quota_registered)
                         }
                         Err(e) => {
-                            if e.kind() == io::ErrorKind::InvalidData && !pz_err.is_null() {
-                                *pz_err = sqlite_error_message(&e.to_string());
+                            if e.kind() == io::ErrorKind::InvalidData {
+                                set_pz_err(pz_err, &e.to_string());
                             }
                             return io_err_to_sqlite_rc(&e);
                         }
@@ -1604,9 +1556,7 @@ unsafe fn vtab_create_or_connect(
                     }
                     if let Some(snapshot) = aux.read_session.current() {
                         if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
-                            if !pz_err.is_null() {
-                                *pz_err = sqlite_error_message(&error.to_string());
-                            }
+                            set_pz_err(pz_err, &error.to_string());
                             return io_err_to_sqlite_rc(&error);
                         }
                     }
@@ -1694,8 +1644,8 @@ unsafe fn vtab_create_or_connect(
                     } else if began_here {
                         let _ = eng.rollback_transaction_for_conn(db as usize);
                     }
-                    if e.kind() == io::ErrorKind::InvalidData && !pz_err.is_null() {
-                        *pz_err = sqlite_error_message(&e.to_string());
+                    if e.kind() == io::ErrorKind::InvalidData {
+                        set_pz_err(pz_err, &e.to_string());
                     }
                     return io_err_to_sqlite_rc(&e);
                 }
@@ -4575,49 +4525,41 @@ unsafe fn query_schema_for_aydb_table(db: *mut sqlite3, catalog: &str, name: &st
     let Ok(sql_len) = i32::try_from(sql.len()) else {
         return None;
     };
-    let mut stmt: *mut sqlite3_stmt = core::ptr::null_mut();
+    let mut raw_stmt: *mut sqlite3_stmt = core::ptr::null_mut();
     let prep_rc = unsafe {
         sqlite3_prepare_v2(
             db,
             sql.as_ptr() as *const c_char,
             sql_len,
-            &mut stmt,
+            &mut raw_stmt,
             core::ptr::null_mut(),
         )
     };
-    if prep_rc != SQLITE_OK || stmt.is_null() {
-        if !stmt.is_null() {
-            unsafe {
-                sqlite3_finalize(stmt);
-            }
-        }
+    let stmt = SqliteStmtGuard::new(raw_stmt);
+    if prep_rc != SQLITE_OK || stmt.as_ptr().is_null() {
         return None;
     }
     let bind_rc = unsafe {
         sqlite3_bind_text(
-            stmt,
+            stmt.as_ptr(),
             1,
             name.as_ptr() as *const c_char,
             name_len,
             sqlite_transient(),
         )
     };
-    let result = if bind_rc != SQLITE_OK {
+    if bind_rc != SQLITE_OK {
         None
     } else {
-        match unsafe { sqlite3_step(stmt) } {
+        match unsafe { sqlite3_step(stmt.as_ptr()) } {
             SQLITE_ROW => {
-                let bytes = unsafe { sqlite_column_text_bytes(stmt, 0) };
+                let bytes = unsafe { sqlite_column_text_bytes(stmt.as_ptr(), 0) };
                 core::str::from_utf8(bytes).ok().map(is_aydb_vtab_sql)
             }
             SQLITE_DONE => Some(false),
             _ => None,
         }
-    };
-    unsafe {
-        sqlite3_finalize(stmt);
     }
-    result
 }
 
 /// Whether SQLite's schema (`db_name`, or `temp`/`main` if empty) still has an `aydb` virtual

@@ -459,3 +459,209 @@ pub(crate) unsafe fn sqlite_column_blob_bytes<'a>(stmt: *mut sqlite3_stmt, col: 
         }
     }
 }
+
+/// Safe lifetime-bound borrow of a `*mut sqlite3_value` passed by SQLite to FFI callbacks.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(in crate::vtab) struct SqliteValueRef<'a>(
+    *mut sqlite3_value,
+    core::marker::PhantomData<&'a ()>,
+);
+
+impl<'a> SqliteValueRef<'a> {
+    /// Wraps a raw non-null SQLite value pointer valid for `'a`.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for the lifetime `'a`.
+    #[inline]
+    pub(in crate::vtab) unsafe fn from_raw(ptr: *mut sqlite3_value) -> Self {
+        Self(ptr, core::marker::PhantomData)
+    }
+
+    /// Reinterprets an FFI `argv` array of `argc` value pointers as a slice of [`SqliteValueRef`].
+    ///
+    /// # Safety
+    /// When `argc > 0` and `!argv.is_null()`, `argv` must point to `argc` valid `sqlite3_value`
+    /// pointers valid for `'a`.
+    #[inline]
+    pub(in crate::vtab) unsafe fn slice_from_argv(
+        argv: *mut *mut sqlite3_value,
+        argc: c_int,
+    ) -> &'a [Self] {
+        if argc <= 0 || argv.is_null() {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(argv as *const Self, argc as usize) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_ptr(self) -> *mut sqlite3_value {
+        self.0
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn value_type(self) -> c_int {
+        unsafe { sqlite3_value_type(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn is_null(self) -> bool {
+        self.0.is_null() || self.value_type() == SQLITE_NULL
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn is_null_or_nan(self) -> bool {
+        if self.0.is_null() {
+            return true;
+        }
+        let ty = self.value_type();
+        ty == SQLITE_NULL || (ty == SQLITE_FLOAT && self.as_double().is_nan())
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_int64(self) -> i64 {
+        unsafe { sqlite3_value_int64(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_double(self) -> f64 {
+        unsafe { sqlite3_value_double(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_text_bytes(self) -> &'a [u8] {
+        unsafe { sqlite_value_text_bytes(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_blob_bytes(self) -> &'a [u8] {
+        unsafe { sqlite_value_blob_bytes(self.0) }
+    }
+}
+
+/// Safe wrapper around a `*mut sqlite3_context` passed to `xColumn` / `xRowid`.
+#[repr(transparent)]
+pub(in crate::vtab) struct SqliteContextRef<'a>(
+    *mut sqlite3_context,
+    core::marker::PhantomData<&'a mut ()>,
+);
+
+impl<'a> SqliteContextRef<'a> {
+    /// Wraps a raw SQLite result context pointer valid for `'a`.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid non-null `*mut sqlite3_context` for `'a`.
+    #[inline]
+    pub(in crate::vtab) unsafe fn from_raw(ptr: *mut sqlite3_context) -> Self {
+        Self(ptr, core::marker::PhantomData)
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_ptr(&self) -> *mut sqlite3_context {
+        self.0
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn set_i64(&self, val: i64) {
+        unsafe { sqlite3_result_int64(self.0, val) };
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn set_error_code(&self, rc: c_int) {
+        unsafe { sqlite3_result_error_code(self.0, rc) };
+    }
+
+    /// Maps an `io::Result<()>` to a SQLite return code, setting the error code on the context
+    /// unless `rc == SQLITE_TOOBIG` (where SQLite relies on the `sqlite3_result_error_toobig`
+    /// already reported or the mapped `SQLITE_TOOBIG` rc).
+    #[inline]
+    pub(in crate::vtab) fn finish_io_result(
+        &self,
+        res: std::io::Result<()>,
+        map_err: fn(&std::io::Error) -> c_int,
+    ) -> c_int {
+        match res {
+            Ok(()) => SQLITE_OK,
+            Err(e) => {
+                let rc = map_err(&e);
+                if rc != SQLITE_TOOBIG {
+                    self.set_error_code(rc);
+                }
+                rc
+            }
+        }
+    }
+}
+
+/// RAII guard that calls `sqlite3_finalize` when dropped.
+pub(in crate::vtab) struct SqliteStmtGuard(*mut sqlite3_stmt);
+
+impl SqliteStmtGuard {
+    #[inline]
+    pub(in crate::vtab) fn new(stmt: *mut sqlite3_stmt) -> Self {
+        Self(stmt)
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn as_ptr(&self) -> *mut sqlite3_stmt {
+        self.0
+    }
+}
+
+impl Drop for SqliteStmtGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                sqlite3_finalize(self.0);
+            }
+        }
+    }
+}
+
+/// Copies `msg` into memory owned by SQLite (`sqlite3_free` releases it), as `*pzErr` and
+/// `zErrMsg` require. Returns null if the allocation fails; the error code still reports.
+pub(in crate::vtab) unsafe fn sqlite_error_message(msg: &str) -> *mut c_char {
+    let Some(alloc_len) = msg
+        .len()
+        .checked_add(1)
+        .and_then(|n| c_int::try_from(n).ok())
+    else {
+        return core::ptr::null_mut();
+    };
+    unsafe {
+        let buf = sqlite3_malloc(alloc_len) as *mut c_char;
+        if !buf.is_null() {
+            core::ptr::copy_nonoverlapping(msg.as_ptr() as *const c_char, buf, msg.len());
+            *buf.add(msg.len()) = 0;
+        }
+        buf
+    }
+}
+
+/// Writes a SQLite-owned copy of `msg` into `*pz_err` when `pz_err` is non-null.
+///
+/// # Safety
+/// `pz_err` must be null or point to a valid writable `*mut c_char` slot (usually uninitialized or
+/// null on entry from SQLite `xCreate`/`xConnect`).
+pub(in crate::vtab) unsafe fn set_pz_err(pz_err: *mut *mut c_char, msg: &str) {
+    if !pz_err.is_null() {
+        unsafe {
+            *pz_err = sqlite_error_message(msg);
+        }
+    }
+}
+
+/// Replaces `(*p_vtab).zErrMsg` with a SQLite-owned copy of `msg`.
+///
+/// # Safety
+/// `p_vtab` must be null or point to a valid `sqlite3_vtab` (such as `vtab.base.get()`).
+pub(in crate::vtab) unsafe fn set_vtab_err_msg(p_vtab: *mut sqlite3_vtab, msg: &str) {
+    unsafe {
+        if !p_vtab.is_null() {
+            if !(*p_vtab).zErrMsg.is_null() {
+                sqlite3_free((*p_vtab).zErrMsg as *mut c_void);
+            }
+            (*p_vtab).zErrMsg = sqlite_error_message(msg);
+        }
+    }
+}

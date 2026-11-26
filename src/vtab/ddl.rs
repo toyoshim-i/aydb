@@ -555,7 +555,10 @@ pub(super) unsafe fn parse_vtab_ddl(
     argc: c_int,
     argv: *const *const c_char,
 ) -> Result<ParsedVtabDdl, c_int> {
-    unsafe {
+    if argc < 0 || (argc > 0 && argv.is_null()) {
+        return Err(SQLITE_ERROR);
+    }
+    let (db_name, table_name, raw_args) = unsafe {
         // Extract SQLite schema name from argv[1] and virtual table name from argv[2],
         // preserving any leading/trailing whitespace so distinct quoted names do not collide.
         let db_name = if argc > 1 && !(*argv.offset(1)).is_null() {
@@ -577,177 +580,188 @@ pub(super) unsafe fn parse_vtab_ddl(
         } else {
             String::from("vtab")
         };
-
-        let mut explicit_table_id: Option<u16> = None;
-        let mut max_bytes: u64 = 0;
-        let mut durability = WriteDurability::BufferedFast;
-        let mut on_corrupt: Option<CorruptPolicy> = None;
-        let mut inline_max: Option<usize> = None;
-        let mut columns_spec = String::from("key TEXT PRIMARY KEY, value BLOB");
-        let mut indexes_spec = String::new();
-
+        let mut raw_args = Vec::with_capacity(argc.saturating_sub(3) as usize);
         for i in 3..argc {
             let arg_ptr = *argv.offset(i as isize);
             if arg_ptr.is_null() {
                 continue;
             }
-            let raw_arg = CStr::from_ptr(arg_ptr).to_string_lossy();
-            if let Some((k, v)) = raw_arg.split_once('=') {
-                let key = k.trim().to_ascii_lowercase();
-                let val = unwrap_option_value(v);
-                match key.as_str() {
-                    "table_id" => match val.parse::<u16>() {
-                        Ok(id) if id != 0 => explicit_table_id = Some(id),
-                        _ => return Err(SQLITE_ERROR),
-                    },
-                    "max_bytes" => match val.parse::<u64>() {
-                        Ok(mb) => max_bytes = mb,
-                        Err(_) => return Err(SQLITE_ERROR),
-                    },
-                    "durability" => {
-                        if val.eq_ignore_ascii_case("sync") {
-                            durability = WriteDurability::SyncTransactional;
-                        } else if val.eq_ignore_ascii_case("buffered") {
-                            durability = WriteDurability::BufferedFast;
-                        } else {
-                            return Err(SQLITE_ERROR);
-                        }
-                    }
-                    "on_corrupt" => {
-                        if val.eq_ignore_ascii_case("error") {
-                            on_corrupt = Some(CorruptPolicy::Error);
-                        } else if val.eq_ignore_ascii_case("evict") {
-                            on_corrupt = Some(CorruptPolicy::Evict);
-                        } else {
-                            return Err(SQLITE_ERROR);
-                        }
-                    }
-                    "inline_max" => match val.parse::<usize>() {
-                        Ok(thresh) if thresh <= 4096 => inline_max = Some(thresh),
-                        _ => return Err(SQLITE_ERROR),
-                    },
-                    "columns" => {
-                        columns_spec = val.to_string();
-                    }
-                    "indexes" => {
-                        indexes_spec = val.to_string();
-                    }
-                    _ => return Err(SQLITE_ERROR),
-                }
-            } else if !raw_arg.trim().is_empty() {
-                return Err(SQLITE_ERROR);
-            }
+            raw_args.push(CStr::from_ptr(arg_ptr).to_string_lossy().into_owned());
         }
+        (db_name, table_name, raw_args)
+    };
+    parse_vtab_ddl_args(db_name, table_name, &raw_args)
+}
 
-        // Parse column names, identify PRIMARY KEY column index, and determine affinity & collation
-        let mut col_names = Vec::new();
-        let mut col_affinities = Vec::new();
-        let mut col_collations = Vec::new();
-        let mut col_not_null = Vec::new();
-        let mut col_unique = Vec::new();
-        let mut pk_col_idx = 0usize;
-        let mut pk_rowid_alias = false;
-        let mut has_primary_key = false;
-        let mut unsupported: Option<&'static str> = None;
-        let mut declared_columns: Vec<String> = Vec::new();
-        for col_def in split_top_level_commas(&columns_spec) {
-            let trimmed = col_def.trim();
-            // The parser does not support comments or per-constraint conflict policies.
-            // Reject them rather than silently misinterpret a constraint.
-            if has_comment_outside_quotes(trimmed) {
-                return Err(SQLITE_ERROR);
-            }
-            let raw_tokens = column_tokens(trimmed)?;
-            if raw_tokens.windows(2).any(|pair| {
-                pair[0].eq_ignore_ascii_case("ON") && pair[1].eq_ignore_ascii_case("CONFLICT")
-            }) {
-                return Err(SQLITE_ERROR);
-            }
-            if raw_tokens.is_empty() {
-                return Err(SQLITE_ERROR);
-            }
-            if is_table_constraint(&raw_tokens) {
-                return Err(SQLITE_ERROR);
-            }
-            let def = parse_column_def(&raw_tokens)?;
-            if def.primary_key {
-                if has_primary_key {
-                    return Err(SQLITE_ERROR);
+fn parse_vtab_ddl_args(
+    db_name: String,
+    table_name: String,
+    raw_args: &[String],
+) -> Result<ParsedVtabDdl, c_int> {
+    let mut explicit_table_id: Option<u16> = None;
+    let mut max_bytes: u64 = 0;
+    let mut durability = WriteDurability::BufferedFast;
+    let mut on_corrupt: Option<CorruptPolicy> = None;
+    let mut inline_max: Option<usize> = None;
+    let mut columns_spec = String::from("key TEXT PRIMARY KEY, value BLOB");
+    let mut indexes_spec = String::new();
+
+    for raw_arg in raw_args {
+        if let Some((k, v)) = raw_arg.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = unwrap_option_value(v);
+            match key.as_str() {
+                "table_id" => match val.parse::<u16>() {
+                    Ok(id) if id != 0 => explicit_table_id = Some(id),
+                    _ => return Err(SQLITE_ERROR),
+                },
+                "max_bytes" => match val.parse::<u64>() {
+                    Ok(mb) => max_bytes = mb,
+                    Err(_) => return Err(SQLITE_ERROR),
+                },
+                "durability" => {
+                    if val.eq_ignore_ascii_case("sync") {
+                        durability = WriteDurability::SyncTransactional;
+                    } else if val.eq_ignore_ascii_case("buffered") {
+                        durability = WriteDurability::BufferedFast;
+                    } else {
+                        return Err(SQLITE_ERROR);
+                    }
                 }
-                has_primary_key = true;
-                pk_col_idx = col_names.len();
-                pk_rowid_alias = def.rowid_alias;
+                "on_corrupt" => {
+                    if val.eq_ignore_ascii_case("error") {
+                        on_corrupt = Some(CorruptPolicy::Error);
+                    } else if val.eq_ignore_ascii_case("evict") {
+                        on_corrupt = Some(CorruptPolicy::Evict);
+                    } else {
+                        return Err(SQLITE_ERROR);
+                    }
+                }
+                "inline_max" => match val.parse::<usize>() {
+                    Ok(thresh) if thresh <= 4096 => inline_max = Some(thresh),
+                    _ => return Err(SQLITE_ERROR),
+                },
+                "columns" => {
+                    columns_spec = val.to_string();
+                }
+                "indexes" => {
+                    indexes_spec = val.to_string();
+                }
+                _ => return Err(SQLITE_ERROR),
             }
-            if unsupported.is_none() {
-                unsupported = def.unsupported;
-            }
-            declared_columns.push(def.declared);
-            col_names.push(def.name);
-            col_affinities.push(def.affinity);
-            col_collations.push(def.collation);
-            col_not_null.push(def.not_null);
-            col_unique.push(def.unique);
-        }
-        if col_names.is_empty() || col_names.len() >= 0x8000 || !has_primary_key {
+        } else if !raw_arg.trim().is_empty() {
             return Err(SQLITE_ERROR);
         }
-        let pk_affinity = col_affinities
-            .get(pk_col_idx)
-            .copied()
-            .unwrap_or(ColumnAffinity::Blob);
-        let pk_collation = col_collations
-            .get(pk_col_idx)
-            .copied()
-            .unwrap_or(ColCollation::Binary);
-
-        // Parse secondary index column names
-        let mut secondary_indexes = Vec::new();
-        let mut next_idx_id = 1u16;
-        if !indexes_spec.trim().is_empty() {
-            for idx_col in split_top_level_commas(&indexes_spec) {
-                if idx_col.trim().is_empty() {
-                    return Err(SQLITE_ERROR);
-                }
-                if next_idx_id >= 0x8000 {
-                    return Err(SQLITE_ERROR);
-                }
-                let target = unquote_identifier(idx_col.trim());
-                let Some(pos) = col_names
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(&target))
-                else {
-                    return Err(SQLITE_ERROR);
-                };
-                if secondary_indexes.iter().any(|&(p, _)| p == pos) {
-                    return Err(SQLITE_ERROR);
-                }
-                secondary_indexes.push((pos, next_idx_id));
-                next_idx_id += 1;
-            }
-        }
-
-        Ok(ParsedVtabDdl {
-            db_name,
-            table_name,
-            explicit_table_id,
-            max_bytes,
-            durability,
-            on_corrupt,
-            inline_max,
-            declared_columns: declared_columns.join(", "),
-            col_names,
-            col_affinities,
-            col_collations,
-            col_not_null,
-            col_unique,
-            pk_col_idx,
-            pk_affinity,
-            pk_rowid_alias,
-            unsupported,
-            pk_collation,
-            secondary_indexes,
-        })
     }
+
+    // Parse column names, identify PRIMARY KEY column index, and determine affinity & collation
+    let mut col_names = Vec::new();
+    let mut col_affinities = Vec::new();
+    let mut col_collations = Vec::new();
+    let mut col_not_null = Vec::new();
+    let mut col_unique = Vec::new();
+    let mut pk_col_idx = 0usize;
+    let mut pk_rowid_alias = false;
+    let mut has_primary_key = false;
+    let mut unsupported: Option<&'static str> = None;
+    let mut declared_columns: Vec<String> = Vec::new();
+    for col_def in split_top_level_commas(&columns_spec) {
+        let trimmed = col_def.trim();
+        // The parser does not support comments or per-constraint conflict policies.
+        // Reject them rather than silently misinterpret a constraint.
+        if has_comment_outside_quotes(trimmed) {
+            return Err(SQLITE_ERROR);
+        }
+        let raw_tokens = column_tokens(trimmed)?;
+        if raw_tokens.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("ON") && pair[1].eq_ignore_ascii_case("CONFLICT")
+        }) {
+            return Err(SQLITE_ERROR);
+        }
+        if raw_tokens.is_empty() {
+            return Err(SQLITE_ERROR);
+        }
+        if is_table_constraint(&raw_tokens) {
+            return Err(SQLITE_ERROR);
+        }
+        let def = parse_column_def(&raw_tokens)?;
+        if def.primary_key {
+            if has_primary_key {
+                return Err(SQLITE_ERROR);
+            }
+            has_primary_key = true;
+            pk_col_idx = col_names.len();
+            pk_rowid_alias = def.rowid_alias;
+        }
+        if unsupported.is_none() {
+            unsupported = def.unsupported;
+        }
+        declared_columns.push(def.declared);
+        col_names.push(def.name);
+        col_affinities.push(def.affinity);
+        col_collations.push(def.collation);
+        col_not_null.push(def.not_null);
+        col_unique.push(def.unique);
+    }
+    if col_names.is_empty() || col_names.len() >= 0x8000 || !has_primary_key {
+        return Err(SQLITE_ERROR);
+    }
+    let pk_affinity = col_affinities
+        .get(pk_col_idx)
+        .copied()
+        .unwrap_or(ColumnAffinity::Blob);
+    let pk_collation = col_collations
+        .get(pk_col_idx)
+        .copied()
+        .unwrap_or(ColCollation::Binary);
+
+    // Parse secondary index column names
+    let mut secondary_indexes = Vec::new();
+    let mut next_idx_id = 1u16;
+    if !indexes_spec.trim().is_empty() {
+        for idx_col in split_top_level_commas(&indexes_spec) {
+            if idx_col.trim().is_empty() {
+                return Err(SQLITE_ERROR);
+            }
+            if next_idx_id >= 0x8000 {
+                return Err(SQLITE_ERROR);
+            }
+            let target = unquote_identifier(idx_col.trim());
+            let Some(pos) = col_names
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&target))
+            else {
+                return Err(SQLITE_ERROR);
+            };
+            if secondary_indexes.iter().any(|&(p, _)| p == pos) {
+                return Err(SQLITE_ERROR);
+            }
+            secondary_indexes.push((pos, next_idx_id));
+            next_idx_id += 1;
+        }
+    }
+
+    Ok(ParsedVtabDdl {
+        db_name,
+        table_name,
+        explicit_table_id,
+        max_bytes,
+        durability,
+        on_corrupt,
+        inline_max,
+        declared_columns: declared_columns.join(", "),
+        col_names,
+        col_affinities,
+        col_collations,
+        col_not_null,
+        col_unique,
+        pk_col_idx,
+        pk_affinity,
+        pk_rowid_alias,
+        unsupported,
+        pk_collation,
+        secondary_indexes,
+    })
 }
 
 #[cfg(test)]
