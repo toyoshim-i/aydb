@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::Arc;
 
+use super::catalog::CATALOG_PREFIX;
 use super::{TrackedLruBlob, TrackedStdBlob};
 use crate::index::{IdxSegmentReader, IndexValue};
 use crate::lru::NS_PRIMARY_ROW;
@@ -49,9 +50,6 @@ pub(super) struct Salvage {
     /// The `unsalvageable` count of the report.
     pub unsalvageable: u64,
 }
-
-/// Catalog keys are `[0, 0, 'c', name]`, the value is the table id (u16 BE).
-const CATALOG_PREFIX: [u8; 3] = [0, 0, b'c'];
 
 fn table_id_of(value: &[u8]) -> Option<u16> {
     (value.len() == 2).then(|| u16::from_be_bytes([value[0], value[1]]))

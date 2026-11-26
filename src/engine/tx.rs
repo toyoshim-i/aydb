@@ -116,7 +116,7 @@ impl CommitGate {
     }
 
     #[inline]
-    pub(crate) fn is_failed(&self) -> bool {
+    pub(super) fn is_failed(&self) -> bool {
         self.failed_flag.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -229,7 +229,7 @@ pub(crate) enum CommitStep<F: PlatformFile> {
 }
 
 #[derive(Clone)]
-pub(crate) struct TxMetaSnapshot {
+pub(super) struct TxMetaSnapshot {
     pub(super) next_lsn: u64,
     pub(super) std_blobs: BTreeMap<u64, (u64, u64)>,
     pub(super) lru_blobs: BTreeMap<(u16, u64), (u64, u64)>,
@@ -247,7 +247,7 @@ pub(crate) struct TxMetaSnapshot {
 }
 
 #[derive(Clone)]
-pub(crate) struct SavepointPayload {
+pub(super) struct SavepointPayload {
     pub(super) buf_offset: usize,
     pub(super) undo_len: usize,
     pub(super) meta: SavepointMeta,
@@ -457,7 +457,7 @@ impl TxState {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum BlobUndo {
+pub(super) enum BlobUndo {
     Appended {
         kind: crate::wal::BlobKind,
         table_id: u16,
@@ -473,7 +473,7 @@ pub(crate) enum BlobUndo {
 }
 
 #[derive(Clone)]
-pub(crate) struct StatementMetaSnapshot {
+pub(super) struct StatementMetaSnapshot {
     pub(super) next_lsn: u64,
     pub(super) table_id: u16,
     pub(super) capped_table: Option<CappedTableState>,
@@ -484,7 +484,7 @@ pub(crate) struct StatementMetaSnapshot {
 }
 
 #[derive(Clone)]
-pub(crate) enum SavepointMeta {
+pub(super) enum SavepointMeta {
     Full(Box<TxMetaSnapshot>),
     Statement(StatementMetaSnapshot),
 }
@@ -499,7 +499,7 @@ pub(crate) enum SavepointMeta {
 /// than every committed LSN. Merged scans nevertheless do not compare overlay LSNs; precedence is
 /// by source (see `MemView`), so correctness does not depend on that numeric property.
 #[derive(Default)]
-pub(crate) struct TxOverlay {
+pub(super) struct TxOverlay {
     pub(super) map: BTreeMap<Vec<u8>, MemEntry>,
     /// Per-key undo log (`key`, previous overlay entry), recorded only while at least one
     /// savepoint exists. `rollback_to_savepoint` pops it back to the marker's length.

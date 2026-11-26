@@ -17,13 +17,13 @@ struct Unsynced {
 
 /// The two log streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LogStream {
+pub(super) enum LogStream {
     Sync,
     Buffered,
 }
 
 #[derive(Debug)]
-pub(crate) struct WalLinks {
+pub(super) struct WalLinks {
     /// LSN of the batch appended last, in either stream (or the checkpoint LSN after open).
     last_appended: u64,
     /// Every batch with an LSN at or below this value has reached the device in its stream.
