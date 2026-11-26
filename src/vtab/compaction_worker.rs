@@ -94,6 +94,32 @@ impl Drop for AliveGuard {
     }
 }
 
+struct SpawnedWorker {
+    worker_id: u64,
+    signal: Arc<Signal>,
+    handle: JoinHandle<()>,
+    alive: Arc<AtomicBool>,
+}
+
+fn prepare_worker_spawn(engine: &Arc<RwLock<StorageEngine<OsFs>>>) -> Option<SpawnedWorker> {
+    let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+    let signal = Signal::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    let handle = spawn_worker_thread(
+        Arc::clone(engine),
+        Arc::clone(&signal),
+        worker_id,
+        Arc::clone(&alive),
+    )
+    .ok()?;
+    Some(SpawnedWorker {
+        worker_id,
+        signal,
+        handle,
+        alive,
+    })
+}
+
 /// A registration of the shared per-engine worker. Dropping the last registration for an
 /// engine shuts the worker down.
 pub(crate) struct CompactionWorker {
@@ -123,51 +149,33 @@ impl CompactionWorker {
                     e.refs += 1;
                     SpawnAction::Reuse
                 } else {
-                    let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
-                    let signal = Signal::new();
-                    let alive = Arc::new(AtomicBool::new(true));
-                    let handle = spawn_worker_thread(
-                        Arc::clone(&engine),
-                        Arc::clone(&signal),
-                        worker_id,
-                        Arc::clone(&alive),
-                    )
-                    .ok()?;
-                    let old_handle = e.handle.replace(handle);
+                    let spawned = prepare_worker_spawn(&engine)?;
+                    let old_handle = e.handle.replace(spawned.handle);
                     e.refs += 1;
-                    e.worker_id = worker_id;
-                    e.signal = Arc::clone(&signal);
-                    e.alive = alive;
+                    e.worker_id = spawned.worker_id;
+                    e.signal = Arc::clone(&spawned.signal);
+                    e.alive = spawned.alive;
                     SpawnAction::Attach {
-                        worker_id,
-                        signal,
+                        worker_id: spawned.worker_id,
+                        signal: spawned.signal,
                         old_handle,
                     }
                 }
             } else {
-                let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
-                let signal = Signal::new();
-                let alive = Arc::new(AtomicBool::new(true));
-                let handle = spawn_worker_thread(
-                    Arc::clone(&engine),
-                    Arc::clone(&signal),
-                    worker_id,
-                    Arc::clone(&alive),
-                )
-                .ok()?;
+                let spawned = prepare_worker_spawn(&engine)?;
                 map.insert(
                     key,
                     Entry {
                         refs: 1,
-                        worker_id,
-                        signal: Arc::clone(&signal),
-                        handle: Some(handle),
-                        alive,
+                        worker_id: spawned.worker_id,
+                        signal: Arc::clone(&spawned.signal),
+                        handle: Some(spawned.handle),
+                        alive: spawned.alive,
                     },
                 );
                 SpawnAction::Attach {
-                    worker_id,
-                    signal,
+                    worker_id: spawned.worker_id,
+                    signal: spawned.signal,
                     old_handle: None,
                 }
             }
@@ -299,6 +307,162 @@ enum PassOutcome {
     Error,
 }
 
+#[inline]
+fn record_failure_outcome<FS: PlatformFs>(eng: &StorageEngine<FS>, err: &io::Error) -> PassOutcome {
+    eng.record_maintenance_failure(err);
+    if eng.is_poisoned() {
+        PassOutcome::Poisoned
+    } else {
+        PassOutcome::Error
+    }
+}
+
+fn run_index_compaction_step<FS: PlatformFs>(
+    engine: &Arc<RwLock<StorageEngine<FS>>>,
+    contention_retries: &mut usize,
+) -> Option<PassOutcome> {
+    let job = {
+        let Ok(mut eng) = engine.write() else {
+            return Some(PassOutcome::Poisoned);
+        };
+        if eng.is_poisoned() {
+            return Some(PassOutcome::Poisoned);
+        }
+        if !eng.compaction_pending() {
+            return None;
+        }
+        match eng.prepare_compaction() {
+            Ok(Some(job)) => job,
+            Ok(None) => return None,
+            Err(e) => return Some(record_failure_outcome(&eng, &e)),
+        }
+    };
+
+    let out = match job.run() {
+        Ok(out) => out,
+        Err(e) => {
+            if let Ok(eng) = engine.read() {
+                eng.record_maintenance_failure(&e);
+            }
+            return Some(PassOutcome::Error);
+        }
+    };
+
+    let Ok(mut eng) = engine.write() else {
+        return Some(PassOutcome::Poisoned);
+    };
+    match eng.install_compaction(out) {
+        Ok(true) => {}
+        Ok(false) => {
+            *contention_retries += 1;
+            if *contention_retries >= MAX_INSTALL_CONTENTION_RETRIES {
+                return Some(PassOutcome::Deferred);
+            }
+        }
+        Err(e) => return Some(record_failure_outcome(&eng, &e)),
+    }
+    None
+}
+
+fn run_blob_relocation_step<FS: PlatformFs>(
+    engine: &Arc<RwLock<StorageEngine<FS>>>,
+    signal: &Signal,
+    blob_reloc_passes: &mut usize,
+) -> Option<PassOutcome> {
+    // Up to two passes: rolling over an already-fragmented active writer during pass 1
+    // can seal one more fragmented segment that a bounded second pass immediately cleans.
+    *blob_reloc_passes += 1;
+    let (session_opt, tx_active) = {
+        let Ok(mut eng) = engine.write() else {
+            return Some(PassOutcome::Poisoned);
+        };
+        if eng.is_poisoned() {
+            return Some(PassOutcome::Poisoned);
+        }
+        match eng.start_std_blob_relocation(0.5) {
+            Ok(Some(session)) => (Some(session), false),
+            Ok(None) => (None, eng.in_active_transaction()),
+            Err(e) => return Some(record_failure_outcome(&eng, &e)),
+        }
+    };
+    let Some(mut session) = session_opt else {
+        if tx_active {
+            return Some(PassOutcome::Deferred);
+        }
+        *blob_reloc_passes = 2;
+        return None;
+    };
+
+    const BG_RELOCATE_SCAN_KEYS: usize = 128;
+    const BG_RELOCATE_CHUNK_BYTES: usize = 256 * 1024;
+    loop {
+        if is_shutdown(signal) {
+            return Some(PassOutcome::IdleOrDone);
+        }
+        let step = {
+            let Ok(mut eng) = engine.write() else {
+                return Some(PassOutcome::Poisoned);
+            };
+            if eng.is_poisoned() {
+                return Some(PassOutcome::Poisoned);
+            }
+            match eng.step_std_blob_relocation(
+                &mut session,
+                BG_RELOCATE_SCAN_KEYS,
+                BG_RELOCATE_CHUNK_BYTES,
+            ) {
+                Ok(step) => step,
+                Err(e) => return Some(record_failure_outcome(&eng, &e)),
+            }
+        };
+        match step {
+            StdBlobRelocStep::Continue => std::thread::yield_now(),
+            StdBlobRelocStep::Deferred => return Some(PassOutcome::Deferred),
+            StdBlobRelocStep::Finished { relocated } => {
+                if relocated == 0 {
+                    *blob_reloc_passes = 2;
+                } else if !is_shutdown(signal) {
+                    let Ok(mut eng) = engine.write() else {
+                        return Some(PassOutcome::Poisoned);
+                    };
+                    if eng.is_poisoned() {
+                        return Some(PassOutcome::Poisoned);
+                    }
+                    let was_in_tx = eng.in_active_transaction();
+                    if let Err(e) = eng.finish_std_blob_relocation(relocated) {
+                        return Some(record_failure_outcome(&eng, &e));
+                    }
+                    if was_in_tx {
+                        return Some(PassOutcome::Deferred);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+}
+
+fn run_dead_blob_reclaim_step<FS: PlatformFs>(
+    engine: &Arc<RwLock<StorageEngine<FS>>>,
+) -> Option<PassOutcome> {
+    let Ok(mut eng) = engine.write() else {
+        return Some(PassOutcome::Poisoned);
+    };
+    if eng.is_poisoned() {
+        return Some(PassOutcome::Poisoned);
+    }
+    if eng.in_active_transaction() {
+        return Some(PassOutcome::Deferred);
+    }
+    if let Err(e) = eng.finish_std_blob_relocation(1) {
+        return Some(record_failure_outcome(&eng, &e));
+    }
+    if eng.has_fully_dead_std_blobs() {
+        return Some(PassOutcome::Deferred);
+    }
+    None
+}
+
 fn run_drain_cycle<FS: PlatformFs>(
     engine: &Arc<RwLock<StorageEngine<FS>>>,
     signal: &Signal,
@@ -329,175 +493,15 @@ fn run_drain_cycle<FS: PlatformFs>(
             return PassOutcome::IdleOrDone;
         }
 
-        if need_idx {
-            let job = {
-                let Ok(mut eng) = engine.write() else {
-                    return PassOutcome::Poisoned;
-                };
-                if eng.is_poisoned() {
-                    return PassOutcome::Poisoned;
-                }
-                if !eng.compaction_pending() {
-                    continue;
-                }
-                match eng.prepare_compaction() {
-                    Ok(Some(job)) => job,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        eng.record_maintenance_failure(&e);
-                        return if eng.is_poisoned() {
-                            PassOutcome::Poisoned
-                        } else {
-                            PassOutcome::Error
-                        };
-                    }
-                }
-            };
-
-            let out = match job.run() {
-                Ok(out) => out,
-                Err(e) => {
-                    if let Ok(eng) = engine.read() {
-                        eng.record_maintenance_failure(&e);
-                    }
-                    return PassOutcome::Error;
-                }
-            };
-
-            let Ok(mut eng) = engine.write() else {
-                return PassOutcome::Poisoned;
-            };
-            match eng.install_compaction(out) {
-                Ok(true) => {}
-                Ok(false) => {
-                    contention_retries += 1;
-                    if contention_retries >= MAX_INSTALL_CONTENTION_RETRIES {
-                        return PassOutcome::Deferred;
-                    }
-                }
-                Err(e) => {
-                    eng.record_maintenance_failure(&e);
-                    return if eng.is_poisoned() {
-                        PassOutcome::Poisoned
-                    } else {
-                        PassOutcome::Error
-                    };
-                }
-            }
+        let outcome = if need_idx {
+            run_index_compaction_step(engine, &mut contention_retries)
         } else if need_blob {
-            // Up to two passes: rolling over an already-fragmented active writer during pass 1
-            // can seal one more fragmented segment that a bounded second pass immediately cleans.
-            blob_reloc_passes += 1;
-            let (session_opt, tx_active) = {
-                let Ok(mut eng) = engine.write() else {
-                    return PassOutcome::Poisoned;
-                };
-                if eng.is_poisoned() {
-                    return PassOutcome::Poisoned;
-                }
-                match eng.start_std_blob_relocation(0.5) {
-                    Ok(Some(session)) => (Some(session), false),
-                    Ok(None) => (None, eng.in_active_transaction()),
-                    Err(e) => {
-                        eng.record_maintenance_failure(&e);
-                        return if eng.is_poisoned() {
-                            PassOutcome::Poisoned
-                        } else {
-                            PassOutcome::Error
-                        };
-                    }
-                }
-            };
-            let Some(mut session) = session_opt else {
-                if tx_active {
-                    return PassOutcome::Deferred;
-                }
-                blob_reloc_passes = 2;
-                continue;
-            };
-
-            const BG_RELOCATE_SCAN_KEYS: usize = 128;
-            const BG_RELOCATE_CHUNK_BYTES: usize = 256 * 1024;
-            loop {
-                if is_shutdown(signal) {
-                    return PassOutcome::IdleOrDone;
-                }
-                let step = {
-                    let Ok(mut eng) = engine.write() else {
-                        return PassOutcome::Poisoned;
-                    };
-                    if eng.is_poisoned() {
-                        return PassOutcome::Poisoned;
-                    }
-                    match eng.step_std_blob_relocation(
-                        &mut session,
-                        BG_RELOCATE_SCAN_KEYS,
-                        BG_RELOCATE_CHUNK_BYTES,
-                    ) {
-                        Ok(step) => step,
-                        Err(e) => {
-                            eng.record_maintenance_failure(&e);
-                            return if eng.is_poisoned() {
-                                PassOutcome::Poisoned
-                            } else {
-                                PassOutcome::Error
-                            };
-                        }
-                    }
-                };
-                match step {
-                    StdBlobRelocStep::Continue => std::thread::yield_now(),
-                    StdBlobRelocStep::Deferred => {
-                        return PassOutcome::Deferred;
-                    }
-                    StdBlobRelocStep::Finished { relocated } => {
-                        if relocated == 0 {
-                            blob_reloc_passes = 2;
-                        } else if !is_shutdown(signal) {
-                            let Ok(mut eng) = engine.write() else {
-                                return PassOutcome::Poisoned;
-                            };
-                            if eng.is_poisoned() {
-                                return PassOutcome::Poisoned;
-                            }
-                            let was_in_tx = eng.in_active_transaction();
-                            if let Err(e) = eng.finish_std_blob_relocation(relocated) {
-                                eng.record_maintenance_failure(&e);
-                                return if eng.is_poisoned() {
-                                    PassOutcome::Poisoned
-                                } else {
-                                    PassOutcome::Error
-                                };
-                            }
-                            if was_in_tx {
-                                return PassOutcome::Deferred;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
+            run_blob_relocation_step(engine, signal, &mut blob_reloc_passes)
         } else {
-            let Ok(mut eng) = engine.write() else {
-                return PassOutcome::Poisoned;
-            };
-            if eng.is_poisoned() {
-                return PassOutcome::Poisoned;
-            }
-            if eng.in_active_transaction() {
-                return PassOutcome::Deferred;
-            }
-            if let Err(e) = eng.finish_std_blob_relocation(1) {
-                eng.record_maintenance_failure(&e);
-                return if eng.is_poisoned() {
-                    PassOutcome::Poisoned
-                } else {
-                    PassOutcome::Error
-                };
-            }
-            if eng.has_fully_dead_std_blobs() {
-                return PassOutcome::Deferred;
-            }
+            run_dead_blob_reclaim_step(engine)
+        };
+        if let Some(outcome) = outcome {
+            return outcome;
         }
     }
 }
