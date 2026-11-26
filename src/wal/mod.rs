@@ -127,6 +127,62 @@ pub struct BlobPtr {
     pub crc32c: u32,
 }
 
+impl BlobPtr {
+    /// Fixed little-endian wire size of an encoded [`BlobPtr`] in bytes.
+    pub const ENCODED_LEN: usize = 23;
+
+    /// Serializes `self` into its fixed 23-byte little-endian wire representation.
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0] = self.kind as u8;
+        out[1..3].copy_from_slice(&self.table_id.to_le_bytes());
+        out[3..11].copy_from_slice(&self.seg_id.to_le_bytes());
+        out[11..15].copy_from_slice(&self.offset.to_le_bytes());
+        out[15..19].copy_from_slice(&self.len.to_le_bytes());
+        out[19..23].copy_from_slice(&self.crc32c.to_le_bytes());
+        out
+    }
+
+    /// Appends the 23-byte little-endian wire encoding of `self` into `dst`.
+    #[inline]
+    pub fn encode_into(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.to_bytes());
+    }
+
+    /// Decodes a 23-byte [`BlobPtr`] from `r`.
+    #[inline]
+    pub fn decode_from(r: &mut ByteReader<'_>) -> io::Result<Self> {
+        let kind = BlobKind::from_u8(r.read_u8()?)?;
+        let table_id = r.read_u16_le()?;
+        let seg_id = r.read_u64_le()?;
+        let offset = r.read_u32_le()?;
+        let len = r.read_u32_le()?;
+        let crc32c = r.read_u32_le()?;
+        Ok(Self {
+            kind,
+            table_id,
+            seg_id,
+            offset,
+            len,
+            crc32c,
+        })
+    }
+
+    /// Decodes a [`BlobPtr`] from an exact 23-byte slice.
+    #[inline]
+    pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
+        if buf.len() != Self::ENCODED_LEN {
+            return Err(io_err(
+                io::ErrorKind::InvalidData,
+                "corrupted BlobPtr slice length",
+            ));
+        }
+        let mut r = ByteReader::new(buf);
+        Self::decode_from(&mut r)
+    }
+}
+
 /// A single key-value mutation logged inside a [`WalBatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
@@ -169,47 +225,25 @@ enum BorrowedWalRecord {
 }
 
 impl BorrowedWalRecord {
-    #[inline]
-    fn read_range(r: &mut ByteReader<'_>, len: usize) -> io::Result<std::ops::Range<usize>> {
-        let start = r.position();
-        let _ = r.read_bytes(len)?;
-        Ok(start..r.position())
-    }
-
     fn decode_from(r: &mut ByteReader<'_>) -> io::Result<Self> {
         let op = r.read_u8()?;
         match op {
             1 => {
                 let klen = r.read_u32_le()? as usize;
-                let key = Self::read_range(r, klen)?;
+                let key = r.read_range(klen)?;
                 let vlen = r.read_u32_le()? as usize;
-                let value = Self::read_range(r, vlen)?;
+                let value = r.read_range(vlen)?;
                 Ok(Self::PutInline { key, value })
             }
             2 => {
                 let klen = r.read_u32_le()? as usize;
-                let key = Self::read_range(r, klen)?;
-                let kind = BlobKind::from_u8(r.read_u8()?)?;
-                let table_id = r.read_u16_le()?;
-                let seg_id = r.read_u64_le()?;
-                let offset = r.read_u32_le()?;
-                let len = r.read_u32_le()?;
-                let crc = r.read_u32_le()?;
-                Ok(Self::PutBlobPtr {
-                    key,
-                    blob_ptr: BlobPtr {
-                        kind,
-                        table_id,
-                        seg_id,
-                        offset,
-                        len,
-                        crc32c: crc,
-                    },
-                })
+                let key = r.read_range(klen)?;
+                let blob_ptr = BlobPtr::decode_from(r)?;
+                Ok(Self::PutBlobPtr { key, blob_ptr })
             }
             3 => {
                 let klen = r.read_u32_le()? as usize;
-                let key = Self::read_range(r, klen)?;
+                let key = r.read_range(klen)?;
                 Ok(Self::Delete { key })
             }
             4 => Ok(Self::TxBegin),
@@ -277,12 +311,7 @@ impl WalBatch {
                 buf.push(2u8);
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
-                buf.push(blob_ptr.kind as u8);
-                buf.extend_from_slice(&blob_ptr.table_id.to_le_bytes());
-                buf.extend_from_slice(&blob_ptr.seg_id.to_le_bytes());
-                buf.extend_from_slice(&blob_ptr.offset.to_le_bytes());
-                buf.extend_from_slice(&blob_ptr.len.to_le_bytes());
-                buf.extend_from_slice(&blob_ptr.crc32c.to_le_bytes());
+                blob_ptr.encode_into(buf);
             }
             WalRecord::Delete { key } => {
                 buf.push(3u8);

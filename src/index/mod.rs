@@ -23,6 +23,7 @@ pub use key_codec::{
 use crate::cache::VerifiedBlockCache;
 use crate::meta::format_idx_file_name;
 use crate::pal::{OpenHint, PlatformFile, PlatformFs};
+use crate::util::byte_reader::ByteReader;
 use crate::util::crc32c::crc32c;
 use crate::util::{io_err, io_err_with_tag};
 use crate::wal::{BlobKind, BlobPtr};
@@ -47,7 +48,7 @@ const IDX_BLOCK_USABLE_SIZE: usize = IDX_BLOCK_SIZE - IDX_BLOCK_TRAILER_SIZE;
 pub const MAX_SINGLE_BLOCK_ENTRY_BYTES: usize = IDX_BLOCK_USABLE_SIZE - 2;
 
 /// Encoded byte length of a `BlobPtr` inside an `IndexEntry` (`23` bytes).
-pub const BLOB_PTR_ENCODED_LEN: usize = 23;
+pub const BLOB_PTR_ENCODED_LEN: usize = BlobPtr::ENCODED_LEN;
 
 /// Default Bloom filter bits per key (`10` bits/key -> ~0.9% false-positive rate).
 pub const DEFAULT_BLOOM_BITS_PER_KEY: usize = 10;
@@ -365,53 +366,11 @@ impl IdxBlockBuilder {
 
     /// Appends `entry` (which must be in strictly ascending key order) to this block.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
-        let val_len = match &entry.value {
-            IndexValue::Inline(v) => v.len(),
-            IndexValue::Blob(_) => BLOB_PTR_ENCODED_LEN,
-            IndexValue::Tombstone => 0,
-        };
-        let (klen, vlen) =
-            Self::validate_raw_entry_params(entry.key.len(), entry.value.type_tag(), val_len)?;
-        if !self.can_fit(entry) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IndexEntry exceeds remaining 4 KB block capacity",
-            ));
-        }
-        let start_u16 = self.check_key_order_and_start(&entry.key)?;
-
-        let start = self.write_pos;
-        self.offsets.push(start_u16);
-
-        self.buf[start..start + 2].copy_from_slice(&klen.to_le_bytes());
-        self.buf[start + 2] = entry.value.type_tag();
-        self.buf[start + 3..start + 11].copy_from_slice(&entry.lsn.to_le_bytes());
-        let mut pos = start + 11;
-
-        self.buf[pos..pos + entry.key.len()].copy_from_slice(&entry.key);
-        pos += entry.key.len();
-
         match &entry.value {
-            IndexValue::Inline(val) => {
-                self.buf[pos..pos + 2].copy_from_slice(&vlen.to_le_bytes());
-                pos += 2;
-                self.buf[pos..pos + val.len()].copy_from_slice(val);
-                pos += val.len();
-            }
-            IndexValue::Blob(ptr) => {
-                self.buf[pos] = ptr.kind as u8;
-                self.buf[pos + 1..pos + 3].copy_from_slice(&ptr.table_id.to_le_bytes());
-                self.buf[pos + 3..pos + 11].copy_from_slice(&ptr.seg_id.to_le_bytes());
-                self.buf[pos + 11..pos + 15].copy_from_slice(&ptr.offset.to_le_bytes());
-                self.buf[pos + 15..pos + 19].copy_from_slice(&ptr.len.to_le_bytes());
-                self.buf[pos + 19..pos + 23].copy_from_slice(&ptr.crc32c.to_le_bytes());
-                pos += 23;
-            }
-            IndexValue::Tombstone => {}
+            IndexValue::Inline(v) => self.add_raw_entry(&entry.key, entry.lsn, 1, v),
+            IndexValue::Blob(ptr) => self.add_raw_entry(&entry.key, entry.lsn, 2, &ptr.to_bytes()),
+            IndexValue::Tombstone => self.add_raw_entry(&entry.key, entry.lsn, 3, &[]),
         }
-
-        self.write_pos = pos;
-        Ok(())
     }
 
     /// Seals the 4 KB block in place without resetting `self`.
@@ -466,36 +425,7 @@ impl<'a> RawIdxEntry<'a> {
     /// Decodes a 23-byte encoded [`BlobPtr`] slice without heap allocation.
     #[inline]
     pub fn decode_blob_ptr(val_bytes: &[u8]) -> io::Result<BlobPtr> {
-        if val_bytes.len() != BLOB_PTR_ENCODED_LEN {
-            return Err(io_err(
-                io::ErrorKind::InvalidData,
-                "corrupted BlobPtr slice length in RawIdxEntry",
-            ));
-        }
-        let kind = BlobKind::from_u8(val_bytes[0])?;
-        let table_id = u16::from_le_bytes([val_bytes[1], val_bytes[2]]);
-        let seg_id = u64::from_le_bytes([
-            val_bytes[3],
-            val_bytes[4],
-            val_bytes[5],
-            val_bytes[6],
-            val_bytes[7],
-            val_bytes[8],
-            val_bytes[9],
-            val_bytes[10],
-        ]);
-        let offset =
-            u32::from_le_bytes([val_bytes[11], val_bytes[12], val_bytes[13], val_bytes[14]]);
-        let len = u32::from_le_bytes([val_bytes[15], val_bytes[16], val_bytes[17], val_bytes[18]]);
-        let crc = u32::from_le_bytes([val_bytes[19], val_bytes[20], val_bytes[21], val_bytes[22]]);
-        Ok(BlobPtr {
-            kind,
-            table_id,
-            seg_id,
-            offset,
-            len,
-            crc32c: crc,
-        })
+        BlobPtr::from_bytes(val_bytes)
     }
 
     /// Decodes the value payload of this entry into an owned [`IndexValue`].
@@ -1273,7 +1203,8 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         let mut footer = [0u8; IDX_FOOTER_SIZE];
         file.read_exact_at(&mut footer, file_len - (IDX_FOOTER_SIZE as u64))?;
 
-        if &footer[0..4] != IDX_FOOTER_MAGIC {
+        let mut fr = ByteReader::new(&footer);
+        if fr.read_bytes(4)? != IDX_FOOTER_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid magic in idx segment footer",
@@ -1287,7 +1218,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             ));
         }
 
-        let version = u16::from_le_bytes([footer[4], footer[5]]);
+        let version = fr.read_u16_le()?;
         if version != IDX_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1295,13 +1226,13 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             ));
         }
 
-        let level = u16::from_le_bytes([footer[6], footer[7]]);
-        let stored_seq_id = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let num_blocks = u32::from_le_bytes(footer[16..20].try_into().unwrap());
-        let record_count = u32::from_le_bytes(footer[20..24].try_into().unwrap());
-        let meta_offset = u64::from_le_bytes(footer[24..32].try_into().unwrap());
-        let meta_len = u32::from_le_bytes(footer[32..36].try_into().unwrap()) as usize;
-        let expected_meta_crc = u32::from_le_bytes(footer[36..40].try_into().unwrap());
+        let level = fr.read_u16_le()?;
+        let stored_seq_id = fr.read_u64_le()?;
+        let num_blocks = fr.read_u32_le()?;
+        let record_count = fr.read_u32_le()?;
+        let meta_offset = fr.read_u64_le()?;
+        let meta_len = fr.read_u32_le()? as usize;
+        let expected_meta_crc = fr.read_u32_le()?;
 
         let expected_meta_offset = (num_blocks as u64).checked_mul(IDX_BLOCK_SIZE as u64);
         let expected_file_len = meta_offset
@@ -1342,26 +1273,25 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             ));
         }
 
-        let mut slice: &[u8] = &meta_buf;
-        let bloom = BloomFilter::decode(&mut slice)?;
-        if slice.len() < 4 {
+        let mut r = ByteReader::new(&meta_buf);
+        let bloom = BloomFilter::decode_from(&mut r)?;
+        if r.remaining() < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated fence pointer count in idx segment",
             ));
         }
-        let fp_count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
-        slice = &slice[4..];
+        let fp_count = r.read_u32_le()? as usize;
 
         // Validate `fp_count` against the number of 4 KB data blocks (`1` fence pointer per block)
-        // and the remaining bytes in `slice` (`>= 6` bytes per fence pointer) BEFORE allocating.
+        // and the remaining bytes in `r` (`>= 6` bytes per fence pointer) BEFORE allocating.
         let min_fp_bytes = fp_count.checked_mul(6).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "fence pointer count byte size overflow",
             )
         })?;
-        if fp_count != num_blocks as usize || min_fp_bytes > slice.len() {
+        if fp_count != num_blocks as usize || min_fp_bytes > r.remaining() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "corrupted or out-of-bounds fence pointer count in idx segment",
@@ -1376,29 +1306,27 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             )
         })?;
         for expected_block_idx in 0..fp_count {
-            if slice.len() < 6 {
+            if r.remaining() < 6 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated fence pointer entry",
                 ));
             }
-            let klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
-            let block_idx = u32::from_le_bytes([slice[2], slice[3], slice[4], slice[5]]);
+            let klen = r.read_u16_le()? as usize;
+            let block_idx = r.read_u32_le()?;
             if block_idx != expected_block_idx as u32 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "non-sequential fence pointer block_idx in idx segment",
                 ));
             }
-            slice = &slice[6..];
-            if slice.len() < klen {
+            if r.remaining() < klen {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated fence pointer key",
                 ));
             }
-            let first_key = slice[..klen].to_vec().into_boxed_slice();
-            slice = &slice[klen..];
+            let first_key = r.read_bytes(klen)?.to_vec().into_boxed_slice();
             if let Some(prev) = fence_pointers.last() {
                 if first_key.as_ref() <= prev.first_key.as_ref() {
                     return Err(io::Error::new(
@@ -1417,35 +1345,35 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
             .first()
             .map(|fp| fp.first_key.to_vec())
             .unwrap_or_default();
-        let max_key = if slice.len() < 2 {
+        let max_key = if r.remaining() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "missing or truncated max_key in idx segment metadata",
             ));
         } else {
-            let max_klen = u16::from_le_bytes([slice[0], slice[1]]) as usize;
-            slice = &slice[2..];
-            if slice.len() != max_klen {
+            let max_klen = r.read_u16_le()? as usize;
+            if r.remaining() != max_klen {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated or trailing bytes in idx segment max_key",
                 ));
             }
-            if num_blocks == 0 && !slice.is_empty() {
+            let max_slice = r.read_bytes(max_klen)?;
+            if num_blocks == 0 && !max_slice.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "empty idx segment must have empty max_key",
                 ));
             }
             if let Some(last_fp) = fence_pointers.last() {
-                if slice < last_fp.first_key.as_ref() {
+                if max_slice < last_fp.first_key.as_ref() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "idx segment max_key precedes last fence pointer",
                     ));
                 }
             }
-            slice.to_vec()
+            max_slice.to_vec()
         };
 
         Ok(Self {
@@ -2299,6 +2227,15 @@ pub fn compact_idx_segments<F: PlatformFile>(
         for cur in &mut cursors {
             while cur.current_key() == Some(target_key_buf.as_slice()) {
                 let raw = cur.peek_raw().unwrap();
+                let mut record_dead_blob = |vtype: u8, bytes: &[u8]| {
+                    if vtype == 2 {
+                        if let Ok(ptr) = BlobPtr::from_bytes(bytes) {
+                            *dead_blob_map
+                                .entry((ptr.kind as u8, ptr.table_id, ptr.seg_id))
+                                .or_insert(0) += ptr.len as u64;
+                        }
+                    }
+                };
                 match &mut winning_meta {
                     None => {
                         winning_meta = Some((raw.lsn, raw.val_type));
@@ -2307,27 +2244,13 @@ pub fn compact_idx_segments<F: PlatformFile>(
                     }
                     Some((win_lsn, win_vtype)) => {
                         if raw.lsn > *win_lsn {
-                            if *win_vtype == 2 && winning_val_buf.len() == BLOB_PTR_ENCODED_LEN {
-                                let k = winning_val_buf[0];
-                                let tid =
-                                    u16::from_le_bytes([winning_val_buf[1], winning_val_buf[2]]);
-                                let sid =
-                                    u64::from_le_bytes(winning_val_buf[3..11].try_into().unwrap());
-                                let blen =
-                                    u32::from_le_bytes(winning_val_buf[15..19].try_into().unwrap());
-                                *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
-                            }
+                            record_dead_blob(*win_vtype, &winning_val_buf);
                             *win_lsn = raw.lsn;
                             *win_vtype = raw.val_type;
                             winning_val_buf.clear();
                             winning_val_buf.extend_from_slice(raw.val_bytes);
-                        } else if raw.val_type == 2 && raw.val_bytes.len() == BLOB_PTR_ENCODED_LEN {
-                            let k = raw.val_bytes[0];
-                            let tid = u16::from_le_bytes([raw.val_bytes[1], raw.val_bytes[2]]);
-                            let sid = u64::from_le_bytes(raw.val_bytes[3..11].try_into().unwrap());
-                            let blen =
-                                u32::from_le_bytes(raw.val_bytes[15..19].try_into().unwrap());
-                            *dead_blob_map.entry((k, tid, sid)).or_insert(0) += blen as u64;
+                        } else {
+                            record_dead_blob(raw.val_type, raw.val_bytes);
                         }
                     }
                 }

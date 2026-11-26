@@ -179,9 +179,7 @@ pub fn decode_secondary_index_key(
     index_id: u16,
     full_key: &[u8],
 ) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let mut prefix = [0u8; 5];
-    prefix[0..3].copy_from_slice(&encode_namespace_prefix(table_id, NS_SECONDARY_INDEX));
-    prefix[3..5].copy_from_slice(&index_id.to_be_bytes());
+    let prefix = encode_secondary_index_prefix(table_id, index_id);
     if !full_key.starts_with(&prefix) {
         return Ok(None);
     }
@@ -197,9 +195,7 @@ pub fn decode_secondary_index_pk_slice(
     index_id: u16,
     full_key: &[u8],
 ) -> Option<&[u8]> {
-    let mut prefix = [0u8; 5];
-    prefix[0..3].copy_from_slice(&encode_namespace_prefix(table_id, NS_SECONDARY_INDEX));
-    prefix[3..5].copy_from_slice(&index_id.to_be_bytes());
+    let prefix = encode_secondary_index_prefix(table_id, index_id);
     if !full_key.starts_with(&prefix) {
         return None;
     }

@@ -10,6 +10,8 @@
 
 use std::io;
 
+use crate::util::byte_reader::ByteReader;
+
 const SECRET0: u64 = 0xa076_1d64_78bd_642f;
 const SECRET1: u64 = 0xe703_7ed1_a0b4_28db;
 const SECRET2: u64 = 0x8ebc_6af0_9c88_c6e3;
@@ -258,17 +260,17 @@ impl BloomFilter {
         out.extend_from_slice(&self.bits);
     }
 
-    /// Deserializes a [`BloomFilter`] from the beginning of `input`, advancing the slice.
-    pub fn decode(input: &mut &[u8]) -> io::Result<Self> {
-        if input.len() < 8 {
+    /// Deserializes a [`BloomFilter`] from `r`, advancing its cursor past the bitset.
+    pub fn decode_from(r: &mut ByteReader<'_>) -> io::Result<Self> {
+        if r.remaining() < 8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated BloomFilter header",
             ));
         }
-        let num_probes = input[0];
-        let byte_len = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
-        *input = &input[8..];
+        let num_probes = r.read_u8()?;
+        r.skip(3)?;
+        let byte_len = r.read_u32_le()? as usize;
 
         if byte_len == 0 && num_probes != 0 {
             return Err(io::Error::new(
@@ -283,7 +285,7 @@ impl BloomFilter {
             ));
         }
 
-        if input.len() < byte_len {
+        if r.remaining() < byte_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated BloomFilter bitset",
@@ -305,14 +307,21 @@ impl BloomFilter {
                 "failed to allocate BloomFilter bitset",
             )
         })?;
-        bits.extend_from_slice(&input[..byte_len]);
-        *input = &input[byte_len..];
+        bits.extend_from_slice(r.read_bytes(byte_len)?);
 
         Ok(Self {
             bits,
             num_bits,
             num_probes,
         })
+    }
+
+    /// Deserializes a [`BloomFilter`] from the beginning of `input`, advancing the slice.
+    pub fn decode(input: &mut &[u8]) -> io::Result<Self> {
+        let mut r = ByteReader::new(input);
+        let bf = Self::decode_from(&mut r)?;
+        *input = r.remaining_slice();
+        Ok(bf)
     }
 }
 
