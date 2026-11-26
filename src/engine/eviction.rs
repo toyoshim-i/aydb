@@ -19,16 +19,6 @@ use super::reader::ReadView;
 use super::scan::{MergeScanSpec, MergedValueRef};
 use super::{ExistingRowStatus, MetaLookup, StorageEngine, WriteDurability};
 
-#[inline]
-pub(super) fn est_wal_record_bytes(rec: &WalRecord) -> usize {
-    match rec {
-        WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
-        WalRecord::PutBlobPtr { key, .. } => 28 + key.len(),
-        WalRecord::Delete { key } => 5 + key.len(),
-        WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
-    }
-}
-
 /// Computes a safe sub-batch WAL byte cap that fits within `total_sectors` without overflowing a
 /// 1-sector (`4096 B`) WAL, capped at `max_cap_bytes`.
 #[inline]
@@ -306,7 +296,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         }
                         // Duplicate or stale `'l'` entry for a PK already handled in this window.
                         let del = WalRecord::Delete { key: entry.key };
-                        let del_est = est_wal_record_bytes(&del);
+                        let del_est = del.est_wire_bytes();
                         if !batch_records.is_empty()
                             && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
                         {
@@ -328,7 +318,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     let existing = self.check_existing_row(&row_key)?;
                     if existing == ExistingRowStatus::NotFound {
                         let del = WalRecord::Delete { key: entry.key };
-                        let del_est = est_wal_record_bytes(&del);
+                        let del_est = del.est_wire_bytes();
                         if !batch_records.is_empty()
                             && batch_est_bytes.saturating_add(del_est) > max_window_wal_bytes
                         {
@@ -358,8 +348,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                                 key: encode_lru_queue_key(table_id, hot_tick, &pk),
                                 value: Vec::new(),
                             };
-                            let mut cand_est = est_wal_record_bytes(&promo_del_lru)
-                                .saturating_add(est_wal_record_bytes(&promo_put_lru));
+                            let mut cand_est = promo_del_lru
+                                .est_wire_bytes()
+                                .saturating_add(promo_put_lru.est_wire_bytes());
                             let meta_info = if let Some((mut mrec, m_ptr)) =
                                 self.get_row_meta_with_ptr(&meta_key)?
                             {
@@ -488,7 +479,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     }
                     let cand_est = cand_records
                         .iter()
-                        .fold(0usize, |acc, r| acc.saturating_add(est_wal_record_bytes(r)));
+                        .fold(0usize, |acc, r| acc.saturating_add(r.est_wire_bytes()));
                     if !batch_records.is_empty()
                         && batch_est_bytes.saturating_add(cand_est) > max_window_wal_bytes
                     {
@@ -773,7 +764,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             } else {
                                 28 + meta_key.len()
                             };
-                            let row_est = est_wal_record_bytes(&lru_rec).saturating_add(meta_est);
+                            let row_est = lru_rec.est_wire_bytes().saturating_add(meta_est);
                             if !missing_records.is_empty()
                                 && batch_est_bytes.saturating_add(row_est) > max_batch_wal_bytes
                             {
@@ -806,7 +797,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             }
                             for r in &missing_records[rec_start..] {
                                 batch_est_bytes =
-                                    batch_est_bytes.saturating_add(est_wal_record_bytes(r));
+                                    batch_est_bytes.saturating_add(r.est_wire_bytes());
                             }
                             if let Some(m_ptr) = *old_m_ptr {
                                 dead_meta_ptrs.push(m_ptr);
@@ -854,8 +845,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                             key: encode_row_meta_key(tid, pk),
                             value: encoded_meta,
                         };
-                        let row_est = est_wal_record_bytes(&lru_rec)
-                            .saturating_add(est_wal_record_bytes(&meta_rec));
+                        let row_est = lru_rec
+                            .est_wire_bytes()
+                            .saturating_add(meta_rec.est_wire_bytes());
                         if !missing_records.is_empty()
                             && batch_est_bytes.saturating_add(row_est) > max_batch_wal_bytes
                         {

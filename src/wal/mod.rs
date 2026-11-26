@@ -69,6 +69,17 @@ pub const FRAGMENT_HEADER_SIZE: usize = 3;
 /// Maximum data bytes in a single fragment (`4077` bytes).
 pub const MAX_FRAGMENT_DATA_LEN: usize = WAL_SECTOR_PAYLOAD_CAP - FRAGMENT_HEADER_SIZE;
 
+/// Conservative usable WAL bytes per 4 KB sector leaving fragment-header headroom.
+pub const EST_WAL_SECTOR_USABLE_BYTES: usize = 4070;
+
+/// Wire operation tags for [`WalRecord`] entries inside an encoded [`WalBatch`].
+pub const OP_PUT_INLINE: u8 = 1;
+pub const OP_PUT_BLOB_PTR: u8 = 2;
+pub const OP_DELETE: u8 = 3;
+pub const OP_TX_BEGIN: u8 = 4;
+pub const OP_TX_COMMIT: u8 = 5;
+pub const OP_TX_CONTINUE: u8 = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum FragmentType {
@@ -206,6 +217,30 @@ pub enum WalRecord {
     TxContinue,
 }
 
+impl WalRecord {
+    /// Estimated encoded size of this record inside a WAL batch buffer (excluding blob payloads).
+    #[inline]
+    pub fn est_wire_bytes(&self) -> usize {
+        match self {
+            Self::PutInline { key, value } => 9 + key.len() + value.len(),
+            Self::PutBlobPtr { key, .. } => 5 + BlobPtr::ENCODED_LEN + key.len(),
+            Self::Delete { key } => 5 + key.len(),
+            Self::TxBegin | Self::TxCommit | Self::TxContinue => 1,
+        }
+    }
+
+    /// Estimated transaction memory/WAL footprint including out-of-line blob payloads.
+    #[inline]
+    pub fn est_tx_budget_bytes(&self) -> usize {
+        match self {
+            Self::PutBlobPtr { key, blob_ptr } => {
+                5 + BlobPtr::ENCODED_LEN + key.len() + (blob_ptr.len as usize)
+            }
+            other => other.est_wire_bytes(),
+        }
+    }
+}
+
 /// Zero-allocation byte-span view of one [`WalRecord`] decoded from a [`ByteReader`].
 enum BorrowedWalRecord {
     PutInline {
@@ -228,27 +263,27 @@ impl BorrowedWalRecord {
     fn decode_from(r: &mut ByteReader<'_>) -> io::Result<Self> {
         let op = r.read_u8()?;
         match op {
-            1 => {
+            OP_PUT_INLINE => {
                 let klen = r.read_u32_le()? as usize;
                 let key = r.read_range(klen)?;
                 let vlen = r.read_u32_le()? as usize;
                 let value = r.read_range(vlen)?;
                 Ok(Self::PutInline { key, value })
             }
-            2 => {
+            OP_PUT_BLOB_PTR => {
                 let klen = r.read_u32_le()? as usize;
                 let key = r.read_range(klen)?;
                 let blob_ptr = BlobPtr::decode_from(r)?;
                 Ok(Self::PutBlobPtr { key, blob_ptr })
             }
-            3 => {
+            OP_DELETE => {
                 let klen = r.read_u32_le()? as usize;
                 let key = r.read_range(klen)?;
                 Ok(Self::Delete { key })
             }
-            4 => Ok(Self::TxBegin),
-            5 => Ok(Self::TxCommit),
-            6 => Ok(Self::TxContinue),
+            OP_TX_BEGIN => Ok(Self::TxBegin),
+            OP_TX_COMMIT => Ok(Self::TxCommit),
+            OP_TX_CONTINUE => Ok(Self::TxContinue),
             other => Err(io_err_with_tag(
                 io::ErrorKind::InvalidData,
                 "unknown WalRecord op_type",
@@ -301,32 +336,26 @@ impl WalBatch {
     fn encode_single_record_into(rec: &WalRecord, buf: &mut Vec<u8>) {
         match rec {
             WalRecord::PutInline { key, value } => {
-                buf.push(1u8);
+                buf.push(OP_PUT_INLINE);
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
                 buf.extend_from_slice(value);
             }
             WalRecord::PutBlobPtr { key, blob_ptr } => {
-                buf.push(2u8);
+                buf.push(OP_PUT_BLOB_PTR);
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
                 blob_ptr.encode_into(buf);
             }
             WalRecord::Delete { key } => {
-                buf.push(3u8);
+                buf.push(OP_DELETE);
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
             }
-            WalRecord::TxBegin => {
-                buf.push(4u8);
-            }
-            WalRecord::TxCommit => {
-                buf.push(5u8);
-            }
-            WalRecord::TxContinue => {
-                buf.push(6u8);
-            }
+            WalRecord::TxBegin => buf.push(OP_TX_BEGIN),
+            WalRecord::TxCommit => buf.push(OP_TX_COMMIT),
+            WalRecord::TxContinue => buf.push(OP_TX_CONTINUE),
         }
     }
 
@@ -404,6 +433,56 @@ impl WalBatch {
         buf[24..32].copy_from_slice(&durable_lsn.to_le_bytes());
         let batch_crc = crc32c(&buf[WAL_BATCH_CRC_START..]);
         buf[8..12].copy_from_slice(&batch_crc.to_le_bytes());
+    }
+
+    /// Partitions an encoded pending batch buffer (starting after the 32-byte header) into
+    /// `(start, end, record_count)` byte spans each fitting within `max_chunk_bytes` once framed
+    /// with a 1-byte transaction marker (`TxBegin` / `TxContinue` / `TxCommit`).
+    pub fn plan_encoded_chunks(raw_buf: &[u8], max_chunk_bytes: usize) -> Vec<(usize, usize, u32)> {
+        let mut cursor = WAL_BATCH_HEADER_SIZE;
+        let total_len = raw_buf.len();
+        let mut chunk_spans = Vec::new();
+        let mut cur_start = cursor;
+        let mut cur_records = 0u32;
+
+        while cursor < total_len {
+            let rec_start = cursor;
+            let op = raw_buf[cursor];
+            cursor += 1;
+            match op {
+                OP_PUT_INLINE => {
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
+                    cursor += 4 + klen;
+                    let vlen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
+                    cursor += 4 + vlen;
+                }
+                OP_PUT_BLOB_PTR => {
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
+                    cursor += 4 + klen + BlobPtr::ENCODED_LEN;
+                }
+                OP_DELETE => {
+                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
+                        as usize;
+                    cursor += 4 + klen;
+                }
+                OP_TX_BEGIN..=OP_TX_CONTINUE => {}
+                _ => unreachable!("invalid op in pending WAL batch buffer"),
+            }
+            if cur_records > 0 && WAL_BATCH_HEADER_SIZE + 1 + (cursor - cur_start) > max_chunk_bytes
+            {
+                chunk_spans.push((cur_start, rec_start, cur_records));
+                cur_start = rec_start;
+                cur_records = 0;
+            }
+            cur_records += 1;
+        }
+        if cur_records > 0 {
+            chunk_spans.push((cur_start, total_len, cur_records));
+        }
+        chunk_spans
     }
 
     /// Serializes this batch into the 32-byte header followed by the records, returning an error

@@ -13,7 +13,6 @@ use crate::lru::{
 use crate::pal::PlatformFs;
 use crate::wal::{BlobKind, BlobPtr, WalRecord};
 
-use super::eviction::est_wal_record_bytes;
 use super::{
     BLOB_RECORD_HEADER_LEN, ExistingRowStatus, MetaLookup, ReadView, StorageEngine, WriteDurability,
 };
@@ -429,7 +428,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 let row_est_bytes = planned
                     .records
                     .iter()
-                    .map(est_wal_record_bytes)
+                    .map(WalRecord::est_wire_bytes)
                     .sum::<usize>()
                     .saturating_add(meta_est_bytes);
 

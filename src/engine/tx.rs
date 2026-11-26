@@ -939,30 +939,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 .tx_state
                 .active_tx()
                 .map_or(0, |tx| tx.pending_buf.len());
-            let (wal_current_sector, wal_total_sectors) = match effective_durability {
-                WriteDurability::SyncTransactional => (
-                    self.sync_wal().current_sector_idx(),
-                    self.sync_wal().total_sectors(),
-                ),
-                WriteDurability::BufferedFast => (
-                    self.buf_wal().current_sector_idx(),
-                    self.buf_wal().total_sectors(),
-                ),
+            let usable = crate::wal::EST_WAL_SECTOR_USABLE_BYTES;
+            let wal_total_sectors = match effective_durability {
+                WriteDurability::SyncTransactional => self.sync_wal().total_sectors(),
+                WriteDurability::BufferedFast => self.buf_wal().total_sectors(),
             };
-            let exceeds_wal = pending_buf_len / 4070 + 2 > wal_total_sectors;
+            let exceeds_wal = pending_buf_len / usable + 2 > wal_total_sectors;
             if pending_buf_len > MAX_WAL_CHUNK_BYTES || exceeds_wal {
-                let required_sectors = (pending_buf_len / 4070) + 8;
-                let target_sectors = wal_current_sector
-                    .checked_add(required_sectors)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                    })?;
-                if target_sectors > wal_total_sectors {
-                    self.healthy()?.ensure_wal_min_size(
-                        effective_durability,
-                        checked_wal_bytes(target_sectors)?,
-                    )?;
-                }
+                let required_sectors = (pending_buf_len / usable) + 8;
+                self.ensure_wal_sector_headroom(effective_durability, required_sectors)?;
             }
             Ok(())
         })();
@@ -1068,28 +1053,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 return Err(e);
             }
         }
-        let (effects, _) = match self.apply_tx_event(TxEvent::EnterWalFlush {
-            defer_sync_barrier: false,
-        }) {
-            Ok(res) => res,
-            Err(err) => {
-                let io_err = self.tx_error_to_io(err);
-                let _ = self.rollback_transaction();
-                return Err(io_err);
-            }
-        };
-        let (durability, record_count) = match effects.iter().next() {
-            Some(TxEffect::FlushWal {
-                durability,
-                record_count,
-                ..
-            }) => (durability, record_count),
-            _ => unreachable!("EnterWalFlush must emit FlushWal"),
-        };
-        if let Err(e) = self.flush_pending_tx_records(durability, record_count) {
-            let _ = self.rollback_transaction();
-            return Err(e);
-        }
+        self.enter_wal_flush_and_write(false)?;
         let (effects, taken) = self
             .apply_tx_event(TxEvent::CompleteWalFlush {
                 mode: FlushCompleteMode::PublishImmediate,
@@ -1161,31 +1125,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
-        let (effects, _) = match self.apply_tx_event(TxEvent::EnterWalFlush {
-            defer_sync_barrier: true,
-        }) {
-            Ok(res) => res,
-            Err(err) => {
-                let io_err = self.tx_error_to_io(err);
-                let _ = self.rollback_transaction();
-                return Err(io_err);
-            }
-        };
-        let (durability, record_count, defer_sync_barrier) = match effects.iter().next() {
-            Some(TxEffect::FlushWal {
-                durability,
-                record_count,
-                defer_sync_barrier,
-            }) => (durability, record_count, defer_sync_barrier),
-            _ => unreachable!("EnterWalFlush must emit FlushWal"),
-        };
-        self.storage.set_sync_defer_barrier(defer_sync_barrier);
-        let appended = self.flush_pending_tx_records(durability, record_count);
-        self.storage.set_sync_defer_barrier(false);
-        if let Err(e) = appended {
-            let _ = self.rollback_transaction();
-            return Err(e);
-        }
+        self.enter_wal_flush_and_write(true)?;
 
         let mode = if can_group {
             FlushCompleteMode::HandOffGroup
@@ -1409,26 +1349,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             if let Some((_, entries)) = self.pending_group.pop_front() {
                 if !entries.is_empty() {
                     self.data_generation += 1;
-                    let mut last_tid: Option<u16> = None;
-                    for key in entries.keys() {
-                        if key.len() < 3 {
-                            continue;
-                        }
-                        let tid = u16::from_be_bytes([key[0], key[1]]);
-                        if tid == 0 || last_tid == Some(tid) {
-                            continue;
-                        }
-                        if matches!(
-                            key[2],
-                            crate::lru::NS_PRIMARY_ROW
-                                | super::rowid::NS_ROWID_BY_PK
-                                | super::rowid::NS_PK_BY_ROWID
-                        ) {
-                            last_tid = Some(tid);
-                            let e = self.table_mutation_epochs.entry(tid).or_insert(0);
-                            *e = e.wrapping_add(1);
-                        }
-                    }
+                    let tids = Self::collect_table_ids_from_overlay_map(&entries);
+                    self.bump_table_epochs_for_ids(&tids);
                 }
                 self.invalidate_snapshot_memtable();
                 self.memtable.absorb(entries);
@@ -1934,47 +1856,35 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             entries
         };
         for entry in blob_entries {
-            match entry {
+            let (kind, table_id, seg_id, len, was_append) = match entry {
                 BlobUndo::Appended {
-                    kind: crate::wal::BlobKind::Standard,
-                    seg_id,
-                    len,
-                    ..
-                } => {
-                    if let Some(b) = self.std_blobs.get_mut(&seg_id) {
-                        b.dead_bytes = b.dead_bytes.saturating_add(len);
-                    }
-                }
-                BlobUndo::Appended {
-                    kind: crate::wal::BlobKind::Lru,
+                    kind,
                     table_id,
                     seg_id,
                     len,
-                } => {
-                    if let Some(b) = self.lru_blobs.get_mut(&(table_id, seg_id)) {
-                        b.dead_bytes = b.dead_bytes.saturating_add(len);
-                    }
-                }
+                } => (kind, table_id, seg_id, len, true),
                 BlobUndo::MarkedDead {
-                    kind: crate::wal::BlobKind::Standard,
-                    seg_id,
-                    len,
-                    ..
-                } => {
-                    if let Some(b) = self.std_blobs.get_mut(&seg_id) {
-                        b.dead_bytes = b.dead_bytes.saturating_sub(len);
-                    }
-                }
-                BlobUndo::MarkedDead {
-                    kind: crate::wal::BlobKind::Lru,
+                    kind,
                     table_id,
                     seg_id,
                     len,
-                } => {
-                    if let Some(b) = self.lru_blobs.get_mut(&(table_id, seg_id)) {
-                        b.dead_bytes = b.dead_bytes.saturating_sub(len);
-                    }
+                } => (kind, table_id, seg_id, len, false),
+            };
+            let dead_bytes = match kind {
+                crate::wal::BlobKind::Standard => {
+                    self.std_blobs.get_mut(&seg_id).map(|b| &mut b.dead_bytes)
                 }
+                crate::wal::BlobKind::Lru => self
+                    .lru_blobs
+                    .get_mut(&(table_id, seg_id))
+                    .map(|b| &mut b.dead_bytes),
+            };
+            if let Some(dead) = dead_bytes {
+                *dead = if was_append {
+                    dead.saturating_add(len)
+                } else {
+                    dead.saturating_sub(len)
+                };
             }
         }
         if let Some(ct) = &st.capped_table {
@@ -2071,6 +1981,131 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_has_row_meta = snap.table_has_row_meta.clone();
     }
 
+    fn enter_wal_flush_and_write(&mut self, defer_sync_barrier: bool) -> io::Result<()> {
+        let (effects, _) = match self.apply_tx_event(TxEvent::EnterWalFlush { defer_sync_barrier })
+        {
+            Ok(res) => res,
+            Err(err) => {
+                let io_err = self.tx_error_to_io(err);
+                let _ = self.rollback_transaction();
+                return Err(io_err);
+            }
+        };
+        let (durability, record_count, defer) = match effects.iter().next() {
+            Some(TxEffect::FlushWal {
+                durability,
+                record_count,
+                defer_sync_barrier,
+            }) => (durability, record_count, defer_sync_barrier),
+            _ => unreachable!("EnterWalFlush must emit FlushWal"),
+        };
+        if defer {
+            self.storage.set_sync_defer_barrier(true);
+        }
+        let res = self.flush_pending_tx_records(durability, record_count);
+        if defer {
+            self.storage.set_sync_defer_barrier(false);
+        }
+        if let Err(e) = res {
+            let _ = self.rollback_transaction();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn ensure_wal_sector_headroom(
+        &mut self,
+        durability: WriteDurability,
+        required_sectors: usize,
+    ) -> io::Result<()> {
+        let (cur_sector, total_sectors) = match durability {
+            WriteDurability::SyncTransactional => (
+                self.sync_wal().current_sector_idx(),
+                self.sync_wal().total_sectors(),
+            ),
+            WriteDurability::BufferedFast => (
+                self.buf_wal().current_sector_idx(),
+                self.buf_wal().total_sectors(),
+            ),
+        };
+        let target_sectors = cur_sector.checked_add(required_sectors).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
+        })?;
+        if target_sectors > total_sectors {
+            self.healthy()?
+                .ensure_wal_min_size(durability, checked_wal_bytes(target_sectors)?)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_and_append_tx_buf(
+        &mut self,
+        durability: WriteDurability,
+        record_count: u32,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
+        // `next_lsn` advances only after the append: a ring-full rotation or flush derives the
+        // checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
+        let lsn = self.next_lsn;
+        let (prev, durable) = self.wal_links_for_append(durability)?;
+        WalBatch::finalize_encoded_buf(lsn, prev, durable, record_count, buf);
+        self.append_raw_wal_batch_with_rotation(buf, durability)?;
+        self.next_lsn = lsn + 1;
+        Ok(())
+    }
+
+    fn flush_chunked_tx_records(
+        &mut self,
+        durability: WriteDurability,
+        raw_buf: &[u8],
+        chunk_spans: &[(usize, usize, u32)],
+    ) -> io::Result<()> {
+        let usable = crate::wal::EST_WAL_SECTOR_USABLE_BYTES;
+        let mut required_sectors = 0usize;
+        // Refuse the entire transaction before the first chunk reaches either log.
+        self.lsn_after_batches(chunk_spans.len())?;
+        let mut max_chunk_len = 0usize;
+        for &(start, end, _) in chunk_spans {
+            let chunk_len = crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (end - start);
+            required_sectors += (chunk_len / usable) + 2;
+            max_chunk_len = max_chunk_len.max(chunk_len);
+        }
+
+        let caller_deferred = self.sync_wal().barrier_deferred();
+        let chunked_res = (|| -> io::Result<()> {
+            self.ensure_wal_sector_headroom(durability, required_sectors)?;
+
+            let mut chunk_buf = Vec::with_capacity(max_chunk_len);
+            let last_idx = chunk_spans.len() - 1;
+            for (idx, &(start, end, user_records)) in chunk_spans.iter().enumerate() {
+                chunk_buf.clear();
+                chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
+                if idx == 0 {
+                    chunk_buf.push(crate::wal::OP_TX_BEGIN);
+                } else if idx < last_idx {
+                    chunk_buf.push(crate::wal::OP_TX_CONTINUE);
+                }
+                chunk_buf.extend_from_slice(&raw_buf[start..end]);
+                if idx == last_idx {
+                    chunk_buf.push(crate::wal::OP_TX_COMMIT);
+                }
+                let chunk_records = user_records + 1;
+                if durability == WriteDurability::SyncTransactional {
+                    self.storage.set_sync_defer_barrier(if idx < last_idx {
+                        true
+                    } else {
+                        caller_deferred
+                    });
+                }
+                self.finalize_and_append_tx_buf(durability, chunk_records, &mut chunk_buf)?;
+            }
+            Ok(())
+        })();
+
+        self.storage.set_sync_defer_barrier(caller_deferred);
+        chunked_res
+    }
+
     pub(super) fn flush_pending_tx_records(
         &mut self,
         durability: WriteDurability,
@@ -2094,174 +2129,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
 
             if raw_buf.len() <= MAX_WAL_CHUNK_BYTES {
-                // `next_lsn` advances only after the append: a ring-full rotation or flush derives
-                // the checkpoint LSN from `next_lsn - 1`, which must stay below this batch's LSN.
-                let lsn = self.next_lsn;
-                let (prev, durable) = self.wal_links_for_append(durability)?;
-                WalBatch::finalize_encoded_buf(lsn, prev, durable, record_count, &mut raw_buf);
-                self.append_raw_wal_batch_with_rotation(&raw_buf, durability)?;
-                self.next_lsn = lsn + 1;
-                return Ok(());
+                return self.finalize_and_append_tx_buf(durability, record_count, &mut raw_buf);
             }
 
-            // Large transaction buffer (> 512 KB): scan record boundaries in-place and slice into
-            // <= 512 KB WAL batches framed by `WalRecord::TxBegin` (`4u8`) in the first chunk,
-            // `WalRecord::TxContinue` (`6u8`) in each middle chunk, and `WalRecord::TxCommit`
-            // (`5u8`) in the last chunk. Ensure the target WAL file has enough capacity so all
-            // chunks remain in the same WAL epoch without flushing uncommitted `MemTable` state,
-            // and defer the device barrier until the terminal `TxCommit` chunk.
-            let mut cursor = crate::wal::WAL_BATCH_HEADER_SIZE;
-            let total_len = raw_buf.len();
-            let mut chunk_spans: Vec<(usize, usize, u32)> = Vec::new();
-            let mut cur_start = cursor;
-            let mut cur_records = 0u32;
-
-            while cursor < total_len {
-                let rec_start = cursor;
-                let op = raw_buf[cursor];
-                cursor += 1;
-                match op {
-                    1 => {
-                        let klen =
-                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
-                        cursor += 4 + klen;
-                        let vlen =
-                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
-                        cursor += 4 + vlen;
-                    }
-                    2 => {
-                        let klen =
-                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
-                        cursor += 4 + klen + 23;
-                    }
-                    3 => {
-                        let klen =
-                            u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
-                        cursor += 4 + klen;
-                    }
-                    4..=6 => {}
-                    _ => unreachable!("invalid op in pending_buf"),
-                }
-                if cur_records > 0
-                    && crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (cursor - cur_start)
-                        > MAX_WAL_CHUNK_BYTES
-                {
-                    chunk_spans.push((cur_start, rec_start, cur_records));
-                    cur_start = rec_start;
-                    cur_records = 0;
-                }
-                cur_records += 1;
-            }
-            if cur_records > 0 {
-                chunk_spans.push((cur_start, total_len, cur_records));
-            }
-
+            // Large transaction buffer (> 512 KB): slice at record boundaries into <= 512 KB WAL
+            // batches framed by `TxBegin` / `TxContinue` / `TxCommit`, ensuring sufficient capacity
+            // up front so all chunks share one WAL epoch with the barrier deferred to `TxCommit`.
+            let chunk_spans = WalBatch::plan_encoded_chunks(&raw_buf, MAX_WAL_CHUNK_BYTES);
             if chunk_spans.len() <= 1 {
                 // Single oversized record: `raw_buf` already holds the 32-byte header space with
                 // no transaction framing byte, so finalize and write it in-place with zero copies.
                 debug_assert_eq!(chunk_spans.first().map_or(0, |&(_, _, n)| n), record_count);
-                let required_sectors = (raw_buf.len() / 4070) + 2;
-                let (cur_sector, total_sectors) = match durability {
-                    WriteDurability::SyncTransactional => (
-                        self.sync_wal().current_sector_idx(),
-                        self.sync_wal().total_sectors(),
-                    ),
-                    WriteDurability::BufferedFast => (
-                        self.buf_wal().current_sector_idx(),
-                        self.buf_wal().total_sectors(),
-                    ),
-                };
-                let target_sectors = cur_sector.checked_add(required_sectors).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                })?;
-                if target_sectors > total_sectors {
-                    self.healthy()?
-                        .ensure_wal_min_size(durability, checked_wal_bytes(target_sectors)?)?;
-                }
-                let lsn = self.next_lsn;
-                let (prev, durable) = self.wal_links_for_append(durability)?;
-                WalBatch::finalize_encoded_buf(lsn, prev, durable, record_count, &mut raw_buf);
-                self.append_raw_wal_batch_with_rotation(&raw_buf, durability)?;
-                self.next_lsn = lsn + 1;
-                return Ok(());
+                let required_sectors =
+                    (raw_buf.len() / crate::wal::EST_WAL_SECTOR_USABLE_BYTES) + 2;
+                self.ensure_wal_sector_headroom(durability, required_sectors)?;
+                return self.finalize_and_append_tx_buf(durability, record_count, &mut raw_buf);
             }
 
-            let mut required_sectors = 0usize;
-            // Refuse the entire transaction before the first chunk reaches either log.
-            self.lsn_after_batches(chunk_spans.len())?;
-            let mut max_chunk_len = 0usize;
-            for &(start, end, _) in &chunk_spans {
-                let chunk_len = crate::wal::WAL_BATCH_HEADER_SIZE + 1 + (end - start);
-                required_sectors += (chunk_len / 4070) + 2;
-                max_chunk_len = max_chunk_len.max(chunk_len);
-            }
-
-            let caller_deferred = self.sync_wal().barrier_deferred();
-            let chunked_res = (|| -> io::Result<()> {
-                let (cur_sector, total_sectors) = match durability {
-                    WriteDurability::SyncTransactional => (
-                        self.sync_wal().current_sector_idx(),
-                        self.sync_wal().total_sectors(),
-                    ),
-                    WriteDurability::BufferedFast => (
-                        self.buf_wal().current_sector_idx(),
-                        self.buf_wal().total_sectors(),
-                    ),
-                };
-                let target_sectors = cur_sector.checked_add(required_sectors).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "WAL sector count overflow")
-                })?;
-                if target_sectors > total_sectors {
-                    self.healthy()?
-                        .ensure_wal_min_size(durability, checked_wal_bytes(target_sectors)?)?;
-                }
-
-                let mut chunk_buf = Vec::with_capacity(max_chunk_len);
-                let last_idx = chunk_spans.len() - 1;
-                for (idx, &(start, end, user_records)) in chunk_spans.iter().enumerate() {
-                    chunk_buf.clear();
-                    chunk_buf.extend_from_slice(&[0u8; crate::wal::WAL_BATCH_HEADER_SIZE]);
-                    if idx == 0 {
-                        // Prepend `WalRecord::TxBegin` (`4u8`) to the first chunk.
-                        chunk_buf.push(4u8);
-                    } else if idx < last_idx {
-                        // Prepend `WalRecord::TxContinue` (`6u8`) to every middle chunk.
-                        chunk_buf.push(6u8);
-                    }
-                    chunk_buf.extend_from_slice(&raw_buf[start..end]);
-                    if idx == last_idx {
-                        // Append `WalRecord::TxCommit` (`5u8`) to the final chunk.
-                        chunk_buf.push(5u8);
-                    }
-                    let chunk_records = user_records + 1;
-                    if durability == WriteDurability::SyncTransactional {
-                        self.storage.set_sync_defer_barrier(if idx < last_idx {
-                            true
-                        } else {
-                            caller_deferred
-                        });
-                    }
-                    let lsn = self.next_lsn;
-                    let (prev, durable) = self.wal_links_for_append(durability)?;
-                    WalBatch::finalize_encoded_buf(
-                        lsn,
-                        prev,
-                        durable,
-                        chunk_records,
-                        &mut chunk_buf,
-                    );
-                    self.append_raw_wal_batch_with_rotation(&chunk_buf, durability)?;
-                    self.next_lsn = lsn + 1;
-                }
-                Ok(())
-            })();
-
-            self.storage.set_sync_defer_barrier(caller_deferred);
-            chunked_res
+            self.flush_chunked_tx_records(durability, &raw_buf, &chunk_spans)
         })();
 
         self.recycle_tx_buf(raw_buf);

@@ -3038,12 +3038,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             || !IndexEntry::inline_fits_in_block(row_key.len(), value.len());
         let extra_bytes: usize = extra_records
             .iter()
-            .map(|r| match r {
-                WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
-                WalRecord::PutBlobPtr { key, blob_ptr } => 28 + key.len() + (blob_ptr.len as usize),
-                WalRecord::Delete { key } => 5 + key.len(),
-                WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
-            })
+            .map(WalRecord::est_tx_budget_bytes)
             .sum();
         if self.config.max_transaction_bytes > 0
             && self.tx_state.is_active()
@@ -4778,17 +4773,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let successor = self.lsn_after_batches(1)?;
 
         if self.tx_state.is_active() {
-            let batch_bytes: usize = records
-                .iter()
-                .map(|r| match r {
-                    WalRecord::PutInline { key, value } => 9 + key.len() + value.len(),
-                    WalRecord::PutBlobPtr { key, blob_ptr } => {
-                        28 + key.len() + (blob_ptr.len as usize)
-                    }
-                    WalRecord::Delete { key } => 5 + key.len(),
-                    WalRecord::TxBegin | WalRecord::TxCommit | WalRecord::TxContinue => 1,
-                })
-                .sum();
+            let batch_bytes: usize = records.iter().map(WalRecord::est_tx_budget_bytes).sum();
             let max_transaction_bytes = self.config.max_transaction_bytes;
             let poisoned = self.is_poisoned();
             let reset_buf = match self.tx_state.can_record_write(
