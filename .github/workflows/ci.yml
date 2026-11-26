@@ -41,6 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
 
+      - name: Site generator unit tests
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
       # Each step disables `set -e` around the pipeline so both PIPESTATUS[0]
       # (cargo) and PIPESTATUS[1] (tee) are captured without masking failures.
       - name: Prepare results directory

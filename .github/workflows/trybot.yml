@@ -76,13 +76,16 @@ jobs:
           sudo apt-get install -y libsqlite3-dev
 
       - name: Regression tests
-        run: cargo test --all-targets 2>&1 | tee regression.log
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee regression.log
 
       - name: Additional crash tests
         env:
           AYDB_CRASH_SEED_START: ${{ inputs.seed_start || '4000' }}
           AYDB_CRASH_SEEDS: ${{ inputs.seed_count || '100' }}
         run: |
+          set -o pipefail
           if [[ "$AYDB_CRASH_SEEDS" == 1 ]]; then
             export AYDB_CRASH_SEED="$AYDB_CRASH_SEED_START"
           fi

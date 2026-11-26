@@ -33,8 +33,6 @@ import textwrap
 import urllib.parse
 from pathlib import Path
 
-import markdown
-
 OS_NAMES = ["windows-latest", "ubuntu-latest", "macos-latest"]
 
 # Benchmarks in display order; the first two also feed the comparison tables.
@@ -265,6 +263,8 @@ def github_slug(value, separator):
 
 
 def render_markdown(text):
+    import markdown
+
     md = markdown.Markdown(
         extensions=["tables", "fenced_code", "sane_lists", "toc"],
         extension_configs={"toc": {"slugify": github_slug}},

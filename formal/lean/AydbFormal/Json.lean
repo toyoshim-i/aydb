@@ -198,4 +198,22 @@ def asArr : Json → Except String (List Json)
   | .arr xs => .ok xs
   | _ => .error "expected json array"
 
+def reqStr (j : Json) (key : String) : Except String String :=
+  reqField j key >>= asStr
+
+def reqBool (j : Json) (key : String) : Except String Bool :=
+  reqField j key >>= asBool
+
+def reqInt (j : Json) (key : String) : Except String Int :=
+  reqField j key >>= asInt
+
+def reqNat (j : Json) (key : String) : Except String Nat :=
+  reqField j key >>= asNat
+
+def reqOptNat (j : Json) (key : String) : Except String (Option Nat) :=
+  reqField j key >>= asOptNat
+
+def reqArr (j : Json) (key : String) : Except String (List Json) :=
+  reqField j key >>= asArr
+
 end AydbFormal.Json

@@ -12,6 +12,7 @@ FORBIDDEN_PATTERNS = [
     ("sorry", re.compile(r"\bsorry\b")),
     ("admit", re.compile(r"\badmit\b")),
     ("axiom", re.compile(r"(?m)^\s*axiom\b")),
+    ("partial", re.compile(r"(?m)^\s*(?:private\s+|protected\s+)?partial\b")),
     ("unsafe", re.compile(r"(?m)^\s*(?:private\s+|protected\s+)?unsafe\b")),
     ("implemented_by", re.compile(r"@\[.*?implemented_by")),
     ("extern", re.compile(r"@\[.*?extern")),
@@ -79,6 +80,39 @@ def scan_sources() -> None:
                 )
 
 
+def collect_declared_theorems() -> set[str]:
+    declared: set[str] = set()
+    ns_re = re.compile(r"^\s*namespace\s+([A-Za-z0-9_.']+)\s*$")
+    end_re = re.compile(r"^\s*end\s+([A-Za-z0-9_.']+)\s*$")
+    thm_re = re.compile(r"^\s*(?:@\[[^\]]*\]\s*)*theorem\s+([A-Za-z0-9_']+)")
+
+    for path in sorted((ROOT / "AydbFormal").glob("*.lean")):
+        if path.name == "AxiomCheck.lean":
+            continue
+        cleaned = strip_lean_comments(path.read_text(encoding="utf-8"))
+        ns_stack: list[str] = []
+        for line in cleaned.splitlines():
+            if m := ns_re.match(line):
+                ns_stack.extend(m.group(1).split("."))
+            elif m := end_re.match(line):
+                parts = m.group(1).split(".")
+                if len(ns_stack) >= len(parts) and ns_stack[-len(parts) :] == parts:
+                    del ns_stack[-len(parts) :]
+            elif m := thm_re.match(line):
+                full_name = ".".join([*ns_stack, m.group(1)])
+                declared.add(full_name)
+    return declared
+
+
+def check_theorem_coverage(expected: list[str]) -> None:
+    declared = collect_declared_theorems()
+    missing = sorted(declared - set(expected))
+    if missing:
+        raise RuntimeError(
+            f"AxiomCheck.lean is missing theorem coverage for: {missing}"
+        )
+
+
 def verify_axioms() -> int:
     axiom_file = ROOT / "AydbFormal" / "AxiomCheck.lean"
     expected = []
@@ -88,6 +122,7 @@ def verify_axioms() -> int:
             expected.append(line[len("#print axioms ") :].strip())
     if not expected:
         raise RuntimeError("AxiomCheck.lean lists zero theorems")
+    check_theorem_coverage(expected)
 
     proc = subprocess.run(
         ["lake", "env", "lean", "AydbFormal/AxiomCheck.lean"],

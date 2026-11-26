@@ -67,12 +67,12 @@ private def decodeFlushMode (j : Json) : Except String FlushCompleteMode := do
   | other => .error s!"unknown FlushCompleteMode `{other}`"
 
 private def decodeSavepointFrame (j : Json) : Except String SavepointFrame := do
-  let spId ← reqField j "sp_id" >>= asInt
-  let isStatement ← reqField j "is_statement" >>= asBool
-  let recordCount ← reqField j "record_count" >>= asNat
-  let pendingBytes ← reqField j "pending_bytes" >>= asNat
-  let pendingSync ← reqField j "pending_sync" >>= asBool
-  let implicitTx ← reqField j "implicit_tx" >>= asBool
+  let spId ← reqInt j "sp_id"
+  let isStatement ← reqBool j "is_statement"
+  let recordCount ← reqNat j "record_count"
+  let pendingBytes ← reqNat j "pending_bytes"
+  let pendingSync ← reqBool j "pending_sync"
+  let implicitTx ← reqBool j "implicit_tx"
   return {
     spId := spId
     isStatement := isStatement
@@ -83,21 +83,21 @@ private def decodeSavepointFrame (j : Json) : Except String SavepointFrame := do
   }
 
 private def decodeTxCoreState (j : Json) : Except String TxCoreState := do
-  let tag ← reqField j "tag" >>= asStr
+  let tag ← reqStr j "tag"
   match tag with
   | "Idle" => .ok .idle
   | "InTx" =>
       let phase ← reqField j "phase" >>= decodeTxPhase
-      let depth ← reqField j "depth" >>= asNat
-      let ownerConn ← reqField j "owner_conn" >>= asOptNat
-      let pendingRecordCount ← reqField j "pending_record_count" >>= asNat
-      let pendingBytes ← reqField j "pending_bytes" >>= asNat
-      let pendingSync ← reqField j "pending_sync" >>= asBool
-      let syncDurabilityUpgrade ← reqField j "sync_durability_upgrade" >>= asBool
-      let vtabs ← reqField j "vtabs" >>= asArr >>= decodeList asNat
-      let syncedVtabs ← reqField j "synced_vtabs" >>= asArr >>= decodeList asNat
-      let savepoints ← reqField j "savepoints" >>= asArr >>= decodeList decodeSavepointFrame
-      let statementSavepointActive ← reqField j "statement_savepoint_active" >>= asBool
+      let depth ← reqNat j "depth"
+      let ownerConn ← reqOptNat j "owner_conn"
+      let pendingRecordCount ← reqNat j "pending_record_count"
+      let pendingBytes ← reqNat j "pending_bytes"
+      let pendingSync ← reqBool j "pending_sync"
+      let syncDurabilityUpgrade ← reqBool j "sync_durability_upgrade"
+      let vtabs ← reqArr j "vtabs" >>= decodeList asNat
+      let syncedVtabs ← reqArr j "synced_vtabs" >>= decodeList asNat
+      let savepoints ← reqArr j "savepoints" >>= decodeList decodeSavepointFrame
+      let statementSavepointActive ← reqBool j "statement_savepoint_active"
       return .inTx {
         phase := phase
         depth := depth
@@ -119,108 +119,108 @@ private def decodeTxMachine (j : Json) : Except String TxMachine := do
   return { health := health, state := state }
 
 private def decodeTxEvent (j : Json) : Except String TxEvent := do
-  let tag ← reqField j "tag" >>= asStr
+  let tag ← reqStr j "tag"
   match tag with
   | "Begin" => .ok .begin
   | "BeginForConn" =>
-      let connId ← reqField j "conn_id" >>= asNat
+      let connId ← reqNat j "conn_id"
       .ok (.beginForConn connId)
   | "BeginVtab" =>
-      let connId ← reqField j "conn_id" >>= asNat
-      let vtabId ← reqField j "vtab_id" >>= asNat
+      let connId ← reqNat j "conn_id"
+      let vtabId ← reqNat j "vtab_id"
       .ok (.beginVtab connId vtabId)
   | "AttachVtab" =>
-      let connId ← reqField j "conn_id" >>= asNat
-      let vtabId ← reqField j "vtab_id" >>= asNat
+      let connId ← reqNat j "conn_id"
+      let vtabId ← reqNat j "vtab_id"
       .ok (.attachVtab connId vtabId)
   | "DetachVtab" =>
-      let connId ← reqField j "conn_id" >>= asNat
-      let vtabId ← reqField j "vtab_id" >>= asNat
+      let connId ← reqNat j "conn_id"
+      let vtabId ← reqNat j "vtab_id"
       .ok (.detachVtab connId vtabId)
   | "VtabSync" =>
-      let vtabId ← reqField j "vtab_id" >>= asNat
+      let vtabId ← reqNat j "vtab_id"
       let dur ← reqField j "durability" >>= decodeWriteDurability
       .ok (.vtabSync vtabId dur)
   | "RecordWrite" =>
       let scope ← reqField j "scope" >>= decodeWriteScope
       let dur ← reqField j "durability" >>= decodeWriteDurability
-      let rc ← reqField j "record_count" >>= asNat
-      let bb ← reqField j "batch_bytes" >>= asNat
-      let maxB ← reqField j "max_transaction_bytes" >>= asNat
+      let rc ← reqNat j "record_count"
+      let bb ← reqNat j "batch_bytes"
+      let maxB ← reqNat j "max_transaction_bytes"
       .ok (.recordWrite scope dur rc bb maxB)
   | "InvalidatePrepare" => .ok .invalidatePrepare
   | "BeginPrepare" =>
       let dur ← reqField j "durability" >>= decodeWriteDurability
       .ok (.beginPrepare dur)
   | "FinishPrepare" =>
-      let okFlag ← reqField j "ok" >>= asBool
+      let okFlag ← reqBool j "ok"
       .ok (.finishPrepare okFlag)
   | "Savepoint" =>
-      let ownerConn ← reqField j "owner_conn" >>= asOptNat
-      let spId ← reqField j "sp_id" >>= asInt
-      let isStmt ← reqField j "is_statement" >>= asBool
-      let checkPoison ← reqField j "check_poison" >>= asBool
+      let ownerConn ← reqOptNat j "owner_conn"
+      let spId ← reqInt j "sp_id"
+      let isStmt ← reqBool j "is_statement"
+      let checkPoison ← reqBool j "check_poison"
       .ok (.savepoint ownerConn spId isStmt checkPoison)
   | "ReleaseSavepoint" =>
-      let connId ← reqField j "conn_id" >>= asOptNat
-      let spId ← reqField j "sp_id" >>= asInt
+      let connId ← reqOptNat j "conn_id"
+      let spId ← reqInt j "sp_id"
       .ok (.releaseSavepoint connId spId)
   | "RollbackToSavepoint" =>
-      let connId ← reqField j "conn_id" >>= asOptNat
-      let spId ← reqField j "sp_id" >>= asInt
+      let connId ← reqOptNat j "conn_id"
+      let spId ← reqInt j "sp_id"
       .ok (.rollbackToSavepoint connId spId)
   | "PlanCommit" =>
-      let connId ← reqField j "conn_id" >>= asOptNat
-      let dsa ← reqField j "defer_sync_allowed" >>= asBool
-      let cg ← reqField j "can_group" >>= asBool
-      let hmc ← reqField j "has_metadata_changes" >>= asBool
-      let blec ← reqField j "buf_len_exceeds_chunk" >>= asBool
+      let connId ← reqOptNat j "conn_id"
+      let dsa ← reqBool j "defer_sync_allowed"
+      let cg ← reqBool j "can_group"
+      let hmc ← reqBool j "has_metadata_changes"
+      let blec ← reqBool j "buf_len_exceeds_chunk"
       .ok (.planCommit connId dsa cg hmc blec)
   | "EnterWalFlush" =>
-      let dsb ← reqField j "defer_sync_barrier" >>= asBool
+      let dsb ← reqBool j "defer_sync_barrier"
       .ok (.enterWalFlush dsb)
   | "CompleteWalFlush" =>
       let mode ← reqField j "mode" >>= decodeFlushMode
       .ok (.completeWalFlush mode)
   | "FinishSyncCommit" =>
-      let okFlag ← reqField j "ok" >>= asBool
+      let okFlag ← reqBool j "ok"
       .ok (.finishSyncCommit okFlag)
   | "Rollback" =>
-      let connId ← reqField j "conn_id" >>= asOptNat
+      let connId ← reqOptNat j "conn_id"
       .ok (.rollback connId)
   | "MarkPoisoned" => .ok .markPoisoned
   | other => .error s!"unknown TxEvent tag `{other}`"
 
 private def decodeTxEffect (j : Json) : Except String TxEffect := do
-  let tag ← reqField j "tag" >>= asStr
+  let tag ← reqStr j "tag"
   match tag with
   | "InitTxData" => .ok .initTxData
   | "AppendTxBatch" =>
-      let rb ← reqField j "reset_buf" >>= asBool
-      let ru ← reqField j "record_undo" >>= asBool
+      let rb ← reqBool j "reset_buf"
+      let ru ← reqBool j "record_undo"
       .ok (.appendTxBatch rb ru)
   | "VtabSyncOutcome" =>
-      let allSynced ← reqField j "all_synced" >>= asBool
+      let allSynced ← reqBool j "all_synced"
       .ok (.vtabSyncOutcome allSynced)
   | "RunPrepare" =>
       let ed ← reqField j "effective_durability" >>= decodeWriteDurability
       .ok (.runPrepare ed)
   | "CaptureSavepointPayload" =>
-      let spId ← reqField j "sp_id" >>= asInt
-      let isStmt ← reqField j "is_statement" >>= asBool
-      let zbo ← reqField j "zero_buf_offset" >>= asBool
+      let spId ← reqInt j "sp_id"
+      let isStmt ← reqBool j "is_statement"
+      let zbo ← reqBool j "zero_buf_offset"
       .ok (.captureSavepointPayload spId isStmt zbo)
   | "TruncateSavepointPayloads" =>
-      let newLen ← reqField j "new_len" >>= asNat
-      let cou ← reqField j "clear_overlay_undo" >>= asBool
-      let csbu ← reqField j "clear_stmt_blob_undo" >>= asBool
+      let newLen ← reqNat j "new_len"
+      let cou ← reqBool j "clear_overlay_undo"
+      let csbu ← reqBool j "clear_stmt_blob_undo"
       .ok (.truncateSavepointPayloads newLen cou csbu)
   | "CommitImplicitTx" => .ok .commitImplicitTx
   | "BumpUniqueGenIfModified" => .ok .bumpUniqueGenIfModified
   | "RestoreTxToStart" => .ok .restoreTxToStart
   | "RestoreSavepointPayload" =>
-      let index ← reqField j "index" >>= asNat
-      let cpb ← reqField j "clear_pending_buf" >>= asBool
+      let index ← reqNat j "index"
+      let cpb ← reqBool j "clear_pending_buf"
       .ok (.restoreSavepointPayload index cpb)
   | "DecDepthDone" => .ok .decDepthDone
   | "EnsurePreparedBeforeCommit" =>
@@ -231,8 +231,8 @@ private def decodeTxEffect (j : Json) : Except String TxEffect := do
   | "ClearEmptyOverlay" => .ok .clearEmptyOverlay
   | "FlushWal" =>
       let dur ← reqField j "durability" >>= decodeWriteDurability
-      let rc ← reqField j "record_count" >>= asNat
-      let dsb ← reqField j "defer_sync_barrier" >>= asBool
+      let rc ← reqNat j "record_count"
+      let dsb ← reqBool j "defer_sync_barrier"
       .ok (.flushWal dur rc dsb)
   | "PublishCommittedTx" => .ok .publishCommittedTx
   | "ReturnAwaitingSync" => .ok .returnAwaitingSync
@@ -243,22 +243,22 @@ private def decodeTxEffect (j : Json) : Except String TxEffect := do
   | other => .error s!"unknown TxEffect tag `{other}`"
 
 private def decodeTxError (j : Json) : Except String TxError := do
-  let tag ← reqField j "tag" >>= asStr
+  let tag ← reqStr j "tag"
   match tag with
   | "Poisoned" => .ok .poisoned
   | "Busy" => .ok .busy
   | "TxBudgetExceeded" => .ok .txBudgetExceeded
   | "TooManyRecords" => .ok .tooManyRecords
   | "UnknownSavepoint" =>
-      let spId ← reqField j "sp_id" >>= asInt
+      let spId ← reqInt j "sp_id"
       .ok (.unknownSavepoint spId)
   | "InvalidPhase" => .ok .invalidPhase
   | other => .error s!"unknown TxError tag `{other}`"
 
 private def decodeTxOutcome (j : Json) : Except String TxOutcome := do
-  match ← reqField j "status" >>= asStr with
+  match ← reqStr j "status" with
   | "Ok" =>
-      let effs ← reqField j "effects" >>= asArr >>= decodeList decodeTxEffect
+      let effs ← reqArr j "effects" >>= decodeList decodeTxEffect
       .ok (.ok effs)
   | "Err" =>
       let err ← reqField j "error" >>= decodeTxError
@@ -274,11 +274,11 @@ private def verifyTxFsmSteps :
         .ok count
   | line :: rest, idx, prevPost => do
       let j ← parseJson line
-      let kind ← reqField j "kind" >>= asStr
+      let kind ← reqStr j "kind"
       if kind != "step" then
         .error s!"tx_fsm seq {idx}: expected kind=\"step\", got `{kind}`"
       else
-        let seq ← reqField j "seq" >>= asNat
+        let seq ← reqNat j "seq"
         if seq != idx then
           .error s!"tx_fsm seq mismatch: expected {idx}, got {seq}"
         else
@@ -312,17 +312,17 @@ private def decodeLogStream (j : Json) : Except String LogStream := do
   | other => .error s!"unknown LogStream `{other}`"
 
 private def decodeWalLinksEvent (j : Json) : Except String WalLinksEvent := do
-  let tag ← reqField j "tag" >>= asStr
+  let tag ← reqStr j "tag"
   match tag with
   | "Appended" =>
       let stream ← reqField j "stream" >>= decodeLogStream
-      let lsn ← reqField j "lsn" >>= asNat
-      let prev ← reqField j "prev" >>= asNat
-      let synced ← reqField j "synced" >>= asBool
+      let lsn ← reqNat j "lsn"
+      let prev ← reqNat j "prev"
+      let synced ← reqBool j "synced"
       .ok (.appended stream lsn prev synced)
   | "BufSynced" => .ok .bufSynced
   | "SyncFlushed" =>
-      let through ← reqField j "through" >>= asNat
+      let through ← reqNat j "through"
       .ok (.syncFlushed through)
   | "SyncFlushedAll" => .ok .syncFlushedAll
   | "Rotated" => .ok .rotated
@@ -346,16 +346,16 @@ private def verifyWalLinksLines :
         .ok stepCount
   | line :: rest, seqIdx, curOpt => do
       let j ← parseJson line
-      match ← reqField j "kind" >>= asStr with
+      match ← reqStr j "kind" with
       | "init" =>
-          let base ← reqField j "base" >>= asNat
+          let base ← reqNat j "base"
           let st := WalLinksState.init base
           verifyWalLinksLines rest seqIdx (some st)
       | "step" =>
           match curOpt with
           | none => .error s!"wal_links step {seqIdx}: missing prior `init` record"
           | some cur =>
-              let seq ← reqField j "seq" >>= asNat
+              let seq ← reqNat j "seq"
               if seq != seqIdx then
                 .error s!"wal_links seq mismatch: expected {seqIdx}, got {seq}"
               else
@@ -381,13 +381,13 @@ private def decodeCut (j : Json) : Except String (Option Cut) :=
   match j with
   | .null => .ok none
   | _ => do
-      let lsn ← reqField j "lsn" >>= asNat
+      let lsn ← reqNat j "lsn"
       let kind ← reqField j "kind" >>= decodeCutKind
       return some { lsn := lsn, kind := kind }
 
 private def decodeStopFlags (j : Json) : Except String StopFlags := do
-  let uf ← reqField j "unsupported_format" >>= asBool
-  let cs ← reqField j "corrupt_sector" >>= asBool
+  let uf ← reqBool j "unsupported_format"
+  let cs ← reqBool j "corrupt_sector"
   return { unsupportedFormat := uf, corruptSector := cs }
 
 private def decodeDamageReason (j : Json) : Except String WalDamageReason := do
@@ -404,7 +404,7 @@ private def decodeJudgeResult (j : Json) : Except String (Option (WalDamageReaso
   | .null => .ok none
   | _ => do
       let reason ← reqField j "reason" >>= decodeDamageReason
-      let lost ← reqField j "lost" >>= asNat
+      let lost ← reqNat j "lost"
       return some (reason, lost)
 
 private def verifyWalJudgeCases : List String → Nat → Except String Nat
@@ -415,17 +415,17 @@ private def verifyWalJudgeCases : List String → Nat → Except String Nat
         .ok count
   | line :: rest, idx => do
       let j ← parseJson line
-      let kind ← reqField j "kind" >>= asStr
+      let kind ← reqStr j "kind"
       if kind != "case" then
         .error s!"wal_judge seq {idx}: expected kind=\"case\", got `{kind}`"
       else
-        let seq ← reqField j "seq" >>= asNat
+        let seq ← reqNat j "seq"
         if seq != idx then
           .error s!"wal_judge seq mismatch: expected {idx}, got {seq}"
         else
           let cut ← reqField j "cut" >>= decodeCut
-          let floor ← reqField j "floor" >>= asNat
-          let lastGood ← reqField j "last_good" >>= asNat
+          let floor ← reqNat j "floor"
+          let lastGood ← reqNat j "last_good"
           let flags ← reqField j "flags" >>= decodeStopFlags
           let expected ← reqField j "result" >>= decodeJudgeResult
           let actual := AydbFormal.WalRecovery.judge cut floor lastGood flags
@@ -440,15 +440,15 @@ private def verifyTraceContents (contents : String) : Except String (String × N
   | [] => .error "trace file is empty"
   | headerLine :: body =>
       let hdr ← parseJson headerLine
-      let kind ← reqField hdr "kind" >>= asStr
+      let kind ← reqStr hdr "kind"
       if kind != "header" then
         .error s!"line 1 must be a header record, got kind=`{kind}`"
       else
-        let schema ← reqField hdr "schema" >>= asNat
+        let schema ← reqNat hdr "schema"
         if schema != 1 then
           .error s!"unsupported schema version {schema} (expected 1)"
         else
-          let fsm ← reqField hdr "fsm" >>= asStr
+          let fsm ← reqStr hdr "fsm"
           match fsm with
           | "tx_fsm" =>
               let n ← verifyTxFsmSteps body 0 none
