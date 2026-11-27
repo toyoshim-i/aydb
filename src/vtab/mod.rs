@@ -30,7 +30,7 @@ mod ddl_slot;
 mod dml;
 #[cfg(test)]
 mod drop_tests;
-pub mod ffi;
+mod ffi;
 #[cfg(test)]
 mod integrity_tests;
 #[cfg(test)]
@@ -46,7 +46,7 @@ mod read_poison_tests;
 #[cfg(test)]
 mod rename_tests;
 pub mod row_codec;
-pub mod rowid_map;
+mod rowid_map;
 #[cfg(test)]
 mod rowid_tests;
 #[cfg(test)]
@@ -110,18 +110,17 @@ use crate::vtab::planner::{
     LAST_BEST_INDEX_PLAN, PLAN_FULL_SCAN, PLAN_PK_RANGE, PLAN_SECONDARY_RANGE,
     POINT_FLAG_KEYS_ONLY, RANGE_FLAG_KEYS_ONLY,
 };
-pub use crate::vtab::row_codec::{
-    ColCollation, ColumnAffinity, KEY_TAG_BLOB, KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1,
-    KEY_TAG_FLOAT_LT_I64_MIN, KEY_TAG_INTEGER, KEY_TAG_NULL, KEY_TAG_TEXT, SqlValue,
-    decode_all_columns, decode_column_at, decode_f64_memcomparable, decode_i64_tagged_key,
-    encode_canonical_numeric_key_from_f64, encode_f64_memcomparable, encode_f64_unified_key,
-    encode_i64_tagged_key, encode_row, encode_sqlite_values_direct, extract_column_key_bytes,
-    extract_column_key_bytes_with_collation, f64_to_exact_i64, format_sqlite_float_text,
-    parse_sqlite_numeric_str, project_column_zero_copy, project_key_zero_copy,
-    sqlite_value_to_key_bytes, sqlite_value_to_key_bytes_with_schema, try_encode_row,
-    try_encode_sqlite_values_direct,
+#[cfg(test)]
+pub(crate) use crate::vtab::row_codec::encode_row;
+pub(crate) use crate::vtab::row_codec::{ColCollation, ColumnAffinity};
+pub(in crate::vtab) use crate::vtab::row_codec::{
+    KEY_TAG_INTEGER, encode_i64_tagged_key, extract_column_key_bytes_with_collation,
 };
-pub use crate::vtab::rowid_map::hash_pk_to_rowid;
+#[cfg(test)]
+use crate::vtab::row_codec::{KEY_TAG_TEXT, encode_f64_unified_key};
+pub use crate::vtab::row_codec::{SqlValue, decode_all_columns};
+#[cfg(test)]
+use crate::vtab::rowid_map::hash_pk_to_rowid;
 #[cfg(test)]
 use crate::vtab::tx_callbacks::UNIQUE_MIGRATION_DISABLED;
 use crate::vtab::tx_callbacks::{

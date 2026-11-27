@@ -184,20 +184,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             value: Vec::new(),
         });
         let meta_bytes = meta.to_bytes()?;
-        let mut new_m_ptr = None;
-        if !IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-            let ptr = self.append_to_blob_segment(BlobKind::Standard, 0, &meta_key, &meta_bytes)?;
-            new_m_ptr = Some(ptr);
-            records.push(WalRecord::PutBlobPtr {
-                key: meta_key,
-                blob_ptr: ptr,
-            });
-        } else {
-            records.push(WalRecord::PutInline {
-                key: meta_key,
-                value: meta_bytes,
-            });
-        }
+        let new_m_ptr = self.append_std_meta_record(
+            meta_key,
+            meta_bytes,
+            WriteDurability::BufferedFast,
+            &mut records,
+        )?;
         if let Err(e) = self.commit_wal_and_memtable_core(
             records,
             WriteDurability::BufferedFast,
@@ -205,9 +197,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             false,
             super::tx::WriteScope::Normal,
         ) {
-            if let Some(p) = new_m_ptr {
-                self.record_dead_blob_bytes(&p);
-            }
+            self.abort_uncommitted_blobs(new_m_ptr.as_slice());
             return Err(e);
         }
         if let Some(m_ptr) = old_m_ptr {

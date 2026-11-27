@@ -100,17 +100,17 @@ struct PreparedRowMutation {
     logical_size: u32,
 }
 
-pub(super) struct OldMetaDeleteOpts<'a> {
-    pub(super) require_capped_for_lru: bool,
-    pub(super) delete_meta_key: bool,
-    pub(super) match_lru_key: Option<&'a [u8]>,
+pub(in crate::engine) struct OldMetaDeleteOpts<'a> {
+    pub(in crate::engine) require_capped_for_lru: bool,
+    pub(in crate::engine) delete_meta_key: bool,
+    pub(in crate::engine) match_lru_key: Option<&'a [u8]>,
 }
 
-pub(super) struct OldMetaDeleteResult {
-    pub(super) had_old_meta: bool,
-    pub(super) old_meta_blob_ptr: Option<BlobPtr>,
-    pub(super) old_logical_size: u64,
-    pub(super) matched_lru_key: bool,
+pub(in crate::engine) struct OldMetaDeleteResult {
+    pub(in crate::engine) had_old_meta: bool,
+    pub(in crate::engine) old_meta_blob_ptr: Option<BlobPtr>,
+    pub(in crate::engine) old_logical_size: u64,
+    pub(in crate::engine) matched_lru_key: bool,
 }
 use self::scoped_guards::{
     ReconcilingCappedGuard, RelocatingBlobsGuard, ScopedReconcilingTable, ScopedRelocatingFlag,
@@ -685,7 +685,7 @@ mod health {
 }
 
 /// Result of a policy-free `'t'` row-meta lookup.
-pub(super) enum MetaLookup {
+pub(in crate::engine) enum MetaLookup {
     Absent,
     Found(RowMetaRecord, Option<BlobPtr>),
     /// Record exists but cannot be read/decoded (carries the spilled blob pointer, if any).
@@ -693,7 +693,7 @@ pub(super) enum MetaLookup {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExistingRowStatus {
+pub(in crate::engine) enum ExistingRowStatus {
     NotFound,
     Inline,
     Blob(BlobPtr),
@@ -881,39 +881,39 @@ impl<F: PlatformFile> Clone for LazyBlob<F> {
     }
 }
 
-pub(super) struct TrackedStdBlob<F: PlatformFile> {
-    pub(super) reader: BlobSegmentReader<F>,
-    pub(super) file_len: u64,
-    pub(super) dead_bytes: u64,
+pub(in crate::engine) struct TrackedStdBlob<F: PlatformFile> {
+    pub(in crate::engine) reader: BlobSegmentReader<F>,
+    pub(in crate::engine) file_len: u64,
+    pub(in crate::engine) dead_bytes: u64,
 }
 
-pub(super) struct TrackedLruBlob<F: PlatformFile> {
-    pub(super) table_id: u16,
-    pub(super) reader: BlobSegmentReader<F>,
-    pub(super) file_len: u64,
-    pub(super) dead_bytes: u64,
+pub(in crate::engine) struct TrackedLruBlob<F: PlatformFile> {
+    pub(in crate::engine) table_id: u16,
+    pub(in crate::engine) reader: BlobSegmentReader<F>,
+    pub(in crate::engine) file_len: u64,
+    pub(in crate::engine) dead_bytes: u64,
 }
 
 /// Unified Phase 1 Storage Engine.
 pub struct StorageEngine<FS: PlatformFs> {
     pub(in crate::engine) engine_id: u64,
     pub(in crate::engine) snapshot_cache: RwLock<snapshot::SnapshotCache<FS::File>>,
-    pub(super) fs: Arc<FS>,
-    pub(super) config: EngineConfig,
+    pub(in crate::engine) fs: Arc<FS>,
+    pub(in crate::engine) config: EngineConfig,
     /// Poison-gated storage owner wrapping `BootMetaManager`, WAL writers, and active blob writers.
     pub(in crate::engine) storage: health::HealthGatedStorage<FS>,
-    pub(super) next_lsn: u64,
-    pub(super) memtable: MemTable,
+    pub(in crate::engine) next_lsn: u64,
+    pub(in crate::engine) memtable: MemTable,
     /// Active immutable index segments (`idx_<SeqID>.db`), ordered oldest to newest (`last()` is newest).
-    pub(super) idx_segments: Vec<Arc<IdxSegmentReader<FS::File>>>,
+    pub(in crate::engine) idx_segments: Vec<Arc<IdxSegmentReader<FS::File>>>,
     /// Active standard blob segments (`seq_id -> reader + stats`).
-    pub(super) std_blobs: BTreeMap<u64, TrackedStdBlob<FS::File>>,
+    pub(in crate::engine) std_blobs: BTreeMap<u64, TrackedStdBlob<FS::File>>,
     /// Active per-table LRU blob segments (`(table_id, seq_id) -> reader + stats`).
-    pub(super) lru_blobs: BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
+    pub(in crate::engine) lru_blobs: BTreeMap<(u16, u64), TrackedLruBlob<FS::File>>,
     /// Capped tables (`table_id -> CappedTableState`).
-    pub(super) capped_tables: HashMap<u16, CappedTableState>,
+    pub(in crate::engine) capped_tables: HashMap<u16, CappedTableState>,
     /// Bounded in-memory `AccessTick` tracker.
-    pub(super) access_tracker: AccessTracker,
+    pub(in crate::engine) access_tracker: AccessTracker,
     /// Transaction state machine (`Idle` or `InTx { phase, tx }`). While active, serialized
     /// `WalRecord` bytes are accumulated inside `ActiveTx::pending_buf` and committed as a
     /// single atomic `WalBatch` on `commit_transaction`!
@@ -921,21 +921,21 @@ pub struct StorageEngine<FS: PlatformFs> {
     /// Capacity-only reusable buffer recycled from completed/aborted transactions.
     pub(in crate::engine) scratch_tx_buf: Vec<u8>,
     /// Coordinates writers waiting for their turn and commits sharing a device flush.
-    pub(super) commit_gate: Arc<tx::CommitGate>,
+    pub(in crate::engine) commit_gate: Arc<tx::CommitGate>,
     /// Committed batches written to `wal_sync.db` whose device flush has not finished, in LSN
     /// order, as `(batch LSN, entries)`. The next writer's overlay starts from these entries;
     /// readers see them only after they move to the `MemTable`.
-    pub(super) pending_group:
+    pub(in crate::engine) pending_group:
         std::collections::VecDeque<(u64, BTreeMap<Vec<u8>, crate::memtable::MemEntry>)>,
     /// Fully dead `blob_lru` segments that were dropped from the catalog but not yet queued for
     /// deletion, because a WAL batch of the current epoch may still carry a pointer into them.
     /// They are queued in the commit that rotates the WAL epochs (see
     /// [`Self::release_unlinkable_blob_files`]). A crash before that leaves them as uncataloged
     /// files, which recovery adopts if a batch references them and sweeps otherwise.
-    pub(super) unlink_after_wal_rotation: Vec<String>,
+    pub(in crate::engine) unlink_after_wal_rotation: Vec<String>,
     /// Set when a full-WAL rotation flushed the MemTable without auto compaction; consumed by
     /// `run_due_auto_compaction` at the next point where no batch holds an unappended LSN.
-    pub(super) auto_compaction_due: bool,
+    pub(in crate::engine) auto_compaction_due: bool,
     /// Re-entrancy guard preventing `relocate_fragmented_std_blobs` from triggering another
     /// relocation pass if its internal MemTable flush invokes auto-compaction. Mutated only via
     /// [`RelocatingBlobsGuard`].
@@ -946,49 +946,49 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(in crate::engine) reconciling_capped_table: ScopedReconcilingTable,
     /// Sealed `blob_std` segment IDs containing an unreadable corrupt blob under lenient
     /// relocation, skipped on subsequent relocation passes until reclaimed by compaction/drop.
-    pub(super) unrelocatable_std_blobs: std::collections::HashSet<u64>,
+    pub(in crate::engine) unrelocatable_std_blobs: std::collections::HashSet<u64>,
     /// Invoked (under the engine lock, so it must be cheap and non-blocking) when a flush leaves
     /// compaction pending in background mode.
-    pub(super) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(in crate::engine) compaction_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Generation id of the worker that owns [`Self::compaction_hook`] so an older worker's teardown
     /// cannot clear a newly registered worker's hook.
-    pub(super) compaction_hook_id: u64,
+    pub(in crate::engine) compaction_hook_id: u64,
     /// Initial `(kind, tid_key, seq_id, prev_file_len)` recorded for autocommit (`Idle` /
     /// non-tx) blob appends not yet appended to the WAL (`tid_key = 0` for
     /// `BlobKind::Standard`), so a `RingFull` WAL rotation checkpoint never catalogs uncommitted
     /// blob lengths ahead of the batch.
-    pub(super) in_flight_autocommit_blob_starts: Vec<(BlobKind, u16, u64, u64)>,
+    pub(in crate::engine) in_flight_autocommit_blob_starts: Vec<(BlobKind, u16, u64, u64)>,
     /// Registry of active virtual tables (`table_id -> table_name`) preventing duplicate `table_id` sharing.
-    pub(super) active_vtab_ids: HashMap<u16, Arc<str>>,
+    pub(in crate::engine) active_vtab_ids: HashMap<u16, Arc<str>>,
     /// Monotonic generation bumped whenever any persisted UNIQUE completion marker changes.
-    pub(super) unique_marker_gen: u64,
+    pub(in crate::engine) unique_marker_gen: u64,
     /// Monotonic registration token counter for live virtual table instances.
     pub(in crate::engine) next_vtab_token: u64,
     /// Live virtual table holder tokens per `table_id` (reference-counted across connections).
-    pub(super) active_vtab_holders: HashMap<u16, Vec<u64>>,
+    pub(in crate::engine) active_vtab_holders: HashMap<u16, Vec<u64>>,
     /// Bumped by every change that can add or remove a row as some view sees it: each write,
     /// each commit, each rollback (also to a savepoint), each drop. A value derived from the
     /// rows (a cache) stays valid exactly as long as the epoch does not move.
-    pub(super) mutation_epoch: u64,
+    pub(in crate::engine) mutation_epoch: u64,
     /// Per-table counterpart to [`Self::mutation_epoch`]: bumped only for tables whose primary rows
     /// or persistent rowid mappings changed, preventing writes on unrelated tables from
     /// invalidating another table's `auto_key_cache`.
-    pub(super) table_mutation_epochs: HashMap<u16, u64>,
+    pub(in crate::engine) table_mutation_epochs: HashMap<u16, u64>,
     /// Lazy per-table cache indicating whether `table_id` may contain synthetic rowid mappings in
     /// `NS_ROWID_BY_PK` (`'u'`) or non-marker `NS_PK_BY_ROWID` (`'v'`) entries.
-    pub(super) table_has_synthetic_rowids: BTreeMap<u16, bool>,
+    pub(in crate::engine) table_has_synthetic_rowids: BTreeMap<u16, bool>,
     /// Monotonic counter of committed user-data publications, incremented when committed batches
     /// (other than internal `EagerWriteOnRead` LRU tick updates) enter the `MemTable`. Used by
     /// read snapshots to detect concurrent writes without false write-upgrade aborts.
-    pub(super) data_generation: u64,
+    pub(in crate::engine) data_generation: u64,
     /// Lazy per-table cache indicating whether `table_id` may contain `'t'` (`NS_ROW_META`) keys.
     /// Standard uncapped tables without secondary indexes resolve to `false` once and skip
     /// all `'t'` negative point lookups on `UPDATE` and `DELETE`!
-    pub(super) table_has_row_meta: BTreeMap<u16, bool>,
+    pub(in crate::engine) table_has_row_meta: BTreeMap<u16, bool>,
     /// Highest LSN appended to `buf_wal`.
-    pub(super) last_buf_append_lsn: u64,
+    pub(in crate::engine) last_buf_append_lsn: u64,
     /// Highest LSN in `buf_wal` synced to durable storage.
-    pub(super) last_buf_synced_lsn: u64,
+    pub(in crate::engine) last_buf_synced_lsn: u64,
     /// Predecessor link and durable watermark stamped into every WAL batch (section 4.6).
     pub(in crate::engine) wal_links: wal_links::WalLinks,
     /// What recovery found in the WAL during `open` (section 4.6.8).
@@ -1000,11 +1000,11 @@ pub struct StorageEngine<FS: PlatformFs> {
     pub(in crate::engine) last_maintenance_error: Mutex<Option<String>>,
     /// Explicit per-table corruption policies (absent -> derived default, see
     /// [`Self::corrupt_policy`]).
-    pub(super) corrupt_policies: HashMap<u16, CorruptPolicy>,
+    pub(in crate::engine) corrupt_policies: HashMap<u16, CorruptPolicy>,
     /// Explicit per-table inline threshold overrides in bytes (see [`Self::set_table_inline_threshold`]).
-    pub(super) table_inline_thresholds: BTreeMap<u16, usize>,
+    pub(in crate::engine) table_inline_thresholds: BTreeMap<u16, usize>,
     /// Scratch buffer for encoded WAL batches on commit, avoiding per-commit heap allocation.
-    pub(super) scratch_wal_encoded: Vec<u8>,
+    pub(in crate::engine) scratch_wal_encoded: Vec<u8>,
     /// In-process verified 4 KB index block cache.
     pub(in crate::engine) block_cache: Arc<VerifiedBlockCache>,
     /// In-process small verified blob payload cache.
@@ -1017,25 +1017,40 @@ pub struct StorageEngine<FS: PlatformFs> {
         Mutex<HashMap<(u16, Vec<u8>), PendingCorruptEviction>>,
     /// Test seam: makes the next `append_raw_wal_batch_with_rotation` fail and poison the engine.
     #[cfg(test)]
-    pub(super) debug_fail_next_wal_append: bool,
+    pub(in crate::engine) debug_fail_next_wal_append: bool,
     /// Test seam: makes the next vtab commit `sync_barrier` fail as a device flush failure would.
     #[cfg(test)]
-    pub(super) debug_fail_next_wal_sync: Arc<std::sync::atomic::AtomicBool>,
+    pub(in crate::engine) debug_fail_next_wal_sync: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only Sans-I/O `tx_fsm` trace recorder attached to [`StorageEngine::apply_tx_event`].
     #[cfg(test)]
-    pub(super) tx_trace: Option<tx_fsm::TxTraceRecorder>,
+    pub(in crate::engine) tx_trace: Option<tx_fsm::TxTraceRecorder>,
 }
 
 impl<FS: PlatformFs> StorageEngine<FS> {
     #[inline]
-    pub(super) fn take_scratch_tx_buf(&mut self) -> Vec<u8> {
+    #[cfg(test)]
+    pub(crate) fn active_vtab_name_for_test(&self, table_id: u16) -> Option<&str> {
+        self.active_vtab_ids.get(&table_id).map(|n| &**n)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_vtabs_for_test(&self) -> bool {
+        !self.active_vtab_ids.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn std_blob_count(&self) -> usize {
+        self.std_blobs.len()
+    }
+
+    pub(in crate::engine) fn take_scratch_tx_buf(&mut self) -> Vec<u8> {
         let mut buf = core::mem::take(&mut self.scratch_tx_buf);
         buf.clear();
         buf
     }
 
     #[inline]
-    pub(super) fn recycle_tx_buf(&mut self, mut buf: Vec<u8>) {
+    pub(in crate::engine) fn recycle_tx_buf(&mut self, mut buf: Vec<u8>) {
         buf.clear();
         if buf.capacity() > self.scratch_tx_buf.capacity() {
             self.scratch_tx_buf = buf;
@@ -1043,7 +1058,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     #[inline]
-    pub(super) fn reconciling_capped_table(&self) -> Option<u16> {
+    pub(in crate::engine) fn reconciling_capped_table(&self) -> Option<u16> {
         self.reconciling_capped_table.get()
     }
 
@@ -1139,12 +1154,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Fails if a prior WAL, metadata, or group-commit leader failure left the on-disk state uncertain.
-    pub(super) fn check_not_poisoned(&self) -> io::Result<()> {
+    pub(in crate::engine) fn check_not_poisoned(&self) -> io::Result<()> {
         self.storage.check_healthy(&self.commit_gate)
     }
 
     /// Records a WAL I/O failure (first one wins) and returns the original error.
-    pub(super) fn poison(&mut self, e: io::Error) -> io::Error {
+    pub(in crate::engine) fn poison(&mut self, e: io::Error) -> io::Error {
         let e = self.storage.poison(e);
         let _ = self.apply_tx_event(TxEvent::MarkPoisoned);
         e
@@ -1336,7 +1351,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Collects cascade `Delete` records and old metadata pointers for an existing row's `'t'`
     /// metadata (LRU queue entry, secondary index keys, and optional `'t'` key itself), falling
     /// back to orphan scanning when `'t'` is corrupt.
-    pub(super) fn collect_old_meta_deletes(
+    pub(in crate::engine) fn collect_old_meta_deletes(
         &mut self,
         table_id: u16,
         pk: &[u8],
@@ -1750,7 +1765,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.owner_read_with_tracking(false, |eng, cx| eng.get_row_cx(cx, table_id, pk))
     }
 
-    pub(super) fn get_row_cx(
+    pub(in crate::engine) fn get_row_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
@@ -1788,7 +1803,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// configured; otherwise coalesced in RAM (interior-mutable tracker, safe under a shared
     /// lock and inside transactions).
     #[inline]
-    pub(super) fn track_read_hit(&self, cx: &ReadCtx<'_, FS::File>, table_id: u16, pk: &[u8]) {
+    pub(in crate::engine) fn track_read_hit(
+        &self,
+        cx: &ReadCtx<'_, FS::File>,
+        table_id: u16,
+        pk: &[u8],
+    ) {
         if !cx.track_hits || !self.capped_tables.contains_key(&table_id) {
             return;
         }
@@ -1805,12 +1825,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
     /// Whether `ptr` lives in an active writer's not-yet-flushed buffer.
     #[inline]
-    pub(super) fn blob_unflushed(&self, ptr: &BlobPtr) -> bool {
+    pub(in crate::engine) fn blob_unflushed(&self, ptr: &BlobPtr) -> bool {
         self.storage.blob_unflushed(ptr)
     }
 
     /// True if any active blob writer holds buffered (unflushed) bytes.
-    pub(super) fn any_blob_unflushed(&self) -> bool {
+    pub(in crate::engine) fn any_blob_unflushed(&self) -> bool {
         self.storage.any_blob_unflushed()
     }
 
@@ -1820,7 +1840,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// uncommitted blobs: the read is aborted with `cx.need_flush` set and the exclusive caller
     /// flushes and retries.
     #[inline]
-    pub(super) fn ensure_flushed_cx(
+    pub(in crate::engine) fn ensure_flushed_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         ptr: &BlobPtr,
@@ -1837,7 +1857,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Owner-view scans that read blob payloads need every buffered byte on the OS handle.
-    pub(super) fn ensure_all_flushed_cx(&self, cx: &ReadCtx<'_, FS::File>) -> io::Result<()> {
+    pub(in crate::engine) fn ensure_all_flushed_cx(
+        &self,
+        cx: &ReadCtx<'_, FS::File>,
+    ) -> io::Result<()> {
         if cx.src.is_owner() && self.tx_state.is_active() && self.any_blob_unflushed() {
             cx.need_flush.set(true);
             return Err(io::Error::other(NEED_FLUSH_MSG));
@@ -1965,14 +1988,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    pub(super) fn owner_read<R>(
+    pub(in crate::engine) fn owner_read<R>(
         &mut self,
         f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
     ) -> io::Result<R> {
         self.owner_read_with_tracking(true, f)
     }
 
-    pub(super) fn combine_read_result<R>(res: (io::Result<R>, Option<io::Error>)) -> io::Result<R> {
+    pub(in crate::engine) fn combine_read_result<R>(
+        res: (io::Result<R>, Option<io::Error>),
+    ) -> io::Result<R> {
         match res {
             (Ok(v), None) => Ok(v),
             (Ok(_), Some(e)) => Err(e),
@@ -1981,7 +2006,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    pub(super) fn owner_read_with_tracking<R>(
+    pub(in crate::engine) fn owner_read_with_tracking<R>(
         &mut self,
         track_hits: bool,
         f: impl for<'a> FnMut(&'a Self, &'a ReadCtx<'a, FS::File>) -> io::Result<R>,
@@ -2089,7 +2114,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.owner_read(|eng, cx| eng.get_row_into_cx(cx, table_id, pk, slab, spans))
     }
 
-    pub(super) fn get_row_into_cx(
+    pub(in crate::engine) fn get_row_into_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
@@ -2178,7 +2203,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         })
     }
 
-    pub(super) fn get_row_into_lazy_cx(
+    pub(in crate::engine) fn get_row_into_lazy_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
         table_id: u16,
@@ -2309,7 +2334,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     // Internal Helper Methods
     // =========================================================================
 
-    pub(super) fn maybe_auto_flush_and_compact(&mut self) {
+    pub(in crate::engine) fn maybe_auto_flush_and_compact(&mut self) {
         if self.tx_state.is_active() || self.is_poisoned() {
             return;
         }
@@ -2323,7 +2348,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.run_due_auto_compaction();
     }
 
-    pub(super) fn commit_wal_and_memtable(
+    pub(in crate::engine) fn commit_wal_and_memtable(
         &mut self,
         records: Vec<WalRecord>,
         durability: WriteDurability,
@@ -2466,7 +2491,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// rewritten in place after being synced) and synced. A blob sync failure or a WAL sync
     /// failure leaves the durability outcome unknown and poisons the engine; a failed buffer
     /// write stays retryable.
-    pub(super) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
+    pub(in crate::engine) fn make_buf_wal_durable(&mut self, durable: bool) -> io::Result<()> {
         self.check_not_poisoned()?;
         self.sync_active_blob_writers()?;
         self.healthy()?.make_buf_wal_durable_and_seal(durable)?;
@@ -2481,7 +2506,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// every earlier `BufferedFast` batch AND its out-of-line blobs are synced. That sync must
     /// precede the stamp, so that the watermark of the synchronous batch covers them. Callers
     /// stamp the header after this call and append the batch right away under the same lock.
-    pub(super) fn wal_links_for_append(
+    pub(in crate::engine) fn wal_links_for_append(
         &mut self,
         durability: WriteDurability,
     ) -> io::Result<(u64, u64)> {
@@ -2493,7 +2518,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(self.wal_links.stamp())
     }
 
-    pub(super) fn append_raw_wal_batch_with_rotation(
+    pub(in crate::engine) fn append_raw_wal_batch_with_rotation(
         &mut self,
         encoded: &[u8],
         durability: WriteDurability,
@@ -2566,7 +2591,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    pub(super) fn check_existing_row(&self, key: &[u8]) -> io::Result<ExistingRowStatus> {
+    pub(in crate::engine) fn check_existing_row(
+        &self,
+        key: &[u8],
+    ) -> io::Result<ExistingRowStatus> {
         self.check_existing_row_src(ReadSource::Owner, key)
     }
 
@@ -2607,7 +2635,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// On standard uncapped tables without secondary indexes, the first `UPDATE`/`DELETE` after
     /// `StorageEngine::open` runs a single 1-item prefix probe and caches `false` in
     /// `self.table_has_row_meta`, skipping all negative `'t'` lookups on subsequent mutations!
-    pub(super) fn may_have_row_meta(&mut self, table_id: u16) -> io::Result<bool> {
+    pub(in crate::engine) fn may_have_row_meta(&mut self, table_id: u16) -> io::Result<bool> {
         if self.capped_tables.contains_key(&table_id) {
             return Ok(true);
         }
@@ -2625,7 +2653,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Policy-free row-meta lookup used by delete/overwrite/eviction paths. An unreadable
     /// `'t'` record (spilled blob failing verification, dangling pointer, or undecodable bytes)
     /// is reported as [`MetaLookup::Corrupt`] instead of an error so callers can clean up.
-    pub(super) fn get_row_meta_lookup(&mut self, meta_key: &[u8]) -> io::Result<MetaLookup> {
+    pub(in crate::engine) fn get_row_meta_lookup(
+        &mut self,
+        meta_key: &[u8],
+    ) -> io::Result<MetaLookup> {
         let Some((_lsn, val)) = self.lookup_raw_entry(meta_key)? else {
             return Ok(MetaLookup::Absent);
         };
@@ -2654,7 +2685,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     /// Convenience wrapper: `None` for absent or corrupt metadata.
-    pub(super) fn get_row_meta_with_ptr(
+    pub(in crate::engine) fn get_row_meta_with_ptr(
         &mut self,
         meta_key: &[u8],
     ) -> io::Result<Option<(RowMetaRecord, Option<BlobPtr>)>> {
@@ -2668,7 +2699,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// secondary-index (`'i'`) and LRU-queue (`'l'`) entry of `table_id` whose trailing primary
     /// key equals `pk`, found by scanning both namespaces, plus the best-effort logical size
     /// estimate of the row (`pk.len()` + value length, derived from the row record itself).
-    pub(super) fn collect_orphans_for_pk(
+    pub(in crate::engine) fn collect_orphans_for_pk(
         &self,
         table_id: u16,
         pk: &[u8],
@@ -2732,11 +2763,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.memtable_for(src).get(key)
     }
 
-    pub(super) fn lookup_raw_entry(&self, key: &[u8]) -> io::Result<Option<(u64, IndexValue)>> {
+    pub(in crate::engine) fn lookup_raw_entry(
+        &self,
+        key: &[u8],
+    ) -> io::Result<Option<(u64, IndexValue)>> {
         self.lookup_raw_entry_src(ReadSource::Owner, key)
     }
 
-    pub(super) fn lookup_raw_entry_view(
+    pub(in crate::engine) fn lookup_raw_entry_view(
         &self,
         view: ReadView,
         key: &[u8],

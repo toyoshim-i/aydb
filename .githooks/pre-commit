@@ -7,7 +7,7 @@
 # neither Rust/Cargo nor `formal/lean/` are skipped.
 set -e
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+STAGED=$(git diff --cached --name-only --diff-filter=ACMRD)
 
 if printf '%s\n' "$STAGED" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
     echo "pre-commit: cargo fmt --check"
@@ -18,6 +18,14 @@ if printf '%s\n' "$STAGED" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
 
     echo "pre-commit: cargo clippy --all-targets -- -D warnings"
     cargo clippy --all-targets --quiet -- -D warnings
+fi
+
+if printf '%s\n' "$STAGED" | grep -Eq '^tools/.*\.py$'; then
+    PYTHON_BIN=$(command -v python3 || command -v python || true)
+    if [ -n "$PYTHON_BIN" ]; then
+        echo "pre-commit: running site generator unit tests"
+        "$PYTHON_BIN" -B -m unittest discover -s tools -p 'test_*.py'
+    fi
 fi
 
 if printf '%s\n' "$STAGED" | grep -Eq '^formal/lean/'; then

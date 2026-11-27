@@ -296,9 +296,6 @@ impl<FS: PlatformFs> EngineReader<'_, FS> {
 
 // The vtab shares one engine across threads behind an `RwLock`.
 const _: () = {
-    fn assert_send_sync<T: Send + Sync>() {}
-    #[allow(dead_code)]
-    fn engine_is_send_sync() {
-        assert_send_sync::<StorageEngine<crate::pal::OsFs>>();
-    }
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<StorageEngine<crate::pal::OsFs>>();
 };

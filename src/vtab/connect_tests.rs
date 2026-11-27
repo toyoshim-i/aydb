@@ -79,7 +79,7 @@ impl Fixture {
 
     fn is_registered(&self, table_id: u16, name: &str) -> bool {
         let eng = self.engine.read().unwrap();
-        eng.active_vtab_ids.get(&table_id).map(|n| &**n) == Some(name)
+        eng.active_vtab_name_for_test(table_id) == Some(name)
     }
 }
 
@@ -403,7 +403,13 @@ fn disconnecting_one_connection_keeps_shared_table_registered_until_last_disconn
 
     // Closing the final connection removes the live registration even after rename.
     drop(conn2);
-    assert!(!fx.engine.read().unwrap().active_vtab_ids.contains_key(&1));
+    assert!(
+        fx.engine
+            .read()
+            .unwrap()
+            .active_vtab_name_for_test(1)
+            .is_none()
+    );
 }
 
 #[test]
@@ -429,7 +435,13 @@ fn stale_disconnect_after_drop_and_recreate_does_not_unregister_new_table() {
     assert_eq!(ids(&conn_live, "t"), vec![10]);
 
     drop(conn_live);
-    assert!(!fx.engine.read().unwrap().active_vtab_ids.contains_key(&1));
+    assert!(
+        fx.engine
+            .read()
+            .unwrap()
+            .active_vtab_name_for_test(1)
+            .is_none()
+    );
 }
 
 #[test]
@@ -512,7 +524,7 @@ fn concurrent_create_rename_and_connect_across_connections_stay_consistent() {
     assert!(fx.is_registered(5, "m"));
 
     drop(verify);
-    assert!(fx.engine.read().unwrap().active_vtab_ids.is_empty());
+    assert!(!fx.engine.read().unwrap().has_active_vtabs_for_test());
 }
 
 #[test]

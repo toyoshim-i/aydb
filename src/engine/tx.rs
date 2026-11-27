@@ -676,7 +676,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     #[cfg(test)]
-    pub(crate) fn tx_trace(&self) -> Option<&tx_fsm::TxTraceRecorder> {
+    pub(super) fn tx_trace(&self) -> Option<&tx_fsm::TxTraceRecorder> {
         self.tx_trace.as_ref()
     }
 
@@ -1959,7 +1959,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    pub(super) fn restore_engine_meta_from_snapshot(&mut self, snap: &TxMetaSnapshot) {
+    fn restore_engine_meta_from_snapshot(&mut self, snap: &TxMetaSnapshot) {
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         self.next_lsn = snap.next_lsn;
         for (&seq, b) in &mut self.std_blobs {
@@ -2106,7 +2106,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         chunked_res
     }
 
-    pub(super) fn flush_pending_tx_records(
+    fn flush_pending_tx_records(
         &mut self,
         durability: WriteDurability,
         record_count: u32,

@@ -1,6 +1,7 @@
 //! Out-of-line blob segment management (`blob_std` / `blob_lru`), dead-byte accounting,
 //! statement undo recording, corrupt-blob policy enforcement, lazy dereferencing, and prefetching.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::Ordering;
 
@@ -116,6 +117,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
+    pub(super) fn lock_corrupt_evictions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(u16, Vec<u8>), PendingCorruptEviction>> {
+        self.pending_corrupt_evictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(super) fn queue_corrupt_eviction(
         &self,
         table_id: u16,
@@ -123,29 +132,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         key: &[u8],
         observed: IndexValue,
     ) {
-        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
-            q.insert(
-                (table_id, pk.to_vec()),
-                PendingCorruptEviction {
-                    key: key.to_vec(),
-                    observed,
-                },
-            );
-        }
+        self.lock_corrupt_evictions().insert(
+            (table_id, pk.to_vec()),
+            PendingCorruptEviction {
+                key: key.to_vec(),
+                observed,
+            },
+        );
     }
 
     pub(crate) fn has_pending_corrupt_evictions(&self) -> bool {
-        self.pending_corrupt_evictions
-            .lock()
-            .map(|pending| !pending.is_empty())
-            .unwrap_or(true)
+        !self.lock_corrupt_evictions().is_empty()
     }
 
     pub(super) fn has_pending_corrupt_evictions_for_table(&self, table_id: u16) -> bool {
-        self.pending_corrupt_evictions
-            .lock()
-            .map(|pending| pending.keys().any(|&(tid, _)| tid == table_id))
-            .unwrap_or(true)
+        self.lock_corrupt_evictions()
+            .keys()
+            .any(|&(tid, _)| tid == table_id)
     }
 
     /// Deletes rows queued by [`CorruptPolicy::Evict`] reads.
@@ -163,11 +166,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             return Ok(());
         }
         self.drain_pending_durable()?;
-        let pending: Vec<((u16, Vec<u8>), PendingCorruptEviction)> =
-            match self.pending_corrupt_evictions.lock() {
-                Ok(mut q) if !q.is_empty() => q.drain().collect(),
-                _ => return Ok(()),
-            };
+        let pending: Vec<((u16, Vec<u8>), PendingCorruptEviction)> = {
+            let mut q = self.lock_corrupt_evictions();
+            if q.is_empty() {
+                return Ok(());
+            }
+            q.drain().collect()
+        };
         let mut iter = pending.into_iter();
         while let Some(((table_id, pk), ev)) = iter.next() {
             let step = match self.lookup_raw_entry(&ev.key) {
@@ -178,11 +183,10 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 Err(e) => Err(e),
             };
             if let Err(e) = step {
-                if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
-                    q.entry((table_id, pk)).or_insert(ev);
-                    for (k, v) in iter {
-                        q.entry(k).or_insert(v);
-                    }
+                let mut q = self.lock_corrupt_evictions();
+                q.entry((table_id, pk)).or_insert(ev);
+                for (k, v) in iter {
+                    q.entry(k).or_insert(v);
                 }
                 return Err(e);
             }

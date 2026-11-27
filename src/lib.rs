@@ -10,12 +10,8 @@
 //!   and Unified Engine (`lru`, `engine`)
 //! - SQLite Adapter: `sqlite3_module` Virtual Table & Connection Wrapper (`vtab`)
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::needless_range_loop,
-    clippy::map_entry
-)]
+#![allow(clippy::collapsible_if)]
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod blob;
 pub mod cache;

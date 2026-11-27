@@ -2862,7 +2862,7 @@ fn vtab_inline_max_ddl_option_inlines_large_rows() {
     {
         let eng = engine.read().unwrap();
         assert_eq!(eng.effective_inline_threshold(1), 2500);
-        assert_eq!(eng.std_blobs.len(), 0);
+        assert_eq!(eng.std_blob_count(), 0);
     }
 
     // 2. Table with inline_max = 256

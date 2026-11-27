@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the static GitHub Pages site for aydb.
 
-The site has three parts:
+The site has four parts:
 
 * index.html: the repository README rendered to HTML.
 * docs/: the Markdown files under docs/ rendered to HTML, with the
@@ -1099,7 +1099,7 @@ def build_results(artifacts, out, meta, repo_url):
     sha = meta["sha"]
     short = sha[:7] if sha else "unknown"
     commit = ('<a href="{}/commit/{}"><code>{}</code></a>'.format(
-        esc(repo_url), esc(sha), esc(short)) if sha else "unknown")
+        esc(repo_url), esc(sha), esc(short)) if sha and repo_url else esc(short) if sha else "unknown")
     run = ('<a href="{}">workflow run</a>'.format(esc(run_url))
            if run_url else "unknown")
     body = [

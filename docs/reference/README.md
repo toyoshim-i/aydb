@@ -6,7 +6,7 @@ This map groups the current application-facing API by task. Read [Public API Bou
 
 | Task | API | Source |
 | :--- | :--- | :--- |
-| Open storage | `OsFs::open`, `StorageEngine::open` | [PAL](../../src/pal/mod.rs), [engine](../../src/engine/mod.rs) |
+| Open storage | `OsFs::open`, `StorageEngine::open` | [PAL](../../src/pal/mod.rs), [open](../../src/engine/open.rs) |
 | Configure resources | `EngineConfig` | [engine](../../src/engine/mod.rs) |
 | Select guarantees | `WriteDurability`, `CorruptPolicy` | [engine](../../src/engine/mod.rs) |
 | Read and write | `put_row`, `put_row_owned`, `get_row`, `row_exists`, `delete_row` | [engine](../../src/engine/mod.rs) |
@@ -16,7 +16,7 @@ This map groups the current application-facing API by task. Read [Public API Bou
 | Savepoints | `savepoint`, `rollback_to_savepoint`, `release_savepoint` | [transactions](../../src/engine/tx.rs) |
 | Capped tables | `register_capped_table`, `capped_table_state` | [eviction](../../src/engine/eviction.rs) |
 | Runtime policies | `set_table_corrupt_policy`, `reset_table_corrupt_policy`, `corrupt_policy`, `set_table_inline_threshold`, `reset_table_inline_threshold`, `effective_inline_threshold` | [engine](../../src/engine/mod.rs) |
-| WAL damage | `EngineConfig::wal_damage_policy` (`WalDamagePolicy`), `last_wal_recovery` (`WalRecoveryReport`, `WalDamage`), `open_with_salvage` (`SalvagedTx`) | [engine](../../src/engine/mod.rs) |
+| WAL damage | `EngineConfig::wal_damage_policy` (`WalDamagePolicy`), `last_wal_recovery` (`WalRecoveryReport`, `WalDamage`), `open_with_salvage` (`SalvagedTx`) | [engine](../../src/engine/mod.rs), [open](../../src/engine/open.rs) |
 | Maintenance | `checkpoint`, `flush_memtable`, `compact`, `compact_auto_tiered` | [compaction](../../src/engine/compaction.rs) |
 | Health and diagnostics | `is_poisoned`, `maintenance_failures`, `last_maintenance_error`, `corrupt_blob_detections`, active segment counts | [engine](../../src/engine/mod.rs) |
 

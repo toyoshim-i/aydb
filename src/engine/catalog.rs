@@ -844,9 +844,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.table_has_row_meta.insert(table_id, false);
         self.bump_table_mutation_epoch(table_id);
         self.blob_cache.invalidate_table_blobs(table_id);
-        if let Ok(mut q) = self.pending_corrupt_evictions.lock() {
-            q.retain(|(tid, _), _| *tid != table_id);
-        }
+        self.lock_corrupt_evictions()
+            .retain(|(tid, _), _| *tid != table_id);
 
         // Blob reclaim, LRU writer/segment disposal, and quota commit happen once on commit in
         // `publish_committed_transaction` via `ActiveTx::dropped_tables` so rolling back an

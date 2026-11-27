@@ -181,7 +181,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_snapshot_strong_count(&self) -> Option<usize> {
+    fn cached_snapshot_strong_count(&self) -> Option<usize> {
         self.snapshot_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -231,7 +231,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// `EagerWriteOnRead` LRU promotions), rather than LSNs or `MemTable::generation`: a flush
     /// inside a commit can make the checkpoint LSN equal an in-flight transaction's LSN, and an
     /// eager LRU promotion bumps the `MemTable` generation without changing user data.
-    pub(crate) fn snapshot_is_current(&self, token: &ReadSnapshotToken<FS::File>) -> bool {
+    pub(super) fn snapshot_is_current(&self, token: &ReadSnapshotToken<FS::File>) -> bool {
         token.snapshot.engine_id == self.engine_id
             && self.pending_group.is_empty()
             && token.snapshot.data_generation == self.data_generation
@@ -257,7 +257,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     }
 
     #[cfg(test)]
-    pub(crate) fn check_snapshot_write_upgrade(
+    fn check_snapshot_write_upgrade(
         &self,
         conn_id: usize,
         token: &ReadSnapshotToken<FS::File>,

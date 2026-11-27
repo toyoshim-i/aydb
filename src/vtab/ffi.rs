@@ -380,7 +380,7 @@ unsafe extern "system" {
 /// # Safety
 /// `val` must be a valid non-null `*mut sqlite3_value` whose buffer stays valid for `'a`.
 #[inline]
-pub(crate) unsafe fn sqlite_value_text_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
+pub(in crate::vtab) unsafe fn sqlite_value_text_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
     unsafe {
         let ptr = sqlite3_value_text(val);
         if ptr.is_null() {
@@ -401,7 +401,7 @@ pub(crate) unsafe fn sqlite_value_text_bytes<'a>(val: *mut sqlite3_value) -> &'a
 /// # Safety
 /// `val` must be a valid non-null `*mut sqlite3_value` whose buffer stays valid for `'a`.
 #[inline]
-pub(crate) unsafe fn sqlite_value_blob_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
+pub(in crate::vtab) unsafe fn sqlite_value_blob_bytes<'a>(val: *mut sqlite3_value) -> &'a [u8] {
     unsafe {
         let ptr = sqlite3_value_blob(val) as *const u8;
         if ptr.is_null() {
@@ -423,7 +423,10 @@ pub(crate) unsafe fn sqlite_value_blob_bytes<'a>(val: *mut sqlite3_value) -> &'a
 /// `stmt` must be positioned on a valid row and the returned slice stays valid only until the
 /// next SQLite step/reset/type conversion on the same column.
 #[inline]
-pub(crate) unsafe fn sqlite_column_text_bytes<'a>(stmt: *mut sqlite3_stmt, col: c_int) -> &'a [u8] {
+pub(in crate::vtab) unsafe fn sqlite_column_text_bytes<'a>(
+    stmt: *mut sqlite3_stmt,
+    col: c_int,
+) -> &'a [u8] {
     unsafe {
         let ptr = sqlite3_column_text(stmt, col);
         if ptr.is_null() {
@@ -445,7 +448,10 @@ pub(crate) unsafe fn sqlite_column_text_bytes<'a>(stmt: *mut sqlite3_stmt, col: 
 /// `stmt` must be positioned on a valid row and the returned slice stays valid only until the
 /// next SQLite step/reset/type conversion on the same column.
 #[inline]
-pub(crate) unsafe fn sqlite_column_blob_bytes<'a>(stmt: *mut sqlite3_stmt, col: c_int) -> &'a [u8] {
+pub(in crate::vtab) unsafe fn sqlite_column_blob_bytes<'a>(
+    stmt: *mut sqlite3_stmt,
+    col: c_int,
+) -> &'a [u8] {
     unsafe {
         let ptr = sqlite3_column_blob(stmt, col) as *const u8;
         if ptr.is_null() {

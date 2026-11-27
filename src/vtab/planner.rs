@@ -12,23 +12,23 @@ use crate::vtab::ffi::{
 use crate::vtab::row_codec::{ColCollation, ColumnAffinity};
 
 pub(in crate::vtab) const PLAN_FULL_SCAN: c_int = 0;
-pub(in crate::vtab) const PLAN_PK_POINT: c_int = 1;
-pub(in crate::vtab) const PLAN_SECONDARY_EQ: c_int = 2;
+const PLAN_PK_POINT: c_int = 1;
+const PLAN_SECONDARY_EQ: c_int = 2;
 pub(in crate::vtab) const PLAN_PK_RANGE: c_int = 3;
 pub(in crate::vtab) const PLAN_SECONDARY_RANGE: c_int = 4;
-pub(in crate::vtab) const PLAN_UNIQUE_EQ: c_int = 5;
+const PLAN_UNIQUE_EQ: c_int = 5;
 
-pub(in crate::vtab) const POINT_FLAG_BY_ROWID: c_int = 0x01;
+const POINT_FLAG_BY_ROWID: c_int = 0x01;
 /// Point lookup only needs existence + primary key (no value read), so a corrupt out-of-line
 /// blob never fails `DELETE ... WHERE pk = ?` / `SELECT pk ... WHERE pk = ?`.
 pub(in crate::vtab) const POINT_FLAG_KEYS_ONLY: c_int = 0x02;
 
-pub(in crate::vtab) const RANGE_FLAG_LOWER_INCLUSIVE: c_int = 0x01;
-pub(in crate::vtab) const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
-pub(in crate::vtab) const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
-pub(in crate::vtab) const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
+const RANGE_FLAG_LOWER_INCLUSIVE: c_int = 0x01;
+const RANGE_FLAG_LOWER_EXCLUSIVE: c_int = 0x02;
+const RANGE_FLAG_UPPER_INCLUSIVE: c_int = 0x04;
+const RANGE_FLAG_UPPER_EXCLUSIVE: c_int = 0x08;
 pub(in crate::vtab) const RANGE_FLAG_KEYS_ONLY: c_int = 0x20;
-pub(in crate::vtab) const RANGE_FLAG_REVERSE: c_int = 0x40;
+const RANGE_FLAG_REVERSE: c_int = 0x40;
 
 #[cfg(test)]
 thread_local! {
@@ -296,14 +296,14 @@ fn sec_range_consumes_order_by(
     order_by.len() == 1 || (order_by[1].iColumn == pk_col_idx as i32 && order_by[1].desc == 0)
 }
 
-pub(in crate::vtab) struct SelectedBestIndexPlan {
-    pub(in crate::vtab) idx_num: c_int,
-    pub(in crate::vtab) idx_flags: Option<c_int>,
-    pub(in crate::vtab) order_by_consumed: bool,
-    pub(in crate::vtab) estimated_cost: f64,
-    pub(in crate::vtab) estimated_rows: i64,
-    pub(in crate::vtab) used_constraints: [usize; 2],
-    pub(in crate::vtab) num_used: usize,
+struct SelectedBestIndexPlan {
+    idx_num: c_int,
+    idx_flags: Option<c_int>,
+    order_by_consumed: bool,
+    estimated_cost: f64,
+    estimated_rows: i64,
+    used_constraints: [usize; 2],
+    num_used: usize,
 }
 
 impl AydbVTab {

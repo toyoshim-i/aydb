@@ -1,5 +1,5 @@
 //! Compact binary row serialization with an $O(1)$ column offset directory,
-//! plus memcomparable key conversion for SQLite [`sqlite3_value`] items.
+//! plus memcomparable key conversion for SQLite `sqlite3_value` items.
 
 use std::io::{self, ErrorKind};
 
@@ -377,66 +377,6 @@ pub enum SqlValue {
 }
 
 impl SqlValue {
-    /// Extracts a [`SqlValue`] from a raw SQLite `sqlite3_value*`.
-    ///
-    /// # Safety
-    /// `val` must be a valid non-null `*mut sqlite3_value` provided by SQLite.
-    pub unsafe fn from_sqlite_value(val: *mut sqlite3_value) -> Self {
-        unsafe {
-            match sqlite3_value_type(val) {
-                SQLITE_NULL => Self::Null,
-                SQLITE_INTEGER => Self::Integer(sqlite3_value_int64(val)),
-                SQLITE_FLOAT => Self::Float(sqlite3_value_double(val)),
-                SQLITE_TEXT => {
-                    let slice = sqlite_value_text_bytes(val);
-                    Self::Text(String::from_utf8_lossy(slice).into_owned())
-                }
-                _ => {
-                    let slice = sqlite_value_blob_bytes(val);
-                    Self::Blob(slice.to_vec())
-                }
-            }
-        }
-    }
-
-    /// Writes this [`SqlValue`] into a SQLite `sqlite3_context*`.
-    ///
-    /// # Safety
-    /// `ctx` must be a valid non-null `*mut sqlite3_context` passed to `xColumn`.
-    pub unsafe fn set_sqlite_result(&self, ctx: *mut sqlite3_context) {
-        unsafe {
-            match self {
-                Self::Null => sqlite3_result_null(ctx),
-                Self::Integer(v) => sqlite3_result_int64(ctx, *v),
-                Self::Float(v) => sqlite3_result_double(ctx, *v),
-                Self::Text(s) => {
-                    if s.len() > i32::MAX as usize {
-                        sqlite3_result_error_toobig(ctx);
-                    } else {
-                        sqlite3_result_text(
-                            ctx,
-                            s.as_ptr() as *const _,
-                            s.len() as i32,
-                            sqlite_transient(),
-                        );
-                    }
-                }
-                Self::Blob(b) => {
-                    if b.len() > i32::MAX as usize {
-                        sqlite3_result_error_toobig(ctx);
-                    } else {
-                        sqlite3_result_blob(
-                            ctx,
-                            b.as_ptr() as *const _,
-                            b.len() as i32,
-                            sqlite_transient(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// Encodes this value into a standalone type-tagged memcomparable primary/secondary key component
     /// ordered according to SQLite's storage-class comparison rules (`NULL < Number < TEXT < BLOB`):
     /// - `Null` -> `[0x05]` (1 byte).
@@ -648,7 +588,8 @@ pub type DirectEncodedRow = (Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>);
 ///
 /// # Safety
 /// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
-pub unsafe fn encode_sqlite_values_direct(
+#[cfg(test)]
+pub(in crate::vtab) unsafe fn encode_sqlite_values_direct(
     values: *mut *mut sqlite3_value,
     col_count: usize,
     pk_col_idx: usize,
@@ -671,11 +612,11 @@ pub unsafe fn encode_sqlite_values_direct(
     .expect("cannot encode SQLite row")
 }
 
-/// Fallible counterpart to [`encode_sqlite_values_direct`].
+/// Fallible counterpart to `encode_sqlite_values_direct`.
 ///
 /// # Safety
 /// `values` must point to `col_count` valid `*mut sqlite3_value` pointers.
-pub unsafe fn try_encode_sqlite_values_direct(
+pub(in crate::vtab) unsafe fn try_encode_sqlite_values_direct(
     values: *mut *mut sqlite3_value,
     col_count: usize,
     pk_col_idx: usize,
@@ -894,23 +835,6 @@ pub unsafe fn try_encode_sqlite_values_direct(
     }
 }
 
-/// Converts a raw `*mut sqlite3_value` directly into type-tagged memcomparable key bytes
-/// ordered according to SQLite's storage-class comparison rules (`NULL < Number < TEXT < BLOB`).
-///
-/// # Safety
-/// `vptr` must be a valid non-null `*mut sqlite3_value`.
-#[inline]
-pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
-    unsafe {
-        sqlite_value_to_key_bytes_with_schema(
-            vptr,
-            ColumnAffinity::Blob,
-            ColCollation::Binary,
-            false,
-        )
-    }
-}
-
 /// Converts a raw `*mut sqlite3_value` into type-tagged memcomparable key bytes, applying the
 /// target column's [`ColumnAffinity`] and [`ColCollation`].
 /// When `canonical_numeric` is `true`, exact integer floats (`10.0`) encode identically to
@@ -919,7 +843,7 @@ pub unsafe fn sqlite_value_to_key_bytes(vptr: *mut sqlite3_value) -> Vec<u8> {
 /// # Safety
 /// `vptr` must be a valid non-null `*mut sqlite3_value`.
 #[inline]
-pub unsafe fn sqlite_value_to_key_bytes_with_schema(
+pub(in crate::vtab) unsafe fn sqlite_value_to_key_bytes_with_schema(
     vptr: *mut sqlite3_value,
     affinity: ColumnAffinity,
     collation: ColCollation,
@@ -1052,7 +976,10 @@ unsafe fn result_bytes(ctx: *mut sqlite3_context, payload: &[u8], is_text: bool)
 /// # Safety
 /// `ctx` must be a valid non-null `*mut sqlite3_context`.
 #[inline]
-pub unsafe fn project_key_zero_copy(key: &[u8], ctx: *mut sqlite3_context) -> io::Result<()> {
+pub(in crate::vtab) unsafe fn project_key_zero_copy(
+    key: &[u8],
+    ctx: *mut sqlite3_context,
+) -> io::Result<()> {
     let invalid = || io::Error::new(ErrorKind::InvalidData, "malformed primary key bytes");
     let Some((&tag, payload)) = key.split_first() else {
         return Err(invalid());
@@ -1189,7 +1116,7 @@ pub(super) fn read_stored_i64_column(row: &[u8], col_idx: usize) -> io::Result<O
 /// # Safety
 /// `ctx` must be a valid non-null `*mut sqlite3_context`.
 #[inline]
-pub unsafe fn project_column_zero_copy(
+pub(in crate::vtab) unsafe fn project_column_zero_copy(
     row_bytes: &[u8],
     col_idx: usize,
     ctx: *mut sqlite3_context,

@@ -122,7 +122,7 @@ fn prepare_worker_spawn(engine: &Arc<RwLock<StorageEngine<OsFs>>>) -> Option<Spa
 
 /// A registration of the shared per-engine worker. Dropping the last registration for an
 /// engine shuts the worker down.
-pub(crate) struct CompactionWorker {
+pub(in crate::vtab) struct CompactionWorker {
     key: usize,
     engine: Arc<RwLock<StorageEngine<OsFs>>>,
 }
@@ -130,7 +130,7 @@ pub(crate) struct CompactionWorker {
 impl CompactionWorker {
     /// Registers with the engine's worker, spawning it (or restarting a dead one after panics)
     /// without ever holding the global `REGISTRY` mutex across engine locks or thread joins.
-    pub(crate) fn spawn(engine: Arc<RwLock<StorageEngine<OsFs>>>) -> Option<Self> {
+    pub(in crate::vtab) fn spawn(engine: Arc<RwLock<StorageEngine<OsFs>>>) -> Option<Self> {
         let key = key_of(&engine);
         enum SpawnAction {
             Reuse,
@@ -242,7 +242,7 @@ impl Drop for CompactionWorker {
 
 /// Test support: `(registrations, worker_thread_alive)` for `engine`, if a worker is registered.
 #[cfg(test)]
-pub(crate) fn worker_stats(
+pub(in crate::vtab) fn worker_stats(
     engine: &Arc<RwLock<StorageEngine<OsFs>>>,
 ) -> Option<(usize, Arc<AtomicBool>)> {
     let reg = REGISTRY.lock().ok()?;
