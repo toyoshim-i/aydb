@@ -126,7 +126,9 @@ aydb/
 │   ├── phase1/                               # Phase 1: Storage Engine textbook (Chapters 1.0 - 1.5)
 │   ├── phase2/                               # Phase 2: SQLite VTab & Benchmarks (Chapters 2.0 - 2.3)
 │   └── reference/                            # API boundaries & method/config reference
-├── tools/build_site.py                       # GitHub Pages Site & Chart Generator
+├── tools/
+│   ├── build_site.py                         # GitHub Pages Site & Chart Generator
+│   └── test_build_site.py                    # Unit tests for site & chart generator
 ├── src/
 │   ├── lib.rs                                # Crate root & module exports
 │   ├── cache/mod.rs                          # Bounded Verified Block & Blob Caches
@@ -136,6 +138,11 @@ aydb/
 │   │   ├── byte_reader.rs
 │   │   └── test_util.rs
 │   ├── pal/                                  # Platform Abstraction Layer (Win32 OVERLAPPED / Unix pread)
+│   │   ├── mod.rs
+│   │   ├── path.rs
+│   │   ├── test_fs.rs
+│   │   ├── unix.rs
+│   │   └── windows.rs
 │   ├── meta/mod.rs                           # 8 KB Ping-Pong boot_meta.db & Deferred GC
 │   ├── wal/                                  # Dual-Stream Fixed-Size Epoch WAL & Ordered Crash Recovery
 │   │   ├── mod.rs
@@ -144,34 +151,46 @@ aydb/
 │   ├── index/                                # 4 KB Block SSTables, Key Codec, Sparse Fence Pointers & Bloom Filter
 │   │   ├── mod.rs
 │   │   ├── bloom.rs
+│   │   ├── compaction.rs
+│   │   ├── cursor.rs
 │   │   └── key_codec.rs
 │   ├── memtable/mod.rs                       # Bounded In-Memory B-Tree MemTable
 │   ├── lru/mod.rs                            # Zero-I/O AccessTracker & Capped Table Metadata
 │   ├── engine/                               # StorageEngine Coordinator, Transactions, Scans, Compaction, Eviction & Salvage
 │   │   ├── mod.rs
+│   │   ├── blobs.rs
+│   │   ├── catalog.rs
 │   │   ├── compaction.rs
 │   │   ├── crash_tests/
 │   │   ├── eviction.rs
+│   │   ├── open.rs
 │   │   ├── reader.rs
 │   │   ├── rowid.rs
 │   │   ├── salvage.rs
 │   │   ├── scan.rs
 │   │   ├── snapshot.rs
-│   │   ├── tests.rs
+│   │   ├── tests/
 │   │   ├── tx.rs
+│   │   ├── tx_fsm.rs
 │   │   ├── unique_index.rs
 │   │   └── wal_links.rs
 │   └── vtab/                                 # SQLite Virtual Table Adapter
 │       ├── mod.rs
+│       ├── catalog_probe.rs
 │       ├── compaction_worker.rs
 │       ├── connection.rs
 │       ├── constraints.rs
+│       ├── cursor.rs
 │       ├── ddl.rs
+│       ├── ddl_slot.rs
+│       ├── dml.rs
 │       ├── ffi.rs
+│       ├── lifecycle.rs
+│       ├── planner.rs
 │       ├── row_codec.rs
 │       ├── rowid_map.rs
 │       ├── snapshot.rs
-│       ├── tests.rs
+│       ├── tx_callbacks.rs
 │       ├── unique_key.rs
 │       └── unique_migration.rs
 └── examples/
@@ -184,7 +203,7 @@ aydb/
     ├── tx_isolation_read_bench.rs            # Non-Owner Read Cost During Transactions
     ├── compaction_latency_bench.rs           # Commit Latency: Inline vs. Background Compaction
     ├── auto_key_bench.rs                     # Automatic-Key INSERT: aydb vs. Native SQLite
-    ├── reliability_bench.rs                  # Crash-Consistency, Fault-Injection, & Audit Regression Suite
+    ├── reliability_bench.rs                  # Crash-Consistency & Fault-Injection Suite
     ├── sqlite_vs_aydb_bench.rs               # Step 2-2: Hybrid Workload SQLite vs. aydb benchmarks
     └── standard_sql_bench.rs                 # Step 2-3: Differential SQL check & Speedtest1/YCSB/TPC-B-style benchmarks
 ```

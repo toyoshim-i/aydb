@@ -166,6 +166,84 @@ class TestBuildSite(unittest.TestCase):
                 self.assertTrue(svg_path.is_file(), f"missing {svg_path}")
                 self.assertIn("<svg", svg_path.read_text(encoding="utf-8"))
 
+    def test_link_rewriter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs" / "phase1").mkdir(parents=True)
+            (root / "docs" / "assets").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / "README.md").write_text("", encoding="utf-8")
+            (root / "docs" / "phase1" / "00_OVERVIEW.md").write_text("", encoding="utf-8")
+            (root / "docs" / "phase1" / "01_PAL.md").write_text("", encoding="utf-8")
+            (root / "docs" / "assets" / "fig.png").write_bytes(b"png")
+            (root / "src" / "lib.rs").write_text("", encoding="utf-8")
+
+            rewriter = build_site.LinkRewriter(root, "https://github.com/org/repo", "main")
+            fragment = (
+                '<a href="../../README.md">root</a>'
+                '<a href="01_PAL.md#sec">pal</a>'
+                '<img src="../assets/fig.png">'
+                '<a href="../../src/lib.rs#L10">src</a>'
+                '<a href="../../src">dir</a>'
+                '<a href="https://example.com">ext</a>'
+                '<a href="mailto:a@b.c">mail</a>'
+                '<a href="//cdn.example/x">proto</a>'
+                '<a href="#local">local</a>'
+                '<a href="../../../outside.txt">escape</a>'
+            )
+            rewritten = rewriter.rewrite(fragment, "docs/phase1/00_OVERVIEW.md")
+            self.assertIn('href="../../index.html"', rewritten)
+            self.assertIn('href="01_PAL.html#sec"', rewritten)
+            self.assertIn('src="../assets/fig.png"', rewritten)
+            self.assertIn('href="https://github.com/org/repo/blob/main/src/lib.rs#L10"', rewritten)
+            self.assertIn('href="https://github.com/org/repo/tree/main/src"', rewritten)
+            self.assertIn('href="https://example.com"', rewritten)
+            self.assertIn('href="mailto:a@b.c"', rewritten)
+            self.assertIn('href="//cdn.example/x"', rewritten)
+            self.assertIn('href="#local"', rewritten)
+            self.assertIn('href="../../../outside.txt"', rewritten)
+
+    def test_os_summary_table(self):
+        entry_ok = {
+            "test_dir": True,
+            "bench_dir": True,
+            "fmt": " \n",
+            "clippy": "Finished",
+            "tests": "test result: ok. 771 passed; 0 failed; 0 ignored",
+            "reliability": "SUITE 1\n3A | PASS | ok",
+            "test_status": {"fmt": 0, "clippy": 0, "tests": 0, "reliability": 0},
+            "status": {name: (0, 2) for name in build_site.BENCHES},
+            "bench": {name: "ok" for name in build_site.BENCHES},
+        }
+        html_ok = build_site.os_summary_table("ubuntu-latest", entry_ok)
+        self.assertIn("771 passed, 0 failed, 0 ignored", html_ok)
+        self.assertIn("completed in 2 s", html_ok)
+        self.assertNotIn('>fail<', html_ok)
+
+        # Non-zero exit overrides classifier; missing exit or missing text marks fail; missing bench is no result.
+        entry_bad = {
+            "test_dir": True,
+            "bench_dir": False,
+            "fmt": "",
+            "clippy": "Finished",
+            "tests": None,
+            "reliability": "SUITE 1\n3A | PASS | ok",
+            "test_status": {"fmt": 1, "clippy": 0, "tests": 0},
+            "status": {"standard_sql_bench": (0, 5)},
+            "bench": {
+                "standard_sql_bench": None,
+                "sqlite_vs_aydb_bench": "output",
+                **{n: None for n in build_site.BENCHES[2:]},
+            },
+        }
+        html_bad = build_site.os_summary_table("windows-latest", entry_bad)
+        self.assertIn("exit status 1 (formatted)", html_bad)
+        self.assertIn("exit status 0, output missing", html_bad)
+        self.assertIn("exit status not recorded (1 checks passed)", html_bad)
+        self.assertIn("exit status 0 after 5 s, output missing", html_bad)
+        self.assertIn("output present, exit status not recorded", html_bad)
+        self.assertIn("no result", html_bad)
+
     def test_main_refuses_ancestor_out_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
