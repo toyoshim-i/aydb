@@ -379,87 +379,36 @@ fn idx_segment_cursor_borrows_cached_block_zero_copy_and_shrinks_struct() {
 
 #[test]
 fn compact_idx_segments_uses_batched_reads_instead_of_per_block_syscalls() {
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    struct CountingReadFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_idx: bool,
+    struct CountingReadHooks {
         read_exact_calls: Arc<AtomicUsize>,
     }
 
-    impl PlatformFile for CountingReadFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_idx {
+    impl FsHooks for CountingReadHooks {
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("idx_") {
                 self.read_exact_calls.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct CountingReadFs {
-        inner: OsFs,
-        read_exact_calls: Arc<AtomicUsize>,
-    }
-
-    impl PlatformFs for CountingReadFs {
-        type File = CountingReadFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(CountingReadFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_idx: rel_name.starts_with("idx_"),
-                read_exact_calls: Arc::clone(&self.read_exact_calls),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.read_exact_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("batched_compaction_reads");
     let calls = Arc::new(AtomicUsize::new(0));
-    let fs = CountingReadFs {
-        inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-        read_exact_calls: Arc::clone(&calls),
-    };
+    let fs = HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("open OsFs"),
+        CountingReadHooks {
+            read_exact_calls: Arc::clone(&calls),
+        },
+    );
 
     let val = vec![0x3Cu8; 64];
     for (seq_id, start) in [(1u64, 0u32), (2u64, 1u32)] {
@@ -574,87 +523,36 @@ fn idx_block_and_segment_builders_reject_malformed_and_unsorted_entries_without_
 
 #[test]
 fn fence_pointer_seek_exact_block_boundary_skips_prior_block() {
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::Mutex;
 
-    struct SpyOffsetFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_idx: bool,
+    struct SpyOffsetHooks {
         offsets: Arc<Mutex<Vec<u64>>>,
     }
 
-    impl PlatformFile for SpyOffsetFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_idx {
+    impl FsHooks for SpyOffsetHooks {
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("idx_") {
                 self.offsets.lock().unwrap().push(offset);
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct SpyOffsetFs {
-        inner: OsFs,
-        offsets: Arc<Mutex<Vec<u64>>>,
-    }
-
-    impl PlatformFs for SpyOffsetFs {
-        type File = SpyOffsetFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(SpyOffsetFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_idx: rel_name.starts_with("idx_"),
-                offsets: Arc::clone(&self.offsets),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.read_exact_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("fence_exact_boundary");
     let offsets = Arc::new(Mutex::new(Vec::new()));
-    let fs = SpyOffsetFs {
-        inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-        offsets: Arc::clone(&offsets),
-    };
+    let fs = HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("open OsFs"),
+        SpyOffsetHooks {
+            offsets: Arc::clone(&offsets),
+        },
+    );
 
     let val = vec![0x7Au8; 512];
     let mut seg = IdxSegmentBuilder::create(&fs, 1, 0, 10).unwrap();

@@ -576,8 +576,7 @@ fn unverifiable_blob_cuts_both_streams() {
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-struct FailFile {
-    inner: Arc<<OsFs as PlatformFs>::File>,
+struct FailHooks {
     fail_write: Arc<AtomicBool>,
     fail_sync: Arc<AtomicBool>,
     /// Bytes that reach the file before an injected write failure; 0 means one full sector.
@@ -585,14 +584,14 @@ struct FailFile {
     write_count: Arc<AtomicUsize>,
 }
 
-impl PlatformFile for FailFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+impl crate::pal::test_fs::FsHooks for FailHooks {
+    fn write_all_at(
+        &self,
+        _name: &str,
+        inner: &dyn PlatformFile,
+        buf: &[u8],
+        offset: u64,
+    ) -> io::Result<()> {
         self.write_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_write.swap(false, Ordering::SeqCst) {
             // Simulate a partial write: first sector lands, then error.
@@ -602,66 +601,21 @@ impl PlatformFile for FailFile {
             } else {
                 buf.len().min(torn)
             };
-            let _ = self.inner.write_all_at(&buf[..n], offset);
+            let _ = inner.write_all_at(&buf[..n], offset);
             return Err(io::Error::other("injected write failure"));
         }
-        self.inner.write_all_at(buf, offset)
+        inner.write_all_at(buf, offset)
     }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(&self, t: u64, s: PreallocStrategy) -> io::Result<()> {
-        self.inner.preallocate(t, s)
-    }
-    fn sync_barrier(&self) -> io::Result<()> {
+
+    fn sync_barrier(&self, _name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
         if self.fail_sync.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("injected sync failure"));
         }
-        self.inner.sync_barrier()
-    }
-    fn sync_durable(&self) -> io::Result<()> {
-        self.inner.sync_durable()
-    }
-    fn evict_os_cache(&self, o: u64, l: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(o, l)
+        inner.sync_barrier()
     }
 }
 
-struct FailFs {
-    inner: OsFs,
-    fail_write: Arc<AtomicBool>,
-    fail_sync: Arc<AtomicBool>,
-    tear_len: Arc<AtomicUsize>,
-    write_count: Arc<AtomicUsize>,
-}
-
-impl PlatformFs for FailFs {
-    type File = FailFile;
-    fn open_file(
-        &self,
-        rel_name: &str,
-        create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<FailFile>> {
-        Ok(Arc::new(FailFile {
-            inner: self.inner.open_file(rel_name, create, writable, hint)?,
-            fail_write: self.fail_write.clone(),
-            fail_sync: self.fail_sync.clone(),
-            tear_len: self.tear_len.clone(),
-            write_count: self.write_count.clone(),
-        }))
-    }
-    fn remove_file(&self, n: &str) -> io::Result<()> {
-        self.inner.remove_file(n)
-    }
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-    fn root_path(&self) -> &std::path::Path {
-        self.inner.root_path()
-    }
-}
+type FailFs = crate::pal::test_fs::HookedFs<OsFs, FailHooks>;
 
 fn put_batch(lsn: u64, key: &[u8], len: usize) -> WalBatch {
     WalBatch::new(
@@ -677,13 +631,15 @@ fn fail_fs(name: &str) -> (TempTestDir, FailFs, Arc<AtomicBool>, Arc<AtomicBool>
     let tmp = TempTestDir::new(name);
     let w = Arc::new(AtomicBool::new(false));
     let s = Arc::new(AtomicBool::new(false));
-    let fs = FailFs {
-        inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-        fail_write: w.clone(),
-        fail_sync: s.clone(),
-        tear_len: Arc::new(AtomicUsize::new(0)),
-        write_count: Arc::new(AtomicUsize::new(0)),
-    };
+    let fs = FailFs::new(
+        OsFs::open(&tmp.path, true).expect("open OsFs"),
+        FailHooks {
+            fail_write: w.clone(),
+            fail_sync: s.clone(),
+            tear_len: Arc::new(AtomicUsize::new(0)),
+            write_count: Arc::new(AtomicUsize::new(0)),
+        },
+    );
     (tmp, fs, w, s)
 }
 
@@ -838,6 +794,7 @@ fn torn_buffered_append_keeps_earlier_batches_in_the_open_sector() {
     w.append_batch(&put_batch(1, b"a", 10)).unwrap();
     // The failed append rewrites the open sector and only half of it reaches the file.
     w.file()
+        .hooks()
         .tear_len
         .store(WAL_SECTOR_SIZE / 2, Ordering::SeqCst);
     fail_w.store(true, Ordering::SeqCst);
@@ -1018,20 +975,20 @@ fn make_durable_and_seal_coalesced_writes_sector_once() {
         WalStreamMode::BufferedUserSpaceCoalesced,
     )
     .unwrap();
-    fs.write_count.store(0, Ordering::SeqCst);
+    fs.hooks().write_count.store(0, Ordering::SeqCst);
 
     for lsn in 1..=3 {
         w.append_batch(&put_batch(lsn, b"k", 32)).unwrap();
     }
     assert_eq!(
-        fs.write_count.load(Ordering::SeqCst),
+        fs.hooks().write_count.load(Ordering::SeqCst),
         0,
         "coalesced small appends must stay purely in RAM"
     );
 
     w.make_durable_and_seal(true).unwrap();
     assert_eq!(
-        fs.write_count.load(Ordering::SeqCst),
+        fs.hooks().write_count.load(Ordering::SeqCst),
         1,
         "make_durable_and_seal in coalesced mode must write the sector once, not twice"
     );
@@ -1040,10 +997,10 @@ fn make_durable_and_seal_coalesced_writes_sector_once() {
         w.append_batch(&put_batch(lsn, b"k", 32)).unwrap();
     }
     w.flush_buffered_to_os().unwrap();
-    assert_eq!(fs.write_count.load(Ordering::SeqCst), 2);
+    assert_eq!(fs.hooks().write_count.load(Ordering::SeqCst), 2);
     w.make_durable_and_seal(true).unwrap();
     assert_eq!(
-        fs.write_count.load(Ordering::SeqCst),
+        fs.hooks().write_count.load(Ordering::SeqCst),
         2,
         "seal after flush_buffered_to_os must not rewrite an unmodified sector"
     );
@@ -1067,6 +1024,7 @@ fn partial_sector_backup_and_dirty_end_zeroing_preserve_torn_write_recovery() {
         assert!(saved_valid > 0 && saved_valid < 512);
 
         w.file()
+            .hooks()
             .tear_len
             .store(WAL_SECTOR_SIZE / 2, Ordering::SeqCst);
         fail_w.store(true, Ordering::SeqCst);

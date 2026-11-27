@@ -180,84 +180,38 @@ fn append_blob_into_rejects_corrupt_huge_len_without_allocating() {
 
 #[test]
 fn append_blob_flush_failure_preserves_write_offset_and_prior_buffered_records() {
-    use crate::pal::{OsFile, PreallocStrategy};
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FaultBlobFile {
-        inner: Arc<OsFile>,
+    struct FaultBlobHooks {
         fail_large_write: Arc<AtomicBool>,
     }
 
-    impl PlatformFile for FaultBlobFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+    impl FsHooks for FaultBlobHooks {
+        fn write_all_at(
+            &self,
+            _name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
             if buf.len() >= BLOB_WRITE_BUFFER_CAPACITY
                 && self.fail_large_write.swap(false, Ordering::SeqCst)
             {
                 return Err(io::Error::other("simulated blob flush write failure"));
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct FaultBlobFs {
-        inner: OsFs,
-        fail_large_write: Arc<AtomicBool>,
-    }
-
-    impl PlatformFs for FaultBlobFs {
-        type File = FaultBlobFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(FaultBlobFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                fail_large_write: Arc::clone(&self.fail_large_write),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
     let dir = TempTestDir::new("blob_flush_fail");
     let fail_flag = Arc::new(AtomicBool::new(true));
-    let fs = FaultBlobFs {
-        inner: OsFs::open(&dir.path, true).unwrap(),
-        fail_large_write: Arc::clone(&fail_flag),
-    };
+    let fs = HookedFs::new(
+        OsFs::open(&dir.path, true).unwrap(),
+        FaultBlobHooks {
+            fail_large_write: Arc::clone(&fail_flag),
+        },
+    );
 
     let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
     let val1 = vec![0x11u8; 4096];
@@ -296,83 +250,28 @@ fn append_blob_flush_failure_preserves_write_offset_and_prior_buffered_records()
 
 #[test]
 fn append_blob_into_skips_file_len_syscall_on_known_range_and_still_rejects_oversized_ptr() {
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CountingLenFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
+    struct CountingLenHooks {
         file_len_calls: Arc<AtomicUsize>,
     }
 
-    impl PlatformFile for CountingLenFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
+    impl FsHooks for CountingLenHooks {
+        fn file_len(&self, _name: &str, inner: &dyn PlatformFile) -> io::Result<u64> {
             self.file_len_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct CountingLenFs {
-        inner: OsFs,
-        file_len_calls: Arc<AtomicUsize>,
-    }
-
-    impl PlatformFs for CountingLenFs {
-        type File = CountingLenFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(CountingLenFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                file_len_calls: Arc::clone(&self.file_len_calls),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.file_len()
         }
     }
 
     let dir = TempTestDir::new("blob_cached_len");
     let calls = Arc::new(AtomicUsize::new(0));
-    let fs = CountingLenFs {
-        inner: OsFs::open(&dir.path, true).unwrap(),
-        file_len_calls: Arc::clone(&calls),
-    };
+    let fs = HookedFs::new(
+        OsFs::open(&dir.path, true).unwrap(),
+        CountingLenHooks {
+            file_len_calls: Arc::clone(&calls),
+        },
+    );
 
     let mut writer = BlobSegmentWriter::open(&fs, BlobKind::Standard, 0, 1).unwrap();
     let reader = writer.reader();
@@ -423,25 +322,27 @@ fn append_blob_into_skips_file_len_syscall_on_known_range_and_still_rejects_over
 
 #[test]
 fn validate_blob_ptr_streams_large_blob_in_bounded_chunks_and_detects_corruption() {
-    use crate::pal::OsFile;
+    use crate::pal::test_fs::{FsHooks, HookedFile};
     use std::sync::atomic::{AtomicU8, AtomicUsize};
 
     const INJECT_NONE: u8 = 0;
     const INJECT_EOF_SECOND_READ: u8 = 1;
     const INJECT_IO_ERR_SECOND_READ: u8 = 2;
 
-    struct SpyStreamFile {
-        inner: Arc<OsFile>,
+    struct SpyStreamHooks {
         max_read_len: AtomicUsize,
         read_calls: AtomicUsize,
         inject_mode: AtomicU8,
     }
 
-    impl PlatformFile for SpyStreamFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    impl FsHooks for SpyStreamHooks {
+        fn read_exact_at(
+            &self,
+            _name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
             let call = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_read_len.fetch_max(buf.len(), Ordering::SeqCst);
             if call == 2 {
@@ -458,29 +359,7 @@ fn validate_blob_ptr_streams_large_blob_in_bounded_chunks_and_detects_corruption
                     _ => {}
                 }
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
+            inner.read_exact_at(buf, offset)
         }
     }
 
@@ -498,27 +377,26 @@ fn validate_blob_ptr_streams_large_blob_in_bounded_chunks_and_detects_corruption
     writer.sync_durable().unwrap();
     drop(writer);
 
+    let blob_name = format_std_blob_file_name(1);
     let rw_file = fs
-        .open_file(
-            &format_std_blob_file_name(1),
-            false,
-            true,
-            OpenHint::ImmutableSequential,
-        )
+        .open_file(&blob_name, false, true, OpenHint::ImmutableSequential)
         .unwrap();
     let file_len = rw_file.file_len().unwrap();
-    let spy = Arc::new(SpyStreamFile {
-        inner: Arc::clone(&rw_file),
-        max_read_len: AtomicUsize::new(0),
-        read_calls: AtomicUsize::new(0),
-        inject_mode: AtomicU8::new(INJECT_NONE),
-    });
+    let spy = Arc::new(HookedFile::new(
+        Arc::clone(&rw_file),
+        blob_name,
+        SpyStreamHooks {
+            max_read_len: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+            inject_mode: AtomicU8::new(INJECT_NONE),
+        },
+    ));
     let reader = BlobSegmentReader::new_with_len(Arc::clone(&spy), 1, file_len);
 
     // Intact 256 KB blob must validate in bounded <= 64 KB chunks over multiple reads.
     assert!(reader.validate_blob_ptr(&ptr).unwrap());
-    assert!(spy.max_read_len.load(Ordering::SeqCst) <= 64 * 1024);
-    assert!(spy.read_calls.load(Ordering::SeqCst) >= 5);
+    assert!(spy.hooks().max_read_len.load(Ordering::SeqCst) <= 64 * 1024);
+    assert!(spy.hooks().read_calls.load(Ordering::SeqCst) >= 5);
     assert!(
         reader
             .validate_blob_ptr_for_key(&long_ptr, Some(&long_key))
@@ -539,19 +417,21 @@ fn validate_blob_ptr_streams_large_blob_in_bounded_chunks_and_detects_corruption
     assert!(!reader.validate_blob_ptr(&bad_crc).unwrap());
 
     // Mid-stream UnexpectedEof resolves to Ok(false); real I/O error propagates Err.
-    spy.read_calls.store(0, Ordering::SeqCst);
-    spy.inject_mode
+    spy.hooks().read_calls.store(0, Ordering::SeqCst);
+    spy.hooks()
+        .inject_mode
         .store(INJECT_EOF_SECOND_READ, Ordering::SeqCst);
     assert!(!reader.validate_blob_ptr(&ptr).unwrap());
 
-    spy.read_calls.store(0, Ordering::SeqCst);
-    spy.inject_mode
+    spy.hooks().read_calls.store(0, Ordering::SeqCst);
+    spy.hooks()
+        .inject_mode
         .store(INJECT_IO_ERR_SECOND_READ, Ordering::SeqCst);
     assert_eq!(
         reader.validate_blob_ptr(&ptr).unwrap_err().kind(),
         io::ErrorKind::Other
     );
-    spy.inject_mode.store(INJECT_NONE, Ordering::SeqCst);
+    spy.hooks().inject_mode.store(INJECT_NONE, Ordering::SeqCst);
 
     // Flipping a byte near the tail of the 256 KB payload must fail streaming CRC32C check.
     let tail_off = u64::from(ptr.offset) + u64::from(ptr.len) - 7;

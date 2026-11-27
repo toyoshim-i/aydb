@@ -282,24 +282,21 @@ fn standby_manifest_survives_commits_and_restart_sweep_and_serves_fallback() {
     assert_eq!(mgr.state().checkpoint_lsn, 3);
 }
 
-/// Test-only `PlatformFs` that fails manifest opens with a non-corruption error on demand.
-struct FlakyManifestFs {
-    inner: OsFs,
+/// Test-only [`crate::pal::test_fs::FsHooks`] that fails manifest opens with a non-corruption error.
+struct FlakyManifestHooks {
     fail_manifest_open: std::sync::atomic::AtomicBool,
     fail_target: Option<String>,
     blocked_open_attempts: std::sync::atomic::AtomicUsize,
 }
 
-impl PlatformFs for FlakyManifestFs {
-    type File = <OsFs as PlatformFs>::File;
-
-    fn open_file(
+impl crate::pal::test_fs::FsHooks for FlakyManifestHooks {
+    fn before_open_file(
         &self,
         rel_name: &str,
         create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
+        _writable: bool,
+        _hint: OpenHint,
+    ) -> io::Result<()> {
         let matches_target = match &self.fail_target {
             Some(name) => rel_name == name,
             None => rel_name.starts_with("manifest_"),
@@ -314,19 +311,7 @@ impl PlatformFs for FlakyManifestFs {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
-        self.inner.open_file(rel_name, create, writable, hint)
-    }
-
-    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        self.inner.remove_file(rel_name)
-    }
-
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-
-    fn root_path(&self) -> &std::path::Path {
-        self.inner.root_path()
+        Ok(())
     }
 }
 
@@ -335,12 +320,14 @@ fn transient_manifest_io_error_does_not_roll_back_or_sweep() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let tmp = TempTestDir::new("flaky_manifest");
-    let fs = Arc::new(FlakyManifestFs {
-        inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-        fail_manifest_open: AtomicBool::new(false),
-        fail_target: None,
-        blocked_open_attempts: AtomicUsize::new(0),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("open OsFs"),
+        FlakyManifestHooks {
+            fail_manifest_open: AtomicBool::new(false),
+            fail_target: None,
+            blocked_open_attempts: AtomicUsize::new(0),
+        },
+    ));
 
     {
         let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("open fresh");
@@ -366,7 +353,7 @@ fn transient_manifest_io_error_does_not_roll_back_or_sweep() {
 
     let files_before = fs.list_files().unwrap();
 
-    fs.fail_manifest_open.store(true, Ordering::SeqCst);
+    fs.hooks().fail_manifest_open.store(true, Ordering::SeqCst);
     let res = BootMetaManager::open_or_recover(Arc::clone(&fs));
     assert_eq!(
         res.err().expect("transient error must fail open").kind(),
@@ -383,7 +370,7 @@ fn transient_manifest_io_error_does_not_roll_back_or_sweep() {
         "nothing may be swept"
     );
 
-    fs.fail_manifest_open.store(false, Ordering::SeqCst);
+    fs.hooks().fail_manifest_open.store(false, Ordering::SeqCst);
     let mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).expect("reopen after clear");
     assert_eq!(mgr.state().generation, 3);
     assert_eq!(mgr.state().checkpoint_lsn, 4242);
@@ -430,16 +417,18 @@ fn healthy_active_manifest_opens_without_reading_corrupt_or_failing_standby_mani
     // Corrupt the standby manifest on disk AND block any attempt to open it.
     let standby_name = format_manifest_file_name(standby_mf_id);
     std::fs::write(tmp.path.join(&standby_name), b"corrupt standby manifest").unwrap();
-    let fs = Arc::new(FlakyManifestFs {
-        inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-        fail_manifest_open: AtomicBool::new(true),
-        fail_target: Some(standby_name.clone()),
-        blocked_open_attempts: AtomicUsize::new(0),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("open OsFs"),
+        FlakyManifestHooks {
+            fail_manifest_open: AtomicBool::new(true),
+            fail_target: Some(standby_name.clone()),
+            blocked_open_attempts: AtomicUsize::new(0),
+        },
+    ));
 
     let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs))
         .expect("healthy active manifest must open without touching standby manifest");
-    assert_eq!(fs.blocked_open_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(fs.hooks().blocked_open_attempts.load(Ordering::SeqCst), 0);
     assert_eq!(mgr.state().generation, 3);
     assert_eq!(mgr.state().checkpoint_lsn, 222);
     assert_eq!(mgr.state().active_manifest_seq_id, Some(active_mf_id));
@@ -609,81 +598,46 @@ enum BootMetaEvent {
 
 type EventLog = Arc<std::sync::Mutex<Vec<BootMetaEvent>>>;
 
-/// Test-only `PlatformFs` that records the writes and syncs issued on `boot_meta.db`.
-struct LoggingFs {
-    inner: OsFs,
+/// Test-only [`crate::pal::test_fs::FsHooks`] recording writes and syncs issued on `boot_meta.db`.
+struct LoggingHooks {
     log: EventLog,
 }
 
-struct LoggingFile {
-    inner: Arc<<OsFs as PlatformFs>::File>,
-    log: Option<EventLog>,
-}
-
-impl LoggingFile {
-    fn record(&self, event: BootMetaEvent) {
-        if let Some(log) = &self.log {
-            log.lock().unwrap().push(event);
-        }
-    }
-}
-
-impl PlatformFile for LoggingFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.record(BootMetaEvent::Write(offset));
-        self.inner.write_all_at(buf, offset)
-    }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-        self.record(BootMetaEvent::Preallocate(target_len));
-        self.inner.preallocate(target_len, strategy)
-    }
-    fn sync_barrier(&self) -> io::Result<()> {
-        self.inner.sync_barrier()
-    }
-    fn sync_durable(&self) -> io::Result<()> {
-        self.record(BootMetaEvent::Sync);
-        self.inner.sync_durable()
-    }
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
-    }
-}
-
-impl PlatformFs for LoggingFs {
-    type File = LoggingFile;
-
-    fn open_file(
+impl crate::pal::test_fs::FsHooks for LoggingHooks {
+    fn write_all_at(
         &self,
-        rel_name: &str,
-        create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        Ok(Arc::new(LoggingFile {
-            inner: self.inner.open_file(rel_name, create, writable, hint)?,
-            log: (rel_name == BOOT_META_FILE_NAME).then(|| Arc::clone(&self.log)),
-        }))
+        name: &str,
+        inner: &dyn PlatformFile,
+        buf: &[u8],
+        offset: u64,
+    ) -> io::Result<()> {
+        if name == BOOT_META_FILE_NAME {
+            self.log.lock().unwrap().push(BootMetaEvent::Write(offset));
+        }
+        inner.write_all_at(buf, offset)
     }
 
-    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        self.inner.remove_file(rel_name)
+    fn preallocate(
+        &self,
+        name: &str,
+        inner: &dyn PlatformFile,
+        target_len: u64,
+        strategy: PreallocStrategy,
+    ) -> io::Result<()> {
+        if name == BOOT_META_FILE_NAME {
+            self.log
+                .lock()
+                .unwrap()
+                .push(BootMetaEvent::Preallocate(target_len));
+        }
+        inner.preallocate(target_len, strategy)
     }
 
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-
-    fn root_path(&self) -> &std::path::Path {
-        self.inner.root_path()
+    fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+        if name == BOOT_META_FILE_NAME {
+            self.log.lock().unwrap().push(BootMetaEvent::Sync);
+        }
+        inner.sync_durable()
     }
 }
 
@@ -698,10 +652,12 @@ fn first_slot_write_after_open_is_preceded_by_a_sync_of_boot_meta() {
         mgr.commit_update(|st| st.checkpoint_lsn = 2).unwrap();
     }
     let log: EventLog = Arc::default();
-    let fs = Arc::new(LoggingFs {
-        inner: OsFs::open(&tmp.path, true).expect("reopen OsFs"),
-        log: Arc::clone(&log),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("reopen OsFs"),
+        LoggingHooks {
+            log: Arc::clone(&log),
+        },
+    ));
     let mut mgr = BootMetaManager::open_or_recover(fs).unwrap();
     mgr.commit_update(|st| st.checkpoint_lsn = 3).unwrap();
     mgr.commit_update(|st| st.checkpoint_lsn = 4).unwrap();
@@ -987,10 +943,12 @@ fn open_deferred_sweep_defers_preallocate_and_sync_until_mutation() {
         .unwrap();
 
     let log: EventLog = Arc::default();
-    let fs = Arc::new(LoggingFs {
-        inner: OsFs::open(&tmp.path, true).expect("reopen OsFs"),
-        log: Arc::clone(&log),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).expect("reopen OsFs"),
+        LoggingHooks {
+            log: Arc::clone(&log),
+        },
+    ));
     let mut mgr = BootMetaManager::open_or_recover_deferred_sweep(fs).unwrap();
     assert!(
         log.lock().unwrap().is_empty(),
@@ -1015,86 +973,47 @@ fn open_deferred_sweep_defers_preallocate_and_sync_until_mutation() {
 
 #[test]
 fn missing_boot_meta_propagates_wal_io_error_without_creating_boot_meta() {
-    struct InjectWalIoErrorFs {
-        inner: OsFs,
+    struct InjectWalIoErrorHooks {
         fail_open: bool,
         fail_len: bool,
     }
-    struct InjectWalLenFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        fail_len: bool,
-    }
-    impl PlatformFile for InjectWalLenFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            if self.fail_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "injected wal_sync file_len failure",
-                ));
-            }
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-    impl PlatformFs for InjectWalIoErrorFs {
-        type File = InjectWalLenFile;
-        fn open_file(
+    impl crate::pal::test_fs::FsHooks for InjectWalIoErrorHooks {
+        fn before_open_file(
             &self,
             rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
+            _create: bool,
+            _writable: bool,
+            _hint: OpenHint,
+        ) -> io::Result<()> {
             if self.fail_open && rel_name == crate::wal::WAL_SYNC_FILE_NAME {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "injected wal_sync open failure",
                 ));
             }
-            Ok(Arc::new(InjectWalLenFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                fail_len: self.fail_len && rel_name == crate::wal::WAL_SYNC_FILE_NAME,
-            }))
+            Ok(())
         }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &std::path::Path {
-            self.inner.root_path()
+        fn file_len(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<u64> {
+            if self.fail_len && name == crate::wal::WAL_SYNC_FILE_NAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected wal_sync file_len failure",
+                ));
+            }
+            inner.file_len()
         }
     }
 
     for (fail_open, fail_len) in [(true, false), (false, true)] {
         let tmp = TempTestDir::new("missing_boot_meta_wal_err");
         std::fs::write(tmp.path.join(crate::wal::WAL_SYNC_FILE_NAME), b"wal").unwrap();
-        let fs = Arc::new(InjectWalIoErrorFs {
-            inner: OsFs::open(&tmp.path, true).expect("open OsFs"),
-            fail_open,
-            fail_len,
-        });
+        let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+            OsFs::open(&tmp.path, true).expect("open OsFs"),
+            InjectWalIoErrorHooks {
+                fail_open,
+                fail_len,
+            },
+        ));
         let err = BootMetaManager::open_or_recover(fs)
             .err()
             .expect("WAL I/O error must propagate instead of creating blank boot_meta");
@@ -1333,76 +1252,26 @@ fn write_rejects_oversized_manifest_and_cleans_up_failed_manifest_file() {
     assert_eq!(mgr.state().checkpoint_lsn, 55);
 
     // Part 2: failure writing/syncing an external manifest cleans up the file while consuming SeqID.
-    struct FailManifestSyncFs {
-        inner: OsFs,
+    struct FailManifestSyncHooks {
         fail_sync: Arc<AtomicBool>,
     }
-    struct FailManifestSyncFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_manifest: bool,
-        fail_sync: Arc<AtomicBool>,
-    }
-    impl PlatformFile for FailManifestSyncFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            if self.is_manifest && self.fail_sync.swap(false, Ordering::SeqCst) {
+    impl crate::pal::test_fs::FsHooks for FailManifestSyncHooks {
+        fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+            if name.starts_with("manifest_") && self.fail_sync.swap(false, Ordering::SeqCst) {
                 return Err(io::Error::other("simulated manifest sync failure"));
             }
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-    impl PlatformFs for FailManifestSyncFs {
-        type File = FailManifestSyncFile;
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(FailManifestSyncFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_manifest: rel_name.starts_with("manifest_"),
-                fail_sync: Arc::clone(&self.fail_sync),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &std::path::Path {
-            self.inner.root_path()
+            inner.sync_durable()
         }
     }
 
     let tmp2 = TempTestDir::new("manifest_cleanup");
     let fail_sync = Arc::new(AtomicBool::new(true));
-    let fs2 = Arc::new(FailManifestSyncFs {
-        inner: OsFs::open(&tmp2.path, true).unwrap(),
-        fail_sync: Arc::clone(&fail_sync),
-    });
+    let fs2 = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp2.path, true).unwrap(),
+        FailManifestSyncHooks {
+            fail_sync: Arc::clone(&fail_sync),
+        },
+    ));
     let mut mgr2 = BootMetaManager::open_or_recover(Arc::clone(&fs2)).unwrap();
     let err = mgr2
         .commit_update(|s| {
@@ -1536,62 +1405,42 @@ fn crc_valid_duplicate_seq_id_slot_and_manifest_abort_without_fallback() {
 
 #[test]
 fn try_process_pending_deletes_batches_into_single_sync_dir() {
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct BatchDeleteCountFs {
-        inner: OsFs,
+    struct BatchDeleteCountHooks {
         unsynced_deletes: AtomicUsize,
         sync_dir_calls: AtomicUsize,
         fail_sync: std::sync::atomic::AtomicBool,
     }
 
-    impl PlatformFs for BatchDeleteCountFs {
-        type File = crate::pal::OsFile;
-
-        fn open_file(
+    impl crate::pal::test_fs::FsHooks for BatchDeleteCountHooks {
+        fn remove_file_unsynced(
             &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: crate::pal::OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            self.inner.open_file(rel_name, create, writable, hint)
-        }
-
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-
-        fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
+            _rel_name: &str,
+            default: &mut dyn FnMut() -> io::Result<()>,
+        ) -> io::Result<()> {
             self.unsynced_deletes.fetch_add(1, Ordering::Relaxed);
-            self.inner.remove_file_unsynced(rel_name)
+            default()
         }
 
-        fn sync_dir(&self) -> io::Result<()> {
+        fn sync_dir(&self, default: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
             self.sync_dir_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_sync.swap(false, Ordering::Relaxed) {
                 return Err(io::Error::other("injected directory flush failure"));
             }
-            self.inner.sync_dir()
-        }
-
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            default()
         }
     }
 
     let tmp = TempTestDir::new("meta_batch_delete_sync_dir");
-    let fs = Arc::new(BatchDeleteCountFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        unsynced_deletes: AtomicUsize::new(0),
-        sync_dir_calls: AtomicUsize::new(0),
-        fail_sync: std::sync::atomic::AtomicBool::new(false),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        BatchDeleteCountHooks {
+            unsynced_deletes: AtomicUsize::new(0),
+            sync_dir_calls: AtomicUsize::new(0),
+            fail_sync: std::sync::atomic::AtomicBool::new(false),
+        },
+    ));
     let mut mgr = BootMetaManager::open_or_recover(Arc::clone(&fs)).unwrap();
 
     let mut names = Vec::new();
@@ -1601,9 +1450,9 @@ fn try_process_pending_deletes_batches_into_single_sync_dir() {
         names.push(name);
     }
 
-    fs.unsynced_deletes.store(0, Ordering::Relaxed);
-    fs.sync_dir_calls.store(0, Ordering::Relaxed);
-    fs.fail_sync.store(true, Ordering::Relaxed);
+    fs.hooks().unsynced_deletes.store(0, Ordering::Relaxed);
+    fs.hooks().sync_dir_calls.store(0, Ordering::Relaxed);
+    fs.hooks().fail_sync.store(true, Ordering::Relaxed);
     mgr.commit_update(|s| {
         for name in &names {
             s.queue_pending_delete(name.clone());
@@ -1611,11 +1460,11 @@ fn try_process_pending_deletes_batches_into_single_sync_dir() {
     })
     .unwrap();
 
-    assert_eq!(fs.unsynced_deletes.load(Ordering::Relaxed), 5);
-    assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fs.hooks().unsynced_deletes.load(Ordering::Relaxed), 5);
+    assert_eq!(fs.hooks().sync_dir_calls.load(Ordering::Relaxed), 1);
     assert_eq!(mgr.state().pending_delete_files, names);
     mgr.try_process_pending_deletes();
-    assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(fs.hooks().sync_dir_calls.load(Ordering::Relaxed), 2);
     assert!(mgr.state().pending_delete_files.is_empty());
     for name in &names {
         assert!(!tmp.path.join(name).exists());
@@ -1749,24 +1598,20 @@ fn try_seq_id_allocation_fails_cleanly_before_u64_max() {
 
 #[test]
 fn open_recovers_concurrently_populated_boot_meta_after_initial_not_found() {
-    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct RacingOpenFs {
-        inner: OsFs,
+    struct RacingOpenHooks {
         inject_not_found: AtomicBool,
     }
 
-    impl PlatformFs for RacingOpenFs {
-        type File = crate::pal::OsFile;
-
-        fn open_file(
+    impl crate::pal::test_fs::FsHooks for RacingOpenHooks {
+        fn before_open_file(
             &self,
             rel_name: &str,
             create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
+            _writable: bool,
+            _hint: OpenHint,
+        ) -> io::Result<()> {
             if rel_name == BOOT_META_FILE_NAME
                 && !create
                 && self.inject_not_found.swap(false, Ordering::AcqRel)
@@ -1776,27 +1621,7 @@ fn open_recovers_concurrently_populated_boot_meta_after_initial_not_found() {
                     "simulated concurrent creation race",
                 ));
             }
-            self.inner.open_file(rel_name, create, writable, hint)
-        }
-
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-
-        fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file_unsynced(rel_name)
-        }
-
-        fn sync_dir(&self) -> io::Result<()> {
-            self.inner.sync_dir()
-        }
-
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            Ok(())
         }
     }
 
@@ -1817,10 +1642,12 @@ fn open_recovers_concurrently_populated_boot_meta_after_initial_not_found() {
         .unwrap();
     }
 
-    let racing_fs = Arc::new(RacingOpenFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        inject_not_found: AtomicBool::new(true),
-    });
+    let racing_fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        RacingOpenHooks {
+            inject_not_found: AtomicBool::new(true),
+        },
+    ));
     let p2 = BootMetaManager::open_or_recover_deferred_sweep(racing_fs).unwrap();
     assert!(p2.state().generation > 1);
     assert_eq!(p2.state().checkpoint_lsn, 42);
@@ -1831,50 +1658,30 @@ fn open_recovers_concurrently_populated_boot_meta_after_initial_not_found() {
 
 #[test]
 fn all_zero_boot_meta_initializes_without_dropping_handle() {
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct OpenCountFs {
-        inner: OsFs,
+    struct OpenCountHooks {
         boot_meta_opens: AtomicUsize,
         sync_dir_calls: AtomicUsize,
     }
 
-    impl PlatformFs for OpenCountFs {
-        type File = crate::pal::OsFile;
-
-        fn open_file(
+    impl crate::pal::test_fs::FsHooks for OpenCountHooks {
+        fn before_open_file(
             &self,
             rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
+            _create: bool,
+            _writable: bool,
+            _hint: OpenHint,
+        ) -> io::Result<()> {
             if rel_name == BOOT_META_FILE_NAME {
                 self.boot_meta_opens.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.open_file(rel_name, create, writable, hint)
+            Ok(())
         }
 
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-
-        fn remove_file_unsynced(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file_unsynced(rel_name)
-        }
-
-        fn sync_dir(&self) -> io::Result<()> {
+        fn sync_dir(&self, default: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
             self.sync_dir_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.sync_dir()
-        }
-
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            default()
         }
     }
 
@@ -1884,13 +1691,15 @@ fn all_zero_boot_meta_initializes_without_dropping_handle() {
         vec![0u8; BOOT_META_FILE_SIZE as usize],
     )
     .unwrap();
-    let fs = Arc::new(OpenCountFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        boot_meta_opens: AtomicUsize::new(0),
-        sync_dir_calls: AtomicUsize::new(0),
-    });
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        OpenCountHooks {
+            boot_meta_opens: AtomicUsize::new(0),
+            sync_dir_calls: AtomicUsize::new(0),
+        },
+    ));
     let mgr = BootMetaManager::open_or_recover_deferred_sweep(Arc::clone(&fs)).unwrap();
     assert_eq!(mgr.state().generation, 1);
-    assert_eq!(fs.boot_meta_opens.load(Ordering::Relaxed), 1);
-    assert_eq!(fs.sync_dir_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fs.hooks().boot_meta_opens.load(Ordering::Relaxed), 1);
+    assert_eq!(fs.hooks().sync_dir_calls.load(Ordering::Relaxed), 1);
 }

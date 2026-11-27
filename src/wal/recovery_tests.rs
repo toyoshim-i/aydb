@@ -734,45 +734,39 @@ fn a_newer_epoch_sector_does_not_end_the_scan() {
     assert_eq!(past_lsns(&rec), vec![3]);
 }
 
-/// A file that counts what is read from it.
-struct CountingFile {
-    inner: Arc<File>,
+#[derive(Default)]
+struct CountingHooks {
     reads: std::sync::atomic::AtomicUsize,
     bytes: std::sync::atomic::AtomicUsize,
 }
 
-impl PlatformFile for CountingFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+impl crate::pal::test_fs::FsHooks for CountingHooks {
+    fn read_at(
+        &self,
+        _name: &str,
+        inner: &dyn PlatformFile,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> io::Result<usize> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bytes
             .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_at(buf, offset)
+        inner.read_at(buf, offset)
     }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+
+    fn read_exact_at(
+        &self,
+        _name: &str,
+        inner: &dyn PlatformFile,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> io::Result<()> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bytes
             .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.inner.write_all_at(buf, offset)
-    }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-        self.inner.preallocate(target_len, strategy)
-    }
-    fn sync_barrier(&self) -> io::Result<()> {
-        self.inner.sync_barrier()
-    }
-    fn sync_durable(&self) -> io::Result<()> {
-        self.inner.sync_durable()
-    }
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
+        inner.read_exact_at(buf, offset)
     }
 }
 
@@ -792,15 +786,21 @@ fn a_file_left_over_from_an_older_epoch_is_read_one_window_at_most() {
     w.append_batch(&put(1, 0, 0)).unwrap();
     w.seal_open_sector_for_durability().unwrap();
     set_epoch(&w, 0, 0, true);
-    let counting = CountingFile {
-        inner: Arc::clone(w.file()),
-        reads: Default::default(),
-        bytes: Default::default(),
-    };
+    let counting = crate::pal::test_fs::HookedFile::new(
+        Arc::clone(w.file()),
+        WAL_BUF_FILE_NAME,
+        CountingHooks::default(),
+    );
     let rec = recover_single_wal_stream(&counting, 1).unwrap();
     assert!(rec.batches.is_empty());
-    let reads = counting.reads.load(std::sync::atomic::Ordering::Relaxed);
-    let bytes = counting.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let reads = counting
+        .hooks()
+        .reads
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = counting
+        .hooks()
+        .bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reads, 1);
     assert_eq!(bytes, WAL_SECTOR_SIZE, "read {bytes} bytes");
 }
@@ -819,16 +819,25 @@ fn clean_reopen_probes_only_first_sector_and_fragmented_sector0_still_recovers()
             WalStreamMode::BufferedImmediateOsCache,
         )
         .unwrap();
-        let counting = CountingFile {
-            inner: Arc::clone(w.file()),
-            reads: Default::default(),
-            bytes: Default::default(),
-        };
+        let counting = crate::pal::test_fs::HookedFile::new(
+            Arc::clone(w.file()),
+            WAL_BUF_FILE_NAME,
+            CountingHooks::default(),
+        );
         let rec = recover_single_wal_stream(&counting, 1).unwrap();
         assert!(rec.batches.is_empty());
-        assert_eq!(counting.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(
-            counting.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            counting
+                .hooks()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counting
+                .hooks()
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
             WAL_SECTOR_SIZE
         );
     }

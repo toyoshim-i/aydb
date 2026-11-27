@@ -296,88 +296,39 @@ fn blob_segments_and_coalesced_wal_survive_reopen_before_flush_memtable() {
 
 #[test]
 fn flush_memtable_metadata_fault_preserves_entries_until_reopen() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicBool;
 
-    struct FaultFile<F> {
-        inner: Arc<F>,
-        name: String,
+    struct FaultHooks {
         fail_boot_meta_sync: Arc<AtomicBool>,
     }
 
-    impl<F: PlatformFile> PlatformFile for FaultFile<F> {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            if self.name == "boot_meta.db" && self.fail_boot_meta_sync.load(Ordering::SeqCst) {
+    impl FsHooks for FaultHooks {
+        fn write_all_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name == "boot_meta.db" && self.fail_boot_meta_sync.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "simulated boot_meta write failure",
                 ));
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct FaultFs {
-        inner: OsFs,
-        fail_boot_meta_sync: Arc<AtomicBool>,
-    }
-
-    impl PlatformFs for FaultFs {
-        type File = FaultFile<<OsFs as PlatformFs>::File>;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(FaultFile {
-                inner,
-                name: rel_name.to_string(),
-                fail_boot_meta_sync: Arc::clone(&self.fail_boot_meta_sync),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("flush_fault_retry");
     let fail_flag = Arc::new(AtomicBool::new(false));
-    let fs = Arc::new(FaultFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        fail_boot_meta_sync: Arc::clone(&fail_flag),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        FaultHooks {
+            fail_boot_meta_sync: Arc::clone(&fail_flag),
+        },
+    ));
 
     let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
     for i in 0..20u32 {
@@ -2343,76 +2294,26 @@ fn secondary_index_streaming_known_absent_hint_and_batched_blob_relocation() {
 
 #[test]
 fn wal_write_failure_poisons_engine_until_reopen() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
-    struct WalFaultFile<F> {
-        inner: Arc<F>,
-        is_wal: bool,
+    struct WalFaultHooks {
         fail_next_wal_write: Arc<AtomicBool>,
     }
 
-    impl<F: PlatformFile> PlatformFile for WalFaultFile<F> {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            if self.is_wal && self.fail_next_wal_write.swap(false, Ordering::SeqCst) {
+    impl crate::pal::test_fs::FsHooks for WalFaultHooks {
+        fn write_all_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if (name == "wal_sync.db" || name == "wal_buf.db")
+                && self.fail_next_wal_write.swap(false, Ordering::SeqCst)
+            {
                 return Err(io::Error::other("simulated WAL write failure"));
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct WalFaultFs {
-        inner: OsFs,
-        fail_next_wal_write: Arc<AtomicBool>,
-    }
-
-    impl PlatformFs for WalFaultFs {
-        type File = WalFaultFile<<OsFs as PlatformFs>::File>;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(WalFaultFile {
-                inner,
-                is_wal: rel_name == "wal_sync.db" || rel_name == "wal_buf.db",
-                fail_next_wal_write: Arc::clone(&self.fail_next_wal_write),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
@@ -2422,10 +2323,12 @@ fn wal_write_failure_poisons_engine_until_reopen() {
     ] {
         let tmp = TempTestDir::new("wal_poison");
         let flag = Arc::new(AtomicBool::new(false));
-        let fs = Arc::new(WalFaultFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            fail_next_wal_write: Arc::clone(&flag),
-        });
+        let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            WalFaultHooks {
+                fail_next_wal_write: Arc::clone(&flag),
+            },
+        ));
 
         let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
         engine
@@ -2640,8 +2543,7 @@ fn stale_same_epoch_wal_sectors_are_not_replayed_after_halt_at_sector_zero() {
 
 #[test]
 fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicI64;
 
     // `mode`: 0 = normal, 1 = silently drop boot_meta writes (lost-write crash simulation),
@@ -2650,20 +2552,18 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
         mode: AtomicI64,
         budget: AtomicI64,
     }
-    struct FaultFile<F> {
-        inner: Arc<F>,
-        name: String,
+    struct FaultHooks {
         ctl: Arc<Ctl>,
     }
-    impl<F: PlatformFile> PlatformFile for FaultFile<F> {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            if self.name == "boot_meta.db" {
+    impl FsHooks for FaultHooks {
+        fn write_all_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name == "boot_meta.db" {
                 match self.ctl.mode.load(Ordering::SeqCst) {
                     1 => return Ok(()),
                     2 if self.ctl.budget.fetch_sub(1, Ordering::SeqCst) <= 0 => {
@@ -2672,52 +2572,7 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
                     _ => {}
                 }
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-    struct FaultFs {
-        inner: OsFs,
-        ctl: Arc<Ctl>,
-    }
-    impl PlatformFs for FaultFs {
-        type File = FaultFile<<OsFs as PlatformFs>::File>;
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(FaultFile {
-                inner,
-                name: rel_name.to_string(),
-                ctl: Arc::clone(&self.ctl),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
@@ -2726,10 +2581,12 @@ fn open_time_catalog_commit_does_not_persist_wal_replay_dead_bytes() {
         mode: AtomicI64::new(0),
         budget: AtomicI64::new(0),
     });
-    let fs = Arc::new(FaultFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        ctl: Arc::clone(&ctl),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        FaultHooks {
+            ctl: Arc::clone(&ctl),
+        },
+    ));
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 128;
     cfg.max_blob_segment_bytes = 16 * 1024;
@@ -3580,81 +3437,35 @@ fn savepoint_rollback_restores_overlay_precisely() {
 
 #[test]
 fn commit_wal_failure_leaves_memtable_without_tx_data_and_poisons_engine() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicBool;
 
-    struct FaultFile<F> {
-        inner: Arc<F>,
-        name: String,
+    struct FaultHooks {
         fail_wal: Arc<AtomicBool>,
     }
-    impl<F: PlatformFile> PlatformFile for FaultFile<F> {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            if self.name.starts_with("wal_") && self.fail_wal.load(Ordering::SeqCst) {
+    impl FsHooks for FaultHooks {
+        fn write_all_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("wal_") && self.fail_wal.load(Ordering::SeqCst) {
                 return Err(io::Error::other("simulated WAL write failure"));
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-    struct FaultFs {
-        inner: OsFs,
-        fail_wal: Arc<AtomicBool>,
-    }
-    impl PlatformFs for FaultFs {
-        type File = FaultFile<<OsFs as PlatformFs>::File>;
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(FaultFile {
-                inner,
-                name: rel_name.to_string(),
-                fail_wal: Arc::clone(&self.fail_wal),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("overlay_commit_fault");
     let fail = Arc::new(AtomicBool::new(false));
-    let fs = Arc::new(FaultFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        fail_wal: Arc::clone(&fail),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        FaultHooks {
+            fail_wal: Arc::clone(&fail),
+        },
+    ));
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     engine
         .put_row(1, b"committed", b"c", &[], WriteDurability::BufferedFast)
@@ -4204,85 +4015,37 @@ fn background_install_with_dirty_memtable_does_not_persist_blob_accounting() {
 
 #[test]
 fn transient_blob_read_error_during_recovery_fails_open_without_dropping_commit() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicBool;
 
-    struct BlobReadFaultFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_blob: bool,
+    struct BlobReadFaultHooks {
         fail_blob_reads: Arc<AtomicBool>,
     }
 
-    impl PlatformFile for BlobReadFaultFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_blob && self.fail_blob_reads.load(Ordering::SeqCst) {
+    impl FsHooks for BlobReadFaultHooks {
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("blob_") && self.fail_blob_reads.load(Ordering::SeqCst) {
                 return Err(io::Error::other("simulated transient read error"));
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct BlobReadFaultFs {
-        inner: OsFs,
-        fail_blob_reads: Arc<AtomicBool>,
-    }
-
-    impl PlatformFs for BlobReadFaultFs {
-        type File = BlobReadFaultFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(BlobReadFaultFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_blob: rel_name.starts_with("blob_"),
-                fail_blob_reads: Arc::clone(&self.fail_blob_reads),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.read_exact_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("recovery_transient_blob_error");
     let fail_flag = Arc::new(AtomicBool::new(false));
     let make_fs = || {
-        Arc::new(BlobReadFaultFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            fail_blob_reads: Arc::clone(&fail_flag),
-        })
+        Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            BlobReadFaultHooks {
+                fail_blob_reads: Arc::clone(&fail_flag),
+            },
+        ))
     };
     let value = vec![0x11u8; 8192];
     {
@@ -4523,8 +4286,7 @@ fn open_reconciles_capped_rows_into_the_rotated_wal_epoch() {
 /// at the time of each WAL sync.
 mod blob_sync_counting {
     use super::*;
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicU64;
 
     #[derive(Default)]
@@ -4533,96 +4295,51 @@ mod blob_sync_counting {
         pub blob_syncs_at_wal_sync: AtomicU64,
         pub fail_blob_sync: std::sync::atomic::AtomicBool,
     }
-    pub struct CountFile<F> {
-        inner: Arc<F>,
-        name: String,
-        ctl: Arc<Ctl>,
+    pub struct CountHooks {
+        pub ctl: Arc<Ctl>,
     }
-    impl<F> CountFile<F> {
-        fn record_wal_sync(&self) {
-            if self.name.starts_with("wal_sync") {
+    impl CountHooks {
+        fn record_wal_sync(&self, name: &str) {
+            if name.starts_with("wal_sync") {
                 self.ctl
                     .blob_syncs_at_wal_sync
                     .store(self.ctl.blob_syncs.load(Ordering::SeqCst), Ordering::SeqCst);
             }
         }
     }
-    impl<F: PlatformFile> PlatformFile for CountFile<F> {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
+    impl FsHooks for CountHooks {
+        fn sync_barrier(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+            self.record_wal_sync(name);
+            inner.sync_barrier()
         }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.record_wal_sync();
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.record_wal_sync();
-            if self.name.starts_with("blob_") {
+        fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+            self.record_wal_sync(name);
+            if name.starts_with("blob_") {
                 if self.ctl.fail_blob_sync.load(Ordering::SeqCst) {
                     return Err(io::Error::other("simulated blob sync failure"));
                 }
                 self.ctl.blob_syncs.fetch_add(1, Ordering::SeqCst);
             }
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
+            inner.sync_durable()
         }
     }
-    pub struct CountFs {
-        pub inner: OsFs,
-        pub ctl: Arc<Ctl>,
-    }
-    impl PlatformFs for CountFs {
-        type File = CountFile<<OsFs as PlatformFs>::File>;
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(CountFile {
-                inner,
-                name: rel_name.to_string(),
-                ctl: Arc::clone(&self.ctl),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
-        }
+    pub fn open_fs(dir: &std::path::Path, ctl: &Arc<Ctl>) -> Arc<HookedFs<OsFs, CountHooks>> {
+        Arc::new(HookedFs::new(
+            OsFs::open(dir, true).unwrap(),
+            CountHooks {
+                ctl: Arc::clone(ctl),
+            },
+        ))
     }
 }
 
 #[test]
 fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
-    use blob_sync_counting::{CountFs, Ctl};
+    use blob_sync_counting::{Ctl, open_fs};
 
     let tmp = TempTestDir::new("idle_blob_sync");
     let ctl = Arc::new(Ctl::default());
-    let fs = Arc::new(CountFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        ctl: Arc::clone(&ctl),
-    });
+    let fs = open_fs(&tmp.path, &ctl);
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     let sync = WriteDurability::SyncTransactional;
 
@@ -4660,14 +4377,11 @@ fn inline_sync_commit_does_not_fsync_idle_blob_segments() {
 
 #[test]
 fn failed_blob_sync_poisons_instead_of_being_retried() {
-    use blob_sync_counting::{CountFs, Ctl};
+    use blob_sync_counting::{Ctl, open_fs};
 
     let tmp = TempTestDir::new("blob_sync_poison");
     let ctl = Arc::new(Ctl::default());
-    let fs = Arc::new(CountFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        ctl: Arc::clone(&ctl),
-    });
+    let fs = open_fs(&tmp.path, &ctl);
     let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
     let sync = WriteDurability::SyncTransactional;
     engine.begin_transaction();
@@ -7259,89 +6973,32 @@ fn multiple_capped_tables_simultaneous_lru_blob_rollover_preserves_durability_an
 
 #[test]
 fn reopen_skips_blob_fsync_when_replayed_pointers_are_within_cataloged_len() {
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
 
-    struct CountingSyncFile {
-        rel_name: String,
-        inner: Arc<<OsFs as PlatformFs>::File>,
+    struct CountingSyncHooks {
         sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     }
 
-    impl PlatformFile for CountingSyncFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_durable(&self) -> io::Result<()> {
+    impl FsHooks for CountingSyncHooks {
+        fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
             *self
                 .sync_counts
                 .lock()
                 .unwrap()
-                .entry(self.rel_name.clone())
+                .entry(name.to_owned())
                 .or_insert(0) += 1;
-            self.inner.sync_durable()
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct CountingSyncFs {
-        inner: OsFs,
-        sync_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    }
-
-    impl PlatformFs for CountingSyncFs {
-        type File = CountingSyncFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(CountingSyncFile {
-                rel_name: rel_name.to_string(),
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                sync_counts: Arc::clone(&self.sync_counts),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.sync_durable()
         }
     }
 
     let tmp = TempTestDir::new("skip_cataloged_blob_sync");
     let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let fs = Arc::new(CountingSyncFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        sync_counts: Arc::clone(&sync_counts),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        CountingSyncHooks {
+            sync_counts: Arc::clone(&sync_counts),
+        },
+    ));
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 64;
     cfg.max_blob_segment_bytes = 300;
@@ -7745,107 +7402,52 @@ fn chunked_std_blob_relocation_steps_interleave_and_reclaim_segments() {
 
 type SyncCountMap = Arc<std::sync::Mutex<HashMap<String, usize>>>;
 
-struct CountedFile {
-    rel_name: String,
-    inner: Arc<<OsFs as PlatformFs>::File>,
+struct CountedHooks {
     sync_counts: SyncCountMap,
     barrier_counts: SyncCountMap,
 }
 
-impl PlatformFile for CountedFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.inner.write_all_at(buf, offset)
-    }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(
-        &self,
-        target_len: u64,
-        strategy: crate::pal::PreallocStrategy,
-    ) -> io::Result<()> {
-        self.inner.preallocate(target_len, strategy)
-    }
-    fn sync_durable(&self) -> io::Result<()> {
+impl crate::pal::test_fs::FsHooks for CountedHooks {
+    fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
         *self
             .sync_counts
             .lock()
             .unwrap()
-            .entry(self.rel_name.clone())
+            .entry(name.to_owned())
             .or_insert(0) += 1;
-        self.inner.sync_durable()
+        inner.sync_durable()
     }
-    fn sync_barrier(&self) -> io::Result<()> {
+
+    fn sync_barrier(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
         *self
             .barrier_counts
             .lock()
             .unwrap()
-            .entry(self.rel_name.clone())
+            .entry(name.to_owned())
             .or_insert(0) += 1;
-        self.inner.sync_barrier()
-    }
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
+        inner.sync_barrier()
     }
 }
 
-struct CountedFs {
-    inner: OsFs,
-    sync_counts: SyncCountMap,
-    barrier_counts: SyncCountMap,
-}
+type CountedFs = crate::pal::test_fs::HookedFs<OsFs, CountedHooks>;
 
-impl CountedFs {
-    fn open_counted(dir: &std::path::Path) -> (Arc<Self>, SyncCountMap, SyncCountMap) {
-        let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let barrier_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let fs = Arc::new(Self {
-            inner: OsFs::open(dir, true).unwrap(),
+fn open_counted(dir: &std::path::Path) -> (Arc<CountedFs>, SyncCountMap, SyncCountMap) {
+    let sync_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let barrier_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let fs = Arc::new(crate::pal::test_fs::HookedFs::new(
+        OsFs::open(dir, true).unwrap(),
+        CountedHooks {
             sync_counts: Arc::clone(&sync_counts),
             barrier_counts: Arc::clone(&barrier_counts),
-        });
-        (fs, sync_counts, barrier_counts)
-    }
-}
-
-impl PlatformFs for CountedFs {
-    type File = CountedFile;
-
-    fn open_file(
-        &self,
-        rel_name: &str,
-        create: bool,
-        writable: bool,
-        hint: crate::pal::OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        Ok(Arc::new(CountedFile {
-            rel_name: rel_name.to_string(),
-            inner: self.inner.open_file(rel_name, create, writable, hint)?,
-            sync_counts: Arc::clone(&self.sync_counts),
-            barrier_counts: Arc::clone(&self.barrier_counts),
-        }))
-    }
-    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        self.inner.remove_file(rel_name)
-    }
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-    fn root_path(&self) -> &std::path::Path {
-        self.inner.root_path()
-    }
+        },
+    ));
+    (fs, sync_counts, barrier_counts)
 }
 
 #[test]
 fn prepare_compaction_and_wal_rotation_avoid_redundant_fsyncs() {
     let tmp = TempTestDir::new("pm1_avoid_redundant_fsyncs");
-    let (fs, sync_counts, _) = CountedFs::open_counted(&tmp.path);
+    let (fs, sync_counts, _) = open_counted(&tmp.path);
 
     let mut cfg = EngineConfig::default();
     cfg.auto_compact_segment_threshold = 2;
@@ -7952,7 +7554,7 @@ fn prepare_compaction_and_wal_rotation_avoid_redundant_fsyncs() {
 #[test]
 fn evict_until_within_quota_batches_window_evictions_and_promotions_into_single_wal_sync() {
     let tmp = TempTestDir::new("ph4_batched_eviction");
-    let (fs, _, barrier_counts) = CountedFs::open_counted(&tmp.path);
+    let (fs, _, barrier_counts) = open_counted(&tmp.path);
 
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 256;
@@ -8061,7 +7663,7 @@ fn evict_until_within_quota_batches_window_evictions_and_promotions_into_single_
 #[test]
 fn multi_chunk_sync_transaction_uses_single_wal_barrier_and_recovers_cleanly() {
     let tmp = TempTestDir::new("ph5_multi_chunk_single_barrier");
-    let (fs, _, barrier_counts) = CountedFs::open_counted(&tmp.path);
+    let (fs, _, barrier_counts) = open_counted(&tmp.path);
 
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 1024 * 1024;
@@ -8428,75 +8030,25 @@ fn table_id_allocation_returns_error_when_all_ids_exhausted() {
 
 #[test]
 fn open_inner_wal_replay_skips_idx_reads_for_non_blob_namespaces() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicUsize;
 
-    struct IdxBlockSpyFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_idx: bool,
+    struct IdxBlockSpyHooks {
         block_reads: Arc<AtomicUsize>,
     }
 
-    impl PlatformFile for IdxBlockSpyFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_idx && buf.len() == crate::index::IDX_BLOCK_SIZE {
+    impl FsHooks for IdxBlockSpyHooks {
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("idx_") && buf.len() == crate::index::IDX_BLOCK_SIZE {
                 self.block_reads.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct IdxBlockSpyFs {
-        inner: OsFs,
-        block_reads: Arc<AtomicUsize>,
-    }
-
-    impl PlatformFs for IdxBlockSpyFs {
-        type File = IdxBlockSpyFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(IdxBlockSpyFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_idx: rel_name.starts_with("idx_"),
-                block_reads: Arc::clone(&self.block_reads),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.read_exact_at(buf, offset)
         }
     }
 
@@ -8541,10 +8093,12 @@ fn open_inner_wal_replay_skips_idx_reads_for_non_blob_namespaces() {
         // Drop without flushing MemTable so next open replays the WAL records above.
     }
 
-    let spy_fs = Arc::new(IdxBlockSpyFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        block_reads: Arc::clone(&reads),
-    });
+    let spy_fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        IdxBlockSpyHooks {
+            block_reads: Arc::clone(&reads),
+        },
+    ));
     reads.store(0, Ordering::Relaxed);
     let mut reopened = StorageEngine::open(spy_fs, cfg).unwrap();
     assert_eq!(
@@ -8568,84 +8122,36 @@ fn open_inner_wal_replay_skips_idx_reads_for_non_blob_namespaces() {
 
 #[test]
 fn prefetch_lazy_blobs_coalesces_reads_and_isolates_bad_pointer() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicUsize;
 
-    struct BlobReadSpyFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_blob: bool,
+    struct BlobReadSpyHooks {
         reads: Arc<AtomicUsize>,
     }
 
-    impl PlatformFile for BlobReadSpyFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_blob {
+    impl FsHooks for BlobReadSpyHooks {
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("blob_std_") {
                 self.reads.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    struct BlobReadSpyFs {
-        inner: OsFs,
-        reads: Arc<AtomicUsize>,
-    }
-
-    impl PlatformFs for BlobReadSpyFs {
-        type File = BlobReadSpyFile;
-
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(BlobReadSpyFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_blob: rel_name.starts_with("blob_std_"),
-                reads: Arc::clone(&self.reads),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.read_exact_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("prefetch_coalesce_isolate");
     let reads = Arc::new(AtomicUsize::new(0));
-    let fs = Arc::new(BlobReadSpyFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        reads: Arc::clone(&reads),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        BlobReadSpyHooks {
+            reads: Arc::clone(&reads),
+        },
+    ));
 
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 256;
@@ -10423,8 +9929,6 @@ fn flushing_wal_phase_keeps_start_meta_settled_during_ring_full_rotation() {
 
 #[test]
 fn healthy_capability_rejects_all_three_poison_sources_and_preserves_reads() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
     let assert_rejected_and_readable = |eng: &mut StorageEngine<OsFs>| {
@@ -10490,76 +9994,34 @@ fn healthy_capability_rejects_all_three_poison_sources_and_preserves_reads() {
 
     // 3. BootMetaManager poison alone
     {
-        struct MetaWriteFaultFile {
-            inner: Arc<<OsFs as PlatformFs>::File>,
-            is_meta: bool,
+        use crate::pal::test_fs::{FsHooks, HookedFs};
+
+        struct MetaWriteFaultHooks {
             fail_meta: Arc<AtomicBool>,
         }
-        impl PlatformFile for MetaWriteFaultFile {
-            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-                self.inner.read_at(buf, offset)
-            }
-            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-                self.inner.read_exact_at(buf, offset)
-            }
-            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-                if self.is_meta && self.fail_meta.load(Ordering::SeqCst) {
+        impl FsHooks for MetaWriteFaultHooks {
+            fn write_all_at(
+                &self,
+                name: &str,
+                inner: &dyn PlatformFile,
+                buf: &[u8],
+                offset: u64,
+            ) -> io::Result<()> {
+                if name == "boot_meta.db" && self.fail_meta.load(Ordering::SeqCst) {
                     return Err(io::Error::other("injected boot_meta write failure"));
                 }
-                self.inner.write_all_at(buf, offset)
-            }
-            fn file_len(&self) -> io::Result<u64> {
-                self.inner.file_len()
-            }
-            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-                self.inner.preallocate(target_len, strategy)
-            }
-            fn sync_barrier(&self) -> io::Result<()> {
-                self.inner.sync_barrier()
-            }
-            fn sync_durable(&self) -> io::Result<()> {
-                self.inner.sync_durable()
-            }
-            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-                self.inner.evict_os_cache(offset, len)
-            }
-        }
-        struct MetaWriteFaultFs {
-            inner: OsFs,
-            fail_meta: Arc<AtomicBool>,
-        }
-        impl PlatformFs for MetaWriteFaultFs {
-            type File = MetaWriteFaultFile;
-            fn open_file(
-                &self,
-                rel_name: &str,
-                create: bool,
-                writable: bool,
-                hint: OpenHint,
-            ) -> io::Result<Arc<Self::File>> {
-                Ok(Arc::new(MetaWriteFaultFile {
-                    inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                    is_meta: rel_name == "boot_meta.db",
-                    fail_meta: Arc::clone(&self.fail_meta),
-                }))
-            }
-            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-                self.inner.remove_file(rel_name)
-            }
-            fn list_files(&self) -> io::Result<Vec<String>> {
-                self.inner.list_files()
-            }
-            fn root_path(&self) -> &Path {
-                self.inner.root_path()
+                inner.write_all_at(buf, offset)
             }
         }
 
         let tmp = TempTestDir::new("m2_poison_meta_mgr");
         let fail_meta = Arc::new(AtomicBool::new(false));
-        let fs = Arc::new(MetaWriteFaultFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            fail_meta: Arc::clone(&fail_meta),
-        });
+        let fs = Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            MetaWriteFaultHooks {
+                fail_meta: Arc::clone(&fail_meta),
+            },
+        ));
         let mut engine = StorageEngine::open(fs, EngineConfig::default()).unwrap();
         engine
             .put_row(1, b"k1", b"v1", &[], WriteDurability::SyncTransactional)
@@ -10600,14 +10062,11 @@ fn healthy_capability_auto_poisons_on_wal_append_and_sync_errors_while_defer_bar
 
     // 2. Blob sync failure auto-poisons `EngineHealth` inside `HealthyEngine::sync_active_std_writer`.
     {
-        use blob_sync_counting::{CountFs, Ctl};
+        use blob_sync_counting::{Ctl, open_fs};
 
         let tmp = TempTestDir::new("m2_auto_poison_blob_sync");
         let ctl = Arc::new(Ctl::default());
-        let fs = Arc::new(CountFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            ctl: Arc::clone(&ctl),
-        });
+        let fs = open_fs(&tmp.path, &ctl);
         let mut cfg = EngineConfig::default();
         cfg.inline_threshold_bytes = 64;
         let mut engine = StorageEngine::open(fs, cfg).unwrap();
@@ -10630,96 +10089,49 @@ fn healthy_capability_auto_poisons_on_wal_append_and_sync_errors_while_defer_bar
 
 #[test]
 fn healthy_capability_allows_retryable_buf_flush_without_poisoning() {
-    use crate::pal::PreallocStrategy;
-    use std::path::Path;
+    use crate::pal::test_fs::{FsHooks, HookedFs};
     use std::sync::atomic::AtomicBool;
 
-    struct RetryableFlushFile {
-        inner: Arc<<OsFs as PlatformFs>::File>,
-        is_buf_wal: bool,
-        is_std_blob: bool,
+    struct RetryableFlushHooks {
         fail_next_buf_wal: Arc<AtomicBool>,
         fail_next_std_blob: Arc<AtomicBool>,
     }
-    impl PlatformFile for RetryableFlushFile {
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            if self.is_buf_wal && self.fail_next_buf_wal.swap(false, Ordering::SeqCst) {
+    impl FsHooks for RetryableFlushHooks {
+        fn write_all_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &[u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name == "wal_buf.db" && self.fail_next_buf_wal.swap(false, Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "transient buf wal write failure",
                 ));
             }
-            if self.is_std_blob && self.fail_next_std_blob.swap(false, Ordering::SeqCst) {
+            if name.starts_with("blob_std_")
+                && self.fail_next_std_blob.swap(false, Ordering::SeqCst)
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "transient blob buffer write failure",
                 ));
             }
-            self.inner.write_all_at(buf, offset)
-        }
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-    struct RetryableFlushFs {
-        inner: OsFs,
-        fail_next_buf_wal: Arc<AtomicBool>,
-        fail_next_std_blob: Arc<AtomicBool>,
-    }
-    impl PlatformFs for RetryableFlushFs {
-        type File = RetryableFlushFile;
-        fn open_file(
-            &self,
-            rel_name: &str,
-            create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            Ok(Arc::new(RetryableFlushFile {
-                inner: self.inner.open_file(rel_name, create, writable, hint)?,
-                is_buf_wal: rel_name == "wal_buf.db",
-                is_std_blob: rel_name.starts_with("blob_std_"),
-                fail_next_buf_wal: Arc::clone(&self.fail_next_buf_wal),
-                fail_next_std_blob: Arc::clone(&self.fail_next_std_blob),
-            }))
-        }
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+            inner.write_all_at(buf, offset)
         }
     }
 
     let tmp = TempTestDir::new("m2_retryable_buf_flush");
     let fail_buf = Arc::new(AtomicBool::new(false));
     let fail_blob = Arc::new(AtomicBool::new(false));
-    let fs = Arc::new(RetryableFlushFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        fail_next_buf_wal: Arc::clone(&fail_buf),
-        fail_next_std_blob: Arc::clone(&fail_blob),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        RetryableFlushHooks {
+            fail_next_buf_wal: Arc::clone(&fail_buf),
+            fail_next_std_blob: Arc::clone(&fail_blob),
+        },
+    ));
     let mut cfg = EngineConfig::default();
     cfg.inline_threshold_bytes = 64;
     cfg.buf_wal_mode = WalStreamMode::BufferedUserSpaceCoalesced;

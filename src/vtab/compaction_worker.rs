@@ -563,7 +563,6 @@ mod tests {
     use crate::engine::{EngineConfig, WriteDurability};
     use crate::pal::{OpenHint, PlatformFile};
     use crate::util::test_util::TempTestDir;
-    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -600,88 +599,49 @@ mod tests {
         assert!(!engine.read().unwrap().background_compaction_enabled());
     }
 
-    struct FaultCompactionFs {
-        inner: Arc<OsFs>,
+    use crate::pal::test_fs::{FsHooks, HookedFs};
+
+    struct FaultCompactionHooks {
         fail_idx_create: AtomicBool,
         panic_idx_read: Arc<AtomicBool>,
         idx_create_attempts: AtomicUsize,
     }
 
-    struct FaultCompactionFile {
-        inner: Arc<crate::pal::OsFile>,
-        is_idx: bool,
-        panic_idx_read: Arc<AtomicBool>,
-    }
-
-    impl PlatformFile for FaultCompactionFile {
-        fn file_len(&self) -> io::Result<u64> {
-            self.inner.file_len()
-        }
-        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            self.inner.read_at(buf, offset)
-        }
-        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-            if self.is_idx && self.panic_idx_read.load(Ordering::Acquire) && offset == 0 {
-                panic!("injected idx read panic during job.run");
-            }
-            self.inner.read_exact_at(buf, offset)
-        }
-        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-            self.inner.write_all_at(buf, offset)
-        }
-        fn preallocate(
-            &self,
-            target_len: u64,
-            strategy: crate::pal::PreallocStrategy,
-        ) -> io::Result<()> {
-            self.inner.preallocate(target_len, strategy)
-        }
-        fn sync_barrier(&self) -> io::Result<()> {
-            self.inner.sync_barrier()
-        }
-        fn sync_durable(&self) -> io::Result<()> {
-            self.inner.sync_durable()
-        }
-        fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.inner.evict_os_cache(offset, len)
-        }
-    }
-
-    impl PlatformFs for FaultCompactionFs {
-        type File = FaultCompactionFile;
-
-        fn open_file(
+    impl FsHooks for FaultCompactionHooks {
+        fn before_open_file(
             &self,
             rel_name: &str,
             create: bool,
-            writable: bool,
-            hint: OpenHint,
-        ) -> io::Result<Arc<Self::File>> {
-            let is_idx = rel_name.starts_with("idx_");
-            if is_idx && create {
+            _writable: bool,
+            _hint: OpenHint,
+        ) -> io::Result<()> {
+            if rel_name.starts_with("idx_") && create {
                 self.idx_create_attempts.fetch_add(1, Ordering::Relaxed);
                 if self.fail_idx_create.load(Ordering::Acquire) {
                     return Err(io::Error::other("injected compaction idx creation failure"));
                 }
             }
-            let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-            Ok(Arc::new(FaultCompactionFile {
-                inner,
-                is_idx,
-                panic_idx_read: Arc::clone(&self.panic_idx_read),
-            }))
+            Ok(())
         }
 
-        fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-            self.inner.remove_file(rel_name)
-        }
-        fn list_files(&self) -> io::Result<Vec<String>> {
-            self.inner.list_files()
-        }
-        fn root_path(&self) -> &Path {
-            self.inner.root_path()
+        fn read_exact_at(
+            &self,
+            name: &str,
+            inner: &dyn PlatformFile,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> io::Result<()> {
+            if name.starts_with("idx_")
+                && self.panic_idx_read.load(Ordering::Acquire)
+                && offset == 0
+            {
+                panic!("injected idx read panic during job.run");
+            }
+            inner.read_exact_at(buf, offset)
         }
     }
+
+    type FaultCompactionFs = HookedFs<OsFs, FaultCompactionHooks>;
 
     fn setup_pending_idx_engine(
         dir_prefix: &str,
@@ -691,12 +651,14 @@ mod tests {
         Arc<RwLock<StorageEngine<FaultCompactionFs>>>,
     ) {
         let tmp = TempTestDir::new(dir_prefix);
-        let fs = Arc::new(FaultCompactionFs {
-            inner: Arc::new(OsFs::open(&tmp.path, true).unwrap()),
-            fail_idx_create: AtomicBool::new(false),
-            panic_idx_read: Arc::new(AtomicBool::new(false)),
-            idx_create_attempts: AtomicUsize::new(0),
-        });
+        let fs = Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            FaultCompactionHooks {
+                fail_idx_create: AtomicBool::new(false),
+                panic_idx_read: Arc::new(AtomicBool::new(false)),
+                idx_create_attempts: AtomicUsize::new(0),
+            },
+        ));
         let mut cfg = EngineConfig::default();
         cfg.memtable_capacity_bytes = 512;
         cfg.auto_compact_segment_threshold = 2;
@@ -719,8 +681,8 @@ mod tests {
     #[test]
     fn compaction_worker_records_maintenance_failure_and_backs_off_on_error() {
         let (_tmp, fs, engine) = setup_pending_idx_engine("worker_err_backoff");
-        fs.idx_create_attempts.store(0, Ordering::Relaxed);
-        fs.fail_idx_create.store(true, Ordering::Release);
+        fs.hooks().idx_create_attempts.store(0, Ordering::Relaxed);
+        fs.hooks().fail_idx_create.store(true, Ordering::Release);
 
         let signal = Signal::new();
         let hook_sig = Arc::clone(&signal);
@@ -755,7 +717,7 @@ mod tests {
             failures_later - failures_snap
         );
 
-        fs.fail_idx_create.store(false, Ordering::Release);
+        fs.hooks().fail_idx_create.store(false, Ordering::Release);
         signal.notify();
         let finish_deadline = Instant::now() + Duration::from_secs(5);
         while engine.read().unwrap().compaction_pending() {
@@ -783,7 +745,7 @@ mod tests {
             .install_compaction_hook(worker_id, Arc::new(move || hook_sig.notify()));
         assert!(engine.read().unwrap().compaction_pending());
 
-        fs.panic_idx_read.store(true, Ordering::Release);
+        fs.hooks().panic_idx_read.store(true, Ordering::Release);
         let alive = Arc::new(AtomicBool::new(true));
         let handle = spawn_worker_thread(
             Arc::clone(&engine),
@@ -1021,21 +983,15 @@ mod tests {
     #[test]
     fn compaction_worker_returns_deferred_on_install_contention_exhaustion() {
         // R3-L2: MAX_INSTALL_CONTENTION_RETRIES exhaustion returns PassOutcome::Deferred, not IdleOrDone.
+        type ContentionFs = HookedFs<OsFs, ContentionHooks>;
         type SharedContentionEngine = Arc<Mutex<Option<Arc<RwLock<StorageEngine<ContentionFs>>>>>>;
-        struct ContentionFs {
-            inner: OsFs,
+        struct ContentionHooks {
             engine: SharedContentionEngine,
             races_left: Arc<AtomicUsize>,
         }
-        struct ContentionFile {
-            inner: Arc<<OsFs as PlatformFs>::File>,
-            is_idx: bool,
-            engine: SharedContentionEngine,
-            races_left: Arc<AtomicUsize>,
-        }
-        impl ContentionFile {
-            fn maybe_race(&self) {
-                if !self.is_idx || self.races_left.load(Ordering::Acquire) == 0 {
+        impl ContentionHooks {
+            fn maybe_race(&self, name: &str) {
+                if !name.starts_with("idx_") || self.races_left.load(Ordering::Acquire) == 0 {
                     return;
                 }
                 let eng_arc = self.engine.lock().unwrap().clone();
@@ -1063,78 +1019,48 @@ mod tests {
                 }
             }
         }
-        impl PlatformFile for ContentionFile {
-            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-                self.maybe_race();
-                self.inner.read_at(buf, offset)
-            }
-            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-                self.maybe_race();
-                self.inner.read_exact_at(buf, offset)
-            }
-            fn read_many_at(&self, requests: &mut [(u64, &mut [u8])]) -> io::Result<()> {
-                self.maybe_race();
-                self.inner.read_many_at(requests)
-            }
-            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-                self.inner.write_all_at(buf, offset)
-            }
-            fn file_len(&self) -> io::Result<u64> {
-                self.inner.file_len()
-            }
-            fn preallocate(
+        impl FsHooks for ContentionHooks {
+            fn read_at(
                 &self,
-                target_len: u64,
-                strategy: crate::pal::PreallocStrategy,
+                name: &str,
+                inner: &dyn PlatformFile,
+                buf: &mut [u8],
+                offset: u64,
+            ) -> io::Result<usize> {
+                self.maybe_race(name);
+                inner.read_at(buf, offset)
+            }
+            fn read_exact_at(
+                &self,
+                name: &str,
+                inner: &dyn PlatformFile,
+                buf: &mut [u8],
+                offset: u64,
             ) -> io::Result<()> {
-                self.inner.preallocate(target_len, strategy)
+                self.maybe_race(name);
+                inner.read_exact_at(buf, offset)
             }
-            fn sync_barrier(&self) -> io::Result<()> {
-                self.inner.sync_barrier()
-            }
-            fn sync_durable(&self) -> io::Result<()> {
-                self.inner.sync_durable()
-            }
-            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-                self.inner.evict_os_cache(offset, len)
-            }
-        }
-        impl PlatformFs for ContentionFs {
-            type File = ContentionFile;
-            fn open_file(
+            fn read_many_at(
                 &self,
-                rel_name: &str,
-                create: bool,
-                writable: bool,
-                hint: OpenHint,
-            ) -> io::Result<Arc<Self::File>> {
-                let inner = self.inner.open_file(rel_name, create, writable, hint)?;
-                Ok(Arc::new(ContentionFile {
-                    inner,
-                    is_idx: rel_name.starts_with("idx_"),
-                    engine: Arc::clone(&self.engine),
-                    races_left: Arc::clone(&self.races_left),
-                }))
-            }
-            fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-                self.inner.remove_file(rel_name)
-            }
-            fn list_files(&self) -> io::Result<Vec<String>> {
-                self.inner.list_files()
-            }
-            fn root_path(&self) -> &Path {
-                self.inner.root_path()
+                name: &str,
+                inner: &dyn PlatformFile,
+                requests: &mut [(u64, &mut [u8])],
+            ) -> io::Result<()> {
+                self.maybe_race(name);
+                inner.read_many_at(requests)
             }
         }
 
         let tmp2 = TempTestDir::new("r3_l2_contention_deferred");
         let shared_engine = Arc::new(Mutex::new(None));
         let races_left = Arc::new(AtomicUsize::new(0));
-        let cfs = Arc::new(ContentionFs {
-            inner: OsFs::open(&tmp2.path, true).unwrap(),
-            engine: Arc::clone(&shared_engine),
-            races_left: Arc::clone(&races_left),
-        });
+        let cfs = Arc::new(HookedFs::new(
+            OsFs::open(&tmp2.path, true).unwrap(),
+            ContentionHooks {
+                engine: Arc::clone(&shared_engine),
+                races_left: Arc::clone(&races_left),
+            },
+        ));
         let mut cfg2 = EngineConfig::default();
         cfg2.memtable_capacity_bytes = 512;
         cfg2.auto_compact_segment_threshold = 2;

@@ -3,75 +3,28 @@
 //! that the eviction at connect changed.
 
 use super::*;
-use crate::pal::{OpenHint, OsFs, PlatformFile, PlatformFs, PreallocStrategy};
+use crate::pal::test_fs::{FsHooks, HookedFs};
+use crate::pal::{OsFs, PlatformFile};
 use crate::util::test_util::TempTestDir;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct CountFile<F> {
-    inner: Arc<F>,
+struct CountHooks {
     syncs: Arc<AtomicUsize>,
 }
 
-impl<F: PlatformFile> PlatformFile for CountFile<F> {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.inner.write_all_at(buf, offset)
-    }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-        self.inner.preallocate(target_len, strategy)
-    }
-    fn sync_barrier(&self) -> io::Result<()> {
+impl FsHooks for CountHooks {
+    fn sync_barrier(&self, _name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
         self.syncs.fetch_add(1, Ordering::SeqCst);
-        self.inner.sync_barrier()
+        inner.sync_barrier()
     }
-    fn sync_durable(&self) -> io::Result<()> {
+
+    fn sync_durable(&self, _name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
         self.syncs.fetch_add(1, Ordering::SeqCst);
-        self.inner.sync_durable()
-    }
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
+        inner.sync_durable()
     }
 }
 
-struct CountFs {
-    inner: OsFs,
-    syncs: Arc<AtomicUsize>,
-}
-
-impl PlatformFs for CountFs {
-    type File = CountFile<<OsFs as PlatformFs>::File>;
-
-    fn open_file(
-        &self,
-        rel_name: &str,
-        create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        Ok(Arc::new(CountFile {
-            inner: self.inner.open_file(rel_name, create, writable, hint)?,
-            syncs: Arc::clone(&self.syncs),
-        }))
-    }
-    fn remove_file(&self, rel_name: &str) -> io::Result<()> {
-        self.inner.remove_file(rel_name)
-    }
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-    fn root_path(&self) -> &Path {
-        self.inner.root_path()
-    }
-}
+type CountFs = HookedFs<OsFs, CountHooks>;
 
 const TABLE: u16 = 7;
 const QUOTA: u64 = 20_000;
@@ -86,10 +39,12 @@ impl Lab {
     fn new(name: &str) -> Self {
         let dir = TempTestDir::new(name);
         let syncs = Arc::new(AtomicUsize::new(0));
-        let fs = Arc::new(CountFs {
-            inner: OsFs::open(&dir.path, true).unwrap(),
-            syncs: Arc::clone(&syncs),
-        });
+        let fs = Arc::new(HookedFs::new(
+            OsFs::open(&dir.path, true).unwrap(),
+            CountHooks {
+                syncs: Arc::clone(&syncs),
+            },
+        ));
         Self {
             fs,
             syncs,

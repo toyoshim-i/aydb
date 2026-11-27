@@ -1,98 +1,43 @@
 use super::*;
 use crate::meta::format_idx_file_name;
-use crate::pal::{OsFile, OsFs, PreallocStrategy};
+use crate::pal::test_fs::{FsHooks, HookedFs};
+use crate::pal::{OsFs, PlatformFile};
 use crate::util::test_util::TempTestDir;
-use std::path::Path;
 use std::sync::atomic::AtomicU8;
 
-struct MetadataFaultFile {
-    inner: Arc<OsFile>,
-    is_metadata: bool,
-    is_manifest: bool,
+struct MetadataFaultHooks {
     fault: Arc<AtomicU8>,
 }
 
-impl PlatformFile for MetadataFaultFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        if self.is_metadata && self.fault.load(Ordering::SeqCst) == 1 {
+impl FsHooks for MetadataFaultHooks {
+    fn write_all_at(
+        &self,
+        name: &str,
+        inner: &dyn PlatformFile,
+        buf: &[u8],
+        offset: u64,
+    ) -> io::Result<()> {
+        if name == "boot_meta.db" && self.fault.load(Ordering::SeqCst) == 1 {
             return Err(io::Error::other("injected metadata write failure"));
         }
-        self.inner.write_all_at(buf, offset)
+        inner.write_all_at(buf, offset)
     }
 
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-
-    fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-        self.inner.preallocate(target_len, strategy)
-    }
-
-    fn sync_barrier(&self) -> io::Result<()> {
-        self.inner.sync_barrier()
-    }
-
-    fn sync_durable(&self) -> io::Result<()> {
-        self.inner.sync_durable()?;
-        if self.is_metadata && self.fault.load(Ordering::SeqCst) == 2 {
+    fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+        inner.sync_durable()?;
+        if name == "boot_meta.db" && self.fault.load(Ordering::SeqCst) == 2 {
             return Err(io::Error::other(
                 "injected metadata error after durable write",
             ));
         }
-        if self.is_manifest && self.fault.load(Ordering::SeqCst) == 3 {
+        if name.starts_with("manifest_") && self.fault.load(Ordering::SeqCst) == 3 {
             return Err(io::Error::other("injected manifest sync failure"));
         }
         Ok(())
     }
-
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
-    }
 }
 
-struct MetadataFaultFs {
-    inner: OsFs,
-    fault: Arc<AtomicU8>,
-}
-
-impl PlatformFs for MetadataFaultFs {
-    type File = MetadataFaultFile;
-
-    fn open_file(
-        &self,
-        name: &str,
-        create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        Ok(Arc::new(MetadataFaultFile {
-            inner: self.inner.open_file(name, create, writable, hint)?,
-            is_metadata: name == "boot_meta.db",
-            is_manifest: name.starts_with("manifest_"),
-            fault: Arc::clone(&self.fault),
-        }))
-    }
-
-    fn remove_file(&self, name: &str) -> io::Result<()> {
-        self.inner.remove_file(name)
-    }
-
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-
-    fn root_path(&self) -> &Path {
-        self.inner.root_path()
-    }
-}
+type MetadataFaultFs = HookedFs<OsFs, MetadataFaultHooks>;
 
 fn assert_fail_stop(engine: &mut StorageEngine<MetadataFaultFs>) {
     assert!(engine.is_poisoned());
@@ -134,10 +79,12 @@ fn uncertain_metadata_flush_keeps_output_until_reopen() {
     for fault_mode in [1, 2] {
         let tmp = TempTestDir::new("metadata_flush_uncertain");
         let fault = Arc::new(AtomicU8::new(0));
-        let fs = Arc::new(MetadataFaultFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            fault: Arc::clone(&fault),
-        });
+        let fs = Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            MetadataFaultHooks {
+                fault: Arc::clone(&fault),
+            },
+        ));
         let mut engine = StorageEngine::open(Arc::clone(&fs), EngineConfig::default()).unwrap();
         engine
             .put_row(1, b"key", b"value", &[], WriteDurability::SyncTransactional)
@@ -173,10 +120,12 @@ fn uncertain_metadata_compaction_keeps_inputs_and_output_until_reopen() {
     for fault_mode in [1, 2] {
         let tmp = TempTestDir::new("metadata_compaction_uncertain");
         let fault = Arc::new(AtomicU8::new(0));
-        let fs = Arc::new(MetadataFaultFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            fault: Arc::clone(&fault),
-        });
+        let fs = Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            MetadataFaultHooks {
+                fault: Arc::clone(&fault),
+            },
+        ));
         let mut config = EngineConfig::default();
         config.auto_compact_segment_threshold = 0;
         let mut engine = StorageEngine::open(Arc::clone(&fs), config.clone()).unwrap();
@@ -225,10 +174,12 @@ fn open_with_large_catalog(
 ) {
     let tmp = TempTestDir::new(name);
     let fault = Arc::new(AtomicU8::new(0));
-    let fs = Arc::new(MetadataFaultFs {
-        inner: OsFs::open(&tmp.path, true).unwrap(),
-        fault: Arc::clone(&fault),
-    });
+    let fs = Arc::new(HookedFs::new(
+        OsFs::open(&tmp.path, true).unwrap(),
+        MetadataFaultHooks {
+            fault: Arc::clone(&fault),
+        },
+    ));
     let mut config = EngineConfig::default();
     config.auto_compact_segment_threshold = 0;
     let mut engine = StorageEngine::open(Arc::clone(&fs), config.clone()).unwrap();

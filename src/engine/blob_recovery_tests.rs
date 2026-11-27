@@ -6,7 +6,7 @@
 //! file although a later, acknowledged WAL batch references it.
 
 use super::*;
-use crate::pal::{OsFile, OsFs};
+use crate::pal::OsFs;
 use crate::util::test_util::TempTestDir;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -63,66 +63,76 @@ fn recovery_rejects_an_intact_blob_bound_to_another_row() {
     assert!(!recovered.row_exists(1, b"later").unwrap());
 }
 
-/// `OsFs` with two additions: the next creation of a file whose name starts with `fail_prefix`
-/// creates it and then reports an error, and every file created that way is remembered as one
-/// whose directory entry is not durable (`volatile`) until it is removed.
-struct VolatileEntryFs {
-    inner: OsFs,
+use crate::pal::test_fs::{FsHooks, HookedFs};
+
+struct VolatileEntryHooks {
+    root: std::path::PathBuf,
     fail_next_create: AtomicBool,
     fail_prefix: &'static str,
     volatile: Mutex<BTreeSet<String>>,
 }
 
-impl PlatformFs for VolatileEntryFs {
-    type File = OsFile;
-
-    fn open_file(
+impl FsHooks for VolatileEntryHooks {
+    fn before_open_file(
         &self,
         name: &str,
         create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        let exists = self.inner.open_file(name, false, false, hint).is_ok();
+        _writable: bool,
+        _hint: OpenHint,
+    ) -> io::Result<()> {
+        let path = self.root.join(name);
         if create
-            && !exists
             && name.starts_with(self.fail_prefix)
+            && !path.exists()
             && self.fail_next_create.swap(false, Ordering::SeqCst)
         {
-            self.inner.open_file(name, true, writable, hint)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
             self.volatile.lock().unwrap().insert(name.to_string());
             return Err(io::Error::other("injected failure after file creation"));
         }
-        self.inner.open_file(name, create, writable, hint)
+        Ok(())
     }
 
-    fn remove_file(&self, name: &str) -> io::Result<()> {
+    fn remove_file(
+        &self,
+        name: &str,
+        default: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
         self.volatile.lock().unwrap().remove(name);
-        self.inner.remove_file(name)
+        default()
     }
 
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-
-    fn root_path(&self) -> &Path {
-        self.inner.root_path()
+    fn remove_file_unsynced(
+        &self,
+        name: &str,
+        default: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.volatile.lock().unwrap().remove(name);
+        default()
     }
 }
 
+type VolatileEntryFs = HookedFs<OsFs, VolatileEntryHooks>;
+
 fn open_fs(dir: &Path, fail_prefix: &'static str) -> Arc<VolatileEntryFs> {
-    Arc::new(VolatileEntryFs {
-        inner: OsFs::open(dir, true).unwrap(),
-        fail_next_create: AtomicBool::new(false),
-        fail_prefix,
-        volatile: Mutex::new(BTreeSet::new()),
-    })
+    Arc::new(HookedFs::new(
+        OsFs::open(dir, true).unwrap(),
+        VolatileEntryHooks {
+            root: dir.to_path_buf(),
+            fail_next_create: AtomicBool::new(false),
+            fail_prefix,
+            volatile: Mutex::new(BTreeSet::new()),
+        },
+    ))
 }
 
 /// A power loss as far as directory entries go: files created by an operation that reported
 /// failure lose their entry, everything else stays.
 fn lose_volatile_entries(fs: &VolatileEntryFs) {
-    for name in fs.volatile.lock().unwrap().iter() {
+    for name in fs.hooks().volatile.lock().unwrap().iter() {
         let _ = std::fs::remove_file(fs.root_path().join(name));
     }
 }
@@ -139,10 +149,10 @@ fn failed_create_then_retry_keeps_acknowledged_row(fail_prefix: &'static str, ta
     let value = vec![0x5Au8; 8000];
     let sync = WriteDurability::SyncTransactional;
 
-    fs.fail_next_create.store(true, Ordering::SeqCst);
+    fs.hooks().fail_next_create.store(true, Ordering::SeqCst);
     assert!(engine.put_row(table, b"lost", &value, &[], sync).is_err());
     assert!(!engine.is_poisoned());
-    assert_eq!(fs.volatile.lock().unwrap().len(), 1);
+    assert_eq!(fs.hooks().volatile.lock().unwrap().len(), 1);
 
     engine.put_row(table, b"acked", &value, &[], sync).unwrap();
     drop(engine);
@@ -283,81 +293,38 @@ struct FlakyCtl {
     fail_idx_remove: AtomicBool,
 }
 
-struct FlakyFile {
-    inner: Arc<OsFile>,
-    is_idx: bool,
+struct FlakyHooks {
     ctl: Arc<FlakyCtl>,
 }
 
-impl PlatformFile for FlakyFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.inner.read_at(buf, offset)
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        self.inner.read_exact_at(buf, offset)
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.inner.write_all_at(buf, offset)
-    }
-    fn file_len(&self) -> io::Result<u64> {
-        self.inner.file_len()
-    }
-    fn preallocate(
-        &self,
-        target_len: u64,
-        strategy: crate::pal::PreallocStrategy,
-    ) -> io::Result<()> {
-        self.inner.preallocate(target_len, strategy)
-    }
-    fn sync_barrier(&self) -> io::Result<()> {
-        self.inner.sync_barrier()
-    }
-    fn sync_durable(&self) -> io::Result<()> {
-        if self.is_idx && self.ctl.fail_idx_sync_once.swap(false, Ordering::SeqCst) {
+impl FsHooks for FlakyHooks {
+    fn sync_durable(&self, name: &str, inner: &dyn PlatformFile) -> io::Result<()> {
+        if name.starts_with("idx_") && self.ctl.fail_idx_sync_once.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("injected idx sync failure"));
         }
-        self.inner.sync_durable()
+        inner.sync_durable()
     }
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.evict_os_cache(offset, len)
-    }
-}
 
-struct FlakyFs {
-    inner: OsFs,
-    ctl: Arc<FlakyCtl>,
-}
-
-impl PlatformFs for FlakyFs {
-    type File = FlakyFile;
-
-    fn open_file(
+    fn remove_file(
         &self,
         name: &str,
-        create: bool,
-        writable: bool,
-        hint: OpenHint,
-    ) -> io::Result<Arc<Self::File>> {
-        Ok(Arc::new(FlakyFile {
-            inner: self.inner.open_file(name, create, writable, hint)?,
-            is_idx: name.starts_with("idx_"),
-            ctl: Arc::clone(&self.ctl),
-        }))
-    }
-
-    fn remove_file(&self, name: &str) -> io::Result<()> {
+        default: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
         if name.starts_with("idx_") && self.ctl.fail_idx_remove.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected idx remove failure"));
         }
-        self.inner.remove_file(name)
+        default()
     }
 
-    fn list_files(&self) -> io::Result<Vec<String>> {
-        self.inner.list_files()
-    }
-
-    fn root_path(&self) -> &Path {
-        self.inner.root_path()
+    fn remove_file_unsynced(
+        &self,
+        name: &str,
+        default: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if name.starts_with("idx_") && self.ctl.fail_idx_remove.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected idx remove failure"));
+        }
+        default()
     }
 }
 
@@ -370,10 +337,12 @@ fn failed_idx_flush_with_failed_cleanup_does_not_reuse_the_name() {
     let tmp = TempTestDir::new("idx_failed_flush");
     let ctl = Arc::new(FlakyCtl::default());
     let open = |ctl: &Arc<FlakyCtl>| {
-        Arc::new(FlakyFs {
-            inner: OsFs::open(&tmp.path, true).unwrap(),
-            ctl: Arc::clone(ctl),
-        })
+        Arc::new(HookedFs::new(
+            OsFs::open(&tmp.path, true).unwrap(),
+            FlakyHooks {
+                ctl: Arc::clone(ctl),
+            },
+        ))
     };
     let mut config = EngineConfig::default();
     config.auto_compact_segment_threshold = 0;

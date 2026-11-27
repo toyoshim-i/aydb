@@ -22,6 +22,9 @@ pub mod unix;
 #[cfg(unix)]
 pub use unix::{UnixPlatformFile as OsFile, UnixPlatformFs as OsFs};
 
+#[cfg(test)]
+pub(crate) mod test_fs;
+
 /// Access pattern and durability hints passed to the OS kernel when opening a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenHint {
@@ -518,51 +521,27 @@ mod tests {
 
     #[test]
     fn preallocate_physical_zero_fill_rolls_back_eof_on_error_and_allows_retry() {
+        use super::test_fs::{FsHooks, HookedFile};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct FailNthWriteFile {
-            inner: Arc<OsFile>,
+        struct FailNthWriteHooks {
             writes: AtomicUsize,
             fail_on: AtomicUsize,
         }
 
-        impl PlatformFile for FailNthWriteFile {
-            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-                self.inner.read_at(buf, offset)
-            }
-            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-                self.inner.read_exact_at(buf, offset)
-            }
-            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        impl FsHooks for FailNthWriteHooks {
+            fn write_all_at(
+                &self,
+                _name: &str,
+                inner: &dyn PlatformFile,
+                buf: &[u8],
+                offset: u64,
+            ) -> io::Result<()> {
                 let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if self.fail_on.load(Ordering::Relaxed) == n {
                     return Err(io::Error::other("injected ENOSPC"));
                 }
-                self.inner.write_all_at(buf, offset)
-            }
-            fn file_len(&self) -> io::Result<u64> {
-                self.inner.file_len()
-            }
-            fn preallocate(&self, target_len: u64, strategy: PreallocStrategy) -> io::Result<()> {
-                let current_len = self.file_len()?;
-                if current_len >= target_len {
-                    return Ok(());
-                }
-                if strategy == PreallocStrategy::LogicalExtendOnly {
-                    return self.inner.preallocate(target_len, strategy);
-                }
-                preallocate_physical_zero_fill_with_rollback(self, current_len, target_len, |len| {
-                    let _ = len;
-                })
-            }
-            fn sync_barrier(&self) -> io::Result<()> {
-                self.inner.sync_barrier()
-            }
-            fn sync_durable(&self) -> io::Result<()> {
-                self.inner.sync_durable()
-            }
-            fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()> {
-                self.inner.evict_os_cache(offset, len)
+                inner.write_all_at(buf, offset)
             }
         }
 
@@ -578,11 +557,14 @@ mod tests {
         inner.write_all_at(&seed_data, 0).unwrap();
         inner.sync_durable().unwrap();
 
-        let wrapped = FailNthWriteFile {
-            inner: Arc::clone(&inner),
-            writes: AtomicUsize::new(0),
-            fail_on: AtomicUsize::new(2),
-        };
+        let wrapped = HookedFile::new(
+            Arc::clone(&inner),
+            "wal_sync.db",
+            FailNthWriteHooks {
+                writes: AtomicUsize::new(0),
+                fail_on: AtomicUsize::new(2),
+            },
+        );
 
         // Writing [4096, 512 * 1024) spans two 256 KB write_all_at calls; the second fails.
         let target_len = 512 * 1024u64;
