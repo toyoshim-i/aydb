@@ -5047,7 +5047,11 @@ fn poisoned_engine_refuses_pending_group_drain_and_finish_group_flush() {
     assert!(engine.drain_group_for_autocommit().is_err());
     assert!(
         engine
-            .reconcile_unique_keys(1, b"a", &[], WriteDurability::BufferedFast)
+            .reconcile_unique_keys_batch(
+                1,
+                &[(b"a".to_vec(), 1, Vec::new())],
+                WriteDurability::BufferedFast
+            )
             .is_err()
     );
     assert!(

@@ -977,48 +977,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// persistence, compaction, flush) fails; such failures are counted in
     /// [`Self::maintenance_failures`] and retained in [`Self::last_maintenance_error`].
     pub fn commit_transaction(&mut self) -> io::Result<()> {
-        let has_metadata_changes = self.tx_has_metadata_changes();
-        let (effects, _) = match self.apply_tx_event(TxEvent::PlanCommit {
-            conn_id: None,
-            defer_sync_allowed: false,
-            can_group: false,
-            has_metadata_changes,
-            buf_len_exceeds_chunk: false,
-        }) {
-            Ok(res) => res,
-            Err(err) => {
-                let io_err = self.tx_error_to_io(err);
-                let _ = self.rollback_transaction();
-                return Err(io_err);
-            }
-        };
-        let mut need_prepare = false;
         let mut clear_empty_overlay = false;
         let mut need_drain = false;
-        let mut early_done = false;
-        let mut had_effect = false;
-        for eff in effects.iter() {
-            had_effect = true;
-            match eff {
-                TxEffect::DecDepthDone => early_done = true,
-                TxEffect::EnsurePreparedBeforeCommit {
-                    effective_durability,
-                } => {
-                    need_prepare = true;
-                    if let Err(e) = self.prepare_commit_transaction(effective_durability) {
-                        let _ = self.rollback_transaction();
-                        return Err(e);
-                    }
-                }
-                TxEffect::ClearEmptyOverlay => clear_empty_overlay = true,
-                TxEffect::DrainPendingGroup => need_drain = true,
-                _ => unreachable!("unexpected effect from commit PlanCommit"),
-            }
-        }
-        if !had_effect || early_done {
-            return Ok(());
-        }
-        if need_prepare {
+        for attempt in 0..2 {
             let has_metadata_changes = self.tx_has_metadata_changes();
             let (effects, _) = match self.apply_tx_event(TxEvent::PlanCommit {
                 conn_id: None,
@@ -1034,12 +995,31 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     return Err(io_err);
                 }
             };
+            if effects.iter().next().is_none() {
+                return Ok(());
+            }
+            let mut need_prepare = None;
+            clear_empty_overlay = false;
+            need_drain = false;
             for eff in effects.iter() {
                 match eff {
+                    TxEffect::DecDepthDone => return Ok(()),
+                    TxEffect::EnsurePreparedBeforeCommit {
+                        effective_durability,
+                    } if attempt == 0 => {
+                        need_prepare = Some(effective_durability);
+                    }
                     TxEffect::ClearEmptyOverlay => clear_empty_overlay = true,
                     TxEffect::DrainPendingGroup => need_drain = true,
-                    _ => unreachable!("unexpected post-prepare effect from PlanCommit"),
+                    _ => unreachable!("unexpected effect from commit PlanCommit"),
                 }
+            }
+            let Some(durability) = need_prepare else {
+                break;
+            };
+            if let Err(e) = self.prepare_commit_transaction(durability) {
+                let _ = self.rollback_transaction();
+                return Err(e);
             }
         }
         if clear_empty_overlay {
@@ -1843,19 +1823,16 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         });
         self.bump_table_epochs_for_ids(&tids);
         self.next_lsn = st.next_lsn;
-        let blob_entries = {
-            let Some(tx) = self.tx_state.any_tx_mut() else {
-                return;
-            };
-            tx.overlay.rollback_to(undo_target_len);
-            tx.pending_lru_clears.truncate(st.lru_clears_len);
-            let mut entries = Vec::new();
-            while tx.statement_blob_undo.len() > st.blob_undo_len {
-                entries.push(tx.statement_blob_undo.pop().unwrap());
-            }
-            entries
+        let (Some(tx), std_blobs, lru_blobs) = (
+            self.tx_state.any_tx_mut(),
+            &mut self.std_blobs,
+            &mut self.lru_blobs,
+        ) else {
+            return;
         };
-        for entry in blob_entries {
+        tx.overlay.rollback_to(undo_target_len);
+        tx.pending_lru_clears.truncate(st.lru_clears_len);
+        for entry in tx.statement_blob_undo.drain(st.blob_undo_len..).rev() {
             let (kind, table_id, seg_id, len, was_append) = match entry {
                 BlobUndo::Appended {
                     kind,
@@ -1872,10 +1849,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             };
             let dead_bytes = match kind {
                 crate::wal::BlobKind::Standard => {
-                    self.std_blobs.get_mut(&seg_id).map(|b| &mut b.dead_bytes)
+                    std_blobs.get_mut(&seg_id).map(|b| &mut b.dead_bytes)
                 }
-                crate::wal::BlobKind::Lru => self
-                    .lru_blobs
+                crate::wal::BlobKind::Lru => lru_blobs
                     .get_mut(&(table_id, seg_id))
                     .map(|b| &mut b.dead_bytes),
             };

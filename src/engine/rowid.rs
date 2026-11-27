@@ -16,7 +16,8 @@ pub(super) const NS_ROWID_BY_PK: u8 = b'u';
 pub(super) const NS_PK_BY_ROWID: u8 = b'v';
 
 fn rowid_key(table_id: u16, namespace: u8, suffix: &[u8]) -> Vec<u8> {
-    let mut key = encode_namespace_prefix(table_id, namespace).to_vec();
+    let mut key = Vec::with_capacity(3 + suffix.len());
+    key.extend_from_slice(&encode_namespace_prefix(table_id, namespace));
     key.extend_from_slice(suffix);
     key
 }

@@ -65,6 +65,129 @@ fn open_uncataloged_blob<FS: PlatformFs>(
     }
 }
 
+fn record_blob_span<F: PlatformFile>(
+    ptr: crate::wal::BlobPtr,
+    cataloged_std_len: &HashMap<u64, u64>,
+    std_blobs: &BTreeMap<u64, TrackedStdBlob<F>>,
+    std_post_catalog_spans: &mut BTreeMap<u64, Vec<(u64, u64)>>,
+    cataloged_lru_len: &HashMap<(u16, u64), u64>,
+    lru_blobs: &BTreeMap<(u16, u64), TrackedLruBlob<F>>,
+    lru_post_catalog_spans: &mut BTreeMap<(u16, u64), Vec<(u64, u64)>>,
+) {
+    let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
+    match ptr.kind {
+        BlobKind::Standard => {
+            if let (Some(&cataloged_len), Some(b)) = (
+                cataloged_std_len.get(&ptr.seg_id),
+                std_blobs.get(&ptr.seg_id),
+            ) {
+                record_post_catalog_span(
+                    std_post_catalog_spans,
+                    ptr.seg_id,
+                    ptr.offset as u64,
+                    end,
+                    cataloged_len,
+                    b.file_len,
+                );
+            }
+        }
+        BlobKind::Lru => {
+            let key = (ptr.table_id, ptr.seg_id);
+            if let (Some(&cataloged_len), Some(b)) =
+                (cataloged_lru_len.get(&key), lru_blobs.get(&key))
+            {
+                record_post_catalog_span(
+                    lru_post_catalog_spans,
+                    key,
+                    ptr.offset as u64,
+                    end,
+                    cataloged_len,
+                    b.file_len,
+                );
+            }
+        }
+    }
+}
+
+fn is_target_uncataloged_blob<F: PlatformFile>(
+    ptr: &crate::wal::BlobPtr,
+    segs: &OpenedSegments<F>,
+) -> bool {
+    match ptr.kind {
+        BlobKind::Standard => {
+            !segs.cataloged_std_seqs.contains(&ptr.seg_id)
+                && segs.std_blobs.contains_key(&ptr.seg_id)
+        }
+        BlobKind::Lru => {
+            let key = (ptr.table_id, ptr.seg_id);
+            !segs.cataloged_lru_keys.contains(&key) && segs.lru_blobs.contains_key(&key)
+        }
+    }
+}
+
+fn count_uncataloged_live_blob(
+    ptr: &crate::wal::BlobPtr,
+    uncataloged_std_live: &mut BTreeMap<u64, u64>,
+    uncataloged_lru_live: &mut BTreeMap<(u16, u64), u64>,
+) {
+    match ptr.kind {
+        BlobKind::Standard => {
+            let e = uncataloged_std_live.entry(ptr.seg_id).or_default();
+            *e = e.saturating_add(ptr.len as u64);
+        }
+        BlobKind::Lru => {
+            let e = uncataloged_lru_live
+                .entry((ptr.table_id, ptr.seg_id))
+                .or_default();
+            *e = e.saturating_add(ptr.len as u64);
+        }
+    }
+}
+
+struct BlobReconcileMaps<'a, K> {
+    cataloged_keys: &'a HashSet<K>,
+    uncataloged_live: &'a BTreeMap<K, u64>,
+    cataloged_len: &'a HashMap<K, u64>,
+    post_catalog_spans: &'a mut BTreeMap<K, Vec<(u64, u64)>>,
+    base_dead: &'a BTreeMap<K, u64>,
+    persist_dead: &'a mut BTreeMap<K, u64>,
+}
+
+fn reconcile_blob_map<K: Ord + std::hash::Hash + Copy, V>(
+    blobs: &mut BTreeMap<K, V>,
+    maps: BlobReconcileMaps<'_, K>,
+    mut file_len_and_dead_mut: impl FnMut(&mut V) -> (u64, &mut u64),
+) -> bool {
+    let mut had_uncataloged_live = false;
+    blobs.retain(|&key, blob| {
+        let (file_len, dead_bytes) = file_len_and_dead_mut(blob);
+        if !maps.cataloged_keys.contains(&key) {
+            let live = maps.uncataloged_live.get(&key).copied().unwrap_or(0);
+            if live == 0 {
+                return false;
+            }
+            had_uncataloged_live = true;
+            let wal_dead_delta = *dead_bytes;
+            let total_dead = file_len.saturating_sub(live);
+            let persisted = total_dead.saturating_sub(wal_dead_delta);
+            *dead_bytes = total_dead;
+            maps.persist_dead.insert(key, persisted);
+            return true;
+        }
+        let persisted = account_post_catalog_gap(
+            key,
+            file_len,
+            dead_bytes,
+            maps.cataloged_len,
+            maps.post_catalog_spans,
+            maps.base_dead,
+        );
+        maps.persist_dead.insert(key, persisted);
+        true
+    });
+    had_uncataloged_live
+}
+
 fn record_post_catalog_span<K: Ord>(
     spans: &mut BTreeMap<K, Vec<(u64, u64)>>,
     key: K,
@@ -294,39 +417,15 @@ fn open_cataloged_and_uncataloged_segments<FS: PlatformFs>(
             let mut cur = seg.cursor_all()?;
             while let Some(entry) = cur.next_entry()? {
                 if let IndexValue::Blob(ptr) = entry.value {
-                    let end = (ptr.offset as u64).saturating_add(ptr.len as u64);
-                    match ptr.kind {
-                        BlobKind::Standard => {
-                            if let (Some(&cataloged_len), Some(b)) = (
-                                cataloged_std_len.get(&ptr.seg_id),
-                                std_blobs.get(&ptr.seg_id),
-                            ) {
-                                record_post_catalog_span(
-                                    &mut std_post_catalog_spans,
-                                    ptr.seg_id,
-                                    ptr.offset as u64,
-                                    end,
-                                    cataloged_len,
-                                    b.file_len,
-                                );
-                            }
-                        }
-                        BlobKind::Lru => {
-                            let key = (ptr.table_id, ptr.seg_id);
-                            if let (Some(&cataloged_len), Some(b)) =
-                                (cataloged_lru_len.get(&key), lru_blobs.get(&key))
-                            {
-                                record_post_catalog_span(
-                                    &mut lru_post_catalog_spans,
-                                    key,
-                                    ptr.offset as u64,
-                                    end,
-                                    cataloged_len,
-                                    b.file_len,
-                                );
-                            }
-                        }
-                    }
+                    record_blob_span(
+                        ptr,
+                        &cataloged_std_len,
+                        &std_blobs,
+                        &mut std_post_catalog_spans,
+                        &cataloged_lru_len,
+                        &lru_blobs,
+                        &mut lru_post_catalog_spans,
+                    );
                 }
             }
         }
@@ -360,10 +459,10 @@ fn recover_wal_and_salvage<FS: PlatformFs>(
     fs: &FS,
     config: &EngineConfig,
     meta_mgr: &mut BootMetaManager<FS>,
+    state_snapshot: &BootMetaState,
     segs: &OpenedSegments<FS::File>,
     with_salvage: bool,
 ) -> io::Result<(RecoveredWalState<FS::File>, Vec<WalBatch>)> {
-    let state_snapshot = meta_mgr.state().clone();
     // Open existing `wal_sync.db` and `wal_buf.db` without creating missing files prior to the
     // `WalDamagePolicy::Fail` decision, then run Two-Stream Recovery.
     let sync_wal_opt = WalStreamWriter::open_existing_unallocated(
@@ -610,26 +709,12 @@ fn reconcile_recovered_blobs<FS: PlatformFs>(
             memtable.iter_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
         {
             if let IndexValue::Blob(ptr) = entry.value {
-                match ptr.kind {
-                    BlobKind::Standard
-                        if !segs.cataloged_std_seqs.contains(&ptr.seg_id)
-                            && segs.std_blobs.contains_key(&ptr.seg_id) =>
-                    {
-                        let e = uncataloged_std_live.entry(ptr.seg_id).or_default();
-                        *e = e.saturating_add(ptr.len as u64);
-                    }
-                    BlobKind::Lru
-                        if !segs
-                            .cataloged_lru_keys
-                            .contains(&(ptr.table_id, ptr.seg_id))
-                            && segs.lru_blobs.contains_key(&(ptr.table_id, ptr.seg_id)) =>
-                    {
-                        let e = uncataloged_lru_live
-                            .entry((ptr.table_id, ptr.seg_id))
-                            .or_default();
-                        *e = e.saturating_add(ptr.len as u64);
-                    }
-                    _ => {}
+                if is_target_uncataloged_blob(&ptr, segs) {
+                    count_uncataloged_live_blob(
+                        &ptr,
+                        &mut uncataloged_std_live,
+                        &mut uncataloged_lru_live,
+                    );
                 }
             }
         }
@@ -639,19 +724,7 @@ fn reconcile_recovered_blobs<FS: PlatformFs>(
                 let IndexValue::Blob(ptr) = entry.value else {
                     continue;
                 };
-                let is_target = match ptr.kind {
-                    BlobKind::Standard => {
-                        !segs.cataloged_std_seqs.contains(&ptr.seg_id)
-                            && segs.std_blobs.contains_key(&ptr.seg_id)
-                    }
-                    BlobKind::Lru => {
-                        !segs
-                            .cataloged_lru_keys
-                            .contains(&(ptr.table_id, ptr.seg_id))
-                            && segs.lru_blobs.contains_key(&(ptr.table_id, ptr.seg_id))
-                    }
-                };
-                if !is_target || memtable.get(&entry.key).is_some() {
+                if !is_target_uncataloged_blob(&ptr, segs) || memtable.get(&entry.key).is_some() {
                     continue;
                 }
                 let mut shadowed = false;
@@ -661,20 +734,12 @@ fn reconcile_recovered_blobs<FS: PlatformFs>(
                         break;
                     }
                 }
-                if shadowed {
-                    continue;
-                }
-                match ptr.kind {
-                    BlobKind::Standard => {
-                        let e = uncataloged_std_live.entry(ptr.seg_id).or_default();
-                        *e = e.saturating_add(ptr.len as u64);
-                    }
-                    BlobKind::Lru => {
-                        let e = uncataloged_lru_live
-                            .entry((ptr.table_id, ptr.seg_id))
-                            .or_default();
-                        *e = e.saturating_add(ptr.len as u64);
-                    }
+                if !shadowed {
+                    count_uncataloged_live_blob(
+                        &ptr,
+                        &mut uncataloged_std_live,
+                        &mut uncataloged_lru_live,
+                    );
                 }
             }
         }
@@ -693,60 +758,31 @@ fn reconcile_recovered_blobs<FS: PlatformFs>(
     // flush together with the new checkpoint_lsn.
     let mut std_persist_dead: BTreeMap<u64, u64> = BTreeMap::new();
     let mut lru_persist_dead: BTreeMap<(u16, u64), u64> = BTreeMap::new();
-    let mut had_uncataloged_live_blobs = false;
-    segs.std_blobs.retain(|&seq_id, b| {
-        if !segs.cataloged_std_seqs.contains(&seq_id) {
-            let live = uncataloged_std_live.get(&seq_id).copied().unwrap_or(0);
-            if live == 0 {
-                return false;
-            }
-            had_uncataloged_live_blobs = true;
-            let wal_dead_delta = b.dead_bytes;
-            let total_dead = b.file_len.saturating_sub(live);
-            let persisted = total_dead.saturating_sub(wal_dead_delta);
-            b.dead_bytes = total_dead;
-            std_persist_dead.insert(seq_id, persisted);
-            return true;
-        }
-        let persisted = account_post_catalog_gap(
-            seq_id,
-            b.file_len,
-            &mut b.dead_bytes,
-            &segs.cataloged_std_len,
-            &mut segs.std_post_catalog_spans,
-            &segs.std_base_dead,
-        );
-        std_persist_dead.insert(seq_id, persisted);
-        true
-    });
-    segs.lru_blobs.retain(|&(tid, seq_id), b| {
-        if !segs.cataloged_lru_keys.contains(&(tid, seq_id)) {
-            let live = uncataloged_lru_live
-                .get(&(tid, seq_id))
-                .copied()
-                .unwrap_or(0);
-            if live == 0 {
-                return false;
-            }
-            had_uncataloged_live_blobs = true;
-            let wal_dead_delta = b.dead_bytes;
-            let total_dead = b.file_len.saturating_sub(live);
-            let persisted = total_dead.saturating_sub(wal_dead_delta);
-            b.dead_bytes = total_dead;
-            lru_persist_dead.insert((tid, seq_id), persisted);
-            return true;
-        }
-        let persisted = account_post_catalog_gap(
-            (tid, seq_id),
-            b.file_len,
-            &mut b.dead_bytes,
-            &segs.cataloged_lru_len,
-            &mut segs.lru_post_catalog_spans,
-            &segs.lru_base_dead,
-        );
-        lru_persist_dead.insert((tid, seq_id), persisted);
-        true
-    });
+    let had_std_uncataloged = reconcile_blob_map(
+        &mut segs.std_blobs,
+        BlobReconcileMaps {
+            cataloged_keys: &segs.cataloged_std_seqs,
+            uncataloged_live: &uncataloged_std_live,
+            cataloged_len: &segs.cataloged_std_len,
+            post_catalog_spans: &mut segs.std_post_catalog_spans,
+            base_dead: &segs.std_base_dead,
+            persist_dead: &mut std_persist_dead,
+        },
+        |b| (b.file_len, &mut b.dead_bytes),
+    );
+    let had_lru_uncataloged = reconcile_blob_map(
+        &mut segs.lru_blobs,
+        BlobReconcileMaps {
+            cataloged_keys: &segs.cataloged_lru_keys,
+            uncataloged_live: &uncataloged_lru_live,
+            cataloged_len: &segs.cataloged_lru_len,
+            post_catalog_spans: &mut segs.lru_post_catalog_spans,
+            base_dead: &segs.lru_base_dead,
+            persist_dead: &mut lru_persist_dead,
+        },
+        |b| (b.file_len, &mut b.dead_bytes),
+    );
+    let had_uncataloged_live_blobs = had_std_uncataloged || had_lru_uncataloged;
 
     // Cataloged lengths are the durable prefix. Adopted segments start at zero.
     // Finish writeback before publishing a longer length or checkpointing the WAL.
@@ -959,8 +995,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let mut segs =
             open_cataloged_and_uncataloged_segments(&*fs, &state_snapshot, &block_cache)?;
-        let (mut wal, merged_batches) =
-            recover_wal_and_salvage(&*fs, &config, &mut meta_mgr, &segs, with_salvage)?;
+        let (mut wal, merged_batches) = recover_wal_and_salvage(
+            &*fs,
+            &config,
+            &mut meta_mgr,
+            &state_snapshot,
+            &segs,
+            with_salvage,
+        )?;
         let salvaged = core::mem::take(&mut wal.salvaged);
         let memtable =
             replay_recovered_batches(config.memtable_capacity_bytes, merged_batches, &mut segs)?;

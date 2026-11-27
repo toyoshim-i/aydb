@@ -10,7 +10,7 @@ use crate::blob::{
 };
 use crate::cache::BlobCacheKey;
 use crate::index::{IndexEntry, IndexValue};
-use crate::lru::{NS_PRIMARY_ROW, encode_namespace_prefix, encode_primary_row_key};
+use crate::lru::{NS_PRIMARY_ROW, encode_namespace_prefix};
 use crate::meta::{
     LruBlobSegmentMeta, StdBlobSegmentMeta, format_lru_blob_file_name, format_std_blob_file_name,
 };
@@ -226,19 +226,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         slab: &mut Vec<u8>,
     ) -> io::Result<Option<(usize, usize)>> {
         let ptr = &lazy.ptr;
-        let mut stack_buf = [0u8; 64];
-        let heap_buf;
-        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
-            let tb = table_id.to_be_bytes();
-            stack_buf[0] = tb[0];
-            stack_buf[1] = tb[1];
-            stack_buf[2] = NS_PRIMARY_ROW;
-            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
-            &stack_buf[..3 + pk.len()]
-        } else {
-            heap_buf = encode_primary_row_key(table_id, pk);
-            &heap_buf
-        };
+        let row_key_buf = super::scan::SmallPrimaryKey::encode(table_id, pk);
+        let row_key = row_key_buf.as_slice();
 
         // The pinned handle must see the blob bytes: committed blobs are always flushed; the
         // owner view may need its writer buffer flushed first (exclusive caller retries).

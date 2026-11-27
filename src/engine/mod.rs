@@ -63,10 +63,12 @@ use crate::index::{
     BloomFilter, DEFAULT_BLOOM_BITS_PER_KEY, IdxSegmentReader, IndexEntry, IndexValue, RawIdxEntry,
     decode_lru_queue_key, decode_secondary_index_pk_slice,
 };
+#[cfg(test)]
+use crate::lru::NS_PRIMARY_ROW;
 use crate::lru::{
-    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX,
-    RowMetaRecord, encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key,
-    encode_row_meta_key, encode_secondary_index_key,
+    AccessTracker, CappedTableState, NS_LRU_QUEUE, NS_ROW_META, NS_SECONDARY_INDEX, RowMetaRecord,
+    encode_lru_queue_key, encode_namespace_prefix, encode_primary_row_key, encode_row_meta_key,
+    encode_secondary_index_key,
 };
 use crate::memtable::{DEFAULT_MEMTABLE_CAPACITY_BYTES, MemTable};
 use crate::meta::BootMetaManager;
@@ -84,6 +86,24 @@ pub use crate::wal::{StreamCounts, WalDamage, WalDamageReason, WalRecoveryReport
 use self::blobs::PendingCorruptEviction;
 use self::reader::{CxRef, NEED_FLUSH_MSG, ReadCtx, ReadSource};
 pub use self::reader::{EngineReader, ReadView};
+
+/// WAL wire bytes for a fixed-size record excluding variable key/value payloads:
+/// `Delete` (`1B op + 4B klen`), `PutInline` (`1B op + 4B klen + 4B vlen`),
+/// `PutBlobPtr` (`1B op + 4B klen + 23B BlobPtr`).
+pub(super) const WAL_DELETE_WIRE_BYTES: usize = 5;
+pub(super) const WAL_PUT_INLINE_WIRE_BYTES: usize = 9;
+pub(super) const WAL_PUT_BLOB_PTR_WIRE_BYTES: usize = 5 + crate::index::BLOB_PTR_ENCODED_LEN;
+
+#[inline]
+pub(super) fn validate_pk_len(pk: &[u8]) -> io::Result<()> {
+    if pk.len() > 2048 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "primary key exceeds maximum length (2048 bytes)",
+        ));
+    }
+    Ok(())
+}
 
 /// Optional parameters controlling row insertion in `StorageEngine::put_row_owned_with_hint_and_extra`.
 pub(crate) struct PutRowOptions<'a> {
@@ -1296,12 +1316,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         value_len: usize,
         secondary_keys: &[(u16, Vec<u8>)],
     ) -> io::Result<PreparedRowMutation> {
-        if pk.len() > 2048 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "primary key exceeds maximum length (2048 bytes)",
-            ));
-        }
+        validate_pk_len(pk)?;
         let row_key = encode_primary_row_key(table_id, pk);
         if !IndexEntry::blob_ptr_fits_in_block(row_key.len()) {
             return Err(io::Error::new(
@@ -1482,9 +1497,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             && self.tx_state.is_active()
             && !self.tx_state.is_preparing()
         {
-            let est_row_bytes =
-                ((if store_as_blob { 28 } else { 9 }) + row_key.len() + value.len())
-                    .saturating_add(extra_bytes);
+            let est_row_bytes = ((if store_as_blob {
+                WAL_PUT_BLOB_PTR_WIRE_BYTES
+            } else {
+                WAL_PUT_INLINE_WIRE_BYTES
+            }) + row_key.len()
+                + value.len())
+            .saturating_add(extra_bytes);
             if self.tx_state.pending_bytes().saturating_add(est_row_bytes)
                 > self.config.max_transaction_bytes
             {
@@ -1603,19 +1622,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         // 6. Apply dead blob byte accounting and update Capped Table logical byte counter before
         //    any auto-flush so `boot_meta.db` never persists stale quotas or uncounted dead bytes.
-        if let Some(old_ptr) = old_blob_ptr {
-            self.record_dead_blob_bytes(&old_ptr);
-        }
-        if let Some(old_m_ptr) = old_meta_blob_ptr {
-            self.record_dead_blob_bytes(&old_m_ptr);
-        }
-        if let Some(ct) = self.capped_tables.get_mut(&table_id) {
-            ct.current_logical_bytes = ct
-                .current_logical_bytes
-                .saturating_sub(old_logical_size)
-                .saturating_add(logical_size as u64);
-        }
-        self.maybe_auto_flush_and_compact();
+        self.finish_row_mutation_accounting(
+            table_id,
+            old_blob_ptr,
+            old_meta_blob_ptr,
+            old_logical_size,
+            logical_size as u64,
+        );
         if is_capped && !self.tx_state.is_active() {
             // The row is committed; an exceeded quota is re-evaluated by the next write.
             if let Err(e) = self.evict_until_within_quota(table_id, durability) {
@@ -1653,12 +1666,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
-        if pk.len() > 2048 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "primary key exceeds maximum length (2048 bytes)",
-            ));
-        }
+        validate_pk_len(pk)?;
         let row_key = encode_primary_row_key(table_id, pk);
         let existing = self.check_existing_row(&row_key)?;
         if existing == ExistingRowStatus::NotFound {
@@ -2037,12 +2045,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.check_not_poisoned()?;
         self.drain_group_for_autocommit()?;
         self.drain_corrupt_evictions()?;
-        if pk.len() > 2048 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "primary key exceeds maximum length (2048 bytes)",
-            ));
-        }
+        validate_pk_len(pk)?;
         let row_key = encode_primary_row_key(table_id, pk);
         let existing = self.check_existing_row(&row_key)?;
         if existing == ExistingRowStatus::NotFound {
@@ -2089,6 +2092,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
 
+        self.finish_row_mutation_accounting(
+            table_id,
+            old_blob_ptr,
+            old_meta_blob_ptr,
+            old_logical_size,
+            0,
+        );
+        Ok(true)
+    }
+
+    fn finish_row_mutation_accounting(
+        &mut self,
+        table_id: u16,
+        old_blob_ptr: Option<BlobPtr>,
+        old_meta_blob_ptr: Option<BlobPtr>,
+        old_logical_size: u64,
+        added_logical_size: u64,
+    ) {
         if let Some(old_ptr) = old_blob_ptr {
             self.record_dead_blob_bytes(&old_ptr);
         }
@@ -2096,10 +2117,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             self.record_dead_blob_bytes(&old_m_ptr);
         }
         if let Some(ct) = self.capped_tables.get_mut(&table_id) {
-            ct.current_logical_bytes = ct.current_logical_bytes.saturating_sub(old_logical_size);
+            ct.current_logical_bytes = ct
+                .current_logical_bytes
+                .saturating_sub(old_logical_size)
+                .saturating_add(added_logical_size);
         }
         self.maybe_auto_flush_and_compact();
-        Ok(true)
     }
 
     /// Point lookup of a row (`pk`) in `table_id`, appending its payload directly into `slab`
@@ -2114,6 +2137,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         self.owner_read(|eng, cx| eng.get_row_into_cx(cx, table_id, pk, slab, spans))
     }
 
+    fn probe_primary_row_into_slab(
+        &self,
+        cx: &ReadCtx<'_, FS::File>,
+        row_key: &[u8],
+        slab: &mut Vec<u8>,
+    ) -> io::Result<Option<(usize, SegProbe)>> {
+        let hash = BloomFilter::hash_pair(row_key);
+        for seg in self.idx_segments_for(cx.src).iter().rev() {
+            let start = slab.len();
+            if let Some(probe) =
+                seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?
+            {
+                return Ok(Some((start, probe)));
+            }
+        }
+        Ok(None)
+    }
+
     pub(in crate::engine) fn get_row_into_cx(
         &self,
         cx: &ReadCtx<'_, FS::File>,
@@ -2122,19 +2163,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         slab: &mut Vec<u8>,
         spans: &mut Vec<(usize, usize)>,
     ) -> io::Result<bool> {
-        let mut stack_buf = [0u8; 64];
-        let heap_buf;
-        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
-            let tb = table_id.to_be_bytes();
-            stack_buf[0] = tb[0];
-            stack_buf[1] = tb[1];
-            stack_buf[2] = NS_PRIMARY_ROW;
-            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
-            &stack_buf[..3 + pk.len()]
-        } else {
-            heap_buf = encode_primary_row_key(table_id, pk);
-            &heap_buf
-        };
+        let row_key_buf = scan::SmallPrimaryKey::encode(table_id, pk);
+        let row_key = row_key_buf.as_slice();
 
         let mut hit = false;
         if let Some(mem_entry) = self.mem_get_src(cx.src, row_key) {
@@ -2155,28 +2185,19 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 IndexValue::Tombstone => {}
             }
-        } else {
-            let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments_for(cx.src).iter().rev() {
-                let start = slab.len();
-                let probe =
-                    seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
-                if let Some(probe) = probe {
-                    match probe {
-                        SegProbe::Inline => {
-                            spans.push((start, slab.len()));
-                            hit = true;
-                        }
-                        SegProbe::Blob(ptr) => {
-                            if self.dereference_blob_append_into_cx(cx, &ptr, row_key, slab)? {
-                                spans.push((start, slab.len()));
-                                hit = true;
-                            }
-                        }
-                        SegProbe::Tombstone => {}
-                    }
-                    break;
+        } else if let Some((start, probe)) = self.probe_primary_row_into_slab(cx, row_key, slab)? {
+            match probe {
+                SegProbe::Inline => {
+                    spans.push((start, slab.len()));
+                    hit = true;
                 }
+                SegProbe::Blob(ptr) => {
+                    if self.dereference_blob_append_into_cx(cx, &ptr, row_key, slab)? {
+                        spans.push((start, slab.len()));
+                        hit = true;
+                    }
+                }
+                SegProbe::Tombstone => {}
             }
         }
 
@@ -2212,19 +2233,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         spans: &mut Vec<(usize, usize)>,
         lazy_blobs: &mut Vec<Option<LazyBlob<FS::File>>>,
     ) -> io::Result<bool> {
-        let mut stack_buf = [0u8; 64];
-        let heap_buf;
-        let row_key: &[u8] = if 3 + pk.len() <= stack_buf.len() {
-            let tb = table_id.to_be_bytes();
-            stack_buf[0] = tb[0];
-            stack_buf[1] = tb[1];
-            stack_buf[2] = NS_PRIMARY_ROW;
-            stack_buf[3..3 + pk.len()].copy_from_slice(pk);
-            &stack_buf[..3 + pk.len()]
-        } else {
-            heap_buf = encode_primary_row_key(table_id, pk);
-            &heap_buf
-        };
+        let row_key_buf = scan::SmallPrimaryKey::encode(table_id, pk);
+        let row_key = row_key_buf.as_slice();
 
         // Evict-policy tables verify blobs eagerly (a row cannot be skipped after emission).
         let lazy_ok = self.corrupt_policy(table_id) == CorruptPolicy::Error;
@@ -2257,36 +2267,25 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 }
                 IndexValue::Tombstone => {}
             }
-        } else {
-            let hash = BloomFilter::hash_pair(row_key);
-            for seg in self.idx_segments_for(cx.src).iter().rev() {
-                let start = slab.len();
-                let probe =
-                    seg.visit_hashed(row_key, hash, |raw| probe_raw_into_slab(raw, slab))?;
-                if let Some(probe) = probe {
-                    match probe {
-                        SegProbe::Inline => {
-                            spans.push((start, slab.len()));
-                            lazy_blobs.push(None);
-                            hit = true;
-                        }
-                        SegProbe::Blob(ptr) => {
-                            if lazy_ok {
-                                spans.push((0, 0));
-                                lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, &ptr)));
-                                hit = true;
-                            } else if self
-                                .read_flushed_blob_append_into_src(cx.src, &ptr, row_key, slab)?
-                            {
-                                spans.push((start, slab.len()));
-                                lazy_blobs.push(None);
-                                hit = true;
-                            }
-                        }
-                        SegProbe::Tombstone => {}
-                    }
-                    break;
+        } else if let Some((start, probe)) = self.probe_primary_row_into_slab(cx, row_key, slab)? {
+            match probe {
+                SegProbe::Inline => {
+                    spans.push((start, slab.len()));
+                    lazy_blobs.push(None);
+                    hit = true;
                 }
+                SegProbe::Blob(ptr) => {
+                    if lazy_ok {
+                        spans.push((0, 0));
+                        lazy_blobs.push(Some(self.pin_lazy_blob_src(cx.src, &ptr)));
+                        hit = true;
+                    } else if self.read_flushed_blob_append_into_src(cx.src, &ptr, row_key, slab)? {
+                        spans.push((start, slab.len()));
+                        lazy_blobs.push(None);
+                        hit = true;
+                    }
+                }
+                SegProbe::Tombstone => {}
             }
         }
 

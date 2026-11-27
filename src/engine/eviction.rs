@@ -112,21 +112,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         && old.max_bytes == new.max_bytes
                 });
             if evicted || !same_registrations {
-                // Ensure buffered deletions from the eviction (or earlier buffered writes) are
-                // durable in `wal_buf.db` before persisting `table_quotas`, so a power cut cannot
-                // drop the WAL while leaving a stale `current_logical_bytes` that `replayed_wal ==
-                // false` would trust on reopen.
-                let commit_res = if self.last_buf_append_lsn > self.last_buf_synced_lsn {
-                    self.make_buf_wal_durable(true)
-                } else {
-                    Ok(())
-                }
-                .and_then(|()| {
-                    self.healthy()?.commit_meta_update(|st| {
-                        st.table_quotas = quota_metas;
-                    })
-                });
-                if let Err(e) = commit_res {
+                if let Err(e) = self.persist_table_quotas(quota_metas) {
                     if !self.is_poisoned() {
                         restore_on_err(self);
                     }
@@ -140,6 +126,21 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         }
         Ok(())
+    }
+
+    /// Ensures buffered WAL deletions are durable before persisting updated `table_quotas` so a
+    /// power cut cannot drop the WAL while leaving stale quota byte counts that `replayed_wal ==
+    /// false` would trust on reopen.
+    pub(super) fn persist_table_quotas(
+        &mut self,
+        quota_metas: Vec<TableQuotaMeta>,
+    ) -> io::Result<()> {
+        if self.last_buf_append_lsn > self.last_buf_synced_lsn {
+            self.make_buf_wal_durable(true)?;
+        }
+        self.healthy()?.commit_meta_update(|st| {
+            st.table_quotas = quota_metas;
+        })
     }
 
     /// Returns a snapshot of the [`CappedTableState`] for `table_id`, if registered.
@@ -455,7 +456,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let meta_bytes = mrec.to_bytes()?;
             let inline = IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len());
             let meta_est = if inline {
-                9 + meta_key.len() + meta_bytes.len()
+                super::WAL_PUT_INLINE_WIRE_BYTES + meta_key.len() + meta_bytes.len()
             } else {
                 28 + meta_key.len()
             };
@@ -691,7 +692,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             }
         };
         let meta_est = if IndexEntry::inline_fits_in_block(meta_key.len(), meta_bytes.len()) {
-            9 + meta_key.len() + meta_bytes.len()
+            super::WAL_PUT_INLINE_WIRE_BYTES + meta_key.len() + meta_bytes.len()
         } else {
             28 + meta_key.len()
         };

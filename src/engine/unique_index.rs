@@ -45,15 +45,15 @@ pub(crate) fn is_unique_index_id(index_id: u16) -> bool {
     index_id & 0x8000 != 0 && index_id != UNIQUE_MARKER_INDEX_ID
 }
 
-pub(super) fn marker_key(table_id: u16) -> Vec<u8> {
-    encode_secondary_index_prefix(table_id, UNIQUE_MARKER_INDEX_ID).to_vec()
+pub(super) fn marker_key(table_id: u16) -> [u8; 5] {
+    encode_secondary_index_prefix(table_id, UNIQUE_MARKER_INDEX_ID)
 }
 
 /// The record that marks a table's UNIQUE index as complete for a given definition.
 /// Written atomically with the catalog entry when creating a new empty table.
 pub(super) fn unique_marker_record(table_id: u16, value: Vec<u8>) -> WalRecord {
     WalRecord::PutInline {
-        key: marker_key(table_id),
+        key: marker_key(table_id).to_vec(),
         value,
     }
 }
@@ -113,7 +113,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.commit_wal_and_memtable(
             vec![WalRecord::PutInline {
-                key: marker_key(table_id),
+                key: marker_key(table_id).to_vec(),
                 value,
             }],
             durability,
@@ -130,7 +130,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         self.commit_wal_and_memtable(
             vec![WalRecord::Delete {
-                key: marker_key(table_id),
+                key: marker_key(table_id).to_vec(),
             }],
             durability,
         )?;
@@ -147,12 +147,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         is_capped: bool,
         known_row_value_len: Option<usize>,
     ) -> io::Result<Option<PlannedRowReconcile>> {
-        if pk.len() > 2048 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "primary key exceeds maximum length (2048 bytes)",
-            ));
-        }
+        super::validate_pk_len(pk)?;
         let row_key = if known_row_value_len.is_none() {
             let rk = encode_primary_row_key(table_id, pk);
             if self.check_existing_row(&rk)? == ExistingRowStatus::NotFound {
@@ -304,62 +299,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         Ok(())
     }
 
-    /// Makes the UNIQUE entries of an existing row equal `desired`, in one WAL batch.
-    #[cfg(test)]
-    pub(crate) fn reconcile_unique_keys(
-        &mut self,
-        table_id: u16,
-        pk: &[u8],
-        desired: &[(u16, Vec<u8>)],
-        durability: WriteDurability,
-    ) -> io::Result<bool> {
-        self.check_not_poisoned()?;
-        self.drain_group_for_autocommit()?;
-        self.drain_corrupt_evictions()?;
-        let may_have_meta = self.may_have_row_meta(table_id)?;
-        let is_capped = self.capped_tables.contains_key(&table_id);
-        let Some(planned) =
-            self.plan_row_unique_reconcile(table_id, pk, desired, may_have_meta, is_capped, None)?
-        else {
-            return Ok(false);
-        };
-
-        let mut records = planned.records;
-        let mut new_meta_blob_ptr = None;
-        let wrote_meta = planned.meta_write.is_some();
-        match planned.meta_write {
-            None => records.push(WalRecord::Delete {
-                key: planned.meta_key,
-            }),
-            Some(meta_bytes) => {
-                new_meta_blob_ptr = self.append_std_meta_record(
-                    planned.meta_key,
-                    meta_bytes,
-                    durability,
-                    &mut records,
-                )?;
-            }
-        }
-        if let Err(e) = self.commit_wal_and_memtable_core(
-            records,
-            durability,
-            true,
-            false,
-            super::tx::WriteScope::Normal,
-        ) {
-            self.abort_uncommitted_blobs(new_meta_blob_ptr.as_slice());
-            return Err(e);
-        }
-        if wrote_meta {
-            self.table_has_row_meta.insert(table_id, true);
-        }
-        if let Some(old_m_ptr) = planned.old_meta_blob_ptr {
-            self.record_dead_blob_bytes(&old_m_ptr);
-        }
-        self.maybe_auto_flush_and_compact();
-        Ok(true)
-    }
-
     /// Reconciles the UNIQUE index entries of a batch of live rows that the caller just scanned
     /// under the same exclusive engine lock, committing them in as few WAL batches as fit within
     /// the WAL safety cap (normally one batch per migration chunk).
@@ -413,13 +352,15 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 };
 
                 let meta_est_bytes = match &planned.meta_write {
-                    None => 5 + planned.meta_key.len(),
+                    None => super::WAL_DELETE_WIRE_BYTES + planned.meta_key.len(),
                     Some(mb)
                         if !IndexEntry::inline_fits_in_block(planned.meta_key.len(), mb.len()) =>
                     {
-                        28 + planned.meta_key.len()
+                        super::WAL_PUT_BLOB_PTR_WIRE_BYTES + planned.meta_key.len()
                     }
-                    Some(mb) => 9 + planned.meta_key.len() + mb.len(),
+                    Some(mb) => {
+                        super::WAL_PUT_INLINE_WIRE_BYTES + planned.meta_key.len() + mb.len()
+                    }
                 };
                 let row_est_bytes = planned
                     .records

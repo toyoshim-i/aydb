@@ -520,10 +520,6 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
     }
 
-    fn abort_relocation_batch(&mut self, new_ptrs: Vec<BlobPtr>) {
-        self.abort_uncommitted_blobs(&new_ptrs);
-    }
-
     fn flush_relocation_batch(
         &mut self,
         wal_records: &mut Vec<WalRecord>,
@@ -541,7 +537,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             false,
             super::tx::WriteScope::Normal,
         ) {
-            self.abort_relocation_batch(core::mem::take(new_ptrs));
+            let aborted = core::mem::take(new_ptrs);
+            self.abort_uncommitted_blobs(&aborted);
             return Err(e);
         }
         new_ptrs.clear();
@@ -647,11 +644,11 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     continue;
                 }
                 Err(e) => {
-                    self.abort_relocation_batch(batch_new_ptrs);
+                    self.abort_uncommitted_blobs(&batch_new_ptrs);
                     return Err(e);
                 }
             };
-            let rec_est = 28usize.saturating_add(key.len());
+            let rec_est = super::WAL_PUT_BLOB_PTR_WIRE_BYTES.saturating_add(key.len());
             if !batch_wal_records.is_empty()
                 && batch_est_bytes.saturating_add(rec_est) > session.max_batch_wal_bytes
             {
@@ -671,7 +668,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             let new_ptr = match self.append_to_blob_segment(BlobKind::Standard, 0, &key, &payload) {
                 Ok(ptr) => ptr,
                 Err(e) => {
-                    self.abort_relocation_batch(batch_new_ptrs);
+                    self.abort_uncommitted_blobs(&batch_new_ptrs);
                     return Err(e);
                 }
             };
@@ -692,11 +689,13 @@ impl<FS: PlatformFs> StorageEngine<FS> {
             &mut batch_new_ptrs,
             &mut batch_dead_ptrs,
         )?;
-        if !hit_chunk_budget {
-            session.seek_key = window_last_key;
-            session.lower_inclusive = false;
-        } else if let Some(last) = batch_last_key {
-            session.seek_key = last;
+        let next_seek = if !hit_chunk_budget {
+            Some(window_last_key)
+        } else {
+            batch_last_key
+        };
+        if let Some(seek) = next_seek {
+            session.seek_key = seek;
             session.lower_inclusive = false;
         }
         session.relocated += batch_relocated;
@@ -933,7 +932,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         // overlay is not in the memtable, so they count as well.
         let persist_blob_state =
             !self.tx_state.is_active() && self.memtable.is_empty() && self.pending_group.is_empty();
-        if persist_blob_state {
+        let (dead_std_seqs, dead_lru_keys, dead_blob_files, blob_quota) = if persist_blob_state {
             // The catalog records each segment's length. Bytes beyond the durable length (for
             // example from a rolled-back transaction) would otherwise be cataloged as present and
             // counted dead, and a power cut would shorten the file below its cataloged length.
@@ -941,15 +940,8 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                 self.discard_compaction_output(out);
                 return Err(e);
             }
-        }
-        let (dead_std_seqs, dead_lru_keys, dead_blob_files) = if persist_blob_state {
-            self.collect_fully_dead_blob_segments()
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        let blob_quota = if !persist_blob_state {
-            None
-        } else {
+            let (dead_std_seqs, dead_lru_keys, dead_blob_files) =
+                self.collect_fully_dead_blob_segments();
             let std_metas: Vec<StdBlobSegmentMeta> = self
                 .std_blobs
                 .iter()
@@ -971,7 +963,14 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                     table_id: b.table_id,
                 })
                 .collect();
-            Some((std_metas, lru_metas, self.build_quota_metas()))
+            (
+                dead_std_seqs,
+                dead_lru_keys,
+                dead_blob_files,
+                Some((std_metas, lru_metas, self.build_quota_metas())),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), None)
         };
 
         if let Err(e) = self.healthy()?.commit_meta_update(|st| {

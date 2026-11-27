@@ -46,6 +46,29 @@ pub(crate) fn normalize_vtab_ident(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+fn decode_catalog_id(val: &IndexValue) -> Option<u16> {
+    let IndexValue::Inline(bytes) = val else {
+        return None;
+    };
+    (bytes.len() == 2).then(|| u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn decode_catalog_entry(entry: &IndexEntry) -> Option<(String, u16)> {
+    if entry.key.len() <= CATALOG_PREFIX.len() {
+        return None;
+    }
+    let id = decode_catalog_id(&entry.value)?;
+    let name = String::from_utf8_lossy(&entry.key[CATALOG_PREFIX.len()..]).into_owned();
+    Some((name, id))
+}
+
+struct LiveVtabMetaRefs<'a> {
+    active_vtab_ids: &'a mut HashMap<u16, Arc<str>>,
+    active_vtab_holders: &'a mut HashMap<u16, Vec<u64>>,
+    corrupt_policies: &'a mut HashMap<u16, CorruptPolicy>,
+    table_inline_thresholds: &'a mut std::collections::BTreeMap<u16, usize>,
+}
+
 pub(super) fn find_free_table_id(mut is_used: impl FnMut(u16) -> bool) -> io::Result<u16> {
     let mut candidate = 1u16;
     loop {
@@ -207,16 +230,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         let mut persisted_name_to_id: HashMap<String, u16> = HashMap::new();
         let mut persisted_id_to_name: HashMap<u16, String> = HashMap::new();
         for entry in entries {
-            if entry.key.len() > CATALOG_PREFIX.len() {
-                if let IndexValue::Inline(val) = entry.value {
-                    if val.len() == 2 {
-                        let name = String::from_utf8_lossy(&entry.key[CATALOG_PREFIX.len()..])
-                            .into_owned();
-                        let id = u16::from_be_bytes([val[0], val[1]]);
-                        persisted_name_to_id.insert(name.clone(), id);
-                        persisted_id_to_name.insert(id, name);
-                    }
-                }
+            if let Some((name, id)) = decode_catalog_entry(&entry) {
+                persisted_name_to_id.insert(name.clone(), id);
+                persisted_id_to_name.insert(id, name);
             }
         }
 
@@ -301,19 +317,23 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     /// Unlike a registration made for a newly created table, it must survive transaction and
     /// savepoint rollbacks, so it is recorded in `start_meta` and savepoint snapshots without
     /// clobbering any existing committed or renamed table name already captured there.
-    pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
-        let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
-        let tok = self.alloc_vtab_token();
+    fn for_each_live_vtab_meta_for_table(
+        &mut self,
+        table_id: u16,
+        mut f: impl FnMut(LiveVtabMetaRefs<'_>, bool),
+    ) {
         if let Some(tx) = self.tx_state.any_tx_mut() {
             let dropped_in_tx = tx.dropped_tables.iter().any(|&(tid, _)| tid == table_id);
             if !dropped_in_tx {
-                self.active_vtab_ids
-                    .entry(table_id)
-                    .or_insert_with(|| name.clone());
-                self.active_vtab_holders
-                    .entry(table_id)
-                    .or_default()
-                    .push(tok);
+                f(
+                    LiveVtabMetaRefs {
+                        active_vtab_ids: &mut self.active_vtab_ids,
+                        active_vtab_holders: &mut self.active_vtab_holders,
+                        corrupt_policies: &mut self.corrupt_policies,
+                        table_inline_thresholds: &mut self.table_inline_thresholds,
+                    },
+                    true,
+                );
             }
             for marker in &mut tx.savepoint_payloads {
                 if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
@@ -322,32 +342,57 @@ impl<FS: PlatformFs> StorageEngine<FS> {
                         .iter()
                         .any(|&(tid, _)| tid == table_id);
                     if !dropped_before_sp {
-                        snap.active_vtab_ids
-                            .entry(table_id)
-                            .or_insert_with(|| name.clone());
-                        snap.active_vtab_holders
-                            .entry(table_id)
-                            .or_default()
-                            .push(tok);
+                        f(
+                            LiveVtabMetaRefs {
+                                active_vtab_ids: &mut snap.active_vtab_ids,
+                                active_vtab_holders: &mut snap.active_vtab_holders,
+                                corrupt_policies: &mut snap.corrupt_policies,
+                                table_inline_thresholds: &mut snap.table_inline_thresholds,
+                            },
+                            false,
+                        );
                     }
                 }
             }
-            tx.start_meta
-                .active_vtab_ids
-                .entry(table_id)
-                .or_insert(name);
-            tx.start_meta
-                .active_vtab_holders
-                .entry(table_id)
-                .or_default()
-                .push(tok);
+            f(
+                LiveVtabMetaRefs {
+                    active_vtab_ids: &mut tx.start_meta.active_vtab_ids,
+                    active_vtab_holders: &mut tx.start_meta.active_vtab_holders,
+                    corrupt_policies: &mut tx.start_meta.corrupt_policies,
+                    table_inline_thresholds: &mut tx.start_meta.table_inline_thresholds,
+                },
+                false,
+            );
         } else {
-            self.active_vtab_ids.insert(table_id, name);
-            self.active_vtab_holders
+            f(
+                LiveVtabMetaRefs {
+                    active_vtab_ids: &mut self.active_vtab_ids,
+                    active_vtab_holders: &mut self.active_vtab_holders,
+                    corrupt_policies: &mut self.corrupt_policies,
+                    table_inline_thresholds: &mut self.table_inline_thresholds,
+                },
+                true,
+            );
+        }
+    }
+
+    pub(crate) fn activate_persisted_vtab(&mut self, table_id: u16, table_name: &str) -> u64 {
+        let name: Arc<str> = Arc::from(normalize_vtab_ident(table_name).as_str());
+        let tok = self.alloc_vtab_token();
+        let has_tx = self.tx_state.any_tx().is_some();
+        self.for_each_live_vtab_meta_for_table(table_id, |refs, is_live_engine| {
+            if is_live_engine && !has_tx {
+                refs.active_vtab_ids.insert(table_id, name.clone());
+            } else {
+                refs.active_vtab_ids
+                    .entry(table_id)
+                    .or_insert_with(|| name.clone());
+            }
+            refs.active_vtab_holders
                 .entry(table_id)
                 .or_default()
                 .push(tok);
-        }
+        });
         tok
     }
 
@@ -359,59 +404,24 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         on_corrupt: Option<CorruptPolicy>,
         inline_max: Option<usize>,
     ) {
-        let apply_to =
-            |policies: &mut HashMap<u16, CorruptPolicy>,
-             thresholds: &mut std::collections::BTreeMap<u16, usize>| {
-                match on_corrupt {
-                    Some(policy) => {
-                        policies.insert(table_id, policy);
-                    }
-                    None => {
-                        policies.remove(&table_id);
-                    }
+        self.for_each_live_vtab_meta_for_table(table_id, |refs, _| {
+            match on_corrupt {
+                Some(policy) => {
+                    refs.corrupt_policies.insert(table_id, policy);
                 }
-                match inline_max {
-                    Some(max_bytes) => {
-                        thresholds.insert(table_id, max_bytes);
-                    }
-                    None => {
-                        thresholds.remove(&table_id);
-                    }
-                }
-            };
-
-        if let Some(tx) = self.tx_state.any_tx_mut() {
-            let dropped_in_tx = tx.dropped_tables.iter().any(|&(tid, _)| tid == table_id);
-            if !dropped_in_tx {
-                apply_to(
-                    &mut self.corrupt_policies,
-                    &mut self.table_inline_thresholds,
-                );
-            }
-            for marker in &mut tx.savepoint_payloads {
-                if let tx::SavepointMeta::Full(snap) = &mut marker.meta {
-                    let prefix_len = snap.dropped_tables_len.min(tx.dropped_tables.len());
-                    let dropped_before_sp = tx.dropped_tables[..prefix_len]
-                        .iter()
-                        .any(|&(tid, _)| tid == table_id);
-                    if !dropped_before_sp {
-                        apply_to(
-                            &mut snap.corrupt_policies,
-                            &mut snap.table_inline_thresholds,
-                        );
-                    }
+                None => {
+                    refs.corrupt_policies.remove(&table_id);
                 }
             }
-            apply_to(
-                &mut tx.start_meta.corrupt_policies,
-                &mut tx.start_meta.table_inline_thresholds,
-            );
-        } else {
-            apply_to(
-                &mut self.corrupt_policies,
-                &mut self.table_inline_thresholds,
-            );
-        }
+            match inline_max {
+                Some(max_bytes) => {
+                    refs.table_inline_thresholds.insert(table_id, max_bytes);
+                }
+                None => {
+                    refs.table_inline_thresholds.remove(&table_id);
+                }
+            }
+        });
     }
 
     /// Returns `true` if `table_id` was created (`xCreate`) inside the active transaction.
@@ -448,12 +458,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
     ) -> io::Result<()> {
         let norm = normalize_vtab_ident(table_name);
         let key = encode_catalog_key(&norm);
-        let mapped = match self.lookup_raw_entry_view(ReadView::Owner, &key)? {
-            Some((_, IndexValue::Inline(val))) if val.len() == 2 => {
-                Some(u16::from_be_bytes([val[0], val[1]]))
-            }
-            _ => None,
-        };
+        let mapped = self
+            .lookup_raw_entry_view(ReadView::Owner, &key)?
+            .and_then(|(_, val)| decode_catalog_id(&val));
         if mapped == Some(table_id) {
             self.drop_table_with_durability(table_id, Some(&norm), WriteDurability::BufferedFast)?;
         }
@@ -655,13 +662,7 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         }
         let mut catalog_old_name: Option<String> = None;
         for entry in self.scan_merged_prefix(&CATALOG_PREFIX)? {
-            let IndexValue::Inline(val) = entry.value else {
-                continue;
-            };
-            if val.len() == 2 && entry.key.len() > CATALOG_PREFIX.len() {
-                let id = u16::from_be_bytes([val[0], val[1]]);
-                let entry_name =
-                    String::from_utf8_lossy(&entry.key[CATALOG_PREFIX.len()..]).into_owned();
+            if let Some((entry_name, id)) = decode_catalog_entry(&entry) {
                 if entry_name == new_norm && id != table_id {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -780,11 +781,9 @@ impl<FS: PlatformFs> StorageEngine<FS> {
 
         let mut catalog_keys_for_id = HashSet::new();
         for entry in self.scan_merged_prefix(&CATALOG_PREFIX)? {
-            if let IndexValue::Inline(val) = entry.value {
-                if val.len() == 2 && u16::from_be_bytes([val[0], val[1]]) == table_id {
-                    catalog_keys_for_id.insert(entry.key.clone());
-                    records.push(WalRecord::Delete { key: entry.key });
-                }
+            if decode_catalog_id(&entry.value) == Some(table_id) {
+                catalog_keys_for_id.insert(entry.key.clone());
+                records.push(WalRecord::Delete { key: entry.key });
             }
         }
 
@@ -794,10 +793,12 @@ impl<FS: PlatformFs> StorageEngine<FS> {
         if let Some(norm_name) = candidate_name {
             let cat_key = encode_catalog_key(&norm_name);
             if !catalog_keys_for_id.contains(&cat_key) {
-                if let Some((_, IndexValue::Inline(val))) = self.lookup_raw_entry(&cat_key)? {
-                    if val.len() == 2 && u16::from_be_bytes([val[0], val[1]]) == table_id {
-                        records.push(WalRecord::Delete { key: cat_key });
-                    }
+                if self
+                    .lookup_raw_entry(&cat_key)?
+                    .and_then(|(_, val)| decode_catalog_id(&val))
+                    == Some(table_id)
+                {
+                    records.push(WalRecord::Delete { key: cat_key });
                 }
             }
         }
