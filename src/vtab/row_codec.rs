@@ -6,10 +6,8 @@ use std::io::{self, ErrorKind};
 use crate::lru::{decode_i64_memcomparable, encode_i64_memcomparable};
 use crate::util::io_err;
 use crate::vtab::ffi::{
-    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_transient,
-    sqlite_value_blob_bytes, sqlite_value_text_bytes, sqlite3_context, sqlite3_result_blob,
-    sqlite3_result_double, sqlite3_result_error_toobig, sqlite3_result_int64, sqlite3_result_null,
-    sqlite3_result_text, sqlite3_value, sqlite3_value_double, sqlite3_value_int64,
+    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT, sqlite_value_blob_bytes,
+    sqlite_value_text_bytes, sqlite3_value, sqlite3_value_double, sqlite3_value_int64,
     sqlite3_value_type,
 };
 
@@ -938,99 +936,66 @@ pub(in crate::vtab) unsafe fn sqlite_value_to_key_bytes_with_schema(
     }
 }
 
-/// Passes a raw slice to `sqlite3_result_text` or `sqlite3_result_blob`, reporting `TOOBIG` and
-/// returning `false` when `payload.len() > i32::MAX as usize`.
-#[inline]
-unsafe fn result_bytes(ctx: *mut sqlite3_context, payload: &[u8], is_text: bool) -> bool {
-    if payload.len() > i32::MAX as usize {
-        unsafe { sqlite3_result_error_toobig(ctx) };
-        return false;
-    }
-    unsafe {
-        if is_text {
-            sqlite3_result_text(
-                ctx,
-                payload.as_ptr() as *const _,
-                payload.len() as i32,
-                sqlite_transient(),
-            );
-        } else {
-            sqlite3_result_blob(
-                ctx,
-                payload.as_ptr() as *const _,
-                payload.len() as i32,
-                sqlite_transient(),
-            );
-        }
-    }
-    true
-}
-
 /// Projects a type-tagged primary key slice directly into `ctx` (`sqlite3_result_*`) with
 /// zero heap allocation and exact byte preservation (including invalid UTF-8 `TEXT` keys).
 ///
 /// Returns `Err(ErrorKind::InvalidData)` if `key` is malformed or has an unknown tag, or
 /// `Err(ErrorKind::FileTooLarge)` (after invoking `sqlite3_result_error_toobig`) if a `TEXT` or
 /// `BLOB` key exceeds `i32::MAX` bytes.
-///
-/// # Safety
-/// `ctx` must be a valid non-null `*mut sqlite3_context`.
 #[inline]
-pub(in crate::vtab) unsafe fn project_key_zero_copy(
+pub(in crate::vtab) fn project_key_zero_copy(
     key: &[u8],
-    ctx: *mut sqlite3_context,
+    ctx: &crate::vtab::ffi::SqliteContextRef<'_>,
 ) -> io::Result<()> {
     let invalid = || io::Error::new(ErrorKind::InvalidData, "malformed primary key bytes");
     let Some((&tag, payload)) = key.split_first() else {
         return Err(invalid());
     };
-    unsafe {
-        match tag {
-            KEY_TAG_NULL if payload.is_empty() => {
-                sqlite3_result_null(ctx);
-                Ok(())
-            }
-            KEY_TAG_INTEGER if payload.len() == 8 => {
-                let arr: [u8; 8] = payload.try_into().unwrap();
-                sqlite3_result_int64(ctx, decode_i64_memcomparable(arr));
-                Ok(())
-            }
-            KEY_TAG_INTEGER if payload.len() == 16 => {
-                let q_arr: [u8; 8] = payload[0..8].try_into().unwrap();
-                let r_arr: [u8; 8] = payload[8..16].try_into().unwrap();
-                let f = if u64::from_be_bytes(r_arr) == 0 {
-                    decode_i64_memcomparable(q_arr) as f64
-                } else {
-                    decode_f64_memcomparable(r_arr)
-                };
-                sqlite3_result_double(ctx, f);
-                Ok(())
-            }
-            KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 if payload.len() == 8 => {
-                let arr: [u8; 8] = payload.try_into().unwrap();
-                sqlite3_result_double(ctx, decode_f64_memcomparable(arr));
-                Ok(())
-            }
-            KEY_TAG_TEXT => {
-                if !result_bytes(ctx, payload, true) {
-                    return Err(io::Error::new(
-                        ErrorKind::FileTooLarge,
-                        "Text key exceeds i32::MAX bytes",
-                    ));
-                }
-                Ok(())
-            }
-            KEY_TAG_BLOB => {
-                if !result_bytes(ctx, payload, false) {
-                    return Err(io::Error::new(
-                        ErrorKind::FileTooLarge,
-                        "Blob key exceeds i32::MAX bytes",
-                    ));
-                }
-                Ok(())
-            }
-            _ => Err(invalid()),
+    match tag {
+        KEY_TAG_NULL if payload.is_empty() => {
+            ctx.set_null();
+            Ok(())
         }
+        KEY_TAG_INTEGER if payload.len() == 8 => {
+            let arr: [u8; 8] = payload.try_into().unwrap();
+            ctx.set_i64(decode_i64_memcomparable(arr));
+            Ok(())
+        }
+        KEY_TAG_INTEGER if payload.len() == 16 => {
+            let q_arr: [u8; 8] = payload[0..8].try_into().unwrap();
+            let r_arr: [u8; 8] = payload[8..16].try_into().unwrap();
+            let f = if u64::from_be_bytes(r_arr) == 0 {
+                decode_i64_memcomparable(q_arr) as f64
+            } else {
+                decode_f64_memcomparable(r_arr)
+            };
+            ctx.set_f64(f);
+            Ok(())
+        }
+        KEY_TAG_FLOAT_LT_I64_MIN | KEY_TAG_FLOAT_GE_I64_MAX_PLUS_1 if payload.len() == 8 => {
+            let arr: [u8; 8] = payload.try_into().unwrap();
+            ctx.set_f64(decode_f64_memcomparable(arr));
+            Ok(())
+        }
+        KEY_TAG_TEXT => {
+            if !ctx.set_result_bytes(payload, true) {
+                return Err(io::Error::new(
+                    ErrorKind::FileTooLarge,
+                    "Text key exceeds i32::MAX bytes",
+                ));
+            }
+            Ok(())
+        }
+        KEY_TAG_BLOB => {
+            if !ctx.set_result_bytes(payload, false) {
+                return Err(io::Error::new(
+                    ErrorKind::FileTooLarge,
+                    "Blob key exceeds i32::MAX bytes",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -1112,34 +1077,29 @@ pub(super) fn read_stored_i64_column(row: &[u8], col_idx: usize) -> io::Result<O
 
 /// Projects column `col_idx` from `row_bytes` directly into `ctx` (`sqlite3_result_*`) with
 /// **zero Rust heap allocations** (`0` `String` / `Vec` allocations)!
-///
-/// # Safety
-/// `ctx` must be a valid non-null `*mut sqlite3_context`.
 #[inline]
-pub(in crate::vtab) unsafe fn project_column_zero_copy(
+pub(in crate::vtab) fn project_column_zero_copy(
     row_bytes: &[u8],
     col_idx: usize,
-    ctx: *mut sqlite3_context,
+    ctx: &crate::vtab::ffi::SqliteContextRef<'_>,
 ) -> io::Result<()> {
-    unsafe {
-        match stored_column(row_bytes, col_idx)? {
-            StoredColumn::Null => sqlite3_result_null(ctx),
-            StoredColumn::Integer(v) => sqlite3_result_int64(ctx, v),
-            StoredColumn::Float(v) => sqlite3_result_double(ctx, v),
-            StoredColumn::Text(bytes) if !result_bytes(ctx, bytes, true) => {
-                return Err(io::Error::new(
-                    ErrorKind::FileTooLarge,
-                    "Text column exceeds i32::MAX bytes",
-                ));
-            }
-            StoredColumn::Blob(bytes) if !result_bytes(ctx, bytes, false) => {
-                return Err(io::Error::new(
-                    ErrorKind::FileTooLarge,
-                    "Blob column exceeds i32::MAX bytes",
-                ));
-            }
-            StoredColumn::Text(_) | StoredColumn::Blob(_) => {}
+    match stored_column(row_bytes, col_idx)? {
+        StoredColumn::Null => ctx.set_null(),
+        StoredColumn::Integer(v) => ctx.set_i64(v),
+        StoredColumn::Float(v) => ctx.set_f64(v),
+        StoredColumn::Text(bytes) if !ctx.set_result_bytes(bytes, true) => {
+            return Err(io::Error::new(
+                ErrorKind::FileTooLarge,
+                "Text column exceeds i32::MAX bytes",
+            ));
         }
+        StoredColumn::Blob(bytes) if !ctx.set_result_bytes(bytes, false) => {
+            return Err(io::Error::new(
+                ErrorKind::FileTooLarge,
+                "Blob column exceeds i32::MAX bytes",
+            ));
+        }
+        StoredColumn::Text(_) | StoredColumn::Blob(_) => {}
     }
     Ok(())
 }

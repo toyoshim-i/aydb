@@ -15,9 +15,8 @@ use crate::vtab::catalog_probe::{CreatedVtabMatch, prune_matching_created_vtabs_
 use crate::vtab::ddl::{ParsedVtabDdl, parse_vtab_ddl};
 use crate::vtab::ddl_slot::{AutocommitDdl, ConnDdlSlot, InTxRename, TxCommitHook};
 use crate::vtab::ffi::{
-    SQLITE_BUSY, SQLITE_ERROR, SQLITE_OK, SQLITE_VTAB_CONSTRAINT_SUPPORT, set_pz_err,
-    set_vtab_err_msg, sqlite3, sqlite3_declare_vtab, sqlite3_get_autocommit, sqlite3_vtab,
-    sqlite3_vtab_config,
+    SQLITE_BUSY, SQLITE_ERROR, SQLITE_OK, SQLITE_VTAB_CONSTRAINT_SUPPORT, set_pz_err, sqlite3,
+    sqlite3_declare_vtab, sqlite3_get_autocommit, sqlite3_vtab, sqlite3_vtab_config,
 };
 use crate::vtab::unique_key;
 use crate::vtab::{
@@ -157,7 +156,7 @@ pub(in crate::vtab) fn connect_table(
     let marker_matches = if unique_def.is_empty() {
         matches!(existing_marker, Ok(None))
     } else {
-        matches!(existing_marker, Ok(Some(ref found)) if *found == unique_def.marker_value())
+        matches!(existing_marker, Ok(Some(ref found)) if found.as_slice() == unique_def.marker_bytes())
     };
     let unique_ready_gen = if marker_matches && marker_gen != 0 {
         marker_gen
@@ -212,7 +211,7 @@ pub(in crate::vtab) fn wait_for_other_transaction(
 
 /// Opens a fresh autocommit engine transaction for `vtab_rename` or `vtab_destroy`, waiting up
 /// to `writer_wait_timeout` if another connection currently holds a transaction open.
-unsafe fn acquire_autocommit_ddl_tx<'a>(
+fn acquire_autocommit_ddl_tx<'a>(
     vtab: &'a AydbVTab,
     pending_ddl: &ConnDdlSlot,
     conn_id: usize,
@@ -228,7 +227,7 @@ unsafe fn acquire_autocommit_ddl_tx<'a>(
             return Err(SQLITE_ERROR);
         }
         if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-            unsafe { set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR) };
+            vtab.set_err(STALE_VTAB_ERR);
             return Err(SQLITE_ERROR);
         }
         match eng.begin_transaction_for_conn(conn_id) {
@@ -240,7 +239,7 @@ unsafe fn acquire_autocommit_ddl_tx<'a>(
             }
             Err(e) => {
                 if report_begin_err {
-                    unsafe { set_vtab_err_msg(vtab.base.get(), &e.to_string()) };
+                    vtab.set_err(&e.to_string());
                 }
                 return Err(io_err_to_sqlite_rc(&e));
             }
@@ -270,129 +269,106 @@ pub(in crate::vtab) unsafe extern "system" fn vtab_connect(
     unsafe { vtab_create_or_connect(db, p_aux, argc, argv, pp_vtab, pz_err, false) }
 }
 
-unsafe fn vtab_create_or_connect(
+unsafe fn declare_vtab_schema(db: *mut sqlite3, declared_columns: &str) -> Result<(), c_int> {
+    let declare_sql = format!("CREATE TABLE x({declared_columns})");
+    let Ok(c_sql) = CString::new(declare_sql) else {
+        return Err(SQLITE_ERROR);
+    };
+    let rc = unsafe { sqlite3_declare_vtab(db, c_sql.as_ptr()) };
+    if rc != SQLITE_OK {
+        return Err(rc);
+    }
+    // Promise that `xUpdate` reports `SQLITE_CONSTRAINT` before it changes anything. SQLite
+    // then applies the statement's conflict mode (ABORT, FAIL, IGNORE, ROLLBACK) to the
+    // violation itself, row counters included, instead of treating it as a generic error.
+    let rc = unsafe { sqlite3_vtab_config(db, SQLITE_VTAB_CONSTRAINT_SUPPORT, 1 as c_int) };
+    if rc != SQLITE_OK {
+        return Err(rc);
+    }
+    Ok(())
+}
+
+struct RegisteredVtabTx<'a> {
+    eng: std::sync::RwLockWriteGuard<'a, StorageEngine<OsFs>>,
+    connected: Connected,
+    autocommit: bool,
+    began_here: bool,
+}
+
+unsafe fn connect_and_register_table<'a>(
     db: *mut sqlite3,
-    p_aux: *mut c_void,
-    argc: c_int,
-    argv: *const *const c_char,
-    pp_vtab: *mut *mut sqlite3_vtab,
-    pz_err: *mut *mut c_char,
+    aux: &'a ModuleAuxContext,
+    ddl: &ParsedVtabDdl,
     is_create: bool,
-) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        if p_aux.is_null() || pp_vtab.is_null() {
-            return SQLITE_ERROR;
+    pz_err: *mut *mut c_char,
+) -> Result<RegisteredVtabTx<'a>, c_int> {
+    let mut deadline = None;
+    let autocommit = unsafe { sqlite3_get_autocommit(db) != 0 };
+    if is_create && !autocommit {
+        if let Err(e) = unsafe { aux.pending_ddl.reconcile_in_tx_renames(db) } {
+            unsafe { set_pz_err(pz_err, &e.to_string()) };
+            return Err(io_err_to_sqlite_rc(&e));
         }
-        let aux = &*(p_aux as *const ModuleAuxContext);
-
-        let ddl = match parse_vtab_ddl(argc, argv) {
-            Ok(d) => d,
-            Err(rc) => return rc,
+    }
+    let mut began_here = false;
+    loop {
+        let mut eng = match aux.engine.write() {
+            Ok(g) => g,
+            Err(_) => return Err(SQLITE_ERROR),
         };
-        // A new table may not have a CHECK or DEFAULT it cannot honour. An existing one (written
-        // by an older build) must still connect so that it can be read and dropped; its writes
-        // are refused instead.
-        if let (true, Some(reason)) = (is_create, ddl.unsupported) {
-            set_pz_err(pz_err, reason);
-            return SQLITE_ERROR;
+        if !autocommit {
+            aux.pending_ddl.disarm_tx_commit();
         }
-
-        // Declare the columns first: it needs no engine state, so a failure leaves nothing
-        // registered.
-        let declare_sql = format!("CREATE TABLE x({})", ddl.declared_columns);
-        let Ok(c_sql) = CString::new(declare_sql) else {
-            return SQLITE_ERROR;
-        };
-        let rc = sqlite3_declare_vtab(db, c_sql.as_ptr());
-        if rc != SQLITE_OK {
-            return rc;
-        }
-        // Promise that `xUpdate` reports `SQLITE_CONSTRAINT` before it changes anything. SQLite
-        // then applies the statement's conflict mode (ABORT, FAIL, IGNORE, ROLLBACK) to the
-        // violation itself, row counters included, instead of treating it as a generic error.
-        let rc = sqlite3_vtab_config(db, SQLITE_VTAB_CONSTRAINT_SUPPORT, 1 as c_int);
-        if rc != SQLITE_OK {
-            return rc;
-        }
-
-        // Connecting an existing table writes no durable state and never waits. Creating a new
-        // table (or changing a table's quota) opens or joins an engine transaction: inside `BEGIN`
-        // it commits via `xSync`/commit hook or `xCommit`; in autocommit it is staged and
-        // committed in `sqlite3_commit_hook` so `SQLITE_BUSY` or WAL sync errors abort atomically.
-        let mut deadline = None;
-        let autocommit = sqlite3_get_autocommit(db) != 0;
-        if is_create && !autocommit {
-            if let Err(e) = aux.pending_ddl.reconcile_in_tx_renames(db) {
-                set_pz_err(pz_err, &e.to_string());
-                return io_err_to_sqlite_rc(&e);
-            }
-        }
-        let mut began_here = false;
-        let (mut eng, connected) = loop {
-            let mut eng = match aux.engine.write() {
-                Ok(g) => g,
-                Err(_) => return SQLITE_ERROR,
-            };
-            if !autocommit {
-                aux.pending_ddl.disarm_tx_commit();
-            }
-            if is_create && !eng.conn_has_open_transaction(db as usize) {
-                let need_tx = if !autocommit {
-                    true
-                } else {
-                    let view = eng.read_view_for_conn(db as usize);
-                    match eng.plan_vtab_registration_view(
-                        view,
-                        &ddl.table_name,
-                        ddl.explicit_table_id,
-                    ) {
-                        Ok(plan) => {
-                            let quota_registered = ddl.max_bytes == 0
-                                || eng
-                                    .capped_table_state_view(view, plan.table_id)
-                                    .is_some_and(|state| state.max_bytes == ddl.max_bytes);
-                            !(plan.persisted && quota_registered)
-                        }
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::InvalidData {
-                                set_pz_err(pz_err, &e.to_string());
-                            }
-                            return io_err_to_sqlite_rc(&e);
-                        }
+        if is_create && !eng.conn_has_open_transaction(db as usize) {
+            let need_tx = if !autocommit {
+                true
+            } else {
+                let view = eng.read_view_for_conn(db as usize);
+                match eng.plan_vtab_registration_view(view, &ddl.table_name, ddl.explicit_table_id)
+                {
+                    Ok(plan) => {
+                        let quota_registered = ddl.max_bytes == 0
+                            || eng
+                                .capped_table_state_view(view, plan.table_id)
+                                .is_some_and(|state| state.max_bytes == ddl.max_bytes);
+                        !(plan.persisted && quota_registered)
                     }
-                };
-                if need_tx {
-                    if autocommit && aux.pending_ddl.is_occupied() {
-                        return SQLITE_ERROR;
-                    }
-                    if let Some(snapshot) = aux.read_session.current() {
-                        if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
-                            set_pz_err(pz_err, &error.to_string());
-                            return io_err_to_sqlite_rc(&error);
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::InvalidData {
+                            unsafe { set_pz_err(pz_err, &e.to_string()) };
                         }
-                    }
-                    match eng.begin_transaction_for_conn(db as usize) {
-                        Ok(()) => {
-                            began_here = true;
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            if !wait_for_other_transaction(eng, &mut deadline) {
-                                return SQLITE_BUSY;
-                            }
-                            continue;
-                        }
-                        Err(e) => return io_err_to_sqlite_rc(&e),
+                        return Err(io_err_to_sqlite_rc(&e));
                     }
                 }
+            };
+            if need_tx {
+                if autocommit && aux.pending_ddl.is_occupied() {
+                    return Err(SQLITE_ERROR);
+                }
+                if let Some(snapshot) = aux.read_session.current() {
+                    if let Err(error) = eng.check_snapshot_current_for_upgrade(&snapshot) {
+                        unsafe { set_pz_err(pz_err, &error.to_string()) };
+                        return Err(io_err_to_sqlite_rc(&error));
+                    }
+                }
+                match eng.begin_transaction_for_conn(db as usize) {
+                    Ok(()) => {
+                        began_here = true;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if !wait_for_other_transaction(eng, &mut deadline) {
+                            return Err(SQLITE_BUSY);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(io_err_to_sqlite_rc(&e)),
+                }
             }
-            // A table that this transaction created under this name or id, and that SQLite is
-            // creating again, was undone in SQLite's schema by a `ROLLBACK TO` that the table
-            // never heard of (it was not announced the savepoint it was created in). Remove
-            // what is left of it only if this connection owns the transaction and SQLite's
-            // schema no longer has that table.
-            if is_create && eng.conn_has_open_transaction(db as usize) {
-                let cur_norm_db = crate::engine::normalize_vtab_ident(&ddl.db_name);
-                eng = match prune_matching_created_vtabs_unlocked(
+        }
+        if is_create && eng.conn_has_open_transaction(db as usize) {
+            let cur_norm_db = crate::engine::normalize_vtab_ident(&ddl.db_name);
+            eng = match unsafe {
+                prune_matching_created_vtabs_unlocked(
                     db,
                     &aux.engine,
                     db as usize,
@@ -403,66 +379,110 @@ unsafe fn vtab_create_or_connect(
                         cur_norm_db: &cur_norm_db,
                         exclude_table_id: None,
                     },
-                ) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        if began_here {
-                            if let Ok(mut g) = aux.engine.write() {
-                                let _ = g.rollback_transaction_for_conn(db as usize);
-                            }
-                        }
-                        return io_err_to_sqlite_rc(&e);
-                    }
-                };
-            }
-            let guard_create_sp = (is_create || ddl.max_bytes > 0)
-                && !began_here
-                && eng.conn_has_open_transaction(db as usize);
-            if guard_create_sp {
-                if let Err(e) = eng.savepoint_for_conn(db as usize, CREATE_SAVEPOINT) {
-                    return io_err_to_sqlite_rc(&e);
-                }
-            }
-            match connect_table(&mut eng, db as usize, &ddl, is_create) {
-                Ok(Some(connected)) => {
-                    if guard_create_sp {
-                        if let Err(e) =
-                            eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT)
-                        {
-                            return io_err_to_sqlite_rc(&e);
-                        }
-                    }
-                    if is_create && connected.newly_created {
-                        eng.note_vtab_created_in_tx(
-                            connected.table_id,
-                            &ddl.table_name,
-                            &ddl.db_name,
-                        );
-                    }
-                    break (eng, connected);
-                }
-                Ok(None) => {
-                    if guard_create_sp {
-                        let _ = eng.rollback_to_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
-                        let _ = eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
-                    }
-                    if !wait_for_other_transaction(eng, &mut deadline) {
-                        return SQLITE_BUSY;
-                    }
-                }
+                )
+            } {
+                Ok(g) => g,
                 Err(e) => {
-                    if guard_create_sp {
-                        let _ = eng.rollback_to_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
-                        let _ = eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
-                    } else if began_here {
-                        let _ = eng.rollback_transaction_for_conn(db as usize);
+                    if began_here {
+                        if let Ok(mut g) = aux.engine.write() {
+                            let _ = g.rollback_transaction_for_conn(db as usize);
+                        }
                     }
-                    if e.kind() == io::ErrorKind::InvalidData {
-                        set_pz_err(pz_err, &e.to_string());
+                    return Err(io_err_to_sqlite_rc(&e));
+                }
+            };
+        }
+        let guard_create_sp = (is_create || ddl.max_bytes > 0)
+            && !began_here
+            && eng.conn_has_open_transaction(db as usize);
+        if guard_create_sp {
+            if let Err(e) = eng.savepoint_for_conn(db as usize, CREATE_SAVEPOINT) {
+                return Err(io_err_to_sqlite_rc(&e));
+            }
+        }
+        match connect_table(&mut eng, db as usize, ddl, is_create) {
+            Ok(Some(connected)) => {
+                if guard_create_sp {
+                    if let Err(e) = eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT) {
+                        return Err(io_err_to_sqlite_rc(&e));
                     }
-                    return io_err_to_sqlite_rc(&e);
+                }
+                if is_create && connected.newly_created {
+                    eng.note_vtab_created_in_tx(connected.table_id, &ddl.table_name, &ddl.db_name);
+                }
+                return Ok(RegisteredVtabTx {
+                    eng,
+                    connected,
+                    autocommit,
+                    began_here,
+                });
+            }
+            Ok(None) => {
+                if guard_create_sp {
+                    let _ = eng.rollback_to_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
+                    let _ = eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
+                }
+                if !wait_for_other_transaction(eng, &mut deadline) {
+                    return Err(SQLITE_BUSY);
                 }
             }
+            Err(e) => {
+                if guard_create_sp {
+                    let _ = eng.rollback_to_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
+                    let _ = eng.release_savepoint_for_conn(db as usize, CREATE_SAVEPOINT);
+                } else if began_here {
+                    let _ = eng.rollback_transaction_for_conn(db as usize);
+                }
+                if e.kind() == io::ErrorKind::InvalidData {
+                    unsafe { set_pz_err(pz_err, &e.to_string()) };
+                }
+                return Err(io_err_to_sqlite_rc(&e));
+            }
+        }
+    }
+}
+
+unsafe fn vtab_create_or_connect(
+    db: *mut sqlite3,
+    p_aux: *mut c_void,
+    argc: c_int,
+    argv: *const *const c_char,
+    pp_vtab: *mut *mut sqlite3_vtab,
+    pz_err: *mut *mut c_char,
+    is_create: bool,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if p_aux.is_null() || pp_vtab.is_null() {
+            return SQLITE_ERROR;
+        }
+        let aux = unsafe { &*(p_aux as *const ModuleAuxContext) };
+
+        let ddl = match unsafe { parse_vtab_ddl(argc, argv) } {
+            Ok(d) => d,
+            Err(rc) => return rc,
+        };
+        // A new table may not have a CHECK or DEFAULT it cannot honour. An existing one (written
+        // by an older build) must still connect so that it can be read and dropped; its writes
+        // are refused instead.
+        if let (true, Some(reason)) = (is_create, ddl.unsupported) {
+            unsafe { set_pz_err(pz_err, reason) };
+            return SQLITE_ERROR;
+        }
+
+        // Declare the columns first: it needs no engine state, so a failure leaves nothing
+        // registered.
+        if let Err(rc) = unsafe { declare_vtab_schema(db, &ddl.declared_columns) } {
+            return rc;
+        }
+
+        let RegisteredVtabTx {
+            mut eng,
+            connected,
+            autocommit,
+            began_here,
+        } = match unsafe { connect_and_register_table(db, aux, &ddl, is_create, pz_err) } {
+            Ok(res) => res,
+            Err(rc) => return rc,
         };
         let Connected {
             table_id,
@@ -525,7 +545,7 @@ unsafe fn vtab_create_or_connect(
                 let _ = eng.rollback_transaction_for_conn(db as usize);
                 eng.unregister_vtab_token(table_id, reg_token);
                 drop(eng);
-                drop(Box::from_raw(raw_vtab as *mut AydbVTab));
+                drop(unsafe { Box::from_raw(raw_vtab as *mut AydbVTab) });
                 return SQLITE_ERROR;
             }
         }
@@ -533,7 +553,7 @@ unsafe fn vtab_create_or_connect(
             aux.read_session.clear();
         }
         drop(eng);
-        *pp_vtab = raw_vtab;
+        unsafe { *pp_vtab = raw_vtab };
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
@@ -542,17 +562,134 @@ unsafe fn vtab_create_or_connect(
 pub(in crate::vtab) unsafe extern "system" fn vtab_disconnect(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         if !p_vtab.is_null() {
-            unsafe {
-                let vtab = Box::from_raw(p_vtab as *mut AydbVTab);
-                if let Ok(mut eng) = vtab.engine.write() {
-                    eng.detach_vtab_from_tx(vtab.db as usize, p_vtab as usize);
-                    eng.unregister_vtab_token(vtab.table_id, vtab.reg_token);
-                }
+            let vtab = unsafe { Box::from_raw(p_vtab as *mut AydbVTab) };
+            if let Ok(mut eng) = vtab.engine.write() {
+                eng.detach_vtab_from_tx(vtab.conn_id(), p_vtab as usize);
+                eng.unregister_vtab_token(vtab.table_id, vtab.reg_token);
             }
         }
         SQLITE_OK
     }))
     .unwrap_or(SQLITE_ERROR)
+}
+
+fn rename_vtab_in_tx(vtab: &AydbVTab, new_name: String) -> c_int {
+    let conn_id = vtab.conn_id();
+    vtab.pending_ddl.disarm_tx_commit();
+    if let Err(e) = vtab.check_schema_renames() {
+        vtab.set_err(&e.to_string());
+        return io_err_to_sqlite_rc(&e);
+    }
+    let mut eng = match vtab.engine.write() {
+        Ok(g) => g,
+        Err(_) => return SQLITE_ERROR,
+    };
+    if let Err(e) = eng.check_write_allowed_for_conn(conn_id) {
+        return io_err_to_sqlite_rc(&e);
+    }
+    // SQLite does not call `xBegin` for a rename, so inside a user transaction the
+    // catalog change joins the engine transaction only if an earlier write opened one.
+    if !eng.conn_has_open_transaction(conn_id) {
+        vtab.set_err(RENAME_NEEDS_WRITE);
+        return SQLITE_ERROR;
+    }
+    if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
+        vtab.set_err(STALE_VTAB_ERR);
+        return SQLITE_ERROR;
+    }
+    let cur_norm_db = crate::engine::normalize_vtab_ident(&vtab.db_name);
+    eng = match unsafe {
+        prune_matching_created_vtabs_unlocked(
+            vtab.db,
+            &vtab.engine,
+            conn_id,
+            eng,
+            CreatedVtabMatch {
+                table_id: None,
+                table_name: &new_name,
+                cur_norm_db: &cur_norm_db,
+                exclude_table_id: Some(vtab.table_id),
+            },
+        )
+    } {
+        Ok(g) => g,
+        Err(e) => {
+            vtab.set_err(&e.to_string());
+            return io_err_to_sqlite_rc(&e);
+        }
+    };
+    if !eng.conn_has_open_transaction(conn_id) {
+        vtab.set_err(RENAME_NEEDS_WRITE);
+        return SQLITE_ERROR;
+    }
+    if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
+        vtab.set_err(STALE_VTAB_ERR);
+        return SQLITE_ERROR;
+    }
+    let old_effective = eng
+        .active_vtab_name(vtab.table_id)
+        .unwrap_or_else(|| vtab.name());
+    if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
+        vtab.set_err(&e.to_string());
+        return io_err_to_sqlite_rc(&e);
+    }
+    if crate::engine::normalize_vtab_ident(&old_effective)
+        != crate::engine::normalize_vtab_ident(&new_name)
+    {
+        let recorded = vtab.pending_ddl.record_in_tx_rename(InTxRename {
+            engine: Arc::clone(&vtab.engine),
+            conn_id,
+            table_id: vtab.table_id,
+            db_name: vtab.db_name.clone(),
+            old_name: old_effective,
+            new_name: new_name.clone(),
+            table_name: Arc::clone(&vtab.table_name),
+            durability: vtab.durability,
+        });
+        debug_assert!(recorded);
+    }
+    if let Ok(mut name) = vtab.table_name.lock() {
+        *name = new_name;
+    }
+    SQLITE_OK
+}
+
+fn rename_vtab_autocommit(vtab: &AydbVTab, new_name: String) -> c_int {
+    let conn_id = vtab.conn_id();
+    let mut eng = match acquire_autocommit_ddl_tx(vtab, &vtab.pending_ddl, conn_id, true) {
+        Ok(g) => g,
+        Err(rc) => return rc,
+    };
+
+    vtab.read_session.clear();
+    let old_effective = eng
+        .active_vtab_name(vtab.table_id)
+        .unwrap_or_else(|| vtab.name());
+    let prev_table_name = vtab.name();
+    if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
+        let _ = eng.rollback_transaction_for_conn(conn_id);
+        vtab.set_err(&e.to_string());
+        return io_err_to_sqlite_rc(&e);
+    }
+    if let Ok(mut name) = vtab.table_name.lock() {
+        *name = new_name;
+    }
+    if !vtab.pending_ddl.stage_autocommit(AutocommitDdl::Rename {
+        commit: TxCommitHook {
+            engine: Arc::clone(&vtab.engine),
+            conn_id,
+            durability: vtab.durability,
+        },
+        table_name: Arc::clone(&vtab.table_name),
+        old_name: prev_table_name.clone(),
+    }) {
+        let _ = eng.rollback_transaction_for_conn(conn_id);
+        if let Ok(mut name) = vtab.table_name.lock() {
+            *name = prev_table_name;
+        }
+        return SQLITE_ERROR;
+    }
+    SQLITE_OK
 }
 
 /// `ALTER TABLE ... RENAME TO`: moves the catalog entry to the new name.
@@ -567,178 +704,63 @@ pub(in crate::vtab) unsafe extern "system" fn vtab_rename(
     p_vtab: *mut sqlite3_vtab,
     z_new: *const c_char,
 ) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        if p_vtab.is_null() || z_new.is_null() {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(vtab) = (unsafe { AydbVTab::from_raw(p_vtab) }) else {
             return SQLITE_ERROR;
-        }
-        let vtab = &*(p_vtab as *const AydbVTab);
-        let new_name = CStr::from_ptr(z_new).to_string_lossy().into_owned();
-        let conn_id = vtab.db as usize;
-        let autocommit = sqlite3_get_autocommit(vtab.db) != 0;
-
-        if !autocommit {
-            vtab.pending_ddl.disarm_tx_commit();
-            if let Err(e) = vtab.pending_ddl.reconcile_in_tx_renames(vtab.db) {
-                set_vtab_err_msg(vtab.base.get(), &e.to_string());
-                return io_err_to_sqlite_rc(&e);
-            }
-            let mut eng = match vtab.engine.write() {
-                Ok(g) => g,
-                Err(_) => return SQLITE_ERROR,
-            };
-            if let Err(e) = eng.check_write_allowed_for_conn(conn_id) {
-                return io_err_to_sqlite_rc(&e);
-            }
-            // SQLite does not call `xBegin` for a rename, so inside a user transaction the
-            // catalog change joins the engine transaction only if an earlier write opened one.
-            if !eng.conn_has_open_transaction(conn_id) {
-                set_vtab_err_msg(vtab.base.get(), RENAME_NEEDS_WRITE);
-                return SQLITE_ERROR;
-            }
-            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
-                return SQLITE_ERROR;
-            }
-            let cur_norm_db = crate::engine::normalize_vtab_ident(&vtab.db_name);
-            eng = match prune_matching_created_vtabs_unlocked(
-                vtab.db,
-                &vtab.engine,
-                conn_id,
-                eng,
-                CreatedVtabMatch {
-                    table_id: None,
-                    table_name: &new_name,
-                    cur_norm_db: &cur_norm_db,
-                    exclude_table_id: Some(vtab.table_id),
-                },
-            ) {
-                Ok(g) => g,
-                Err(e) => {
-                    set_vtab_err_msg(vtab.base.get(), &e.to_string());
-                    return io_err_to_sqlite_rc(&e);
-                }
-            };
-            if !eng.conn_has_open_transaction(conn_id) {
-                set_vtab_err_msg(vtab.base.get(), RENAME_NEEDS_WRITE);
-                return SQLITE_ERROR;
-            }
-            if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, conn_id) {
-                set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
-                return SQLITE_ERROR;
-            }
-            let old_effective = eng
-                .active_vtab_name(vtab.table_id)
-                .unwrap_or_else(|| vtab.name());
-            if let Err(e) =
-                eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability)
-            {
-                set_vtab_err_msg(vtab.base.get(), &e.to_string());
-                return io_err_to_sqlite_rc(&e);
-            }
-            if crate::engine::normalize_vtab_ident(&old_effective)
-                != crate::engine::normalize_vtab_ident(&new_name)
-            {
-                let recorded = vtab.pending_ddl.record_in_tx_rename(InTxRename {
-                    engine: Arc::clone(&vtab.engine),
-                    conn_id,
-                    table_id: vtab.table_id,
-                    db_name: vtab.db_name.clone(),
-                    old_name: old_effective,
-                    new_name: new_name.clone(),
-                    table_name: Arc::clone(&vtab.table_name),
-                    durability: vtab.durability,
-                });
-                debug_assert!(recorded);
-            }
-            if let Ok(mut name) = vtab.table_name.lock() {
-                *name = new_name;
-            }
-            return SQLITE_OK;
-        }
-
-        let mut eng = match acquire_autocommit_ddl_tx(vtab, &vtab.pending_ddl, conn_id, true) {
-            Ok(g) => g,
-            Err(rc) => return rc,
         };
-
-        vtab.read_session.clear();
-        let old_effective = eng
-            .active_vtab_name(vtab.table_id)
-            .unwrap_or_else(|| vtab.name());
-        let prev_table_name = vtab.name();
-        if let Err(e) = eng.rename_vtab(vtab.table_id, &old_effective, &new_name, vtab.durability) {
-            let _ = eng.rollback_transaction_for_conn(conn_id);
-            set_vtab_err_msg(vtab.base.get(), &e.to_string());
-            return io_err_to_sqlite_rc(&e);
-        }
-        if let Ok(mut name) = vtab.table_name.lock() {
-            *name = new_name;
-        }
-        if !vtab.pending_ddl.stage_autocommit(AutocommitDdl::Rename {
-            commit: TxCommitHook {
-                engine: Arc::clone(&vtab.engine),
-                conn_id,
-                durability: vtab.durability,
-            },
-            table_name: Arc::clone(&vtab.table_name),
-            old_name: prev_table_name.clone(),
-        }) {
-            let _ = eng.rollback_transaction_for_conn(conn_id);
-            if let Ok(mut name) = vtab.table_name.lock() {
-                *name = prev_table_name;
-            }
+        if z_new.is_null() {
             return SQLITE_ERROR;
         }
-        SQLITE_OK
+        let new_name = unsafe { CStr::from_ptr(z_new) }
+            .to_string_lossy()
+            .into_owned();
+        if vtab.in_autocommit() {
+            rename_vtab_autocommit(vtab, new_name)
+        } else {
+            rename_vtab_in_tx(vtab, new_name)
+        }
     }))
     .unwrap_or(SQLITE_ERROR)
 }
 
 pub(in crate::vtab) unsafe extern "system" fn vtab_destroy(p_vtab: *mut sqlite3_vtab) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
-        if !p_vtab.is_null() {
-            unsafe {
-                let vtab_ref = &*(p_vtab as *const AydbVTab);
-                // SQLite does not call `xBegin` for a DROP, and once `xDestroy` has freed the
-                // table it no longer calls `xCommit` or `xRollback` for it. Inside a user
-                // transaction we therefore keep refusing `DROP TABLE`. In autocommit mode, we
-                // stage `drop_table_with_durability` in an engine transaction and commit it only
-                // in `sqlite3_commit_hook` once SQLite commits the schema change (or roll back in
-                // `sqlite3_rollback_hook` if SQLite aborts due to locks or errors).
-                if sqlite3_get_autocommit(vtab_ref.db) == 0 {
-                    return SQLITE_ERROR;
-                }
-                let conn_id = vtab_ref.db as usize;
-                let mut eng = match acquire_autocommit_ddl_tx(
-                    vtab_ref,
-                    &vtab_ref.pending_ddl,
-                    conn_id,
-                    false,
-                ) {
+        if let Some(vtab_ref) = unsafe { AydbVTab::from_raw(p_vtab) } {
+            // SQLite does not call `xBegin` for a DROP, and once `xDestroy` has freed the
+            // table it no longer calls `xCommit` or `xRollback` for it. Inside a user
+            // transaction we therefore keep refusing `DROP TABLE`. In autocommit mode, we
+            // stage `drop_table_with_durability` in an engine transaction and commit it only
+            // in `sqlite3_commit_hook` once SQLite commits the schema change (or roll back in
+            // `sqlite3_rollback_hook` if SQLite aborts due to locks or errors).
+            if !vtab_ref.in_autocommit() {
+                return SQLITE_ERROR;
+            }
+            let conn_id = vtab_ref.conn_id();
+            let mut eng =
+                match acquire_autocommit_ddl_tx(vtab_ref, &vtab_ref.pending_ddl, conn_id, false) {
                     Ok(g) => g,
                     Err(rc) => return rc,
                 };
-                vtab_ref.read_session.clear();
-                if let Err(e) =
-                    eng.drop_table_with_durability(vtab_ref.table_id, None, vtab_ref.durability)
-                {
-                    let _ = eng.rollback_transaction_for_conn(conn_id);
-                    return io_err_to_sqlite_rc(&e);
-                }
-                if !vtab_ref.pending_ddl.stage_autocommit(AutocommitDdl::Drop {
-                    commit: TxCommitHook {
-                        engine: Arc::clone(&vtab_ref.engine),
-                        conn_id,
-                        durability: vtab_ref.durability,
-                    },
-                    destroyed_token: (vtab_ref.table_id, vtab_ref.reg_token),
-                }) {
-                    let _ = eng.rollback_transaction_for_conn(conn_id);
-                    return SQLITE_ERROR;
-                }
-                drop(eng);
-                drop(Box::from_raw(p_vtab as *mut AydbVTab));
+            vtab_ref.read_session.clear();
+            if let Err(e) =
+                eng.drop_table_with_durability(vtab_ref.table_id, None, vtab_ref.durability)
+            {
+                let _ = eng.rollback_transaction_for_conn(conn_id);
+                return io_err_to_sqlite_rc(&e);
             }
+            if !vtab_ref.pending_ddl.stage_autocommit(AutocommitDdl::Drop {
+                commit: TxCommitHook {
+                    engine: Arc::clone(&vtab_ref.engine),
+                    conn_id,
+                    durability: vtab_ref.durability,
+                },
+                destroyed_token: (vtab_ref.table_id, vtab_ref.reg_token),
+            }) {
+                let _ = eng.rollback_transaction_for_conn(conn_id);
+                return SQLITE_ERROR;
+            }
+            drop(eng);
+            drop(unsafe { Box::from_raw(p_vtab as *mut AydbVTab) });
         }
         SQLITE_OK
     }))

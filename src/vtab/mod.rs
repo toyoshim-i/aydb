@@ -94,8 +94,9 @@ pub(in crate::vtab) use crate::vtab::dml::{
     resolve_pk_for_rowid,
 };
 use crate::vtab::ffi::{
-    SQLITE_BUSY, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_IOERR, SQLITE_TOOBIG, sqlite3,
-    sqlite3_module, sqlite3_vtab,
+    SQLITE_BUSY, SQLITE_CORRUPT, SQLITE_ERROR, SQLITE_IOERR, SQLITE_TOOBIG, SQLITE_TXN_WRITE,
+    set_vtab_err_msg, sqlite3, sqlite3_get_autocommit, sqlite3_module, sqlite3_txn_state,
+    sqlite3_vtab, sqlite3_vtab_on_conflict,
 };
 #[cfg(test)]
 use crate::vtab::ffi::{SQLITE_OK, sqlite3_index_info};
@@ -346,6 +347,52 @@ pub(in crate::vtab) struct AydbVTab {
 }
 
 impl AydbVTab {
+    /// Converts a raw `sqlite3_vtab` FFI pointer into a shared [`AydbVTab`] reference.
+    ///
+    /// # Safety
+    /// `p_vtab` must be null or point to a valid `AydbVTab` allocation for `'a`.
+    #[inline]
+    pub(in crate::vtab) unsafe fn from_raw<'a>(p_vtab: *mut sqlite3_vtab) -> Option<&'a Self> {
+        (!p_vtab.is_null()).then(|| unsafe { &*(p_vtab as *const Self) })
+    }
+
+    /// Connection identifier used as the engine per-connection key.
+    #[inline]
+    pub(in crate::vtab) fn conn_id(&self) -> usize {
+        self.db as usize
+    }
+
+    /// Reports an error message on `base.zErrMsg`.
+    #[inline]
+    pub(in crate::vtab) fn set_err(&self, msg: &str) {
+        unsafe { set_vtab_err_msg(self.base.get(), msg) };
+    }
+
+    /// Returns `true` when the owning SQLite connection is in autocommit mode.
+    #[inline]
+    pub(in crate::vtab) fn in_autocommit(&self) -> bool {
+        unsafe { sqlite3_get_autocommit(self.db) != 0 }
+    }
+
+    /// Returns SQLite's `ON CONFLICT` resolution mode for the current `xUpdate`.
+    #[inline]
+    pub(in crate::vtab) fn on_conflict_mode(&self) -> c_int {
+        unsafe { sqlite3_vtab_on_conflict(self.db) }
+    }
+
+    /// Returns `true` if the owning SQLite connection has an open native write transaction.
+    #[inline]
+    pub(in crate::vtab) fn txn_in_write(&self) -> bool {
+        unsafe { sqlite3_txn_state(self.db, core::ptr::null()) == SQLITE_TXN_WRITE }
+    }
+
+    /// Reconciles any in-transaction `ALTER TABLE ... RENAME TO` entries undone by a SQLite
+    /// statement journal without invoking `xRollback` / `xRollbackTo`.
+    #[inline]
+    pub(in crate::vtab) fn check_schema_renames(&self) -> io::Result<()> {
+        unsafe { self.pending_ddl.reconcile_in_tx_renames(self.db) }
+    }
+
     /// The table's current name.
     pub(in crate::vtab) fn name(&self) -> String {
         self.table_name

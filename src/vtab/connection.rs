@@ -4,7 +4,7 @@
 #[path = "snapshot_cursor_tests.rs"]
 mod snapshot_cursor_tests;
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::Path;
@@ -14,12 +14,8 @@ use crate::engine::StorageEngine;
 use crate::pal::OsFs;
 use crate::vtab::ffi::{
     SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW, SQLITE_TEXT,
-    sqlite_column_blob_bytes, sqlite_column_text_bytes, sqlite_transient, sqlite3,
-    sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
-    sqlite3_bind_text, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_count,
-    sqlite3_column_double, sqlite3_column_int64, sqlite3_column_type, sqlite3_commit_hook,
-    sqlite3_create_module_v2, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_open,
-    sqlite3_prepare_v2, sqlite3_reset, sqlite3_rollback_hook, sqlite3_step, sqlite3_stmt,
+    SQLITE_TOOBIG, SqliteStmtGuard, sqlite3, sqlite3_close, sqlite3_commit_hook,
+    sqlite3_create_module_v2, sqlite3_errmsg, sqlite3_exec, sqlite3_open, sqlite3_rollback_hook,
 };
 use crate::vtab::row_codec::SqlValue;
 use crate::vtab::snapshot::{
@@ -170,25 +166,8 @@ impl SqliteConnection {
                 "NUL byte in SQL",
             ));
         }
-        if sql.len() > i32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SQL statement exceeds i32::MAX bytes",
-            ));
-        }
-        let mut stmt: *mut sqlite3_stmt = core::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_prepare_v2(
-                self.db,
-                sql.as_ptr() as *const c_char,
-                sql.len() as c_int,
-                &mut stmt,
-                core::ptr::null_mut(),
-            )
-        };
-        if rc != SQLITE_OK || stmt.is_null() {
-            return Err(self.last_error("sqlite3_prepare_v2"));
-        }
+        let stmt = unsafe { SqliteStmtGuard::prepare(self.db, sql) }
+            .map_err(|_| self.last_error("sqlite3_prepare_v2"))?;
         Ok(SqliteStatement { conn: self, stmt })
     }
 
@@ -245,7 +224,7 @@ impl Drop for SqliteConnection {
 /// Prepared SQLite statement supporting reusable parameter binding (`execute` / `query`).
 pub struct SqliteStatement<'a> {
     conn: &'a SqliteConnection,
-    stmt: *mut sqlite3_stmt,
+    stmt: SqliteStmtGuard,
 }
 
 impl<'a> SqliteStatement<'a> {
@@ -254,7 +233,7 @@ impl<'a> SqliteStatement<'a> {
     pub fn execute(&mut self, params: &[SqlValue]) -> io::Result<()> {
         self.bind_all(params)?;
         loop {
-            let rc = unsafe { sqlite3_step(self.stmt) };
+            let rc = self.stmt.step();
             if rc == SQLITE_ROW {
                 continue;
             }
@@ -262,13 +241,10 @@ impl<'a> SqliteStatement<'a> {
                 break;
             }
             let err = self.conn.last_error("sqlite3_step(execute)");
-            unsafe {
-                sqlite3_reset(self.stmt);
-            }
+            self.stmt.reset();
             return Err(err);
         }
-        let reset_rc = unsafe { sqlite3_reset(self.stmt) };
-        if reset_rc != SQLITE_OK {
+        if self.stmt.reset() != SQLITE_OK {
             return Err(self.conn.last_error("sqlite3_reset(execute)"));
         }
         Ok(())
@@ -277,75 +253,58 @@ impl<'a> SqliteStatement<'a> {
     /// Binds parameters, collects all result rows, and resets the statement.
     pub fn query(&mut self, params: &[SqlValue]) -> io::Result<Vec<Vec<SqlValue>>> {
         self.bind_all(params)?;
-        let col_count = unsafe { sqlite3_column_count(self.stmt) as usize };
+        let col_count = self.stmt.column_count();
         let mut rows = Vec::new();
         loop {
-            let rc = unsafe { sqlite3_step(self.stmt) };
+            let rc = self.stmt.step();
             if rc == SQLITE_ROW {
                 let mut row = Vec::with_capacity(col_count);
                 for c in 0..col_count {
-                    row.push(unsafe { self.read_column(c as c_int) });
+                    row.push(self.read_column(c as c_int));
                 }
                 rows.push(row);
             } else if rc == SQLITE_DONE {
                 break;
             } else {
                 let err = self.conn.last_error("sqlite3_step(query)");
-                unsafe {
-                    sqlite3_reset(self.stmt);
-                }
+                self.stmt.reset();
                 return Err(err);
             }
         }
-        let reset_rc = unsafe { sqlite3_reset(self.stmt) };
-        if reset_rc != SQLITE_OK {
+        if self.stmt.reset() != SQLITE_OK {
             return Err(self.conn.last_error("sqlite3_reset(query)"));
         }
         Ok(rows)
     }
 
     fn bind_all(&mut self, params: &[SqlValue]) -> io::Result<()> {
-        unsafe {
-            sqlite3_reset(self.stmt);
-            sqlite3_clear_bindings(self.stmt);
-        }
+        self.stmt.reset();
+        self.stmt.clear_bindings();
         for (i, p) in params.iter().enumerate() {
             let idx = (i + 1) as c_int;
-            let rc = unsafe {
-                match p {
-                    SqlValue::Null => sqlite3_bind_null(self.stmt, idx),
-                    SqlValue::Integer(v) => sqlite3_bind_int64(self.stmt, idx, *v),
-                    SqlValue::Float(v) => sqlite3_bind_double(self.stmt, idx, *v),
-                    SqlValue::Text(s) => {
-                        if s.len() > i32::MAX as usize {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "Text parameter exceeds i32::MAX bytes",
-                            ));
-                        }
-                        sqlite3_bind_text(
-                            self.stmt,
-                            idx,
-                            s.as_ptr() as *const c_char,
-                            s.len() as c_int,
-                            sqlite_transient(),
-                        )
+            let rc = match p {
+                SqlValue::Null => self.stmt.bind_null(idx),
+                SqlValue::Integer(v) => self.stmt.bind_i64(idx, *v),
+                SqlValue::Float(v) => self.stmt.bind_f64(idx, *v),
+                SqlValue::Text(s) => {
+                    let rc = self.stmt.bind_text(idx, s);
+                    if rc == SQLITE_TOOBIG {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Text parameter exceeds i32::MAX bytes",
+                        ));
                     }
-                    SqlValue::Blob(b) => {
-                        if b.len() > i32::MAX as usize {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "Blob parameter exceeds i32::MAX bytes",
-                            ));
-                        }
-                        sqlite3_bind_blob(
-                            self.stmt,
-                            idx,
-                            b.as_ptr() as *const c_void,
-                            b.len() as c_int,
-                            sqlite_transient(),
-                        )
+                    rc
+                }
+                SqlValue::Blob(b) => {
+                    let rc = self.stmt.bind_blob(idx, b);
+                    if rc == SQLITE_TOOBIG {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Blob parameter exceeds i32::MAX bytes",
+                        ));
                     }
+                    rc
                 }
             };
             if rc != SQLITE_OK {
@@ -355,31 +314,16 @@ impl<'a> SqliteStatement<'a> {
         Ok(())
     }
 
-    unsafe fn read_column(&self, col: c_int) -> SqlValue {
-        unsafe {
-            match sqlite3_column_type(self.stmt, col) {
-                SQLITE_NULL => SqlValue::Null,
-                SQLITE_INTEGER => SqlValue::Integer(sqlite3_column_int64(self.stmt, col)),
-                SQLITE_FLOAT => SqlValue::Float(sqlite3_column_double(self.stmt, col)),
-                SQLITE_TEXT => {
-                    let s = sqlite_column_text_bytes(self.stmt, col);
-                    SqlValue::Text(String::from_utf8_lossy(s).into_owned())
-                }
-                _ => {
-                    let s = sqlite_column_blob_bytes(self.stmt, col);
-                    SqlValue::Blob(s.to_vec())
-                }
+    fn read_column(&self, col: c_int) -> SqlValue {
+        match self.stmt.column_type(col) {
+            SQLITE_NULL => SqlValue::Null,
+            SQLITE_INTEGER => SqlValue::Integer(self.stmt.column_i64(col)),
+            SQLITE_FLOAT => SqlValue::Float(self.stmt.column_f64(col)),
+            SQLITE_TEXT => {
+                let s = self.stmt.column_text_bytes(col);
+                SqlValue::Text(String::from_utf8_lossy(s).into_owned())
             }
-        }
-    }
-}
-
-impl Drop for SqliteStatement<'_> {
-    fn drop(&mut self) {
-        if !self.stmt.is_null() {
-            unsafe {
-                sqlite3_finalize(self.stmt);
-            }
+            _ => SqlValue::Blob(self.stmt.column_blob_bytes(col).to_vec()),
         }
     }
 }

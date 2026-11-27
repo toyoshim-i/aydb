@@ -27,8 +27,8 @@ fn implicit_read_snapshot_survives_cursor_refills_and_other_statements() {
     }
     writer.execute_batch("COMMIT").unwrap();
 
-    let statement = reader.prepare("SELECT k,value FROM t ORDER BY k").unwrap();
-    assert_eq!(unsafe { sqlite3_step(statement.stmt) }, SQLITE_ROW);
+    let mut statement = reader.prepare("SELECT k,value FROM t ORDER BY k").unwrap();
+    assert_eq!(statement.stmt.step(), SQLITE_ROW);
     writer.execute_batch(
         "UPDATE t SET value='after'; DELETE FROM t WHERE k=300; INSERT INTO t VALUES (301,'after')",
     ).unwrap();
@@ -42,15 +42,12 @@ fn implicit_read_snapshot_survives_cursor_refills_and_other_statements() {
 
     for key in 1..=300 {
         if key > 1 {
-            assert_eq!(unsafe { sqlite3_step(statement.stmt) }, SQLITE_ROW);
+            assert_eq!(statement.stmt.step(), SQLITE_ROW);
         }
-        assert_eq!(unsafe { sqlite3_column_int64(statement.stmt, 0) }, key);
-        assert_eq!(
-            unsafe { statement.read_column(1) },
-            SqlValue::Text("before".into())
-        );
+        assert_eq!(statement.stmt.column_i64(0), key);
+        assert_eq!(statement.read_column(1), SqlValue::Text("before".into()));
     }
-    assert_eq!(unsafe { sqlite3_step(statement.stmt) }, SQLITE_DONE);
+    assert_eq!(statement.stmt.step(), SQLITE_DONE);
     drop(statement);
     assert!(
         reader
@@ -87,8 +84,8 @@ fn ending_a_transaction_releases_its_session_without_invalidating_open_cursors()
         .execute_batch("INSERT INTO t VALUES (1,'before'),(2,'before')")
         .unwrap();
     reader.execute_batch("BEGIN").unwrap();
-    let statement = reader.prepare("SELECT value FROM t ORDER BY k").unwrap();
-    assert_eq!(unsafe { sqlite3_step(statement.stmt) }, SQLITE_ROW);
+    let mut statement = reader.prepare("SELECT value FROM t ORDER BY k").unwrap();
+    assert_eq!(statement.stmt.step(), SQLITE_ROW);
     writer.execute_batch("UPDATE t SET value='after'").unwrap();
     reader.execute_batch("COMMIT; BEGIN").unwrap();
     assert_eq!(
@@ -97,11 +94,8 @@ fn ending_a_transaction_releases_its_session_without_invalidating_open_cursors()
             .unwrap(),
         vec![vec![SqlValue::Text("after".into())]]
     );
-    assert_eq!(unsafe { sqlite3_step(statement.stmt) }, SQLITE_ROW);
-    assert_eq!(
-        unsafe { statement.read_column(0) },
-        SqlValue::Text("before".into())
-    );
+    assert_eq!(statement.stmt.step(), SQLITE_ROW);
+    assert_eq!(statement.read_column(0), SqlValue::Text("before".into()));
     drop(statement);
     reader.execute_batch("ROLLBACK").unwrap();
 }

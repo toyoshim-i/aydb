@@ -555,41 +555,38 @@ pub(super) unsafe fn parse_vtab_ddl(
     argc: c_int,
     argv: *const *const c_char,
 ) -> Result<ParsedVtabDdl, c_int> {
+    unsafe fn argv_lossy_at(argv: *const *const c_char, idx: isize) -> Option<String> {
+        let ptr = unsafe { *argv.offset(idx) };
+        (!ptr.is_null()).then(|| {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
     if argc < 0 || (argc > 0 && argv.is_null()) {
         return Err(SQLITE_ERROR);
     }
-    let (db_name, table_name, raw_args) = unsafe {
-        // Extract SQLite schema name from argv[1] and virtual table name from argv[2],
-        // preserving any leading/trailing whitespace so distinct quoted names do not collide.
-        let db_name = if argc > 1 && !(*argv.offset(1)).is_null() {
-            let s = CStr::from_ptr(*argv.offset(1))
-                .to_string_lossy()
-                .into_owned();
-            if s.is_empty() {
-                String::from("main")
-            } else {
-                s
-            }
-        } else {
-            String::from("main")
-        };
-        let table_name = if argc > 2 && !(*argv.offset(2)).is_null() {
-            CStr::from_ptr(*argv.offset(2))
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            String::from("vtab")
-        };
-        let mut raw_args = Vec::with_capacity(argc.saturating_sub(3) as usize);
-        for i in 3..argc {
-            let arg_ptr = *argv.offset(i as isize);
-            if arg_ptr.is_null() {
-                continue;
-            }
-            raw_args.push(CStr::from_ptr(arg_ptr).to_string_lossy().into_owned());
-        }
-        (db_name, table_name, raw_args)
+    // Extract SQLite schema name from argv[1] and virtual table name from argv[2],
+    // preserving any leading/trailing whitespace so distinct quoted names do not collide.
+    let db_name = if argc > 1 {
+        unsafe { argv_lossy_at(argv, 1) }
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| String::from("main"))
+    } else {
+        String::from("main")
     };
+    let table_name = if argc > 2 {
+        unsafe { argv_lossy_at(argv, 2) }.unwrap_or_else(|| String::from("vtab"))
+    } else {
+        String::from("vtab")
+    };
+    let mut raw_args = Vec::with_capacity(argc.saturating_sub(3) as usize);
+    for i in 3..argc {
+        if let Some(arg) = unsafe { argv_lossy_at(argv, i as isize) } {
+            raw_args.push(arg);
+        }
+    }
     parse_vtab_ddl_args(db_name, table_name, &raw_args)
 }
 

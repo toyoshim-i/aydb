@@ -568,8 +568,41 @@ impl<'a> SqliteContextRef<'a> {
     }
 
     #[inline]
+    pub(in crate::vtab) fn set_null(&self) {
+        unsafe { sqlite3_result_null(self.0) };
+    }
+
+    #[inline]
     pub(in crate::vtab) fn set_i64(&self, val: i64) {
         unsafe { sqlite3_result_int64(self.0, val) };
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn set_f64(&self, val: f64) {
+        unsafe { sqlite3_result_double(self.0, val) };
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn set_error_toobig(&self) {
+        unsafe { sqlite3_result_error_toobig(self.0) };
+    }
+
+    /// Passes a raw slice to `sqlite3_result_text` or `sqlite3_result_blob`, reporting `TOOBIG`
+    /// and returning `false` when `payload.len() > i32::MAX as usize`.
+    #[inline]
+    pub(in crate::vtab) fn set_result_bytes(&self, payload: &[u8], is_text: bool) -> bool {
+        let Ok(n) = c_int::try_from(payload.len()) else {
+            self.set_error_toobig();
+            return false;
+        };
+        unsafe {
+            if is_text {
+                sqlite3_result_text(self.0, payload.as_ptr() as *const _, n, sqlite_transient());
+            } else {
+                sqlite3_result_blob(self.0, payload.as_ptr() as *const _, n, sqlite_transient());
+            }
+        }
+        true
     }
 
     #[inline]
@@ -608,9 +641,128 @@ impl SqliteStmtGuard {
         Self(stmt)
     }
 
+    /// Compiles `sql` on `db`, wrapping the resulting prepared statement in [`SqliteStmtGuard`].
+    ///
+    /// # Safety
+    /// `db` must be a valid non-null `*mut sqlite3`.
+    pub(in crate::vtab) unsafe fn prepare(db: *mut sqlite3, sql: &str) -> Result<Self, c_int> {
+        let Ok(sql_len) = c_int::try_from(sql.len()) else {
+            return Err(SQLITE_ERROR);
+        };
+        let mut raw_stmt: *mut sqlite3_stmt = core::ptr::null_mut();
+        let rc = unsafe {
+            sqlite3_prepare_v2(
+                db,
+                sql.as_ptr() as *const c_char,
+                sql_len,
+                &mut raw_stmt,
+                core::ptr::null_mut(),
+            )
+        };
+        let guard = Self::new(raw_stmt);
+        if rc != SQLITE_OK || guard.0.is_null() {
+            return Err(rc);
+        }
+        Ok(guard)
+    }
+
     #[inline]
     pub(in crate::vtab) fn as_ptr(&self) -> *mut sqlite3_stmt {
         self.0
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn step(&mut self) -> c_int {
+        unsafe { sqlite3_step(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn reset(&mut self) -> c_int {
+        unsafe { sqlite3_reset(self.0) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn clear_bindings(&mut self) {
+        unsafe {
+            sqlite3_clear_bindings(self.0);
+        }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn bind_null(&mut self, col: c_int) -> c_int {
+        unsafe { sqlite3_bind_null(self.0, col) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn bind_i64(&mut self, col: c_int, val: i64) -> c_int {
+        unsafe { sqlite3_bind_int64(self.0, col, val) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn bind_f64(&mut self, col: c_int, val: f64) -> c_int {
+        unsafe { sqlite3_bind_double(self.0, col, val) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn bind_text(&mut self, col: c_int, text: &str) -> c_int {
+        let Ok(n) = c_int::try_from(text.len()) else {
+            return SQLITE_TOOBIG;
+        };
+        unsafe {
+            sqlite3_bind_text(
+                self.0,
+                col,
+                text.as_ptr() as *const c_char,
+                n,
+                sqlite_transient(),
+            )
+        }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn bind_blob(&mut self, col: c_int, bytes: &[u8]) -> c_int {
+        let Ok(n) = c_int::try_from(bytes.len()) else {
+            return SQLITE_TOOBIG;
+        };
+        unsafe {
+            sqlite3_bind_blob(
+                self.0,
+                col,
+                bytes.as_ptr() as *const c_void,
+                n,
+                sqlite_transient(),
+            )
+        }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_count(&self) -> usize {
+        unsafe { sqlite3_column_count(self.0).max(0) as usize }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_type(&self, col: c_int) -> c_int {
+        unsafe { sqlite3_column_type(self.0, col) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_i64(&self, col: c_int) -> i64 {
+        unsafe { sqlite3_column_int64(self.0, col) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_f64(&self, col: c_int) -> f64 {
+        unsafe { sqlite3_column_double(self.0, col) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_text_bytes(&self, col: c_int) -> &[u8] {
+        unsafe { sqlite_column_text_bytes(self.0, col) }
+    }
+
+    #[inline]
+    pub(in crate::vtab) fn column_blob_bytes(&self, col: c_int) -> &[u8] {
+        unsafe { sqlite_column_blob_bytes(self.0, col) }
     }
 }
 

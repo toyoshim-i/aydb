@@ -12,8 +12,8 @@ use crate::pal::OsFs;
 use crate::vtab::constraints;
 use crate::vtab::ffi::{
     SQLITE_CONSTRAINT, SQLITE_ERROR, SQLITE_FULL, SQLITE_INTEGER, SQLITE_MISMATCH, SQLITE_NOMEM,
-    SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_TOOBIG, SqliteValueRef, set_vtab_err_msg,
-    sqlite3_int64, sqlite3_value, sqlite3_vtab, sqlite3_vtab_on_conflict,
+    SQLITE_NULL, SQLITE_OK, SQLITE_REPLACE, SQLITE_TOOBIG, SqliteValueRef, sqlite3_int64,
+    sqlite3_value, sqlite3_vtab,
 };
 use crate::vtab::lifecycle::STALE_VTAB_ERR;
 use crate::vtab::row_codec::{
@@ -205,8 +205,7 @@ fn has_stale_unique_marker(eng: &StorageEngine<OsFs>, vtab: &AydbVTab) -> io::Re
     if vtab.unique_def.is_empty() {
         Ok(existing.is_some())
     } else {
-        let want = vtab.unique_def.marker_value();
-        Ok(existing.is_some_and(|found| found != want))
+        Ok(existing.is_some_and(|found| found.as_slice() != vtab.unique_def.marker_bytes()))
     }
 }
 
@@ -227,11 +226,8 @@ fn invalidate_stale_unique_marker_if_needed(
             eng.unique_marker_gen(),
             !eng.in_active_transaction() && !eng.unique_marker_modified_in_tx(),
         );
-    } else {
-        let want = vtab.unique_def.marker_value();
-        if existing.is_some_and(|found| found != want) {
-            eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
-        }
+    } else if existing.is_some_and(|found| found.as_slice() != vtab.unique_def.marker_bytes()) {
+        eng.remove_unique_marker(vtab.table_id, vtab.durability)?;
     }
     Ok(())
 }
@@ -432,31 +428,55 @@ fn find_rowid_conflict(
     }
 }
 
-fn execute_upsert(
-    eng: &mut StorageEngine<OsFs>,
+struct UpsertRowidPlan {
+    is_insert: bool,
+    old_rowid_arg: Option<i64>,
+    new_rowid_req: Option<i64>,
+    pk_override: Option<i64>,
+    auto_assigned: bool,
+    cache_next_key: Option<i64>,
+}
+
+struct UpsertWritePlan {
+    new_pk: Vec<u8>,
+    row_bytes: Vec<u8>,
+    sec_keys: Vec<(u16, Vec<u8>)>,
+    old_pk_opt: Option<Vec<u8>>,
+    same_pk: bool,
+    known_absent: bool,
+    pk_conflict_to_delete: Option<Vec<u8>>,
+    unique_conflicts: Vec<Vec<u8>>,
+    rowid_conflict_pk: Option<Vec<u8>>,
+    pk_override: Option<i64>,
+    coerced_int_pk: Option<i64>,
+    mapped_rowid: Option<i64>,
+    kept_rowid: Option<i64>,
+    is_insert: bool,
+    old_rowid_arg: Option<i64>,
+    cache_next_key: Option<i64>,
+}
+
+fn validate_upsert_constraints(
     vtab: &AydbVTab,
     args: &[SqliteValueRef<'_>],
-    p_rowid: *mut sqlite3_int64,
-) -> c_int {
+    is_insert: bool,
+) -> Result<(), c_int> {
     if let Some(reason) = vtab.unsupported {
         // A row cannot be checked (CHECK) or completed (DEFAULT), so none may be stored.
         // SQLITE_CONSTRAINT would be resolved by the statement's conflict mode (OR IGNORE
         // would skip the row and report success, OR REPLACE would delete conflicting rows
         // first), so this is a plain error that every mode reports as such.
-        unsafe { set_vtab_err_msg(vtab.base.get(), reason) };
-        return SQLITE_ERROR;
+        vtab.set_err(reason);
+        return Err(SQLITE_ERROR);
     }
     let num_cols = vtab.col_names.len();
     if args.len() < 2 + num_cols {
-        return SQLITE_ERROR;
+        return Err(SQLITE_ERROR);
     }
-
-    let arg0 = args[0];
-    let is_insert = arg0.value_type() == SQLITE_NULL;
     // A native rowid alias refuses to become NULL in an UPDATE ("datatype mismatch"), a hard
     // error that no conflict clause turns into a skipped row.
     if !is_insert && vtab.pk_rowid_alias && args[2 + vtab.pk_col_idx].value_type() == SQLITE_NULL {
-        return SQLITE_MISMATCH;
+        return Err(SQLITE_MISMATCH);
     }
     for (idx, &not_null) in vtab.col_not_null.iter().enumerate() {
         if not_null
@@ -465,9 +485,19 @@ fn execute_upsert(
         {
             // NOT NULL has no REPLACE resolution without a DEFAULT, which this adapter does not
             // support, so SQLite handles every mode as the statement requires.
-            return SQLITE_CONSTRAINT;
+            return Err(SQLITE_CONSTRAINT);
         }
     }
+    Ok(())
+}
+
+fn resolve_upsert_rowid_plan(
+    eng: &mut StorageEngine<OsFs>,
+    vtab: &AydbVTab,
+    args: &[SqliteValueRef<'_>],
+    is_insert: bool,
+) -> Result<UpsertRowidPlan, c_int> {
+    let arg0 = args[0];
     let pk_val = args[2 + vtab.pk_col_idx];
     let pk_val_type = pk_val.value_type();
 
@@ -476,7 +506,7 @@ fn execute_upsert(
     // is set only when the statement really asks for a rowid.
     let new_rowid_arg = args[1];
     if !is_insert && new_rowid_arg.value_type() == SQLITE_NULL {
-        return SQLITE_MISMATCH;
+        return Err(SQLITE_MISMATCH);
     }
     let old_rowid_arg = if is_insert {
         None
@@ -489,7 +519,7 @@ fn execute_upsert(
         match extract_lossless_rowid(new_rowid_arg) {
             Some(rowid) if is_insert || old_rowid_arg != Some(rowid) => Some(rowid),
             Some(_) => None,
-            None => return SQLITE_MISMATCH,
+            None => return Err(SQLITE_MISMATCH),
         }
     };
     // `INTEGER PRIMARY KEY` is the rowid: a rowid without a key of its own sets the key
@@ -514,26 +544,137 @@ fn execute_upsert(
         alias_rowid
     } else if pk_val_type == SQLITE_NULL {
         if is_insert && vtab.pk_rowid_alias {
-            let (chosen, next_cache) = match allocate_auto_rowid(eng, vtab) {
-                Ok(pair) => pair,
-                Err(rc) => return rc,
-            };
+            let (chosen, next_cache) = allocate_auto_rowid(eng, vtab)?;
             auto_assigned = true;
             cache_next_key = next_cache;
             Some(chosen)
         } else {
-            return SQLITE_CONSTRAINT;
+            return Err(SQLITE_CONSTRAINT);
         }
     } else {
         None
     };
 
+    Ok(UpsertRowidPlan {
+        is_insert,
+        old_rowid_arg,
+        new_rowid_req,
+        pk_override,
+        auto_assigned,
+        cache_next_key,
+    })
+}
+
+fn apply_upsert_write(
+    eng: &mut StorageEngine<OsFs>,
+    vtab: &AydbVTab,
+    mut plan: UpsertWritePlan,
+) -> io::Result<i64> {
+    let in_place_same_pk =
+        !plan.is_insert && plan.old_pk_opt.as_deref() == Some(plan.new_pk.as_slice());
+    let stale_marker = has_stale_unique_marker(eng, vtab)?;
+    let removes_rows = stale_marker
+        || plan.pk_conflict_to_delete.is_some()
+        || !plan.unique_conflicts.is_empty()
+        || plan.rowid_conflict_pk.is_some()
+        || plan
+            .old_pk_opt
+            .as_ref()
+            .is_some_and(|old_pk| old_pk.as_slice() != plan.new_pk.as_slice());
+
+    let rid = with_statement_savepoint(eng, vtab.conn_id(), vtab.table_id, removes_rows, |eng| {
+        for conflict_pk in plan
+            .pk_conflict_to_delete
+            .into_iter()
+            .chain(plan.unique_conflicts)
+            .chain(plan.rowid_conflict_pk)
+        {
+            let check_syn = needs_synthetic_delete_check(vtab, &conflict_pk);
+            eng.delete_row_with_rowid_hint(
+                vtab.table_id,
+                &conflict_pk,
+                vtab.durability,
+                check_syn,
+            )?;
+        }
+
+        // If UPDATE changed the physical PK bytes, delete the old PK row.
+        if let Some(old_pk) = plan.old_pk_opt {
+            if old_pk.as_slice() != plan.new_pk.as_slice() {
+                let check_syn = needs_synthetic_delete_check(vtab, &old_pk);
+                eng.delete_row_with_rowid_hint(vtab.table_id, &old_pk, vtab.durability, check_syn)?;
+                if plan.same_pk {
+                    plan.known_absent = true;
+                }
+            }
+        }
+
+        let (rid, extra_records) = if let Some(auto_id) = plan.pk_override {
+            (auto_id, Vec::new())
+        } else if let Some(int_id) = plan.coerced_int_pk {
+            (int_id, Vec::new())
+        } else if let Some(rowid) = plan.mapped_rowid.or(plan.kept_rowid) {
+            let extra = eng.plan_set_rowid(vtab.table_id, &plan.new_pk, rowid)?;
+            (rowid, extra)
+        } else if in_place_same_pk {
+            if let Some(old_rid) = plan.old_rowid_arg {
+                (old_rid, Vec::new())
+            } else {
+                rowid_map::plan_synthetic_rowid(
+                    eng,
+                    vtab.table_id,
+                    &plan.new_pk,
+                    vtab.pk_rowid_alias,
+                )?
+            }
+        } else {
+            rowid_map::plan_synthetic_rowid(eng, vtab.table_id, &plan.new_pk, vtab.pk_rowid_alias)?
+        };
+
+        eng.put_row_owned_with_hint_and_extra(
+            vtab.table_id,
+            &plan.new_pk,
+            plan.row_bytes,
+            PutRowOptions {
+                secondary_keys: &plan.sec_keys,
+                extra_records,
+                durability: vtab.durability,
+                known_absent: plan.known_absent,
+            },
+        )?;
+        invalidate_stale_unique_marker_if_needed(eng, vtab)?;
+        Ok(rid)
+    })?;
+
+    if let (Some(next), Ok(mut cache)) = (plan.cache_next_key, vtab.auto_key_cache.lock()) {
+        // After this insert's own writes: anything touching this table later moves its epoch.
+        *cache = Some((eng.table_mutation_epoch(vtab.table_id), next));
+    }
+    Ok(rid)
+}
+
+fn execute_upsert(
+    eng: &mut StorageEngine<OsFs>,
+    vtab: &AydbVTab,
+    args: &[SqliteValueRef<'_>],
+    p_rowid: *mut sqlite3_int64,
+) -> c_int {
+    let is_insert = args.first().is_some_and(|a| a.value_type() == SQLITE_NULL);
+    if let Err(rc) = validate_upsert_constraints(vtab, args, is_insert) {
+        return rc;
+    }
+    let rowid_plan = match resolve_upsert_rowid_plan(eng, vtab, args, is_insert) {
+        Ok(p) => p,
+        Err(rc) => return rc,
+    };
+
+    let num_cols = vtab.col_names.len();
     let (new_pk, row_bytes, mut sec_keys) = match unsafe {
         try_encode_sqlite_values_direct(
             args[2..].as_ptr() as *mut *mut sqlite3_value,
             num_cols,
             vtab.pk_col_idx,
-            pk_override,
+            rowid_plan.pk_override,
             &vtab.col_affinities,
             &vtab.col_collations,
             &vtab.secondary_indexes,
@@ -554,15 +695,15 @@ fn execute_upsert(
     // other key (including non-alias `INT PRIMARY KEY`) keeps an independent persistent rowid,
     // where an explicit rowid is stored as requested.
     let mapped_rowid = if coerced_int_pk.is_none() {
-        new_rowid_req
+        rowid_plan.new_rowid_req
     } else {
         None
     };
 
     // Resolve `old_pk` if this is an UPDATE (`!is_insert`).
     let mut old_pk_opt: Option<Vec<u8>> = None;
-    if !is_insert {
-        if let Some(rid) = old_rowid_arg {
+    if !rowid_plan.is_insert {
+        if let Some(rid) = rowid_plan.old_rowid_arg {
             let mapped = match resolve_pk_for_rowid(
                 vtab,
                 rid,
@@ -583,7 +724,7 @@ fn execute_upsert(
         } else {
             old_pk_opt = Some(unsafe {
                 sqlite_value_to_key_bytes_with_schema(
-                    arg0.as_ptr(),
+                    args[0].as_ptr(),
                     vtab.pk_affinity,
                     vtab.pk_collation,
                     false,
@@ -607,7 +748,7 @@ fn execute_upsert(
         Ok(conflict) => conflict,
         Err(e) => return io_err_to_sqlite_rc(&e),
     };
-    let conflict_mode = unsafe { sqlite3_vtab_on_conflict(vtab.db) };
+    let conflict_mode = vtab.on_conflict_mode();
     if rowid_conflict_pk.is_some() && conflict_mode != SQLITE_REPLACE {
         return SQLITE_CONSTRAINT;
     }
@@ -620,7 +761,7 @@ fn execute_upsert(
         }
         None => false,
     };
-    let mut known_absent = auto_assigned;
+    let mut known_absent = rowid_plan.auto_assigned;
     let mut pk_conflict_to_delete: Option<Vec<u8>> = None;
     let unique_probes = if vtab.unique_def.is_empty() {
         Vec::new()
@@ -642,7 +783,7 @@ fn execute_upsert(
     if !unique_conflicts.is_empty() && conflict_mode != SQLITE_REPLACE {
         return SQLITE_CONSTRAINT;
     }
-    if (is_insert || !same_pk) && !auto_assigned {
+    if (rowid_plan.is_insert || !same_pk) && !rowid_plan.auto_assigned {
         let existing_conflict =
             match find_existing_pk_or_numeric_alt(eng, vtab.table_id, &new_pk, vtab.pk_affinity) {
                 Ok(opt) => opt,
@@ -667,114 +808,37 @@ fn execute_upsert(
     // A row whose key changes keeps its rowid, as on a native table. SQLite addresses the rows it
     // still has queued by their old rowids, so a rowid that moved to another row (or a new one
     // derived from the new key) would make them hit the wrong row.
-    let kept_rowid = old_rowid_arg.filter(|_| {
+    let kept_rowid = rowid_plan.old_rowid_arg.filter(|_| {
         old_pk_opt
             .as_ref()
             .is_some_and(|old| old.as_slice() != new_pk.as_slice())
     });
 
-    // Everything below mutates the engine. A statement that removes rows (REPLACE conflict
-    // resolution, or a PK-changing UPDATE) and then fails to store the new row must leave every
-    // row and mapping intact. SQLite cannot be relied on for that: it opens a statement journal
-    // only for statements that may write several rows, so a single-row statement that fails inside
-    // `BEGIN` keeps whatever `xUpdate` already did. Rowid allocation or updates are folded into the
-    // single atomic `put_row_owned_with_hint_and_extra` WAL batch so inserts and in-place updates
-    // never need a per-row statement savepoint.
-    let in_place_same_pk = !is_insert && old_pk_opt.as_deref() == Some(new_pk.as_slice());
-    let stale_marker = match has_stale_unique_marker(eng, vtab) {
-        Ok(b) => b,
-        Err(e) => return io_err_to_sqlite_rc(&e),
-    };
-    let removes_rows = stale_marker
-        || pk_conflict_to_delete.is_some()
-        || !unique_conflicts.is_empty()
-        || rowid_conflict_pk.is_some()
-        || old_pk_opt
-            .as_ref()
-            .is_some_and(|old_pk| old_pk.as_slice() != new_pk.as_slice());
-    let applied =
-        with_statement_savepoint(eng, vtab.db as usize, vtab.table_id, removes_rows, |eng| {
-            for conflict_pk in pk_conflict_to_delete.into_iter().chain(unique_conflicts) {
-                let check_syn = needs_synthetic_delete_check(vtab, &conflict_pk);
-                eng.delete_row_with_rowid_hint(
-                    vtab.table_id,
-                    &conflict_pk,
-                    vtab.durability,
-                    check_syn,
-                )?;
-            }
-
-            if let Some(conflict_pk) = rowid_conflict_pk {
-                let check_syn = needs_synthetic_delete_check(vtab, &conflict_pk);
-                eng.delete_row_with_rowid_hint(
-                    vtab.table_id,
-                    &conflict_pk,
-                    vtab.durability,
-                    check_syn,
-                )?;
-            }
-
-            // If UPDATE changed the physical PK bytes, delete the old PK row.
-            if let Some(old_pk) = old_pk_opt {
-                if old_pk.as_slice() != new_pk.as_slice() {
-                    let check_syn = needs_synthetic_delete_check(vtab, &old_pk);
-                    eng.delete_row_with_rowid_hint(
-                        vtab.table_id,
-                        &old_pk,
-                        vtab.durability,
-                        check_syn,
-                    )?;
-                    if same_pk {
-                        known_absent = true;
-                    }
-                }
-            }
-
-            let (rid, extra_records) = if let Some(auto_id) = pk_override {
-                (auto_id, Vec::new())
-            } else if let Some(int_id) = coerced_int_pk {
-                (int_id, Vec::new())
-            } else if let Some(rowid) = mapped_rowid.or(kept_rowid) {
-                let extra = eng.plan_set_rowid(vtab.table_id, &new_pk, rowid)?;
-                (rowid, extra)
-            } else if in_place_same_pk {
-                if let Some(old_rid) = old_rowid_arg {
-                    (old_rid, Vec::new())
-                } else {
-                    rowid_map::plan_synthetic_rowid(
-                        eng,
-                        vtab.table_id,
-                        &new_pk,
-                        vtab.pk_rowid_alias,
-                    )?
-                }
-            } else {
-                rowid_map::plan_synthetic_rowid(eng, vtab.table_id, &new_pk, vtab.pk_rowid_alias)?
-            };
-
-            eng.put_row_owned_with_hint_and_extra(
-                vtab.table_id,
-                &new_pk,
-                row_bytes,
-                PutRowOptions {
-                    secondary_keys: &sec_keys,
-                    extra_records,
-                    durability: vtab.durability,
-                    known_absent,
-                },
-            )?;
-            invalidate_stale_unique_marker_if_needed(eng, vtab)?;
-
-            Ok(rid)
-        });
-    let rid = match applied {
+    let rid = match apply_upsert_write(
+        eng,
+        vtab,
+        UpsertWritePlan {
+            new_pk,
+            row_bytes,
+            sec_keys,
+            old_pk_opt,
+            same_pk,
+            known_absent,
+            pk_conflict_to_delete,
+            unique_conflicts,
+            rowid_conflict_pk,
+            pk_override: rowid_plan.pk_override,
+            coerced_int_pk,
+            mapped_rowid,
+            kept_rowid,
+            is_insert: rowid_plan.is_insert,
+            old_rowid_arg: rowid_plan.old_rowid_arg,
+            cache_next_key: rowid_plan.cache_next_key,
+        },
+    ) {
         Ok(rid) => rid,
         Err(e) => return io_err_to_sqlite_rc(&e),
     };
-    if let (Some(next), Ok(mut cache)) = (cache_next_key, vtab.auto_key_cache.lock()) {
-        // After this insert's own writes: anything touching this table later moves its epoch.
-        *cache = Some((eng.table_mutation_epoch(vtab.table_id), next));
-    }
     if !p_rowid.is_null() {
         unsafe { *p_rowid = rid };
     }
@@ -787,24 +851,23 @@ pub(in crate::vtab) unsafe extern "system" fn vtab_update(
     argv: *mut *mut sqlite3_value,
     p_rowid: *mut sqlite3_int64,
 ) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        if p_vtab.is_null() {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(vtab) = (unsafe { AydbVTab::from_raw(p_vtab) }) else {
             return SQLITE_ERROR;
-        }
-        let args = SqliteValueRef::slice_from_argv(argv, argc);
+        };
+        let args = unsafe { SqliteValueRef::slice_from_argv(argv, argc) };
         if args.is_empty() {
             return SQLITE_ERROR;
         }
-        let vtab = &*(p_vtab as *const AydbVTab);
         let mut eng = match vtab.engine.write() {
             Ok(g) => g,
             Err(_) => return SQLITE_ERROR,
         };
-        if let Err(e) = eng.check_write_allowed_for_conn(vtab.db as usize) {
+        if let Err(e) = eng.check_write_allowed_for_conn(vtab.conn_id()) {
             return io_err_to_sqlite_rc(&e);
         }
-        if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.db as usize) {
-            set_vtab_err_msg(vtab.base.get(), STALE_VTAB_ERR);
+        if !eng.is_vtab_token_active(vtab.table_id, vtab.reg_token, vtab.conn_id()) {
+            vtab.set_err(STALE_VTAB_ERR);
             return SQLITE_ERROR;
         }
         vtab.pending_ddl.disarm_tx_commit();

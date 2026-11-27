@@ -308,16 +308,16 @@ struct SelectedBestIndexPlan {
 
 impl AydbVTab {
     pub(in crate::vtab) fn is_unique_index_ready_for_plan(&self) -> bool {
-        let want = self.unique_def.marker_value();
+        let want = self.unique_def.marker_bytes();
         let Ok(eng) = self.engine.read() else {
             return false;
         };
-        if eng.conn_has_open_transaction(self.db as usize) && eng.unique_marker_modified_in_tx() {
+        if eng.conn_has_open_transaction(self.conn_id()) && eng.unique_marker_modified_in_tx() {
             return eng
                 .unique_marker_view(crate::engine::ReadView::Owner, self.table_id)
                 .ok()
                 .flatten()
-                .is_some_and(|found| found == want);
+                .is_some_and(|found| found.as_slice() == want);
         }
         let marker_gen = eng.unique_marker_gen();
         if self.unique_ready.is_ready_for(marker_gen) {
@@ -327,7 +327,7 @@ impl AydbVTab {
             .unique_marker_view(crate::engine::ReadView::Committed, self.table_id)
             .ok()
             .flatten()
-            .is_some_and(|found| found == want);
+            .is_some_and(|found| found.as_slice() == want);
         if marked && marker_gen != 0 {
             self.unique_ready
                 .latch_if_committed(marker_gen, !eng.unique_marker_modified_in_tx());
@@ -343,20 +343,26 @@ pub(in crate::vtab) unsafe extern "system" fn vtab_best_index(
     p_vtab: *mut sqlite3_vtab,
     p_info: *mut sqlite3_index_info,
 ) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        if p_vtab.is_null() || p_info.is_null() {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(vtab) = (unsafe { AydbVTab::from_raw(p_vtab) }) else {
+            return SQLITE_ERROR;
+        };
+        if p_info.is_null() {
             return SQLITE_ERROR;
         }
-        let vtab = &*(p_vtab as *const AydbVTab);
         // Read input fields via raw pointer without holding a live `&mut sqlite3_index_info`
         // across FFI calls to `sqlite3_vtab_collation(p_info, ...)`, which inspects `p_info`
         // and SQLite's trailing `HiddenIndexInfo`.
-        let n_constraint = (*p_info).nConstraint;
-        let a_constraint = (*p_info).aConstraint;
-        let a_constraint_usage = (*p_info).aConstraintUsage;
-        let n_order_by = (*p_info).nOrderBy;
-        let a_order_by = (*p_info).aOrderBy;
-        let col_used = (*p_info).colUsed;
+        let (n_constraint, a_constraint, a_constraint_usage, n_order_by, a_order_by, col_used) = unsafe {
+            (
+                (*p_info).nConstraint,
+                (*p_info).aConstraint,
+                (*p_info).aConstraintUsage,
+                (*p_info).nOrderBy,
+                (*p_info).aOrderBy,
+                (*p_info).colUsed,
+            )
+        };
 
         let n = usize::try_from(n_constraint).unwrap_or(0);
         let constraints: &[crate::vtab::ffi::sqlite3_index_constraint] = if n == 0 {
@@ -364,19 +370,20 @@ pub(in crate::vtab) unsafe extern "system" fn vtab_best_index(
         } else if a_constraint.is_null() || a_constraint_usage.is_null() {
             return SQLITE_ERROR;
         } else {
-            core::slice::from_raw_parts(a_constraint, n)
+            unsafe { core::slice::from_raw_parts(a_constraint, n) }
         };
-        let order_by = order_by_slice(n_order_by, a_order_by);
-        let matches_collation =
-            |idx: usize, coll: ColCollation| constraint_matches_col_collation(p_info, idx, coll);
+        let order_by = unsafe { order_by_slice(n_order_by, a_order_by) };
+        let matches_collation = |idx: usize, coll: ColCollation| unsafe {
+            constraint_matches_col_collation(p_info, idx, coll)
+        };
         let plan = select_best_index(vtab, &matches_collation, constraints, order_by, col_used);
 
         // No more calls into `sqlite3_vtab_collation`: safe to materialize unique references.
-        let info = &mut *p_info;
+        let info = unsafe { &mut *p_info };
         let usages: &mut [crate::vtab::ffi::sqlite3_index_constraint_usage] = if n == 0 {
             &mut []
         } else {
-            core::slice::from_raw_parts_mut(a_constraint_usage, n)
+            unsafe { core::slice::from_raw_parts_mut(a_constraint_usage, n) }
         };
         for slot in 0..plan.num_used {
             let idx = plan.used_constraints[slot];

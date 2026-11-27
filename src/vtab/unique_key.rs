@@ -37,6 +37,7 @@ pub(super) fn unique_index_id(col_idx: usize) -> u16 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UniqueDef {
     cols: Vec<(usize, ColCollation, ColumnAffinity)>,
+    marker_bytes: Vec<u8>,
 }
 
 impl UniqueDef {
@@ -44,7 +45,25 @@ impl UniqueDef {
     const MARKER_VERSION: u8 = 2;
 
     pub(crate) fn new(cols: Vec<(usize, ColCollation, ColumnAffinity)>) -> Self {
-        Self { cols }
+        let mut marker_bytes = Vec::with_capacity(3 + cols.len() * 4);
+        marker_bytes.push(Self::MARKER_VERSION);
+        marker_bytes.extend_from_slice(&(cols.len() as u16).to_be_bytes());
+        for &(col, collation, affinity) in &cols {
+            marker_bytes.extend_from_slice(&(col as u16).to_be_bytes());
+            marker_bytes.push(match collation {
+                ColCollation::Binary => 0,
+                ColCollation::NoCase => 1,
+                ColCollation::RTrim => 2,
+            });
+            marker_bytes.push(match affinity {
+                ColumnAffinity::Integer => 0,
+                ColumnAffinity::Text => 1,
+                ColumnAffinity::Blob => 2,
+                ColumnAffinity::Real => 3,
+                ColumnAffinity::Numeric => 4,
+            });
+        }
+        Self { cols, marker_bytes }
     }
 
     pub(super) fn from_columns(
@@ -66,27 +85,16 @@ impl UniqueDef {
         self.cols.is_empty()
     }
 
-    /// `[ver = 2][n u16 BE][(col_idx u16 BE, collation u8, affinity u8) * n]`.
+    /// Cached marker payload (`[ver = 2][n u16 BE][(col_idx u16 BE, collation u8, affinity u8) * n]`).
+    #[inline]
+    pub(crate) fn marker_bytes(&self) -> &[u8] {
+        &self.marker_bytes
+    }
+
+    /// Owned copy of [`Self::marker_bytes`] for APIs that persist a `Vec<u8>`.
+    #[inline]
     pub(crate) fn marker_value(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(3 + self.cols.len() * 4);
-        out.push(Self::MARKER_VERSION);
-        out.extend_from_slice(&(self.cols.len() as u16).to_be_bytes());
-        for &(col, collation, affinity) in &self.cols {
-            out.extend_from_slice(&(col as u16).to_be_bytes());
-            out.push(match collation {
-                ColCollation::Binary => 0,
-                ColCollation::NoCase => 1,
-                ColCollation::RTrim => 2,
-            });
-            out.push(match affinity {
-                ColumnAffinity::Integer => 0,
-                ColumnAffinity::Text => 1,
-                ColumnAffinity::Blob => 2,
-                ColumnAffinity::Real => 3,
-                ColumnAffinity::Numeric => 4,
-            });
-        }
-        out
+        self.marker_bytes.clone()
     }
 
     /// The probes for the finished row `row`: one per non-NULL UNIQUE column, by column position.

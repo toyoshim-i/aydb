@@ -3,16 +3,12 @@
 //! Releases the engine write lock around all SQLite catalog queries so schema re-parsing (`xConnect`)
 //! can never deadlock against `engine.write()`.
 
-use core::ffi::c_char;
 use std::io;
 use std::sync::{Arc, RwLock};
 
 use crate::engine::StorageEngine;
 use crate::pal::OsFs;
-use crate::vtab::ffi::{
-    SQLITE_DONE, SQLITE_OK, SQLITE_ROW, SqliteStmtGuard, sqlite_column_text_bytes,
-    sqlite_transient, sqlite3, sqlite3_bind_text, sqlite3_prepare_v2, sqlite3_step, sqlite3_stmt,
-};
+use crate::vtab::ffi::{SQLITE_DONE, SQLITE_OK, SQLITE_ROW, SqliteStmtGuard, sqlite3};
 use crate::vtab::snapshot;
 
 /// Target descriptor for [`prune_matching_created_vtabs_unlocked`].
@@ -277,9 +273,6 @@ pub(in crate::vtab) fn is_aydb_vtab_sql(sql: &str) -> bool {
 /// Queries one schema's `sqlite_master` (`sqlite_temp_master` for `"temp"`) for `name` and checks
 /// whether it is an `aydb` virtual table. Returns `None` if the query could not be completed.
 unsafe fn query_schema_for_aydb_table(db: *mut sqlite3, catalog: &str, name: &str) -> Option<bool> {
-    let Ok(name_len) = i32::try_from(name.len()) else {
-        return None;
-    };
     let schema_table = if catalog.eq_ignore_ascii_case("temp") {
         "temp.sqlite_temp_master".to_string()
     } else if catalog.eq_ignore_ascii_case("main") {
@@ -291,40 +284,14 @@ unsafe fn query_schema_for_aydb_table(db: *mut sqlite3, catalog: &str, name: &st
     let sql = format!(
         "SELECT sql FROM {schema_table} WHERE type = 'table' AND name = ?1 COLLATE NOCASE LIMIT 1"
     );
-    let Ok(sql_len) = i32::try_from(sql.len()) else {
-        return None;
-    };
-    let mut raw_stmt: *mut sqlite3_stmt = core::ptr::null_mut();
-    let prep_rc = unsafe {
-        sqlite3_prepare_v2(
-            db,
-            sql.as_ptr() as *const c_char,
-            sql_len,
-            &mut raw_stmt,
-            core::ptr::null_mut(),
-        )
-    };
-    let stmt = SqliteStmtGuard::new(raw_stmt);
-    if prep_rc != SQLITE_OK || stmt.as_ptr().is_null() {
-        return None;
-    }
-    let bind_rc = unsafe {
-        sqlite3_bind_text(
-            stmt.as_ptr(),
-            1,
-            name.as_ptr() as *const c_char,
-            name_len,
-            sqlite_transient(),
-        )
-    };
-    if bind_rc != SQLITE_OK {
+    let mut stmt = unsafe { SqliteStmtGuard::prepare(db, &sql) }.ok()?;
+    if stmt.bind_text(1, name) != SQLITE_OK {
         None
     } else {
-        match unsafe { sqlite3_step(stmt.as_ptr()) } {
-            SQLITE_ROW => {
-                let bytes = unsafe { sqlite_column_text_bytes(stmt.as_ptr(), 0) };
-                core::str::from_utf8(bytes).ok().map(is_aydb_vtab_sql)
-            }
+        match stmt.step() {
+            SQLITE_ROW => core::str::from_utf8(stmt.column_text_bytes(0))
+                .ok()
+                .map(is_aydb_vtab_sql),
             SQLITE_DONE => Some(false),
             _ => None,
         }

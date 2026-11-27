@@ -154,12 +154,12 @@ pub(super) unsafe extern "system" fn trace_reads(
     statement: *mut c_void,
     _detail: *mut c_void,
 ) -> c_int {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
         if IN_INTERNAL_SCHEMA_QUERY.with(Cell::get) || context.is_null() {
             return;
         }
-        let trace = &*(context as *const ReadTrace);
-        let autocommit = sqlite3_get_autocommit(trace.database) != 0;
+        let trace = unsafe { &*(context as *const ReadTrace) };
+        let autocommit = unsafe { sqlite3_get_autocommit(trace.database) != 0 };
         let previously_autocommit = trace.autocommit.replace(autocommit);
         let transaction_ended = autocommit && !previously_autocommit;
         let idle = {
@@ -178,29 +178,29 @@ pub(super) unsafe extern "system" fn trace_reads(
             trace.abort_pending_ddl();
             trace.clear();
         } else if event == TRACE_PROFILE && !autocommit {
-            let _ = trace.pending_ddl.reconcile_in_tx_renames(trace.database);
+            let _ = unsafe { trace.pending_ddl.reconcile_in_tx_renames(trace.database) };
         }
     }));
     0
 }
 
 pub(super) unsafe extern "system" fn ddl_commit_hook(context: *mut c_void) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| unsafe {
+    catch_unwind(AssertUnwindSafe(|| {
         if context.is_null() {
             return 1;
         }
-        let trace = &*(context as *const ReadTrace);
+        let trace = unsafe { &*(context as *const ReadTrace) };
         trace.pending_ddl.commit_pending()
     }))
     .unwrap_or(1)
 }
 
 pub(super) unsafe extern "system" fn ddl_rollback_hook(context: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
         if context.is_null() {
             return;
         }
-        let trace = &*(context as *const ReadTrace);
+        let trace = unsafe { &*(context as *const ReadTrace) };
         trace.pending_ddl.rollback_pending();
     }));
 }

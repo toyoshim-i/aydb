@@ -33,13 +33,13 @@ pub(super) fn find_unique_conflicts(
 /// latching `unique_ready` prematurely (so a `ROLLBACK` never leaves a stale latch). A
 /// connection whose own migration failed stays on the scan.
 fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
-    let want = vtab.unique_def.marker_value();
-    if engine.conn_has_open_transaction(vtab.db as usize) && engine.unique_marker_modified_in_tx() {
+    let want = vtab.unique_def.marker_bytes();
+    if engine.conn_has_open_transaction(vtab.conn_id()) && engine.unique_marker_modified_in_tx() {
         return engine
             .unique_marker_view(crate::engine::ReadView::Owner, vtab.table_id)
             .ok()
             .flatten()
-            .is_some_and(|found| found == want);
+            .is_some_and(|found| found.as_slice() == want);
     }
     let marker_gen = engine.unique_marker_gen();
     if vtab.unique_ready.is_ready_for(marker_gen) {
@@ -52,7 +52,7 @@ fn index_is_trusted(engine: &StorageEngine<OsFs>, vtab: &AydbVTab) -> bool {
         .unique_marker_view(crate::engine::ReadView::Committed, vtab.table_id)
         .ok()
         .flatten()
-        .is_some_and(|found| found == want);
+        .is_some_and(|found| found.as_slice() == want);
     if marked {
         vtab.unique_ready
             .latch_if_committed(marker_gen, !engine.unique_marker_modified_in_tx());
