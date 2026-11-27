@@ -381,7 +381,6 @@ impl UnixPlatformFile {
         full_path: &Path,
         create: bool,
         writable: bool,
-        truncate: bool,
         hint: OpenHint,
         pool: Option<Arc<HandlePool>>,
     ) -> io::Result<Self> {
@@ -392,7 +391,7 @@ impl UnixPlatformFile {
             .read(true)
             .write(writable)
             .create(create)
-            .truncate(truncate)
+            .truncate(false)
             .open(full_path)?;
         apply_open_hint(&file, hint);
         let fd = if pool.is_some() {
@@ -584,10 +583,6 @@ impl PlatformFile for UnixPlatformFile {
             self.sync_with(|f| f.sync_all())
         }
     }
-
-    fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Unix implementation of [`PlatformFs`].
@@ -691,7 +686,7 @@ impl PlatformFs for UnixPlatformFs {
             None
         };
         let file = Arc::new(UnixPlatformFile::open_internal(
-            &full_path, create, writable, false, hint, pool_ref,
+            &full_path, create, writable, hint, pool_ref,
         )?);
         if use_pool {
             self.pool.register(&full_path, &file);

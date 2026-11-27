@@ -402,13 +402,39 @@ impl<F: PlatformFile> BlobSegmentReader<F> {
         expected_key: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) -> io::Result<bool> {
+        const STACK_READ_LEN: usize = 16 * 1024;
+
         let Some(_) = self.checked_ptr_end_in_file(ptr)? else {
             return Ok(false);
         };
         let len = ptr.len as usize;
 
-        // Validate the 16-byte stack header before allocating `ptr.len` bytes in `out` so a
-        // tampered or mismatched record cannot force a huge reservation before failing checks.
+        if len <= STACK_READ_LEN {
+            let mut stack_buf = [0u8; STACK_READ_LEN];
+            match self
+                .file
+                .read_exact_at(&mut stack_buf[..len], ptr.offset as u64)
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            let Some(val) = Self::verify_blob_record(&stack_buf[..len], ptr.crc32c, expected_key)
+            else {
+                return Ok(false);
+            };
+            out.try_reserve(val.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "failed to allocate buffer for blob record",
+                )
+            })?;
+            out.extend_from_slice(val);
+            return Ok(true);
+        }
+
+        // For larger blobs, validate the 16-byte stack header before allocating `ptr.len` bytes in
+        // `out` so a tampered or mismatched record cannot force a huge reservation first.
         let mut hdr = [0u8; BLOB_RECORD_HEADER_LEN];
         match self.file.read_exact_at(&mut hdr, ptr.offset as u64) {
             Ok(()) => {}

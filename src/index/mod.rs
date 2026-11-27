@@ -4,13 +4,18 @@
 //! See `docs/phase1/04_WISCKEY_AND_SEGMENTS.md` for the detailed binary format.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
 pub mod bloom;
+mod compaction;
+mod cursor;
 pub mod key_codec;
 pub use bloom::BloomFilter;
+pub use compaction::{CompactionResult, compact_idx_segments};
+#[cfg(test)]
+use cursor::ActiveBlock;
+pub use cursor::{IdxSegmentCursor, IdxSegmentRevCursor};
 pub use key_codec::{
     NS_LRU_QUEUE, NS_PRIMARY_ROW, NS_ROW_META, NS_SECONDARY_INDEX, RowMetaRecord,
     decode_bytes_escaped, decode_i64_memcomparable, decode_lru_queue_key, decode_primary_row_key,
@@ -35,9 +40,6 @@ pub const IDX_BLOCK_SIZE: usize = 4096;
 /// Manager Virtual Address Control Block size) used by [`IdxSegmentBuilder`].
 const IDX_WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
 
-/// Sequential read-ahead chunk size (`64 * 4 KB = 256 KB`) for compaction merge cursors.
-const COMPACTION_READAHEAD_BLOCKS: u32 = 64;
-
 /// Size of the fixed trailer at the end of every 4 KB index data block (`4088..4096`).
 const IDX_BLOCK_TRAILER_SIZE: usize = 8;
 
@@ -61,6 +63,13 @@ const IDX_FOOTER_SIZE: usize = 48;
 const IDX_FOOTER_MAGIC: &[u8; 4] = b"AYIX";
 const IDX_FORMAT_VERSION: u16 = 1;
 
+/// Encoded `val_type` tag for inline values inside `idx_<SeqID>.db` blocks.
+pub(crate) const VAL_TYPE_INLINE: u8 = 1;
+/// Encoded `val_type` tag for 23-byte `BlobPtr` references inside `idx_<SeqID>.db` blocks.
+pub(crate) const VAL_TYPE_BLOB: u8 = 2;
+/// Encoded `val_type` tag for tombstone markers inside `idx_<SeqID>.db` blocks.
+pub(crate) const VAL_TYPE_TOMBSTONE: u8 = 3;
+
 /// Value stored for a key inside a `MemTable` or `idx_<SeqID>.db` data block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexValue {
@@ -73,15 +82,6 @@ pub enum IndexValue {
 }
 
 impl IndexValue {
-    #[inline]
-    fn type_tag(&self) -> u8 {
-        match self {
-            Self::Inline(_) => 1,
-            Self::Blob(_) => 2,
-            Self::Tombstone => 3,
-        }
-    }
-
     #[inline]
     pub fn encoded_payload_len(&self) -> usize {
         match self {
@@ -214,12 +214,12 @@ impl IdxBlockBuilder {
     #[inline]
     pub fn can_fit_raw(&self, key_len: usize, val_type: u8, val_len: usize) -> bool {
         let payload_len = match val_type {
-            1 => match val_len.checked_add(2) {
+            VAL_TYPE_INLINE => match val_len.checked_add(2) {
                 Some(n) => n,
                 None => return false,
             },
-            2 if val_len == BLOB_PTR_ENCODED_LEN => BLOB_PTR_ENCODED_LEN,
-            3 if val_len == 0 => 0,
+            VAL_TYPE_BLOB if val_len == BLOB_PTR_ENCODED_LEN => BLOB_PTR_ENCODED_LEN,
+            VAL_TYPE_TOMBSTONE if val_len == 0 => 0,
             _ => return false,
         };
         let Some(needed) = 11usize
@@ -242,7 +242,7 @@ impl IdxBlockBuilder {
         let klen = u16::try_from(key_len)
             .map_err(|_| io_err(io::ErrorKind::InvalidInput, "key length exceeds u16::MAX"))?;
         let (vlen, payload_len) = match val_type {
-            1 => {
+            VAL_TYPE_INLINE => {
                 let vlen = u16::try_from(val_len).map_err(|_| {
                     io_err(
                         io::ErrorKind::InvalidInput,
@@ -257,7 +257,7 @@ impl IdxBlockBuilder {
                 })?;
                 (vlen, payload_len)
             }
-            2 => {
+            VAL_TYPE_BLOB => {
                 if val_len != BLOB_PTR_ENCODED_LEN {
                     return Err(io_err(
                         io::ErrorKind::InvalidInput,
@@ -266,7 +266,7 @@ impl IdxBlockBuilder {
                 }
                 (0, BLOB_PTR_ENCODED_LEN)
             }
-            3 => {
+            VAL_TYPE_TOMBSTONE => {
                 if val_len != 0 {
                     return Err(io_err(
                         io::ErrorKind::InvalidInput,
@@ -323,7 +323,7 @@ impl IdxBlockBuilder {
         val_bytes: &[u8],
     ) -> io::Result<()> {
         let (klen, vlen) = Self::validate_raw_entry_params(key.len(), val_type, val_bytes.len())?;
-        if val_type == 2 {
+        if val_type == VAL_TYPE_BLOB {
             BlobKind::from_u8(val_bytes[0])?;
         }
         if !self.can_fit_raw(key.len(), val_type, val_bytes.len()) {
@@ -346,17 +346,17 @@ impl IdxBlockBuilder {
         pos += key.len();
 
         match val_type {
-            1 => {
+            VAL_TYPE_INLINE => {
                 self.buf[pos..pos + 2].copy_from_slice(&vlen.to_le_bytes());
                 pos += 2;
                 self.buf[pos..pos + val_bytes.len()].copy_from_slice(val_bytes);
                 pos += val_bytes.len();
             }
-            2 => {
+            VAL_TYPE_BLOB => {
                 self.buf[pos..pos + BLOB_PTR_ENCODED_LEN].copy_from_slice(val_bytes);
                 pos += BLOB_PTR_ENCODED_LEN;
             }
-            3 => {}
+            VAL_TYPE_TOMBSTONE => {}
             _ => unreachable!("val_type validated above"),
         }
 
@@ -367,9 +367,13 @@ impl IdxBlockBuilder {
     /// Appends `entry` (which must be in strictly ascending key order) to this block.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
         match &entry.value {
-            IndexValue::Inline(v) => self.add_raw_entry(&entry.key, entry.lsn, 1, v),
-            IndexValue::Blob(ptr) => self.add_raw_entry(&entry.key, entry.lsn, 2, &ptr.to_bytes()),
-            IndexValue::Tombstone => self.add_raw_entry(&entry.key, entry.lsn, 3, &[]),
+            IndexValue::Inline(v) => self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_INLINE, v),
+            IndexValue::Blob(ptr) => {
+                self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_BLOB, &ptr.to_bytes())
+            }
+            IndexValue::Tombstone => {
+                self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_TOMBSTONE, &[])
+            }
         }
     }
 
@@ -431,9 +435,9 @@ impl<'a> RawIdxEntry<'a> {
     /// Decodes the value payload of this entry into an owned [`IndexValue`].
     pub fn decode_value(&self) -> io::Result<IndexValue> {
         match self.val_type {
-            1 => Ok(IndexValue::Inline(self.val_bytes.to_vec())),
-            2 => Ok(IndexValue::Blob(Self::decode_blob_ptr(self.val_bytes)?)),
-            3 => Ok(IndexValue::Tombstone),
+            VAL_TYPE_INLINE => Ok(IndexValue::Inline(self.val_bytes.to_vec())),
+            VAL_TYPE_BLOB => Ok(IndexValue::Blob(Self::decode_blob_ptr(self.val_bytes)?)),
+            VAL_TYPE_TOMBSTONE => Ok(IndexValue::Tombstone),
             other => Err(io_err_with_tag(
                 io::ErrorKind::InvalidData,
                 "unknown IndexValue type_tag",
@@ -454,11 +458,11 @@ impl<'a> RawIdxEntry<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct CursorEntrySpan {
-    key_range: core::ops::Range<usize>,
-    lsn: u64,
-    val_type: u8,
-    val_range: core::ops::Range<usize>,
+pub(super) struct CursorEntrySpan {
+    pub(super) key_range: core::ops::Range<usize>,
+    pub(super) lsn: u64,
+    pub(super) val_type: u8,
+    pub(super) val_range: core::ops::Range<usize>,
 }
 
 /// Minimum encoded header size of an entry in a 4 KB data block (`klen(2) + type(1) + lsn(8)`).
@@ -521,7 +525,7 @@ fn validate_block_entry_layout(buf: &[u8], num_entries: usize, dir_start: usize)
         }
         prev_key = Some(key);
         let vend = match val_type {
-            1 => {
+            VAL_TYPE_INLINE => {
                 let Some(vstart) = kend.checked_add(2) else {
                     return Err(io_err(
                         io::ErrorKind::InvalidData,
@@ -543,7 +547,7 @@ fn validate_block_entry_layout(buf: &[u8], num_entries: usize, dir_start: usize)
                 };
                 vend
             }
-            2 => {
+            VAL_TYPE_BLOB => {
                 let Some(vend) = kend.checked_add(BLOB_PTR_ENCODED_LEN) else {
                     return Err(io_err(
                         io::ErrorKind::InvalidData,
@@ -555,7 +559,7 @@ fn validate_block_entry_layout(buf: &[u8], num_entries: usize, dir_start: usize)
                 }
                 vend
             }
-            3 => kend,
+            VAL_TYPE_TOMBSTONE => kend,
             other => {
                 return Err(io_err_with_tag(
                     io::ErrorKind::InvalidData,
@@ -680,7 +684,7 @@ impl<'a> IdxBlockReader<'a> {
 
     /// Parses the byte ranges of the entry at `index` inside `self.buf` with zero heap allocations.
     #[inline]
-    fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
+    pub(super) fn parse_entry_span_at(&self, index: usize) -> io::Result<CursorEntrySpan> {
         let off = self.entry_offset(index)?;
         if off + 11 > self.dir_start {
             return Err(io_err(
@@ -709,7 +713,7 @@ impl<'a> IdxBlockReader<'a> {
             ));
         }
         let val_range = match val_type {
-            1 => {
+            VAL_TYPE_INLINE => {
                 if kend + 2 > self.dir_start {
                     return Err(io_err(
                         io::ErrorKind::InvalidData,
@@ -727,7 +731,7 @@ impl<'a> IdxBlockReader<'a> {
                 }
                 vstart..vend
             }
-            2 => {
+            VAL_TYPE_BLOB => {
                 let vend = kend + BLOB_PTR_ENCODED_LEN;
                 if vend > self.dir_start {
                     return Err(io_err(
@@ -738,7 +742,7 @@ impl<'a> IdxBlockReader<'a> {
                 BlobKind::from_u8(self.buf[kend])?;
                 kend..vend
             }
-            3 => kend..kend,
+            VAL_TYPE_TOMBSTONE => kend..kend,
             other => {
                 return Err(io_err_with_tag(
                     io::ErrorKind::InvalidData,
@@ -875,39 +879,15 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
 
     /// Adds a sorted [`IndexEntry`] to the segment, flushing a 4 KB data block whenever full.
     pub fn add_entry(&mut self, entry: &IndexEntry) -> io::Result<()> {
-        let val_len = match &entry.value {
-            IndexValue::Inline(v) => v.len(),
-            IndexValue::Blob(_) => BLOB_PTR_ENCODED_LEN,
-            IndexValue::Tombstone => 0,
-        };
-        IdxBlockBuilder::validate_raw_entry_params(
-            entry.key.len(),
-            entry.value.type_tag(),
-            val_len,
-        )?;
-        if self.record_count > 0 && entry.key.as_slice() <= self.last_key.as_slice() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "idx segment keys must be added in strictly ascending order",
-            ));
+        match &entry.value {
+            IndexValue::Inline(v) => self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_INLINE, v),
+            IndexValue::Blob(ptr) => {
+                self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_BLOB, &ptr.to_bytes())
+            }
+            IndexValue::Tombstone => {
+                self.add_raw_entry(&entry.key, entry.lsn, VAL_TYPE_TOMBSTONE, &[])
+            }
         }
-        let next_count = self.record_count.checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "idx segment record count exceeds u32::MAX",
-            )
-        })?;
-        if !self.block_builder.is_empty() && !self.block_builder.can_fit(entry) {
-            self.flush_current_data_block()?;
-        }
-        self.block_builder.add_entry(entry)?;
-        if self.bloom_bits_per_key > 0 {
-            self.bloom_hashes.push(BloomFilter::hash64(&entry.key));
-        }
-        self.last_key.clear();
-        self.last_key.extend_from_slice(&entry.key);
-        self.record_count = next_count;
-        Ok(())
     }
 
     /// Adds a sorted raw entry (`key`, `lsn`, `val_type`, `val_bytes`) directly to the segment
@@ -1173,14 +1153,14 @@ impl<F: PlatformFile> IdxSegmentBuilder<F> {
 /// Keeps ONLY the [`BloomFilter`] and [`FencePointer`] array in heap memory, fetching
 /// 4 KB data blocks on demand from the OS Page Cache via positional `read_exact_at`.
 pub struct IdxSegmentReader<F: PlatformFile> {
-    file: Arc<F>,
-    seq_id: u64,
+    pub(super) file: Arc<F>,
+    pub(super) seq_id: u64,
     level: u16,
     file_len: u64,
-    num_blocks: u32,
+    pub(super) num_blocks: u32,
     record_count: u32,
     bloom: BloomFilter,
-    fence_pointers: Vec<FencePointer>,
+    pub(super) fence_pointers: Vec<FencePointer>,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
     block_cache: Option<Arc<VerifiedBlockCache>>,
@@ -1492,7 +1472,7 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
     }
 
     /// Reads and verifies block `block_idx` from the file, then optionally caches it.
-    fn read_block_from_disk<'b>(
+    pub(super) fn read_block_from_disk<'b>(
         &self,
         block_idx: u32,
         block_buf: &'b mut [u8; IDX_BLOCK_SIZE],
@@ -1667,622 +1647,6 @@ impl<F: PlatformFile> IdxSegmentReader<F> {
         }
         Ok(out)
     }
-
-    /// Creates a bounded-memory streaming cursor over all entries in this segment, reading
-    /// one 4 KB data block at a time on demand (bypasses cache insertion).
-    pub fn cursor_all(&self) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_all(self, false, CursorBlockStorage::new())
-    }
-
-    /// Creates a streaming cursor over all entries in this segment using batched sequential
-    /// read-ahead chunks of up to `max_blocks` 4 KB blocks per `read_exact_at` syscall.
-    pub(crate) fn cursor_all_batched(
-        &self,
-        max_blocks: u32,
-    ) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_all(self, false, CursorBlockStorage::new_batched(max_blocks))
-    }
-
-    /// Creates a bounded-memory streaming cursor over all entries in this segment with explicit cache policy.
-    pub fn cursor_all_with_cache(
-        &self,
-        populate_cache: bool,
-    ) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_all(self, populate_cache, CursorBlockStorage::new())
-    }
-
-    /// Creates a bounded-memory streaming cursor starting at `(lower_key, lower_inclusive)`,
-    /// seeking via sparse fence pointers and reading one 4 KB data block at a time on demand.
-    pub fn cursor_from(
-        &self,
-        lower_key: &[u8],
-        lower_inclusive: bool,
-    ) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_from(self, lower_key, lower_inclusive, true)
-    }
-
-    /// Creates a bounded-memory streaming cursor starting at `(lower_key, lower_inclusive)` with explicit cache policy.
-    pub fn cursor_from_with_cache(
-        &self,
-        lower_key: &[u8],
-        lower_inclusive: bool,
-        populate_cache: bool,
-    ) -> io::Result<IdxSegmentCursor<'_, F>> {
-        IdxSegmentCursor::new_from(self, lower_key, lower_inclusive, populate_cache)
-    }
-
-    /// Creates a bounded-memory reverse streaming cursor starting at `(upper_key, upper_inclusive)`,
-    /// seeking via sparse fence pointers and walking 4 KB data blocks backward on demand.
-    pub fn cursor_reverse_from(
-        &self,
-        upper_key: Option<(&[u8], bool)>,
-    ) -> io::Result<IdxSegmentRevCursor<'_, F>> {
-        IdxSegmentRevCursor::new_from(self, upper_key, true)
-    }
-
-    /// Creates a bounded-memory reverse streaming cursor starting at `(upper_key, upper_inclusive)` with explicit cache policy.
-    pub fn cursor_reverse_from_with_cache(
-        &self,
-        upper_key: Option<(&[u8], bool)>,
-        populate_cache: bool,
-    ) -> io::Result<IdxSegmentRevCursor<'_, F>> {
-        IdxSegmentRevCursor::new_from(self, upper_key, populate_cache)
-    }
-}
-
-struct ReadAheadBuffer {
-    buf: Vec<u8>,
-    start_block: u32,
-    block_count: u32,
-    max_blocks: u32,
-}
-
-enum ActiveBlock {
-    None,
-    Cached(Arc<[u8; IDX_BLOCK_SIZE]>),
-    Scratch,
-    ReadAhead(usize),
-}
-
-struct CursorBlockStorage {
-    active: ActiveBlock,
-    scratch: Option<Box<[u8; IDX_BLOCK_SIZE]>>,
-    read_ahead: Option<ReadAheadBuffer>,
-}
-
-impl CursorBlockStorage {
-    fn new() -> Self {
-        Self {
-            active: ActiveBlock::None,
-            scratch: None,
-            read_ahead: None,
-        }
-    }
-
-    fn new_batched(max_blocks: u32) -> Self {
-        let max_blocks = max_blocks.max(1);
-        Self {
-            active: ActiveBlock::None,
-            scratch: None,
-            read_ahead: Some(ReadAheadBuffer {
-                buf: Vec::with_capacity((max_blocks as usize) * IDX_BLOCK_SIZE),
-                start_block: 0,
-                block_count: 0,
-                max_blocks,
-            }),
-        }
-    }
-
-    #[inline]
-    fn block_bytes(&self) -> &[u8; IDX_BLOCK_SIZE] {
-        match &self.active {
-            ActiveBlock::Cached(arc) => arc.as_ref(),
-            ActiveBlock::Scratch => self
-                .scratch
-                .as_deref()
-                .expect("Scratch active without allocated buffer"),
-            ActiveBlock::ReadAhead(off) => {
-                let ra = self
-                    .read_ahead
-                    .as_ref()
-                    .expect("ReadAhead active without buffer");
-                ra.buf[*off..*off + IDX_BLOCK_SIZE]
-                    .try_into()
-                    .expect("ReadAhead slice matches IDX_BLOCK_SIZE")
-            }
-            ActiveBlock::None => panic!("CursorBlockStorage::block_bytes called when empty"),
-        }
-    }
-
-    fn load<F: PlatformFile>(
-        &mut self,
-        seg: &IdxSegmentReader<F>,
-        block_idx: u32,
-        populate_cache: bool,
-    ) -> io::Result<IdxBlockReader<'_>> {
-        let preverified = if let Some(ra) = &mut self.read_ahead {
-            if block_idx < ra.start_block || block_idx >= ra.start_block + ra.block_count {
-                // Invalidate window metadata before resizing so a failed read leaves no stale span.
-                ra.block_count = 0;
-                self.active = ActiveBlock::None;
-                let count = seg
-                    .num_blocks
-                    .saturating_sub(block_idx)
-                    .min(ra.max_blocks)
-                    .max(1);
-                let bytes = (count as usize) * IDX_BLOCK_SIZE;
-                ra.buf.resize(bytes, 0);
-                seg.file
-                    .read_exact_at(&mut ra.buf, (block_idx as u64) * (IDX_BLOCK_SIZE as u64))?;
-                ra.start_block = block_idx;
-                ra.block_count = count;
-            }
-            let off = ((block_idx - ra.start_block) as usize) * IDX_BLOCK_SIZE;
-            self.active = ActiveBlock::ReadAhead(off);
-            false
-        } else if let Some(arc) = seg
-            .block_cache
-            .as_ref()
-            .and_then(|c| c.get_arc(seg.seq_id, block_idx))
-        {
-            self.active = ActiveBlock::Cached(arc);
-            true
-        } else {
-            self.active = ActiveBlock::None;
-            let scratch = self
-                .scratch
-                .get_or_insert_with(|| Box::new([0u8; IDX_BLOCK_SIZE]));
-            seg.file
-                .read_exact_at(&mut **scratch, (block_idx as u64) * (IDX_BLOCK_SIZE as u64))?;
-            self.active = ActiveBlock::Scratch;
-            false
-        };
-
-        let num_entries = if preverified {
-            match IdxBlockReader::open_preverified(self.block_bytes()) {
-                Ok(r) => r.num_entries,
-                Err(e) => {
-                    self.active = ActiveBlock::None;
-                    return Err(e);
-                }
-            }
-        } else {
-            let num_entries = match IdxBlockReader::open_verified(self.block_bytes()) {
-                Ok(r) => r.num_entries,
-                Err(e) => {
-                    self.active = ActiveBlock::None;
-                    return Err(e);
-                }
-            };
-            if populate_cache {
-                if let Some(cache) = &seg.block_cache {
-                    cache.insert(seg.seq_id, block_idx, self.block_bytes());
-                }
-            }
-            num_entries
-        };
-        Ok(IdxBlockReader::from_verified_buf(
-            self.block_bytes(),
-            num_entries,
-        ))
-    }
-}
-
-/// Bounded-memory reverse block-by-block cursor over an [`IdxSegmentReader`].
-pub struct IdxSegmentRevCursor<'a, F: PlatformFile> {
-    seg: &'a IdxSegmentReader<F>,
-    next_block_idx: Option<u32>,
-    block: CursorBlockStorage,
-    entry_idx: usize,
-    num_entries_in_block: usize,
-    current_span: Option<CursorEntrySpan>,
-    populate_cache: bool,
-}
-
-impl<'a, F: PlatformFile> IdxSegmentRevCursor<'a, F> {
-    fn new_from(
-        seg: &'a IdxSegmentReader<F>,
-        upper_key: Option<(&[u8], bool)>,
-        populate_cache: bool,
-    ) -> io::Result<Self> {
-        let mut cursor = Self {
-            seg,
-            next_block_idx: None,
-            block: CursorBlockStorage::new(),
-            entry_idx: 0,
-            num_entries_in_block: 0,
-            current_span: None,
-            populate_cache,
-        };
-        if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
-            return Ok(cursor);
-        }
-
-        let Some((ub_key, ub_inclusive)) = upper_key else {
-            cursor.next_block_idx = Some(seg.num_blocks - 1);
-            cursor.advance_to_prev()?;
-            return Ok(cursor);
-        };
-
-        let pos = seg.fence_pointers.partition_point(|fp| {
-            if ub_inclusive {
-                fp.first_key.as_ref() <= ub_key
-            } else {
-                fp.first_key.as_ref() < ub_key
-            }
-        });
-        if pos == 0 {
-            return Ok(cursor);
-        }
-        let mut b = seg.fence_pointers[pos - 1].block_idx;
-
-        loop {
-            let reader = cursor.block.load(seg, b, cursor.populate_cache)?;
-            cursor.num_entries_in_block = reader.num_entries();
-
-            // Binary-search for the first entry strictly after `(ub_key, ub_inclusive)`
-            let mut low = 0usize;
-            let mut high = cursor.num_entries_in_block;
-            while low < high {
-                let mid = low + (high - low) / 2;
-                let k = reader.key_at(mid)?;
-                let within = if ub_inclusive {
-                    k <= ub_key
-                } else {
-                    k < ub_key
-                };
-                if within {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-
-            if low > 0 {
-                let target_idx = low - 1;
-                let span = reader.parse_entry_span_at(target_idx)?;
-                cursor.entry_idx = target_idx;
-                cursor.next_block_idx = b.checked_sub(1);
-                cursor.current_span = Some(span);
-                break;
-            }
-
-            if b == 0 {
-                break;
-            }
-            b -= 1;
-        }
-        Ok(cursor)
-    }
-
-    /// Returns the raw key slice of the current entry without heap allocation.
-    #[inline]
-    pub fn current_key(&self) -> Option<&[u8]> {
-        let s = self.current_span.as_ref()?;
-        let block = self.block.block_bytes();
-        Some(&block[s.key_range.clone()])
-    }
-
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
-    #[inline]
-    pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
-        let s = self.current_span.as_ref()?;
-        let block = self.block.block_bytes();
-        Some(RawIdxEntry {
-            key: &block[s.key_range.clone()],
-            lsn: s.lsn,
-            val_type: s.val_type,
-            val_bytes: &block[s.val_range.clone()],
-        })
-    }
-
-    /// Advances the cursor to the previous entry in the segment without allocating.
-    #[inline]
-    pub fn advance(&mut self) -> io::Result<()> {
-        if self.current_span.is_some() {
-            self.advance_to_prev()?;
-        }
-        Ok(())
-    }
-
-    /// Consumes and returns the current [`IndexEntry`], advancing the cursor to the previous entry.
-    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
-        let Some(raw) = self.peek_raw() else {
-            return Ok(None);
-        };
-        let owned = raw.to_owned_entry()?;
-        self.advance_to_prev()?;
-        Ok(Some(owned))
-    }
-
-    fn advance_to_prev(&mut self) -> io::Result<()> {
-        self.current_span = None;
-        while self.entry_idx == 0 {
-            let Some(b) = self.next_block_idx else {
-                return Ok(());
-            };
-            self.next_block_idx = b.checked_sub(1);
-            let reader = self.block.load(self.seg, b, self.populate_cache)?;
-            self.num_entries_in_block = reader.num_entries();
-            self.entry_idx = self.num_entries_in_block;
-        }
-
-        self.entry_idx -= 1;
-        let reader =
-            IdxBlockReader::from_verified_buf(self.block.block_bytes(), self.num_entries_in_block);
-        let span = reader.parse_entry_span_at(self.entry_idx)?;
-        self.current_span = Some(span);
-        Ok(())
-    }
-}
-
-/// Bounded-memory block-by-block cursor over an [`IdxSegmentReader`].
-///
-/// Borrows cached `Arc<[u8; IDX_BLOCK_SIZE]>` blocks zero-copy on cache hit and falls back to an
-/// on-demand 4 KB scratch buffer (or a sequential read-ahead buffer during compaction) only on miss.
-pub struct IdxSegmentCursor<'a, F: PlatformFile> {
-    seg: &'a IdxSegmentReader<F>,
-    next_block_idx: u32,
-    block: CursorBlockStorage,
-    entry_idx: usize,
-    num_entries_in_block: usize,
-    current_span: Option<CursorEntrySpan>,
-    populate_cache: bool,
-}
-
-impl<'a, F: PlatformFile> IdxSegmentCursor<'a, F> {
-    fn new_all(
-        seg: &'a IdxSegmentReader<F>,
-        populate_cache: bool,
-        block: CursorBlockStorage,
-    ) -> io::Result<Self> {
-        let mut cursor = Self {
-            seg,
-            next_block_idx: 0,
-            block,
-            entry_idx: 0,
-            num_entries_in_block: 0,
-            current_span: None,
-            populate_cache,
-        };
-        cursor.advance_to_next()?;
-        Ok(cursor)
-    }
-
-    fn new_from(
-        seg: &'a IdxSegmentReader<F>,
-        lower_key: &[u8],
-        lower_inclusive: bool,
-        populate_cache: bool,
-    ) -> io::Result<Self> {
-        let mut cursor = Self {
-            seg,
-            next_block_idx: 0,
-            block: CursorBlockStorage::new(),
-            entry_idx: 0,
-            num_entries_in_block: 0,
-            current_span: None,
-            populate_cache,
-        };
-        if seg.fence_pointers.is_empty() || seg.num_blocks == 0 {
-            return Ok(cursor);
-        }
-
-        let start_pos = seg
-            .fence_pointers
-            .partition_point(|fp| fp.first_key.as_ref() <= lower_key);
-        cursor.next_block_idx = start_pos.saturating_sub(1) as u32;
-
-        while cursor.next_block_idx < seg.num_blocks {
-            let b = cursor.next_block_idx;
-            cursor.next_block_idx += 1;
-            let reader = cursor.block.load(seg, b, cursor.populate_cache)?;
-            cursor.num_entries_in_block = reader.num_entries();
-
-            // Binary-search the u16 offset directory for the first key satisfying the lower bound
-            let mut low = 0usize;
-            let mut high = cursor.num_entries_in_block;
-            while low < high {
-                let mid = low + (high - low) / 2;
-                let k = reader.key_at(mid)?;
-                let before = if lower_inclusive {
-                    k < lower_key
-                } else {
-                    k <= lower_key
-                };
-                if before {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-
-            if low < cursor.num_entries_in_block {
-                let first_span = reader.parse_entry_span_at(low)?;
-                cursor.entry_idx = low + 1;
-                cursor.current_span = Some(first_span);
-                break;
-            } else {
-                cursor.entry_idx = cursor.num_entries_in_block;
-            }
-        }
-        Ok(cursor)
-    }
-
-    /// Returns the raw key slice of the current entry without heap allocation.
-    #[inline]
-    pub fn current_key(&self) -> Option<&[u8]> {
-        let s = self.current_span.as_ref()?;
-        let block = self.block.block_bytes();
-        Some(&block[s.key_range.clone()])
-    }
-
-    /// Returns a zero-copy [`RawIdxEntry`] view of the current entry borrowed from `self.block`.
-    #[inline]
-    pub fn peek_raw(&self) -> Option<RawIdxEntry<'_>> {
-        let s = self.current_span.as_ref()?;
-        let block = self.block.block_bytes();
-        Some(RawIdxEntry {
-            key: &block[s.key_range.clone()],
-            lsn: s.lsn,
-            val_type: s.val_type,
-            val_bytes: &block[s.val_range.clone()],
-        })
-    }
-
-    /// Advances the cursor to the next entry in the segment without allocating.
-    #[inline]
-    pub fn advance(&mut self) -> io::Result<()> {
-        if self.current_span.is_some() {
-            self.advance_to_next()?;
-        }
-        Ok(())
-    }
-
-    /// Consumes and returns the current [`IndexEntry`], advancing the cursor to the next entry.
-    pub fn next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
-        let Some(raw) = self.peek_raw() else {
-            return Ok(None);
-        };
-        let owned = raw.to_owned_entry()?;
-        self.advance_to_next()?;
-        Ok(Some(owned))
-    }
-
-    fn advance_to_next(&mut self) -> io::Result<()> {
-        self.current_span = None;
-        while self.entry_idx >= self.num_entries_in_block {
-            if self.next_block_idx >= self.seg.num_blocks {
-                return Ok(());
-            }
-            let b = self.next_block_idx;
-            self.next_block_idx += 1;
-            let reader = self.block.load(self.seg, b, self.populate_cache)?;
-            self.num_entries_in_block = reader.num_entries();
-            self.entry_idx = 0;
-        }
-
-        let reader =
-            IdxBlockReader::from_verified_buf(self.block.block_bytes(), self.num_entries_in_block);
-        let span = reader.parse_entry_span_at(self.entry_idx)?;
-        self.entry_idx += 1;
-        self.current_span = Some(span);
-        Ok(())
-    }
-}
-
-/// Summary returned after multi-way merge compaction of `idx` segments.
-pub struct CompactionResult<F: PlatformFile> {
-    /// Newly created merged segment reader.
-    pub new_segment: IdxSegmentReader<F>,
-    /// Dead bytes accumulated per `(BlobKind, table_id, blob_seq_id)` from overwritten or
-    /// tombstoned `BlobPtr` entries during compaction.
-    pub newly_dead_blob_bytes: Vec<(BlobKind, u16, u64, u64)>,
-}
-
-/// Merges multiple `IdxSegmentReader` instances into a single sorted `idx_<new_seq_id>.db`
-/// segment using a bounded-memory streaming K-way merge ($O(K \times 4\text{ KB})$ RAM), keeping
-/// only the highest-`lsn` version of each key and accumulating dead blob bytes for any overwritten
-/// or deleted `BlobPtr` without copying live blobs!
-pub fn compact_idx_segments<F: PlatformFile>(
-    fs: &impl PlatformFs<File = F>,
-    inputs: &[&IdxSegmentReader<F>],
-    new_seq_id: u64,
-    target_level: u16,
-    bloom_bits_per_key: usize,
-    drop_tombstones: bool,
-) -> io::Result<CompactionResult<F>> {
-    let mut cursors: Vec<IdxSegmentCursor<'_, F>> = Vec::with_capacity(inputs.len());
-    for &seg in inputs {
-        cursors.push(seg.cursor_all_batched(COMPACTION_READAHEAD_BLOCKS)?);
-    }
-
-    let mut builder = IdxSegmentBuilder::create(fs, new_seq_id, target_level, bloom_bits_per_key)?;
-    builder.set_cap_bloom_to_meta_budget(true);
-    let mut dead_blob_map: BTreeMap<(u8, u16, u64), u64> = BTreeMap::new();
-    let mut target_key_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut winning_val_buf: Vec<u8> = Vec::with_capacity(256);
-
-    loop {
-        let mut min_key: Option<&[u8]> = None;
-        for cur in &cursors {
-            if let Some(k) = cur.current_key() {
-                match min_key {
-                    None => min_key = Some(k),
-                    Some(mk) if k < mk => {
-                        min_key = Some(k);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let Some(target_key_slice) = min_key else {
-            break;
-        };
-        target_key_buf.clear();
-        target_key_buf.extend_from_slice(target_key_slice);
-
-        let mut winning_meta: Option<(u64, u8)> = None;
-        for cur in &mut cursors {
-            while cur.current_key() == Some(target_key_buf.as_slice()) {
-                let raw = cur.peek_raw().unwrap();
-                let mut record_dead_blob = |vtype: u8, bytes: &[u8]| {
-                    if vtype == 2 {
-                        if let Ok(ptr) = BlobPtr::from_bytes(bytes) {
-                            *dead_blob_map
-                                .entry((ptr.kind as u8, ptr.table_id, ptr.seg_id))
-                                .or_insert(0) += ptr.len as u64;
-                        }
-                    }
-                };
-                match &mut winning_meta {
-                    None => {
-                        winning_meta = Some((raw.lsn, raw.val_type));
-                        winning_val_buf.clear();
-                        winning_val_buf.extend_from_slice(raw.val_bytes);
-                    }
-                    Some((win_lsn, win_vtype)) => {
-                        if raw.lsn > *win_lsn {
-                            record_dead_blob(*win_vtype, &winning_val_buf);
-                            *win_lsn = raw.lsn;
-                            *win_vtype = raw.val_type;
-                            winning_val_buf.clear();
-                            winning_val_buf.extend_from_slice(raw.val_bytes);
-                        } else {
-                            record_dead_blob(raw.val_type, raw.val_bytes);
-                        }
-                    }
-                }
-                cur.advance()?;
-            }
-        }
-
-        if let Some((lsn, val_type)) = winning_meta {
-            if drop_tombstones && val_type == 3 {
-                continue;
-            }
-            builder.add_raw_entry(&target_key_buf, lsn, val_type, &winning_val_buf)?;
-        }
-    }
-
-    let new_segment = builder.finish()?;
-    let newly_dead_blob_bytes = dead_blob_map
-        .into_iter()
-        .map(|((k, tid, sid), bytes)| {
-            let kind = if k == 0 {
-                BlobKind::Standard
-            } else {
-                BlobKind::Lru
-            };
-            (kind, tid, sid, bytes)
-        })
-        .collect();
-
-    Ok(CompactionResult {
-        new_segment,
-        newly_dead_blob_bytes,
-    })
 }
 
 #[cfg(test)]

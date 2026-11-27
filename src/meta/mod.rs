@@ -82,42 +82,26 @@ fn is_hex_n(s: &str, expected_len: usize) -> bool {
 /// Returns `true` if `file_name` is a canonical immutable segment or manifest managed by
 /// `BootMetaState`.
 fn is_managed_segment_or_manifest(file_name: &str) -> bool {
-    if crate::pal::path::validate_flat_file_name(file_name).is_err() {
-        return false;
-    }
-    let Some(stem) = file_name.strip_suffix(".db") else {
-        return false;
-    };
-    if let Some(hex) = stem
-        .strip_prefix("idx_")
-        .or_else(|| stem.strip_prefix("blob_std_"))
-        .or_else(|| stem.strip_prefix("manifest_"))
-    {
-        return is_hex_n(hex, 16);
-    }
-    if let Some(rest) = stem.strip_prefix("blob_lru_") {
-        return rest
-            .split_once('_')
-            .is_some_and(|(tbl, seq)| is_hex_n(tbl, 4) && is_hex_n(seq, 16));
-    }
-    false
+    parse_managed_seq_id(file_name).is_some()
 }
 
 /// Extracts the SeqID encoded in a managed segment or manifest file name
 /// (`idx_`, `blob_std_`, `blob_lru_<TblID>_` or `manifest_`).
 fn parse_managed_seq_id(file_name: &str) -> Option<u64> {
-    if !is_managed_segment_or_manifest(file_name) {
+    if crate::pal::path::validate_flat_file_name(file_name).is_err() {
         return None;
     }
     let stem = file_name.strip_suffix(".db")?;
-    let hex = if let Some(h) = stem.strip_prefix("idx_") {
-        h
-    } else if let Some(h) = stem.strip_prefix("blob_std_") {
-        h
-    } else if let Some(h) = stem.strip_prefix("blob_lru_") {
-        h.split_once('_')?.1
+    let hex = if let Some(h) = stem
+        .strip_prefix("idx_")
+        .or_else(|| stem.strip_prefix("blob_std_"))
+        .or_else(|| stem.strip_prefix("manifest_"))
+    {
+        is_hex_n(h, 16).then_some(h)?
     } else {
-        stem.strip_prefix("manifest_")?
+        let rest = stem.strip_prefix("blob_lru_")?;
+        let (tbl, seq) = rest.split_once('_')?;
+        (is_hex_n(tbl, 4) && is_hex_n(seq, 16)).then_some(seq)?
     };
     u64::from_str_radix(hex, 16).ok()
 }
@@ -223,18 +207,33 @@ impl Default for BootMetaState {
     }
 }
 
+fn valid_header_counters(
+    generation: u64,
+    next_seq_id: u64,
+    checkpoint_lsn: u64,
+    sync_wal_epoch: u64,
+    buf_wal_epoch: u64,
+) -> bool {
+    generation != 0
+        && generation != u64::MAX
+        && next_seq_id != 0
+        && next_seq_id != u64::MAX
+        && checkpoint_lsn != u64::MAX
+        && sync_wal_epoch != 0
+        && sync_wal_epoch != u64::MAX
+        && buf_wal_epoch != 0
+        && buf_wal_epoch != u64::MAX
+}
+
 impl BootMetaState {
     fn check_header_bounds(&self) -> io::Result<()> {
-        if self.generation == 0
-            || self.generation == u64::MAX
-            || self.next_seq_id == 0
-            || self.next_seq_id == u64::MAX
-            || self.checkpoint_lsn == u64::MAX
-            || self.sync_wal_epoch == 0
-            || self.sync_wal_epoch == u64::MAX
-            || self.buf_wal_epoch == 0
-            || self.buf_wal_epoch == u64::MAX
-        {
+        if !valid_header_counters(
+            self.generation,
+            self.next_seq_id,
+            self.checkpoint_lsn,
+            self.sync_wal_epoch,
+            self.buf_wal_epoch,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "BootMetaState header counter or epoch out of valid bounds",
@@ -374,235 +373,149 @@ impl BootMetaState {
 
     /// Deserializes the catalog lists from `payload` into `self`.
     pub(crate) fn decode_catalog_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        fn read_section<T, K: Eq + std::hash::Hash>(
+            r: &mut ByteReader<'_>,
+            label: &str,
+            key_label: &str,
+            min_entry_bytes: usize,
+            mut read_entry: impl FnMut(&mut ByteReader<'_>) -> io::Result<(K, T)>,
+        ) -> io::Result<Vec<T>> {
+            let count = r.read_u32_le()? as usize;
+            if count
+                .checked_mul(min_entry_bytes)
+                .is_none_or(|b| b > r.remaining())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupted {label} count"),
+                ));
+            }
+            let mut items = Vec::new();
+            items.try_reserve_exact(count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{label} allocation overflow"),
+                )
+            })?;
+            let mut seen = HashSet::new();
+            seen.try_reserve(count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{label} seen-set allocation overflow"),
+                )
+            })?;
+            for _ in 0..count {
+                let (key, item) = read_entry(r)?;
+                if !seen.insert(key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("duplicate {key_label} in {label}"),
+                    ));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+
         let mut r = ByteReader::with_eof_msg(payload, "truncated catalog payload in boot_meta");
 
         // 1. Index segments
-        let num_idx = r.read_u32_le()? as usize;
-        if num_idx.checked_mul(24).is_none_or(|b| b > r.remaining()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted idx_segments count",
-            ));
-        }
-        let mut idx_segments = Vec::new();
-        idx_segments.try_reserve_exact(num_idx).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "idx_segments allocation overflow",
-            )
-        })?;
-        let mut seen_idx = HashSet::new();
-        seen_idx.try_reserve(num_idx).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "idx_segments seen-set allocation overflow",
-            )
-        })?;
-        for _ in 0..num_idx {
+        let idx_segments = read_section(&mut r, "idx_segments", "seq_id", 24, |r| {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
             let level = r.read_u16_le()?;
             let _reserved = r.read_u16_le()?;
             let record_count = r.read_u32_le()?;
-            if !seen_idx.insert(seq_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate seq_id in idx_segments",
-                ));
-            }
-            idx_segments.push(IdxSegmentMeta {
+            Ok((
                 seq_id,
-                file_len,
-                level,
-                record_count,
-            });
-        }
+                IdxSegmentMeta {
+                    seq_id,
+                    file_len,
+                    level,
+                    record_count,
+                },
+            ))
+        })?;
 
         // 2. Standard blob segments
-        let num_std_blob = r.read_u32_le()? as usize;
-        if num_std_blob
-            .checked_mul(24)
-            .is_none_or(|b| b > r.remaining())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted std_blob_segments count",
-            ));
-        }
-        let mut std_blob_segments = Vec::new();
-        std_blob_segments
-            .try_reserve_exact(num_std_blob)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "std_blob_segments allocation overflow",
-                )
-            })?;
-        let mut seen_std = HashSet::new();
-        seen_std.try_reserve(num_std_blob).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "std_blob_segments seen-set allocation overflow",
-            )
-        })?;
-        for _ in 0..num_std_blob {
+        let std_blob_segments = read_section(&mut r, "std_blob_segments", "seq_id", 24, |r| {
             let seq_id = r.read_u64_le()?;
             let file_len = r.read_u64_le()?;
             let dead_bytes = r.read_u64_le()?;
-            if !seen_std.insert(seq_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate seq_id in std_blob_segments",
-                ));
-            }
-            std_blob_segments.push(StdBlobSegmentMeta {
+            Ok((
                 seq_id,
-                file_len,
-                dead_bytes,
-            });
-        }
+                StdBlobSegmentMeta {
+                    seq_id,
+                    file_len,
+                    dead_bytes,
+                },
+            ))
+        })?;
 
         // 3. LRU blob segments
-        let num_lru_blob = r.read_u32_le()? as usize;
-        if num_lru_blob
-            .checked_mul(32)
-            .is_none_or(|b| b > r.remaining())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted lru_blob_segments count",
-            ));
-        }
-        let mut lru_blob_segments = Vec::new();
-        lru_blob_segments
-            .try_reserve_exact(num_lru_blob)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "lru_blob_segments allocation overflow",
-                )
+        let lru_blob_segments =
+            read_section(&mut r, "lru_blob_segments", "(table_id, seq_id)", 32, |r| {
+                let seq_id = r.read_u64_le()?;
+                let file_len = r.read_u64_le()?;
+                let dead_bytes = r.read_u64_le()?;
+                let table_id = r.read_u16_le()?;
+                let _reserved = r.read_bytes(6)?;
+                Ok((
+                    (table_id, seq_id),
+                    LruBlobSegmentMeta {
+                        seq_id,
+                        file_len,
+                        dead_bytes,
+                        table_id,
+                    },
+                ))
             })?;
-        let mut seen_lru = HashSet::new();
-        seen_lru.try_reserve(num_lru_blob).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "lru_blob_segments seen-set allocation overflow",
-            )
-        })?;
-        for _ in 0..num_lru_blob {
-            let seq_id = r.read_u64_le()?;
-            let file_len = r.read_u64_le()?;
-            let dead_bytes = r.read_u64_le()?;
-            let table_id = r.read_u16_le()?;
-            let _reserved = r.read_bytes(6)?;
-            if !seen_lru.insert((table_id, seq_id)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate (table_id, seq_id) in lru_blob_segments",
-                ));
-            }
-            lru_blob_segments.push(LruBlobSegmentMeta {
-                seq_id,
-                file_len,
-                dead_bytes,
-                table_id,
-            });
-        }
 
         // 4. Table quotas
-        let num_quotas = r.read_u32_le()? as usize;
-        if num_quotas.checked_mul(24).is_none_or(|b| b > r.remaining()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted table_quotas count",
-            ));
-        }
-        let mut table_quotas = Vec::new();
-        table_quotas.try_reserve_exact(num_quotas).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "table_quotas allocation overflow",
-            )
-        })?;
-        let mut seen_quotas = HashSet::new();
-        seen_quotas.try_reserve(num_quotas).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "table_quotas seen-set allocation overflow",
-            )
-        })?;
-        for _ in 0..num_quotas {
+        let table_quotas = read_section(&mut r, "table_quotas", "table_id", 24, |r| {
             let table_id = r.read_u16_le()?;
             let policy_byte = r.read_u8()?;
             let eviction_policy = EvictionPolicy::from_u8(policy_byte)?;
             let _reserved = r.read_bytes(5)?;
             let max_bytes = r.read_u64_le()?;
             let current_logical_bytes = r.read_u64_le()?;
-            if !seen_quotas.insert(table_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate table_id in table_quotas",
-                ));
-            }
-            table_quotas.push(TableQuotaMeta {
+            Ok((
                 table_id,
-                eviction_policy,
-                max_bytes,
-                current_logical_bytes,
-            });
-        }
+                TableQuotaMeta {
+                    table_id,
+                    eviction_policy,
+                    max_bytes,
+                    current_logical_bytes,
+                },
+            ))
+        })?;
 
         // 5. Pending deletes
         const MIN_MANAGED_FILE_NAME_LEN: usize = 23; // "idx_" + 16 hex + ".db"
-        let num_deletes = r.read_u32_le()? as usize;
-        if num_deletes
-            .checked_mul(2 + MIN_MANAGED_FILE_NAME_LEN)
-            .is_none_or(|b| b > r.remaining())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted pending_delete_files count",
-            ));
-        }
-        let mut pending_delete_files = Vec::new();
-        pending_delete_files
-            .try_reserve_exact(num_deletes)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "pending_delete_files allocation overflow",
-                )
-            })?;
-        let mut seen_deletes = HashSet::new();
-        seen_deletes.try_reserve(num_deletes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pending_delete_files seen-set allocation overflow",
-            )
-        })?;
-        for _ in 0..num_deletes {
-            let name_len = r.read_u16_le()? as usize;
-            let name_bytes = r.read_bytes(name_len)?;
-            let name = std::str::from_utf8(name_bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid UTF-8 in pending_delete_files",
-                )
-            })?;
-            if !is_managed_segment_or_manifest(name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "non-managed filename in pending_delete_files",
-                ));
-            }
-            if !seen_deletes.insert(name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "duplicate filename in pending_delete_files",
-                ));
-            }
-            pending_delete_files.push(name.to_owned());
-        }
+        let pending_delete_files = read_section(
+            &mut r,
+            "pending_delete_files",
+            "filename",
+            2 + MIN_MANAGED_FILE_NAME_LEN,
+            |r| {
+                let name_len = r.read_u16_le()? as usize;
+                let name_bytes = r.read_bytes(name_len)?;
+                let name = std::str::from_utf8(name_bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid UTF-8 in pending_delete_files",
+                    )
+                })?;
+                if !is_managed_segment_or_manifest(name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-managed filename in pending_delete_files",
+                    ));
+                }
+                let owned = name.to_owned();
+                Ok((owned.clone(), owned))
+            },
+        )?;
 
         if !r.is_empty() {
             return Err(io::Error::new(
@@ -1296,16 +1209,13 @@ impl<F: PlatformFs> BootMetaManager<F> {
         let payload_len = u32::from_le_bytes(slot_buf[48..52].try_into().unwrap()) as usize;
         let expected_payload_crc = u32::from_le_bytes(slot_buf[52..56].try_into().unwrap());
 
-        if generation == 0
-            || generation == u64::MAX
-            || next_seq_id == 0
-            || next_seq_id == u64::MAX
-            || checkpoint_lsn == u64::MAX
-            || sync_wal_epoch == 0
-            || sync_wal_epoch == u64::MAX
-            || buf_wal_epoch == 0
-            || buf_wal_epoch == u64::MAX
-            || payload_len > MAX_INLINE_PAYLOAD_LEN
+        if !valid_header_counters(
+            generation,
+            next_seq_id,
+            checkpoint_lsn,
+            sync_wal_epoch,
+            buf_wal_epoch,
+        ) || payload_len > MAX_INLINE_PAYLOAD_LEN
         {
             return Err(SlotLoadError::Incompatible(io::Error::new(
                 io::ErrorKind::InvalidData,

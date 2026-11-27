@@ -218,13 +218,17 @@ pub enum WalRecord {
 }
 
 impl WalRecord {
+    const fn wire_bytes(key_len: usize, payload_len: usize) -> usize {
+        5 + key_len + payload_len
+    }
+
     /// Estimated encoded size of this record inside a WAL batch buffer (excluding blob payloads).
     #[inline]
     pub fn est_wire_bytes(&self) -> usize {
         match self {
-            Self::PutInline { key, value } => 9 + key.len() + value.len(),
-            Self::PutBlobPtr { key, .. } => 5 + BlobPtr::ENCODED_LEN + key.len(),
-            Self::Delete { key } => 5 + key.len(),
+            Self::PutInline { key, value } => Self::wire_bytes(key.len(), 4 + value.len()),
+            Self::PutBlobPtr { key, .. } => Self::wire_bytes(key.len(), BlobPtr::ENCODED_LEN),
+            Self::Delete { key } => Self::wire_bytes(key.len(), 0),
             Self::TxBegin | Self::TxCommit | Self::TxContinue => 1,
         }
     }
@@ -233,9 +237,7 @@ impl WalRecord {
     #[inline]
     pub fn est_tx_budget_bytes(&self) -> usize {
         match self {
-            Self::PutBlobPtr { key, blob_ptr } => {
-                5 + BlobPtr::ENCODED_LEN + key.len() + (blob_ptr.len as usize)
-            }
+            Self::PutBlobPtr { blob_ptr, .. } => self.est_wire_bytes() + (blob_ptr.len as usize),
             other => other.est_wire_bytes(),
         }
     }
@@ -445,28 +447,23 @@ impl WalBatch {
         let mut cur_start = cursor;
         let mut cur_records = 0u32;
 
+        let read_u32 =
+            |pos: usize| u32::from_le_bytes(raw_buf[pos..pos + 4].try_into().unwrap()) as usize;
+
         while cursor < total_len {
             let rec_start = cursor;
             let op = raw_buf[cursor];
             cursor += 1;
             match op {
-                OP_PUT_INLINE => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
+                OP_PUT_INLINE | OP_PUT_BLOB_PTR | OP_DELETE => {
+                    let klen = read_u32(cursor);
                     cursor += 4 + klen;
-                    let vlen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + vlen;
-                }
-                OP_PUT_BLOB_PTR => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + klen + BlobPtr::ENCODED_LEN;
-                }
-                OP_DELETE => {
-                    let klen = u32::from_le_bytes(raw_buf[cursor..cursor + 4].try_into().unwrap())
-                        as usize;
-                    cursor += 4 + klen;
+                    if op == OP_PUT_INLINE {
+                        let vlen = read_u32(cursor);
+                        cursor += 4 + vlen;
+                    } else if op == OP_PUT_BLOB_PTR {
+                        cursor += BlobPtr::ENCODED_LEN;
+                    }
                 }
                 OP_TX_BEGIN..=OP_TX_CONTINUE => {}
                 _ => unreachable!("invalid op in pending WAL batch buffer"),
@@ -1021,36 +1018,24 @@ impl<F: PlatformFile> WalStreamWriter<F> {
             is_first_piece = false;
             sectors_touched += 1;
 
-            match self.mode {
-                WalStreamMode::SyncSectorIsolated => {
-                    self.seal_current_sector_in_memory();
-                    if staged_start_sector.is_none() && remaining.is_empty() {
-                        let offset = sector_byte_offset(self.current_sector_idx)?;
-                        self.file.write_all_at(&self.sector_buf, offset)?;
-                    } else {
-                        if staged_start_sector.is_none() {
-                            staged_start_sector = Some(self.current_sector_idx);
-                        }
-                        self.multi_sector_buf.extend_from_slice(&self.sector_buf);
+            let should_advance = matches!(self.mode, WalStreamMode::SyncSectorIsolated)
+                || !remaining.is_empty()
+                || WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes < FRAGMENT_HEADER_SIZE;
+            if should_advance {
+                self.seal_current_sector_in_memory();
+                if staged_start_sector.is_none() && remaining.is_empty() {
+                    let offset = sector_byte_offset(self.current_sector_idx)?;
+                    self.file.write_all_at(&self.sector_buf, offset)?;
+                } else {
+                    if staged_start_sector.is_none() {
+                        staged_start_sector = Some(self.current_sector_idx);
                     }
-                    self.advance_and_clear_sector();
+                    self.multi_sector_buf.extend_from_slice(&self.sector_buf);
                 }
-                WalStreamMode::BufferedImmediateOsCache => {
-                    if !remaining.is_empty()
-                        || WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes < FRAGMENT_HEADER_SIZE
-                    {
-                        self.seal_current_sector_in_memory();
-                        if staged_start_sector.is_none() && remaining.is_empty() {
-                            let offset = sector_byte_offset(self.current_sector_idx)?;
-                            self.file.write_all_at(&self.sector_buf, offset)?;
-                        } else {
-                            if staged_start_sector.is_none() {
-                                staged_start_sector = Some(self.current_sector_idx);
-                            }
-                            self.multi_sector_buf.extend_from_slice(&self.sector_buf);
-                        }
-                        self.advance_and_clear_sector();
-                    } else {
+                self.advance_and_clear_sector();
+            } else {
+                match self.mode {
+                    WalStreamMode::BufferedImmediateOsCache => {
                         // Write the updated 4 KB sector into the OS Page Cache immediately
                         // while keeping the sector open for further dense packing.
                         self.seal_current_sector_in_memory();
@@ -1061,25 +1046,10 @@ impl<F: PlatformFile> WalStreamWriter<F> {
                             self.file.write_all_at(&self.sector_buf, offset)?;
                         }
                     }
-                }
-                WalStreamMode::BufferedUserSpaceCoalesced => {
-                    if !remaining.is_empty()
-                        || WAL_SECTOR_PAYLOAD_CAP - self.current_valid_bytes < FRAGMENT_HEADER_SIZE
-                    {
-                        self.seal_current_sector_in_memory();
-                        if staged_start_sector.is_none() && remaining.is_empty() {
-                            let offset = sector_byte_offset(self.current_sector_idx)?;
-                            self.file.write_all_at(&self.sector_buf, offset)?;
-                        } else {
-                            if staged_start_sector.is_none() {
-                                staged_start_sector = Some(self.current_sector_idx);
-                            }
-                            self.multi_sector_buf.extend_from_slice(&self.sector_buf);
-                        }
-                        self.advance_and_clear_sector();
-                    } else {
+                    WalStreamMode::BufferedUserSpaceCoalesced => {
                         self.dirty_in_user_space = true;
                     }
+                    WalStreamMode::SyncSectorIsolated => unreachable!(),
                 }
             }
         }

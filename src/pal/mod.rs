@@ -90,7 +90,9 @@ pub trait PlatformFile: Send + Sync + 'static {
     fn sync_durable(&self) -> io::Result<()>;
 
     /// Hints to the OS kernel that cached pages in `[offset, offset + len)` are no longer needed.
-    fn evict_os_cache(&self, offset: u64, len: u64) -> io::Result<()>;
+    fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Manages the database directory, path normalization, exclusive locking, and open handle lifecycle.
@@ -179,6 +181,7 @@ pub(crate) fn coalesced_read_many_at<F: PlatformFile + ?Sized>(
     let mut indices: Vec<usize> = (0..requests.len()).collect();
     indices.sort_unstable_by_key(|&i| requests[i].0);
 
+    let mut scratch = Vec::new();
     let mut i = 0;
     while i < indices.len() {
         let first_idx = indices[i];
@@ -217,8 +220,8 @@ pub(crate) fn coalesced_read_many_at<F: PlatformFile + ?Sized>(
             file.read_exact_at(buf, *off)?;
         } else {
             let span = (cluster_end - cluster_start) as usize;
-            let mut scratch = vec![0u8; span];
-            file.read_exact_at(&mut scratch, cluster_start)?;
+            scratch.resize(span, 0);
+            file.read_exact_at(&mut scratch[..span], cluster_start)?;
             for &idx in &indices[i..j] {
                 let (off, buf) = &mut requests[idx];
                 let rel = (*off - cluster_start) as usize;

@@ -446,14 +446,14 @@ impl MemTable {
         for (k, entry) in self.chunks.iter().flat_map(|c| c.map.iter()) {
             match &entry.value {
                 IndexValue::Inline(val) => {
-                    builder.add_raw_entry(k, entry.lsn, 1, val)?;
+                    builder.add_raw_entry(k, entry.lsn, crate::index::VAL_TYPE_INLINE, val)?;
                 }
                 IndexValue::Blob(ptr) => {
                     let blob_buf = ptr.to_bytes();
-                    builder.add_raw_entry(k, entry.lsn, 2, &blob_buf)?;
+                    builder.add_raw_entry(k, entry.lsn, crate::index::VAL_TYPE_BLOB, &blob_buf)?;
                 }
                 IndexValue::Tombstone => {
-                    builder.add_raw_entry(k, entry.lsn, 3, &[])?;
+                    builder.add_raw_entry(k, entry.lsn, crate::index::VAL_TYPE_TOMBSTONE, &[])?;
                 }
             }
         }

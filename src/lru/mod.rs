@@ -213,15 +213,16 @@ impl AccessTracker {
         tick
     }
 
-    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
-    #[inline]
-    pub fn take_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
+    fn remove_if(&self, table_id: u16, pk: &[u8], pred: impl FnOnce(u64) -> bool) -> Option<u64> {
         let mut g = self.lock_shard(table_id, pk);
         if g.total_entries == 0 {
             return None;
         }
         let (removed, became_empty) = {
             let table_map = g.hot_ticks.get_mut(&table_id)?;
+            if !table_map.get(pk).copied().is_some_and(pred) {
+                return None;
+            }
             let removed = table_map.remove(pk);
             let empty = table_map.is_empty();
             if removed.is_some() && !empty {
@@ -238,6 +239,12 @@ impl AccessTracker {
         removed
     }
 
+    /// Returns and removes any pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
+    #[inline]
+    pub fn take_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
+        self.remove_if(table_id, pk, |_| true)
+    }
+
     /// Peeks the pending in-memory `AccessTick` for `(table_id, pk)` with zero allocation.
     #[inline]
     pub fn peek_hot_tick(&self, table_id: u16, pk: &[u8]) -> Option<u64> {
@@ -252,56 +259,14 @@ impl AccessTracker {
     /// preserving newer reads recorded concurrently or after the snapshot. Prunes empty table maps.
     #[inline]
     pub fn clear_if_tick_le(&self, table_id: u16, pk: &[u8], max_tick: u64) {
-        let mut g = self.lock_shard(table_id, pk);
-        if g.total_entries == 0 {
-            return;
-        }
-        let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
-            if table_map.get(pk).copied().is_some_and(|t| t <= max_tick) {
-                let did_remove = table_map.remove(pk).is_some();
-                let empty = table_map.is_empty();
-                if did_remove && !empty {
-                    maybe_shrink_table_map(table_map);
-                }
-                (did_remove, empty)
-            } else {
-                (false, false)
-            }
-        } else {
-            return;
-        };
-        if became_empty {
-            g.hot_ticks.remove(&table_id);
-        }
-        if removed {
-            g.total_entries = g.total_entries.saturating_sub(1);
-        }
+        let _ = self.remove_if(table_id, pk, |t| t <= max_tick);
     }
 
     /// Clears any pending read tick for `(table_id, pk)` (called on overwrite or explicit delete)
     /// with zero allocation.
     #[inline]
     pub fn remove_key(&self, table_id: u16, pk: &[u8]) {
-        let mut g = self.lock_shard(table_id, pk);
-        if g.total_entries == 0 {
-            return;
-        }
-        let (removed, became_empty) = if let Some(table_map) = g.hot_ticks.get_mut(&table_id) {
-            let did_remove = table_map.remove(pk).is_some();
-            let empty = table_map.is_empty();
-            if did_remove && !empty {
-                maybe_shrink_table_map(table_map);
-            }
-            (did_remove, empty)
-        } else {
-            return;
-        };
-        if became_empty {
-            g.hot_ticks.remove(&table_id);
-        }
-        if removed {
-            g.total_entries = g.total_entries.saturating_sub(1);
-        }
+        let _ = self.take_hot_tick(table_id, pk);
     }
 
     /// Clears all pending read ticks for a committed `DROP TABLE`.

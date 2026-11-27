@@ -37,7 +37,6 @@ const FILE_SHARE_READ: WinDword = 1;
 const FILE_SHARE_WRITE: WinDword = 2;
 const FILE_SHARE_DELETE: WinDword = 4;
 
-const CREATE_ALWAYS: WinDword = 2;
 const OPEN_EXISTING: WinDword = 3;
 const OPEN_ALWAYS: WinDword = 4;
 
@@ -290,7 +289,6 @@ impl WinPlatformFile {
         full_path: &Path,
         create: bool,
         writable: bool,
-        truncate: bool,
         hint: OpenHint,
     ) -> io::Result<(Self, bool)> {
         let wide_path: Vec<u16> = full_path
@@ -305,11 +303,7 @@ impl WinPlatformFile {
             GENERIC_READ
         };
 
-        let disposition = match (create, truncate) {
-            (true, true) => CREATE_ALWAYS,
-            (true, false) => OPEN_ALWAYS,
-            (false, _) => OPEN_EXISTING,
-        };
+        let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
 
         let mut flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
         match hint {
@@ -597,18 +591,13 @@ impl PlatformFile for WinPlatformFile {
         }
         Ok(())
     }
-
-    fn evict_os_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
-        // On Windows, `FILE_FLAG_SEQUENTIAL_SCAN` instructs the Cache Manager to unmap
-        // 256 KB VACB views automatically behind sequential readers.
-        Ok(())
-    }
 }
 
 /// Windows implementation of [`PlatformFs`].
 #[derive(Debug, Clone)]
 pub struct WinPlatformFs {
     root: PathBuf,
+    is_unc: bool,
 }
 
 fn is_unc_extended_path(path: &Path) -> bool {
@@ -631,13 +620,17 @@ impl WinPlatformFs {
     /// Opens or initializes a database directory at `root`, normalizing the path with `\\?\`.
     pub fn open(root: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let normalized = normalize_db_root_path(root.as_ref(), create)?;
-        Ok(Self { root: normalized })
+        let is_unc = is_unc_extended_path(&normalized);
+        Ok(Self {
+            root: normalized,
+            is_unc,
+        })
     }
 
     /// Best-effort parent directory metadata flush for SMB/CIFS UNC shares (`\\?\UNC\...`) so
     /// newly created or unlinked directory entries survive remote server power loss.
     fn sync_dir_if_unc(&self) -> io::Result<()> {
-        if !is_unc_extended_path(&self.root) {
+        if !self.is_unc {
             return Ok(());
         }
         let wide_dir: Vec<u16> = self
@@ -704,8 +697,7 @@ impl PlatformFs for WinPlatformFs {
     ) -> io::Result<Arc<Self::File>> {
         validate_flat_file_name(rel_name)?;
         let full_path = self.root.join(OsStr::new(rel_name));
-        let (file, existed) =
-            WinPlatformFile::open_internal(&full_path, create, writable, false, hint)?;
+        let (file, existed) = WinPlatformFile::open_internal(&full_path, create, writable, hint)?;
         if create
             && (!existed
                 || matches!(
@@ -776,7 +768,7 @@ mod tests {
 
         // Fresh creation reports `already_existed == false` and preserves positional R/W.
         let (file1, existed1) =
-            WinPlatformFile::open_internal(&path, true, true, false, OpenHint::MutableBufferedLog)
+            WinPlatformFile::open_internal(&path, true, true, OpenHint::MutableBufferedLog)
                 .unwrap();
         assert!(!existed1);
         file1.write_all_at(b"hello-world", 4096).unwrap();
@@ -788,8 +780,7 @@ mod tests {
 
         // Reopen reports `already_existed == true` and concurrent cross-thread reads succeed.
         let (file2, existed2) =
-            WinPlatformFile::open_internal(&path, true, false, false, OpenHint::ImmutableRandom)
-                .unwrap();
+            WinPlatformFile::open_internal(&path, true, false, OpenHint::ImmutableRandom).unwrap();
         assert!(existed2);
         let shared = Arc::new(file2);
         let worker = {
